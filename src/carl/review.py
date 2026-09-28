@@ -454,17 +454,13 @@ class ReviewApplication:
             raise ReviewInputError(
                 "Maximum search runs must be at least the number of selected search tracks"
             )
-        runs_per_track, tracks_with_extra_run = divmod(
-            maximum_runs, len(selected_identifiers)
-        )
+        runs_per_track, tracks_with_extra_run = divmod(maximum_runs, len(selected_identifiers))
         selected_ancestries = tuple(
             [
                 await self._projection_ancestry(
                     identifier,
                     as_of_completion_sequence=as_of_completion_sequence,
-                    maximum_runs=(
-                        runs_per_track + (1 if index < tracks_with_extra_run else 0)
-                    ),
+                    maximum_runs=(runs_per_track + (1 if index < tracks_with_extra_run else 0)),
                 )
                 for index, identifier in enumerate(selected_identifiers)
             ]
@@ -819,9 +815,7 @@ class ReviewApplication:
         self, request: GetComposedListingRequest
     ) -> ComposedListingProjection:
         if request.product_guide_record_identifier is not None:
-            await self._active_product_guide(
-                request.product_guide_record_identifier
-            )
+            await self._active_product_guide(request.product_guide_record_identifier)
         as_of = await self.database.current_completion_boundary()
         observation_candidates = await self.database.facebook_projection_item_observations(
             (request.listing_identifier,),
@@ -1148,9 +1142,7 @@ class ReviewApplication:
         ):
             raise ReviewInputError("Workspace listing filters cannot select a different guide")
         filters = request.filters.model_copy(
-            update={
-                "product_guide_record_identifier": workspace.product_guide_record_identifier
-            }
+            update={"product_guide_record_identifier": workspace.product_guide_record_identifier}
         )
         return await self.list_composed_search(
             ListComposedSearchRequest(
@@ -1158,16 +1150,10 @@ class ReviewApplication:
                 additional_search_run_record_identifiers=current_runs[1:],
                 filters=filters,
                 maximum_ancestry_runs=request.maximum_search_runs,
-                maximum_gallery_images_per_listing=(
-                    request.maximum_gallery_images_per_listing
-                ),
+                maximum_gallery_images_per_listing=(request.maximum_gallery_images_per_listing),
                 maximum_analyses_per_listing=request.maximum_analyses_per_listing,
-                maximum_observations_per_listing=(
-                    request.maximum_observations_per_listing
-                ),
-                maximum_candidate_listings_examined=(
-                    request.maximum_candidate_listings_examined
-                ),
+                maximum_observations_per_listing=(request.maximum_observations_per_listing),
+                maximum_candidate_listings_examined=(request.maximum_candidate_listings_examined),
                 page_size=request.page_size,
                 cursor=request.cursor,
             )
@@ -1329,15 +1315,9 @@ class ReviewApplication:
             raise ReviewInputError("The record is not a supported review workspace")
         return ReviewWorkspace.model_validate_json(encode_json(value))
 
-    async def _workspace_identity(
-        self, workspace: ReviewWorkspace
-    ) -> ReviewWorkspace:
-        for _, value in await self.database.records_by_kind(
-            REVIEW_WORKSPACE_IDENTITY_STATE_KIND
-        ):
-            state = ReviewWorkspaceIdentityStateRecord.model_validate_json(
-                encode_json(value)
-            )
+    async def _workspace_identity(self, workspace: ReviewWorkspace) -> ReviewWorkspace:
+        for _, value in await self.database.records_by_kind(REVIEW_WORKSPACE_IDENTITY_STATE_KIND):
+            state = ReviewWorkspaceIdentityStateRecord.model_validate_json(encode_json(value))
             if state.workspace_record_identifier == workspace.record_identifier:
                 update: dict[str, object] = {}
                 if state.name is not None:
@@ -1385,20 +1365,14 @@ class ReviewApplication:
                 recorded_at_utc=workspace.created_at_utc,
             )
             default_binding_identifier = binding_identifier
-        for _, value in await self.database.records_by_kind(
-            WORKSPACE_PRODUCT_GUIDE_BINDING_KIND
-        ):
-            record = WorkspaceProductGuideBindingRecord.model_validate_json(
-                encode_json(value)
-            )
+        for _, value in await self.database.records_by_kind(WORKSPACE_PRODUCT_GUIDE_BINDING_KIND):
+            record = WorkspaceProductGuideBindingRecord.model_validate_json(encode_json(value))
             if record.workspace_record_identifier == workspace.record_identifier:
                 records[record.binding_identifier] = record
         for _, value in await self.database.records_by_kind(
             WORKSPACE_DEFAULT_PRODUCT_GUIDE_STATE_KIND
         ):
-            state = WorkspaceDefaultProductGuideStateRecord.model_validate_json(
-                encode_json(value)
-            )
+            state = WorkspaceDefaultProductGuideStateRecord.model_validate_json(encode_json(value))
             if state.workspace_record_identifier == workspace.record_identifier:
                 explicit_default_state = True
                 default_binding_identifier = state.binding_identifier
@@ -1445,9 +1419,7 @@ class ReviewApplication:
             tuple(
                 binding.model_copy(
                     update={
-                        "is_default": (
-                            binding.binding_identifier == default_binding_identifier
-                        )
+                        "is_default": (binding.binding_identifier == default_binding_identifier)
                     }
                 )
                 for binding in resolved
@@ -1464,9 +1436,7 @@ class ReviewApplication:
     async def _workspace_search_tracks(
         self, workspace: ReviewWorkspace
     ) -> tuple[WorkspaceSearchTrack, ...]:
-        _, _, initial_value = await self.database.get_record(
-            workspace.search_run_record_identifier
-        )
+        _, _, initial_value = await self.database.get_record(workspace.search_run_record_identifier)
         initial_refresh_identifier = (
             await self.database.facebook_search_run_refresh_work_identifier(
                 workspace.search_run_record_identifier
@@ -1490,7 +1460,9 @@ class ReviewApplication:
             requester_kind=("carl", "mcp", "create_workspace_search"),
             requester_identifier=workspace.record_identifier,
         )
-        creation_work = [await self.database.work(identifier) for identifier in creation_identifiers]
+        creation_work = [
+            await self.database.work(identifier) for identifier in creation_identifiers
+        ]
         for work in sorted(
             creation_work,
             key=lambda value: (int(value["created_at_utc_ns"]), str(value["identifier"])),
@@ -1518,9 +1490,7 @@ class ReviewApplication:
         )
         refresh_work_by_identifier = {
             identifier: await self.database.work(identifier)
-            for identifier in {
-                str(edge["work_identifier"]) for edge in refresh_edges
-            }
+            for identifier in {str(edge["work_identifier"]) for edge in refresh_edges}
         }
         refresh_items = tuple(
             (
@@ -1562,17 +1532,14 @@ class ReviewApplication:
                 update={
                     "current_search_run_record_identifier": (
                         refreshed_identifier
-                        if state is WorkState.COMPLETED
-                        and isinstance(refreshed_identifier, str)
+                        if state is WorkState.COMPLETED and isinstance(refreshed_identifier, str)
                         else track.current_search_run_record_identifier
                     ),
                     "latest_refresh_work_identifier": identifier,
                     "latest_refresh_work_state": state,
                 }
             )
-        for _, value in await self.database.records_by_kind(
-            WORKSPACE_SEARCH_TRACK_STATE_KIND
-        ):
+        for _, value in await self.database.records_by_kind(WORKSPACE_SEARCH_TRACK_STATE_KIND):
             state = WorkspaceSearchTrackStateRecord.model_validate_json(encode_json(value))
             if (
                 state.workspace_record_identifier == workspace.record_identifier
@@ -1586,9 +1553,10 @@ class ReviewApplication:
     async def get_review_workspace(self, record_identifier: str) -> ReviewWorkspace:
         stored = await self._stored_review_workspace(record_identifier)
         workspace = await self._workspace_identity(stored)
-        guide_bindings, default_guide_binding_identifier = (
-            await self._workspace_product_guide_bindings(stored)
-        )
+        (
+            guide_bindings,
+            default_guide_binding_identifier,
+        ) = await self._workspace_product_guide_bindings(stored)
         default_guide_record_identifier = next(
             (
                 binding.resolved_product_guide_record_identifier
@@ -1601,9 +1569,7 @@ class ReviewApplication:
             update={
                 "product_guide_record_identifier": default_guide_record_identifier,
                 "product_guide_bindings": guide_bindings,
-                "default_product_guide_binding_identifier": (
-                    default_guide_binding_identifier
-                ),
+                "default_product_guide_binding_identifier": (default_guide_binding_identifier),
                 "search_tracks": await self._workspace_search_tracks(workspace),
             }
         )
@@ -1637,9 +1603,7 @@ class ReviewApplication:
             inputs=(
                 NamedInput(name=("workspace",), object_identifier=workspace.record_identifier),
             ),
-            outputs=(
-                NamedOutput(name=("identity_state",), object_identifier=record_identifier),
-            ),
+            outputs=(NamedOutput(name=("identity_state",), object_identifier=record_identifier),),
             result=state.model_dump(mode="json", exclude_none=True),
         )
         return await self.get_review_workspace(workspace.record_identifier)
@@ -1729,8 +1693,7 @@ class ReviewApplication:
             NamedOutput(name=("product_guide_binding",), object_identifier=binding_identifier)
         ]
         make_default = (
-            request.make_default
-            or workspace.default_product_guide_binding_identifier is None
+            request.make_default or workspace.default_product_guide_binding_identifier is None
         )
         if make_default:
             default_state_identifier = self.new_identifier()
@@ -1759,9 +1722,7 @@ class ReviewApplication:
             records=tuple(records),
             inputs=(
                 NamedInput(name=("workspace",), object_identifier=workspace.record_identifier),
-                NamedInput(
-                    name=("product_guide",), object_identifier=guide.record_identifier
-                ),
+                NamedInput(name=("product_guide",), object_identifier=guide.record_identifier),
             ),
             outputs=tuple(outputs),
             result={
@@ -1777,9 +1738,7 @@ class ReviewApplication:
         self, request: UpdateWorkspaceProductGuideBindingRequest
     ) -> WorkspaceProductGuideBinding:
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
-        current = self._workspace_product_guide_binding(
-            workspace, request.binding_identifier
-        )
+        current = self._workspace_product_guide_binding(workspace, request.binding_identifier)
         alias = request.alias or current.alias
         if any(
             binding.binding_identifier != current.binding_identifier
@@ -1793,9 +1752,7 @@ class ReviewApplication:
             else None
         )
         if request.enabled is True and requested_guide is None:
-            await self._active_product_guide(
-                current.resolved_product_guide_record_identifier
-            )
+            await self._active_product_guide(current.resolved_product_guide_record_identifier)
         if (
             requested_guide is not None
             and requested_guide.identity != current.product_guide_identity
@@ -1842,9 +1799,7 @@ class ReviewApplication:
             ),
             inputs=(
                 NamedInput(name=("workspace",), object_identifier=workspace.record_identifier),
-                NamedInput(
-                    name=("product_guide",), object_identifier=input_guide_identifier
-                ),
+                NamedInput(name=("product_guide",), object_identifier=input_guide_identifier),
             ),
             outputs=(
                 NamedOutput(
@@ -1862,9 +1817,7 @@ class ReviewApplication:
     ) -> ReviewWorkspace:
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
         if request.binding_identifier is not None:
-            binding = self._workspace_product_guide_binding(
-                workspace, request.binding_identifier
-            )
+            binding = self._workspace_product_guide_binding(workspace, request.binding_identifier)
             if not binding.enabled:
                 raise ReviewInputError(
                     "Enable a workspace product-guide binding before making it the default"
@@ -1956,9 +1909,7 @@ class ReviewApplication:
             inputs=(
                 NamedInput(name=("workspace",), object_identifier=workspace.record_identifier),
             ),
-            outputs=(
-                NamedOutput(name=("track_state",), object_identifier=record_identifier),
-            ),
+            outputs=(NamedOutput(name=("track_state",), object_identifier=record_identifier),),
             result={"state": "completed", "enabled": request.enabled},
         )
         return track.model_copy(update={"enabled": request.enabled})
@@ -1974,9 +1925,7 @@ class ReviewApplication:
             [await self.get_review_workspace(workspace.record_identifier) for workspace in stored]
         )
         return tuple(
-            workspace
-            for workspace in workspaces
-            if include_archived or not workspace.archived
+            workspace for workspace in workspaces if include_archived or not workspace.archived
         )
 
     @staticmethod
@@ -1987,9 +1936,7 @@ class ReviewApplication:
             if track.enabled and track.current_search_run_record_identifier is not None
         )
         return (
-            current_runs
-            if workspace.search_tracks
-            else (workspace.search_run_record_identifier,)
+            current_runs if workspace.search_tracks else (workspace.search_run_record_identifier,)
         )
 
     async def get_review_workspace_activity(
@@ -2232,9 +2179,7 @@ class ReviewApplication:
                     additional_search_run_record_identifiers=current_runs[1:],
                     filters=ComposedListingFilters(
                         statuses=request.statuses,
-                        product_guide_record_identifier=(
-                            workspace.product_guide_record_identifier
-                        ),
+                        product_guide_record_identifier=(workspace.product_guide_record_identifier),
                     ),
                     maximum_gallery_images_per_listing=10,
                     maximum_analyses_per_listing=5,
@@ -3071,9 +3016,7 @@ class ReviewApplication:
         requested_binding_identifier: str | None,
         requested_guide_record_identifier: str | None = None,
     ) -> tuple[str, str]:
-        enabled = tuple(
-            binding for binding in workspace.product_guide_bindings if binding.enabled
-        )
+        enabled = tuple(binding for binding in workspace.product_guide_bindings if binding.enabled)
         if not enabled and workspace.product_guide_record_identifier is not None:
             return (
                 self._legacy_workspace_product_guide_binding_identifier(
@@ -3082,13 +3025,9 @@ class ReviewApplication:
                 workspace.product_guide_record_identifier,
             )
         if requested_binding_identifier is not None:
-            binding = self._workspace_product_guide_binding(
-                workspace, requested_binding_identifier
-            )
+            binding = self._workspace_product_guide_binding(workspace, requested_binding_identifier)
             if not binding.enabled:
-                raise ReviewInputError(
-                    "Enable the workspace product-guide binding before using it"
-                )
+                raise ReviewInputError("Enable the workspace product-guide binding before using it")
         elif requested_guide_record_identifier is not None:
             matching = tuple(
                 candidate
@@ -3141,12 +3080,10 @@ class ReviewApplication:
         bool,
     ]:
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
-        guide_binding_identifier, guide_record_identifier = (
-            self._selected_workspace_product_guide(
-                workspace,
-                request.product_guide_binding_identifier,
-                request.product_guide_record_identifier,
-            )
+        guide_binding_identifier, guide_record_identifier = self._selected_workspace_product_guide(
+            workspace,
+            request.product_guide_binding_identifier,
+            request.product_guide_record_identifier,
         )
         completed_tracks = tuple(
             track
@@ -3165,17 +3102,11 @@ class ReviewApplication:
                     query="unknown",
                     creation_work_identifier=None,
                     creation_work_state=None,
-                    origin_search_run_record_identifier=(
-                        workspace.search_run_record_identifier
-                    ),
-                    current_search_run_record_identifier=(
-                        workspace.search_run_record_identifier
-                    ),
+                    origin_search_run_record_identifier=(workspace.search_run_record_identifier),
+                    current_search_run_record_identifier=(workspace.search_run_record_identifier),
                     latest_refresh_work_identifier=legacy_refresh_identifier,
                     latest_refresh_work_state=(
-                        WorkState.COMPLETED
-                        if legacy_refresh_identifier is not None
-                        else None
+                        WorkState.COMPLETED if legacy_refresh_identifier is not None else None
                     ),
                 ),
             )
@@ -3213,9 +3144,7 @@ class ReviewApplication:
                 item.projection.listing_identifier for item in batch.items
             )
         elif isinstance(selection, WorksetSelection):
-            workset = (await self._current_review_worksets()).get(
-                selection.workset_identifier
-            )
+            workset = (await self._current_review_worksets()).get(selection.workset_identifier)
             if workset is None:
                 raise KeyError(selection.workset_identifier)
             if workset.workspace_record_identifier != workspace.record_identifier:
@@ -3229,9 +3158,7 @@ class ReviewApplication:
             if snapshot.workspace_record_identifier != workspace.record_identifier:
                 raise ReviewInputError("The selection snapshot belongs to a different workspace")
             selection_snapshot_record_identifier = snapshot.record_identifier
-            selected_listing_identifiers = tuple(
-                item.listing_identifier for item in snapshot.items
-            )
+            selected_listing_identifiers = tuple(item.listing_identifier for item in snapshot.items)
 
         (
             status_matching_listing_identifiers,
@@ -3240,9 +3167,7 @@ class ReviewApplication:
         ) = await self._workspace_analysis_candidates(
             workspace,
             statuses=frozenset(request.statuses),
-            maximum_candidate_listings_examined=(
-                request.maximum_candidate_listings_examined
-            ),
+            maximum_candidate_listings_examined=(request.maximum_candidate_listings_examined),
         )
         status_matching = frozenset(status_matching_listing_identifiers)
         selected_listing_identifiers = (
@@ -3290,19 +3215,14 @@ class ReviewApplication:
             as_of_completion_sequence=as_of,
             maximum_runs=100,
         )
-        candidates_with_lookahead = (
-            await self.database.facebook_projection_membership_candidates(
-                tuple(
-                    (run.record_identifier, run.internal_search_run_identifier)
-                    for run in ancestry.runs
-                ),
-                as_of_completion_sequence=as_of,
-                maximum_listings=maximum_candidate_listings_examined + 1,
-            )
+        candidates_with_lookahead = await self.database.facebook_projection_membership_candidates(
+            tuple(
+                (run.record_identifier, run.internal_search_run_identifier) for run in ancestry.runs
+            ),
+            as_of_completion_sequence=as_of,
+            maximum_listings=maximum_candidate_listings_examined + 1,
         )
-        limit_reached = (
-            len(candidates_with_lookahead) > maximum_candidate_listings_examined
-        )
+        limit_reached = len(candidates_with_lookahead) > maximum_candidate_listings_examined
         candidates = candidates_with_lookahead[:maximum_candidate_listings_examined]
         listing_identifiers = tuple(
             candidate.candidate.listing_identifier for candidate in candidates
@@ -3446,7 +3366,8 @@ class ReviewApplication:
         source_refresh_work = tuple(
             track.latest_refresh_work_identifier
             for track in workspace.search_tracks
-            if track.enabled and track.current_search_run_record_identifier is not None
+            if track.enabled
+            and track.current_search_run_record_identifier is not None
             and track.latest_refresh_work_identifier is not None
         ) or (low_level_request.search_refresh_work_identifier,)
         return SelectionAnalysesPreview(
@@ -3463,13 +3384,9 @@ class ReviewApplication:
             source_as_of_completion_sequence=plan.source_as_of_completion_sequence,
             selection_policy=request.selection_policy,
             candidate_listings_examined=candidate_listings_examined,
-            candidate_examination_limit_reached=(
-                candidate_examination_limit_reached
-            ),
+            candidate_examination_limit_reached=(candidate_examination_limit_reached),
             matching_latest_observations=len(plan.matching_observation_record_identifiers),
-            excluded_by_selection_policy=(
-                len(plan.policy_excluded_observation_record_identifiers)
-            ),
+            excluded_by_selection_policy=(len(plan.policy_excluded_observation_record_identifiers)),
             eligible_latest_observations=len(plan.eligible_observation_record_identifiers),
             selected_observations=len(plan.selected_observation_record_identifiers),
             new_analysis_count=len(plan.selected_observation_record_identifiers),
@@ -3498,7 +3415,8 @@ class ReviewApplication:
         source_refresh_work = tuple(
             track.latest_refresh_work_identifier
             for track in workspace.search_tracks
-            if track.enabled and track.current_search_run_record_identifier is not None
+            if track.enabled
+            and track.current_search_run_record_identifier is not None
             and track.latest_refresh_work_identifier is not None
         ) or (low_level_request.search_refresh_work_identifier,)
         payload = RequestMissingAnalysesPayload(
@@ -3508,9 +3426,7 @@ class ReviewApplication:
             ),
             source_search_refresh_work_identifiers=source_refresh_work,
             source_as_of_completion_sequence=plan.source_as_of_completion_sequence,
-            listing_observation_record_identifiers=(
-                plan.selected_observation_record_identifiers
-            ),
+            listing_observation_record_identifiers=(plan.selected_observation_record_identifiers),
             product_guide_record_identifier=low_level_request.product_guide_record_identifier,
             selection_snapshot_record_identifier=(
                 low_level_request.selection_snapshot_record_identifier
@@ -3550,9 +3466,7 @@ class ReviewApplication:
             product_guide_record_identifier=low_level_request.product_guide_record_identifier,
             selection_kind=request.selection.kind,
             candidate_listings_examined=candidate_listings_examined,
-            candidate_examination_limit_reached=(
-                candidate_examination_limit_reached
-            ),
+            candidate_examination_limit_reached=(candidate_examination_limit_reached),
             selected_observation_count=len(plan.selected_observation_record_identifiers),
             source_as_of_completion_sequence=plan.source_as_of_completion_sequence,
         )
@@ -3612,19 +3526,13 @@ class ReviewApplication:
 
     async def _retired_product_guide_identities(self) -> frozenset[tuple[str, ...]]:
         states: dict[tuple[str, ...], bool] = {}
-        for _, value in await self.database.records_by_kind(
-            PRODUCT_GUIDE_IDENTITY_STATE_KIND
-        ):
-            state = ProductGuideIdentityStateRecord.model_validate_json(
-                encode_json(value)
-            )
+        for _, value in await self.database.records_by_kind(PRODUCT_GUIDE_IDENTITY_STATE_KIND):
+            state = ProductGuideIdentityStateRecord.model_validate_json(encode_json(value))
             states[state.product_guide_identity] = state.retired
         return frozenset(identity for identity, retired in states.items() if retired)
 
     @staticmethod
-    def _product_guide_summary(
-        guide: ProductGuideSummary, *, retired: bool
-    ) -> ProductGuideSummary:
+    def _product_guide_summary(guide: ProductGuideSummary, *, retired: bool) -> ProductGuideSummary:
         return ProductGuideSummary(
             record_identifier=guide.record_identifier,
             identity=guide.identity,
@@ -3666,8 +3574,7 @@ class ReviewApplication:
         if request.retired:
             for workspace in await self.list_review_workspaces(include_archived=True):
                 if any(
-                    binding.enabled
-                    and binding.product_guide_identity == guide.identity
+                    binding.enabled and binding.product_guide_identity == guide.identity
                     for binding in workspace.product_guide_bindings
                 ):
                     raise ReviewInputError(
@@ -3803,9 +3710,7 @@ class ReviewApplication:
     async def revise_product_guide(
         self, request: ReviseProductGuideRequest
     ) -> ProductGuideDetails | ProductGuideConflict:
-        base = await self._active_product_guide(
-            request.expected_base_record_identifier
-        )
+        base = await self._active_product_guide(request.expected_base_record_identifier)
         return await self._author_product_guide(
             identity=base.identity,
             display_name=request.display_name,

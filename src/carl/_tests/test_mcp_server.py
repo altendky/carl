@@ -397,12 +397,8 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert not retired_guide.is_error
             assert retired_guide.structured_content is not None
             assert retired_guide.structured_content["retired"] is True
-            assert (await call_json("list_product_guides")).structured_content == {
-                "result": []
-            }
-            retired_listing = await call_json(
-                "list_product_guides", {"include_retired": True}
-            )
+            assert (await call_json("list_product_guides")).structured_content == {"result": []}
+            retired_listing = await call_json("list_product_guides", {"include_retired": True})
             assert retired_listing.structured_content is not None
             assert len(retired_listing.structured_content["result"]) == 2
             provenance = await call_json(

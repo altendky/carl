@@ -194,9 +194,7 @@ async def test_workspace_search_and_refresh_are_tracks_and_workspace_work(
                 archived=False,
             )
         )
-        identity_states = await database.records_by_kind(
-            REVIEW_WORKSPACE_IDENTITY_STATE_KIND
-        )
+        identity_states = await database.records_by_kind(REVIEW_WORKSPACE_IDENTITY_STATE_KIND)
 
         added = await application.create_workspace_search(
             CreateWorkspaceSearchRequest.model_validate_json(
@@ -488,9 +486,7 @@ async def test_workspace_product_guide_bindings_pin_follow_and_select_defaults(
                 make_default=True,
             )
         )
-        revised_workspace = await application.get_review_workspace(
-            workspace.record_identifier
-        )
+        revised_workspace = await application.get_review_workspace(workspace.record_identifier)
         selected_by_record = application._selected_workspace_product_guide(
             revised_workspace, None, second.record_identifier
         )

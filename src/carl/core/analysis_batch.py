@@ -60,8 +60,7 @@ def apply_listing_analysis_selection_policy(
             source.listing_identifier
             for source in sources
             if any(
-                analysis.product_guide_record_identifier
-                == product_guide_record_identifier
+                analysis.product_guide_record_identifier == product_guide_record_identifier
                 for analysis in source.analyses
             )
         }
@@ -135,17 +134,13 @@ def select_listing_analysis_batch(
         eligible_set = set(eligible)
         reusable = (
             tuple(identifier for identifier in matching if identifier not in eligible_set)
-            if selection_policy
-            is ListingAnalysisSelectionPolicy.MISSING_FOR_SELECTED_GUIDE
+            if selection_policy is ListingAnalysisSelectionPolicy.MISSING_FOR_SELECTED_GUIDE
             else ()
         )
         policy_excluded = (
             ()
-            if selection_policy
-            is ListingAnalysisSelectionPolicy.MISSING_FOR_SELECTED_GUIDE
-            else tuple(
-                identifier for identifier in matching if identifier not in eligible_set
-            )
+            if selection_policy is ListingAnalysisSelectionPolicy.MISSING_FOR_SELECTED_GUIDE
+            else tuple(identifier for identifier in matching if identifier not in eligible_set)
         )
     selected = eligible if maximum_items is None else eligible[:maximum_items]
     selected_set = set(selected)

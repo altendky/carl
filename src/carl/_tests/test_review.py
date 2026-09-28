@@ -478,8 +478,7 @@ async def test_product_guide_versions_use_optimistic_concurrency(tmp_path: Path)
         assert retired.retired
         assert await application.list_product_guides() == ()
         assert all(
-            guide.retired
-            for guide in await application.list_product_guides(include_retired=True)
+            guide.retired for guide in await application.list_product_guides(include_retired=True)
         )
         assert (await application.get_product_guide(second.record_identifier)).retired
         with pytest.raises(ReviewInputError, match="Restore the retired"):

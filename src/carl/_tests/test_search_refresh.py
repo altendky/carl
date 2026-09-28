@@ -118,7 +118,7 @@ async def test_refresh_resumes_retryable_terminal_search_child() -> None:
             "kind": "search_refresh_resumed_transient_search_failure",
             "refresh_work_identifier": "refresh-work",
         },
-            "payload_schema_version": COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
+        "payload_schema_version": COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
     }
 
 

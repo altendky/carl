@@ -413,10 +413,7 @@ class CreateProductGuideRequest(StrictModel):
             parts = parts[2:]
         if not parts:
             raise ValueError("Product guide identity requires a suffix after Carl's namespace")
-        if any(
-            not isinstance(part, str) or not part or part != part.strip()
-            for part in parts
-        ):
+        if any(not isinstance(part, str) or not part or part != part.strip() for part in parts):
             raise ValueError("Product guide identity parts must be nonempty and trimmed")
         return parts
 

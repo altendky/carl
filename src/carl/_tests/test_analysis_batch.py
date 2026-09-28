@@ -152,9 +152,7 @@ def test_never_analyzed_policy_excludes_fresher_observation_of_analyzed_listing(
     assert batch.eligible_observation_record_identifiers == ("new-fresh",)
     assert batch.selected_observation_record_identifiers == ("new-fresh",)
     assert batch.reusable_observation_record_identifiers == ()
-    assert batch.policy_excluded_observation_record_identifiers == (
-        "existing-fresh",
-    )
+    assert batch.policy_excluded_observation_record_identifiers == ("existing-fresh",)
     assert batch.excluded_observation_record_identifiers == ("existing-fresh",)
 
 
@@ -167,9 +165,9 @@ def test_selected_guide_policy_reuses_only_analysis_under_exact_guide() -> None:
     ).model_copy(
         update={
             "analyses": (
-                _candidate_source("other", "other-old", analyzed=True).analyses[0].model_copy(
-                    update={"product_guide_record_identifier": "other-guide"}
-                ),
+                _candidate_source("other", "other-old", analyzed=True)
+                .analyses[0]
+                .model_copy(update={"product_guide_record_identifier": "other-guide"}),
             )
         }
     )

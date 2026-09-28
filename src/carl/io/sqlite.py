@@ -6185,9 +6185,7 @@ class Database:
                     identity=record.identity,
                     display_name=record.display_name,
                     version=record.version,
-                    previous_record_identifier=(
-                        None if row[2] is None else _text(row[2])
-                    ),
+                    previous_record_identifier=(None if row[2] is None else _text(row[2])),
                 )
             )
         return tuple(sorted(guides, key=lambda guide: (guide.identity, guide.version)))

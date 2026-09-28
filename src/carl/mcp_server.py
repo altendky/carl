@@ -404,18 +404,14 @@ def tool_definitions(
     ) -> WorkspaceProductGuideBinding:
         """Rename, enable, disable, pin, or advance one workspace guide binding."""
 
-        return await expected(
-            lambda: application.update_workspace_product_guide_binding(request)
-        )
+        return await expected(lambda: application.update_workspace_product_guide_binding(request))
 
     async def set_workspace_default_product_guide(
         request: SetWorkspaceDefaultProductGuideRequest,
     ) -> ReviewWorkspace:
         """Choose or clear the guide binding used by default for workspace operations."""
 
-        return await expected(
-            lambda: application.set_workspace_default_product_guide(request)
-        )
+        return await expected(lambda: application.set_workspace_default_product_guide(request))
 
     async def list_workspace_product_guides(
         workspace_record_identifier: str,
@@ -517,10 +513,7 @@ def tool_definitions(
             await context.report_progress(
                 waited_seconds,
                 timeout_seconds,
-                (
-                    f"{status.queued_count} queued, "
-                    f"{status.in_progress_count} in progress"
-                ),
+                (f"{status.queued_count} queued, {status.in_progress_count} in progress"),
             )
 
         return await expected(
@@ -584,9 +577,7 @@ def tool_definitions(
     ) -> tuple[ReviewWorkset, ...]:
         """List the current versions of a workspace's reusable static groups."""
 
-        return await expected(
-            lambda: application.list_review_worksets(workspace_record_identifier)
-        )
+        return await expected(lambda: application.list_review_worksets(workspace_record_identifier))
 
     async def create_selection_snapshot(
         request: CreateSelectionSnapshotRequest,
@@ -703,9 +694,7 @@ def tool_definitions(
     ) -> ProductGuideSummary:
         """Retire or restore a whole guide identity while preserving every exact version."""
 
-        return await expected(
-            lambda: application.set_product_guide_identity_retired(request)
-        )
+        return await expected(lambda: application.set_product_guide_identity_retired(request))
 
     async def retry_image_failures(
         request: RetryImageFailuresRequest,
@@ -720,9 +709,7 @@ def tool_definitions(
     ) -> WorkStatus:
         """Get compact live progress; include details only for raw durable diagnostic fields."""
 
-        return await expected(
-            lambda: application.get_work_status(work_identifier, include_details)
-        )
+        return await expected(lambda: application.get_work_status(work_identifier, include_details))
 
     definitions = (
         ToolDefinition(

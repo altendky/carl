@@ -165,9 +165,7 @@ class ReviewWorkspace(StrictModel):
     product_guide_bindings: tuple[WorkspaceProductGuideBinding, ...] = Field(
         default=(), max_length=20
     )
-    default_product_guide_binding_identifier: str | None = Field(
-        default=None, min_length=1
-    )
+    default_product_guide_binding_identifier: str | None = Field(default=None, min_length=1)
 
 
 class RenameReviewWorkspaceRequest(StrictModel):
