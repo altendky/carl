@@ -23,6 +23,9 @@ from carl.core.composed_projection import (
     ProjectionEvidence,
     ProjectionRevision,
     ProjectionSourceKind,
+    SearchAncestrySelection,
+    SearchMembershipOccurrenceCandidate,
+    SearchRunCandidate,
     canonical_facebook_listing_url,
 )
 from carl.core.facebook_work import COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION, COLLECT_SEARCH_WORK_KIND
@@ -38,6 +41,8 @@ from carl.core.review import (
 from carl.core.review_workspace import (
     ACQUIRE_REVIEW_BATCH,
     CREATE_REVIEW_WORKSET,
+    LISTING_REVIEW_KIND,
+    RECORD_WORKSPACE_BULK_REVIEW,
     REVIEW_WORKSPACE_IDENTITY_STATE_KIND,
     REVIEW_WORKSPACE_KIND,
     AcquireReviewBatchRequest,
@@ -52,6 +57,8 @@ from carl.core.review_workspace import (
     ListWorkspaceListingsRequest,
     ProjectionRevisionComponent,
     RecordListingReviewsRequest,
+    RecordWorkspaceBulkReviewRequest,
+    RecordWorkspaceBulkReviewResult,
     ReleaseReviewClaimRequest,
     RenameReviewWorkspaceRequest,
     RenewReviewClaimRequest,
@@ -65,11 +72,13 @@ from carl.core.review_workspace import (
     ReviewState,
     ReviewWorksetConflict,
     ReviewWorkspace,
+    SelectionSnapshotBulkReviewSelection,
     SetReviewWorkspaceArchivedRequest,
     SetWorkspaceDefaultProductGuideRequest,
     SetWorkspaceSearchTrackEnabledRequest,
     UpdateReviewWorksetRequest,
     UpdateWorkspaceProductGuideBindingRequest,
+    WorksetBulkReviewSelection,
     WorkspaceProductGuideBinding,
     WorkspaceProductGuideVersionPolicy,
     WorkspaceWorkStatus,
@@ -1291,3 +1300,509 @@ async def test_application_persists_review_workflow(
             )
         )
         assert unclaimed_review.records[0].listing_identifier == "123"
+
+
+@pytest.mark.anyio
+async def test_workspace_bulk_review_preserves_prior_reviews_and_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def projection(identifier: str, scalar: str) -> ComposedListingProjection:
+        return ComposedListingProjection(
+            listing_identifier=identifier,
+            canonical_source_url=canonical_facebook_listing_url(identifier),
+            as_of_completion_sequence=7,
+            projection_revision=_revision(scalar=scalar),
+            status=ComposedStatus(
+                value=ListingStatus.AVAILABLE,
+                raw_flags={"is_live": True},
+                evidence=ProjectionEvidence(
+                    evidence_record_identifier=f"search-card-{identifier}",
+                    acquisition_completion_sequence=7,
+                    observation_completion_sequence=7,
+                    source_kind=ProjectionSourceKind.SEARCH_CARD,
+                ),
+            ),
+            title=None,
+            price=None,
+            location=None,
+            description=None,
+            seller=None,
+            preview_image=None,
+            gallery=None,
+            analyses=(),
+            analyses_truncated=False,
+            search_membership=None,
+        )
+
+    projections = (
+        projection("123", "1"),
+        projection("456", "2"),
+        projection("789", "3"),
+    )
+
+    async def list_composed_search(
+        _application: ReviewApplication, request: ListComposedSearchRequest
+    ) -> ComposedListingPage:
+        return ComposedListingPage(
+            as_of_completion_sequence=7,
+            selected_search_run_record_identifier=request.search_run_record_identifier,
+            included_ancestry_run_count=1,
+            older_ancestry_truncated=False,
+            examined_candidate_listing_count=3,
+            candidate_examination_limit_reached=False,
+            listings=projections,
+            next_cursor=None,
+        )
+
+    async def bulk_projections(
+        _application: ReviewApplication,
+        _workspace: ReviewWorkspace,
+        *,
+        maximum_candidate_listings_examined: int,
+        selected_listing_identifiers: tuple[str, ...] | None = None,
+    ) -> tuple[int, int, tuple[ComposedListingProjection, ...]]:
+        assert maximum_candidate_listings_examined == 10_000
+        selected = (
+            projections
+            if selected_listing_identifiers is None
+            else tuple(
+                projection
+                for projection in projections
+                if projection.listing_identifier in selected_listing_identifiers
+            )
+        )
+        return 7, len(selected), selected
+
+    monkeypatch.setattr(ReviewApplication, "list_composed_search", list_composed_search)
+    monkeypatch.setattr(ReviewApplication, "_workspace_bulk_review_projections", bulk_projections)
+    component = Component(ComponentId(("test", "search")), 1, lambda: None)
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await database.publish_records_operation(
+            component=component,
+            operation_identifier="search-operation",
+            records=(
+                RecordDraft(
+                    identifier="search-run",
+                    kind=("carl", "facebook", "search_run"),
+                    schema_version=1,
+                    value={},
+                ),
+            ),
+            inputs=(),
+            outputs=(NamedOutput(name=("search_run",), object_identifier="search-run"),),
+            provenance=_provenance(),
+            invocation={},
+            started_at_utc="2026-09-28T00:00:00+00:00",
+            ended_at_utc="2026-09-28T00:00:01+00:00",
+            duration_ns=1,
+            result={"state": "completed"},
+        )
+
+        async def code_provenance() -> CodeProvenance:
+            return _provenance()
+
+        application = ReviewApplication(
+            database=database,
+            repository_root=tmp_path,
+            code_provenance=code_provenance,
+        )
+        workspace = await application.create_review_workspace(
+            CreateReviewWorkspaceRequest(
+                name="Bulk review", search_run_record_identifier="search-run"
+            )
+        )
+        acquisition = await application.acquire_review_batch(
+            AcquireReviewBatchRequest(
+                workspace_record_identifier=workspace.record_identifier,
+                request_identifier="explicit-review-batch",
+                owner_identifier="agent-a",
+            )
+        )
+        assert acquisition.lease is not None
+        await application.record_listing_reviews(
+            RecordListingReviewsRequest(
+                request_identifier="explicit-review",
+                workspace_record_identifier=workspace.record_identifier,
+                batch_record_identifier=acquisition.batch.record_identifier,
+                claim_token=acquisition.lease.claim_token,
+                claim_owner_identifier="agent-a",
+                reviews=(
+                    ListingReviewInput(
+                        listing_identifier="123",
+                        projection_revision=projections[0].projection_revision,
+                        disposition=ReviewDisposition.PROMISING,
+                        note="Keep this one.",
+                    ),
+                ),
+            )
+        )
+        await application.release_review_claim(
+            ReleaseReviewClaimRequest(
+                request_identifier="release-explicit-review-batch",
+                claim_token=acquisition.lease.claim_token,
+                owner_identifier="agent-a",
+            )
+        )
+
+        request = RecordWorkspaceBulkReviewRequest(
+            request_identifier="reject-unreviewed",
+            workspace_record_identifier=workspace.record_identifier,
+            disposition=ReviewDisposition.REJECTED,
+            note="Not of interest, first-pass triage 2026-09-28.",
+            exclude_listing_identifiers=("789",),
+        )
+        result = await application.record_workspace_bulk_review(request)
+        assert await application.record_workspace_bulk_review(request) == result
+        assert result.as_of_completion_sequence == 7
+        assert result.candidate_listings_examined == 3
+        assert result.selection_member_count == 3
+        assert result.explicitly_excluded_count == 1
+        assert result.status_excluded_count == 0
+        assert result.review_state_excluded_count == 1
+        assert result.recorded_count == 1
+
+        latest = await database.latest_listing_reviews(
+            workspace_record_identifier=workspace.record_identifier,
+            listing_identifiers=("123", "456", "789"),
+        )
+        assert latest["123"].disposition is ReviewDisposition.PROMISING
+        assert latest["456"].disposition is ReviewDisposition.REJECTED
+        assert "789" not in latest
+        changed_revision = projections[1].projection_revision.model_copy(
+            update={"scalar_fields_sha256": "9" * 64}
+        )
+        assert (
+            classify_review_state(
+                current_revision=changed_revision,
+                previous_review=latest["456"],
+                policy=workspace.staleness_policy,
+            )[0]
+            is ReviewState.STALE
+        )
+
+        with pytest.raises(ReviewInputError, match="different request"):
+            await application.record_workspace_bulk_review(
+                request.model_copy(update={"note": "Changed request content."})
+            )
+        with pytest.raises(ReviewInputError, match="excluded listings are outside"):
+            await application.record_workspace_bulk_review(
+                request.model_copy(
+                    update={
+                        "request_identifier": "mistyped-exclusion",
+                        "exclude_listing_identifiers": ("999",),
+                    }
+                )
+            )
+
+        claimed = await application.acquire_review_batch(
+            AcquireReviewBatchRequest(
+                workspace_record_identifier=workspace.record_identifier,
+                request_identifier="claim-remaining",
+                owner_identifier="agent-b",
+            )
+        )
+        assert claimed.lease is not None
+        assert [item.projection.listing_identifier for item in claimed.batch.items] == ["789"]
+        with pytest.raises(ReviewInputError, match="claimed or reviewed concurrently"):
+            await application.record_workspace_bulk_review(
+                RecordWorkspaceBulkReviewRequest(
+                    request_identifier="reject-claimed",
+                    workspace_record_identifier=workspace.record_identifier,
+                    disposition=ReviewDisposition.REJECTED,
+                )
+            )
+        assert "789" not in await database.latest_listing_reviews(
+            workspace_record_identifier=workspace.record_identifier,
+            listing_identifiers=("789",),
+        )
+        await application.release_review_claim(
+            ReleaseReviewClaimRequest(
+                request_identifier="release-remaining",
+                claim_token=claimed.lease.claim_token,
+                owner_identifier="agent-b",
+            )
+        )
+
+        workset = await application.create_review_workset(
+            CreateReviewWorksetRequest(
+                workspace_record_identifier=workspace.record_identifier,
+                name="Remaining",
+                listing_identifiers=("789",),
+            )
+        )
+        assert not isinstance(workset, ReviewWorksetConflict)
+        workset_result = await application.record_workspace_bulk_review(
+            RecordWorkspaceBulkReviewRequest(
+                request_identifier="reject-workset",
+                workspace_record_identifier=workspace.record_identifier,
+                selection=WorksetBulkReviewSelection(workset_identifier=workset.workset_identifier),
+                disposition=ReviewDisposition.REJECTED,
+            )
+        )
+        assert workset_result.selection_kind == "workset"
+        assert workset_result.recorded_count == 1
+
+        snapshot = await application.create_selection_snapshot(
+            CreateSelectionSnapshotRequest(
+                workspace_record_identifier=workspace.record_identifier,
+                selection=ReviewBatchSelection(
+                    review_batch_record_identifier=acquisition.batch.record_identifier
+                ),
+            )
+        )
+        snapshot_result = await application.record_workspace_bulk_review(
+            RecordWorkspaceBulkReviewRequest(
+                request_identifier="defer-snapshot",
+                workspace_record_identifier=workspace.record_identifier,
+                selection=SelectionSnapshotBulkReviewSelection(
+                    selection_snapshot_record_identifier=snapshot.record_identifier
+                ),
+                include_review_states=(ReviewState.CURRENT,),
+                disposition=ReviewDisposition.DEFERRED,
+                exclude_listing_identifiers=("123", "456"),
+            )
+        )
+        assert snapshot_result.selection_kind == "selection_snapshot"
+        assert snapshot_result.recorded_count == 1
+
+
+@pytest.mark.anyio
+async def test_workset_bulk_projection_does_not_scan_the_whole_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    membership_scan_called = False
+
+    async def current_completion_boundary(_database: Database) -> int:
+        return 7
+
+    async def projection_search_scope(
+        _application: ReviewApplication,
+        primary_search_run_record_identifier: str,
+        additional_search_run_record_identifiers: tuple[str, ...],
+        *,
+        as_of_completion_sequence: int,
+        maximum_runs: int,
+    ) -> SearchAncestrySelection:
+        assert primary_search_run_record_identifier == "search-run"
+        assert additional_search_run_record_identifiers == ()
+        assert as_of_completion_sequence == 7
+        assert maximum_runs == 100
+        return SearchAncestrySelection(
+            runs=(
+                SearchRunCandidate(
+                    record_identifier="search-run",
+                    internal_search_run_identifier="internal-run",
+                    completion_sequence=7,
+                    started_at_utc=None,
+                    completed_at_utc=None,
+                    refresh_source_run_record_identifier=None,
+                    stopping_reason=None,
+                ),
+            ),
+            lineage_root_search_run_record_identifier="search-run",
+            older_ancestry_truncated=False,
+        )
+
+    async def membership_candidates(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        nonlocal membership_scan_called
+        membership_scan_called = True
+        return ()
+
+    async def membership_occurrences(
+        _database: Database,
+        listing_identifiers: tuple[str, ...],
+        included_search_runs: tuple[tuple[str, str], ...],
+        *,
+        as_of_completion_sequence: int,
+    ) -> tuple[SearchMembershipOccurrenceCandidate, ...]:
+        assert listing_identifiers == ("123",)
+        assert included_search_runs == (("search-run", "internal-run"),)
+        assert as_of_completion_sequence == 7
+        return (
+            SearchMembershipOccurrenceCandidate(
+                occurrence_record_identifier="occurrence",
+                listing_identifier="123",
+                search_run_record_identifier="search-run",
+                search_run_completion_sequence=7,
+                acquisition_completion_sequence=7,
+                observed_at_utc=None,
+            ),
+        )
+
+    async def no_projection_rows(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        return ()
+
+    monkeypatch.setattr(Database, "current_completion_boundary", current_completion_boundary)
+    monkeypatch.setattr(ReviewApplication, "_projection_search_scope", projection_search_scope)
+    monkeypatch.setattr(
+        Database, "facebook_projection_membership_candidates", membership_candidates
+    )
+    monkeypatch.setattr(
+        Database, "facebook_projection_membership_occurrences", membership_occurrences
+    )
+    monkeypatch.setattr(Database, "facebook_projection_item_observations", no_projection_rows)
+    monkeypatch.setattr(Database, "facebook_projection_search_occurrences", no_projection_rows)
+    monkeypatch.setattr(Database, "facebook_projection_search_cards", no_projection_rows)
+    monkeypatch.setattr(Database, "facebook_projection_analysis_descriptors", no_projection_rows)
+
+    workspace = ReviewWorkspace(
+        record_identifier="workspace",
+        name="Large workspace",
+        search_run_record_identifier="search-run",
+        product_guide_record_identifier=None,
+        staleness_policy=ReviewStalenessPolicy(),
+        created_at_utc="2026-09-28T00:00:00+00:00",
+    )
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        application = ReviewApplication(database=database, repository_root=tmp_path)
+        as_of, examined, projections = await application._workspace_bulk_review_projections(
+            workspace,
+            maximum_candidate_listings_examined=10_000,
+            selected_listing_identifiers=("123",),
+        )
+
+    assert as_of == 7
+    assert examined == 1
+    assert [projection.listing_identifier for projection in projections] == ["123"]
+    assert not membership_scan_called
+
+
+@pytest.mark.anyio
+async def test_workspace_bulk_review_publishes_thousands_in_one_bounded_write(
+    tmp_path: Path,
+) -> None:
+    workspace_identifier = "workspace"
+    listing_identifiers = tuple(str(1_000_000 + index) for index in range(3_600))
+    recorded_at = "2026-09-28T12:00:00+00:00"
+    reviews = tuple(
+        ListingReviewRecord(
+            record_identifier=f"review-{listing_identifier}",
+            workspace_record_identifier=workspace_identifier,
+            batch_record_identifier=None,
+            listing_identifier=listing_identifier,
+            projection_revision=_revision(),
+            inspected=True,
+            disposition=ReviewDisposition.REJECTED,
+            note="Not of interest, first-pass triage 2026-09-28.",
+            recorded_at_utc=recorded_at,
+        )
+        for listing_identifier in listing_identifiers
+    )
+    response = RecordWorkspaceBulkReviewResult(
+        operation_identifier="bulk-operation",
+        workspace_record_identifier=workspace_identifier,
+        selection_kind="workspace",
+        as_of_completion_sequence=1,
+        candidate_listings_examined=len(reviews),
+        selection_member_count=len(reviews),
+        explicitly_excluded_count=0,
+        status_excluded_count=0,
+        review_state_excluded_count=0,
+        recorded_count=len(reviews),
+        recorded_at_utc=recorded_at,
+    )
+    component = Component(ComponentId(("test", "workspace")), 1, lambda: None)
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await database.publish_records_operation(
+            component=component,
+            operation_identifier="workspace-operation",
+            records=(
+                RecordDraft(
+                    identifier=workspace_identifier,
+                    kind=REVIEW_WORKSPACE_KIND,
+                    schema_version=1,
+                    value={"test": True},
+                ),
+            ),
+            inputs=(),
+            outputs=(NamedOutput(name=("workspace",), object_identifier=workspace_identifier),),
+            provenance=_provenance(),
+            invocation={},
+            started_at_utc=recorded_at,
+            ended_at_utc=recorded_at,
+            duration_ns=1,
+            result={"state": "completed"},
+        )
+        with anyio.fail_after(10):
+            published = await database.publish_workspace_bulk_review_records(
+                request_identifier="bulk-3,600",
+                request_sha256="a" * 64,
+                workspace_record_identifier=workspace_identifier,
+                expected_prior_review_identifiers={
+                    listing_identifier: None for listing_identifier in listing_identifiers
+                },
+                component=build_review_workspace_component_registry().require(
+                    RECORD_WORKSPACE_BULK_REVIEW
+                ),
+                operation_identifier=response.operation_identifier,
+                records=tuple(
+                    RecordDraft(
+                        identifier=review.record_identifier,
+                        kind=LISTING_REVIEW_KIND,
+                        schema_version=1,
+                        value=review.model_dump(mode="json"),
+                    )
+                    for review in reviews
+                ),
+                source_input=None,
+                response=response,
+                provenance=_provenance(),
+                invocation={},
+                started_at_utc=recorded_at,
+                ended_at_utc=recorded_at,
+                duration_ns=1,
+                utc_now_ns=lambda: 1,
+            )
+        assert published == response
+        assert len(
+            await database.latest_listing_reviews(
+                workspace_record_identifier=workspace_identifier,
+                listing_identifiers=listing_identifiers,
+            )
+        ) == len(reviews)
+        assert (
+            await database.latest_listing_reviews(
+                workspace_record_identifier=workspace_identifier,
+                listing_identifiers=(),
+            )
+            == {}
+        )
+        conflicting_review = reviews[0].model_copy(
+            update={"record_identifier": "conflicting-review"}
+        )
+        conflict = await database.publish_workspace_bulk_review_records(
+            request_identifier="stale-plan",
+            request_sha256="b" * 64,
+            workspace_record_identifier=workspace_identifier,
+            expected_prior_review_identifiers={reviews[0].listing_identifier: None},
+            component=build_review_workspace_component_registry().require(
+                RECORD_WORKSPACE_BULK_REVIEW
+            ),
+            operation_identifier="conflicting-operation",
+            records=(
+                RecordDraft(
+                    identifier=conflicting_review.record_identifier,
+                    kind=LISTING_REVIEW_KIND,
+                    schema_version=1,
+                    value=conflicting_review.model_dump(mode="json"),
+                ),
+            ),
+            source_input=None,
+            response=response.model_copy(
+                update={
+                    "operation_identifier": "conflicting-operation",
+                    "candidate_listings_examined": 1,
+                    "selection_member_count": 1,
+                    "recorded_count": 1,
+                }
+            ),
+            provenance=_provenance(),
+            invocation={},
+            started_at_utc=recorded_at,
+            ended_at_utc=recorded_at,
+            duration_ns=1,
+            utc_now_ns=lambda: 2,
+        )
+        assert conflict is None
+        with pytest.raises(KeyError):
+            await database.get_record(conflicting_review.record_identifier)

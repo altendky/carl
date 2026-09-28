@@ -12565,6 +12565,310 @@
     }
   },
   {
+    "name": "record_workspace_bulk_review",
+    "description": "Atomically review a bounded selection; defaults to available and unreviewed.",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "ListingStatus": {
+          "enum": [
+            "available",
+            "pending",
+            "sold",
+            "unavailable",
+            "unknown"
+          ],
+          "title": "ListingStatus",
+          "type": "string"
+        },
+        "RecordWorkspaceBulkReviewRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "request_identifier": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Request Identifier",
+              "type": "string"
+            },
+            "workspace_record_identifier": {
+              "minLength": 1,
+              "title": "Workspace Record Identifier",
+              "type": "string"
+            },
+            "selection": {
+              "default": {
+                "kind": "workspace"
+              },
+              "discriminator": {
+                "mapping": {
+                  "selection_snapshot": "#/$defs/SelectionSnapshotBulkReviewSelection",
+                  "workset": "#/$defs/WorksetBulkReviewSelection",
+                  "workspace": "#/$defs/WorkspaceBulkReviewSelection"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/WorkspaceBulkReviewSelection"
+                },
+                {
+                  "$ref": "#/$defs/WorksetBulkReviewSelection"
+                },
+                {
+                  "$ref": "#/$defs/SelectionSnapshotBulkReviewSelection"
+                }
+              ],
+              "title": "Selection"
+            },
+            "statuses": {
+              "default": [
+                "available"
+              ],
+              "items": {
+                "$ref": "#/$defs/ListingStatus"
+              },
+              "maxItems": 5,
+              "minItems": 1,
+              "title": "Statuses",
+              "type": "array",
+              "uniqueItems": true
+            },
+            "include_review_states": {
+              "default": [
+                "unreviewed"
+              ],
+              "items": {
+                "$ref": "#/$defs/ReviewState"
+              },
+              "maxItems": 3,
+              "minItems": 1,
+              "title": "Include Review States",
+              "type": "array",
+              "uniqueItems": true
+            },
+            "disposition": {
+              "$ref": "#/$defs/ReviewDisposition"
+            },
+            "note": {
+              "anyOf": [
+                {
+                  "maxLength": 4000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Note"
+            },
+            "exclude_listing_identifiers": {
+              "default": [],
+              "items": {
+                "pattern": "^[0-9]+$",
+                "type": "string"
+              },
+              "maxItems": 10000,
+              "title": "Exclude Listing Identifiers",
+              "type": "array",
+              "uniqueItems": true
+            },
+            "maximum_candidate_listings_examined": {
+              "default": 10000,
+              "maximum": 10000,
+              "minimum": 1,
+              "title": "Maximum Candidate Listings Examined",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "request_identifier",
+            "workspace_record_identifier",
+            "disposition"
+          ],
+          "title": "RecordWorkspaceBulkReviewRequest",
+          "type": "object"
+        },
+        "ReviewDisposition": {
+          "enum": [
+            "promising",
+            "rejected",
+            "waiting_for_data",
+            "deferred"
+          ],
+          "title": "ReviewDisposition",
+          "type": "string"
+        },
+        "ReviewState": {
+          "enum": [
+            "unreviewed",
+            "current",
+            "stale"
+          ],
+          "title": "ReviewState",
+          "type": "string"
+        },
+        "SelectionSnapshotBulkReviewSelection": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "selection_snapshot",
+              "default": "selection_snapshot",
+              "title": "Kind",
+              "type": "string"
+            },
+            "selection_snapshot_record_identifier": {
+              "minLength": 1,
+              "title": "Selection Snapshot Record Identifier",
+              "type": "string"
+            }
+          },
+          "required": [
+            "selection_snapshot_record_identifier"
+          ],
+          "title": "SelectionSnapshotBulkReviewSelection",
+          "type": "object"
+        },
+        "WorksetBulkReviewSelection": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "workset",
+              "default": "workset",
+              "title": "Kind",
+              "type": "string"
+            },
+            "workset_identifier": {
+              "minLength": 1,
+              "title": "Workset Identifier",
+              "type": "string"
+            }
+          },
+          "required": [
+            "workset_identifier"
+          ],
+          "title": "WorksetBulkReviewSelection",
+          "type": "object"
+        },
+        "WorkspaceBulkReviewSelection": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "workspace",
+              "default": "workspace",
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          "title": "WorkspaceBulkReviewSelection",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/RecordWorkspaceBulkReviewRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "record_workspace_bulk_reviewArguments"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "operation_identifier": {
+          "minLength": 1,
+          "title": "Operation Identifier",
+          "type": "string"
+        },
+        "workspace_record_identifier": {
+          "minLength": 1,
+          "title": "Workspace Record Identifier",
+          "type": "string"
+        },
+        "selection_kind": {
+          "minLength": 1,
+          "title": "Selection Kind",
+          "type": "string"
+        },
+        "as_of_completion_sequence": {
+          "minimum": 0,
+          "title": "As Of Completion Sequence",
+          "type": "integer"
+        },
+        "candidate_listings_examined": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Candidate Listings Examined",
+          "type": "integer"
+        },
+        "selection_member_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Selection Member Count",
+          "type": "integer"
+        },
+        "explicitly_excluded_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Explicitly Excluded Count",
+          "type": "integer"
+        },
+        "status_excluded_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Status Excluded Count",
+          "type": "integer"
+        },
+        "review_state_excluded_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Review State Excluded Count",
+          "type": "integer"
+        },
+        "recorded_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Recorded Count",
+          "type": "integer"
+        },
+        "recorded_at_utc": {
+          "title": "Recorded At Utc",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_identifier",
+        "workspace_record_identifier",
+        "selection_kind",
+        "as_of_completion_sequence",
+        "candidate_listings_examined",
+        "selection_member_count",
+        "explicitly_excluded_count",
+        "status_excluded_count",
+        "review_state_excluded_count",
+        "recorded_count",
+        "recorded_at_utc"
+      ],
+      "title": "RecordWorkspaceBulkReviewResult",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "review",
+        "record_workspace_bulk_review"
+      ]
+    }
+  },
+  {
     "name": "release_review_claim",
     "description": "Idempotently release every unfinished member of one active review claim.",
     "inputSchema": {
