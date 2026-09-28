@@ -1,0 +1,57 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "rebaseWhen": "conflicted",
+  "enabledManagers": ["github-actions", "mise", "pep621", "pre-commit", "custom.regex"],
+  "pep621": { "managerFilePatterns": ["/^pyproject\\.toml$/"] },
+  "mise": { "managerFilePatterns": ["/^mise\\.toml$/"] },
+  "pre-commit": { "enabled": true },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^mise\\.toml$/", "/^\\.github/workflows/.*\\.ya?ml$/"],
+      "matchStrings": ["(?<currentValue>3\\.(?:13|14)\\.\\d+)"],
+      "depNameTemplate": "python/cpython",
+      "datasourceTemplate": "github-tags",
+      "versioningTemplate": "pep440",
+      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["mise"],
+      "matchPackageNames": ["python", "python/cpython"],
+      "enabled": false
+    },
+    {
+      "matchManagers": ["pep621"],
+      "matchDepTypes": ["requires-python"],
+      "enabled": false
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["python/cpython"],
+      "matchCurrentVersion": "/^3\\.13\\./",
+      "allowedVersions": "/^3\\.13\\./",
+      "groupName": "Python 3.13"
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["python/cpython"],
+      "matchCurrentVersion": "/^3\\.14\\./",
+      "allowedVersions": "/^3\\.14\\./",
+      "groupName": "Python 3.14"
+    },
+    {
+      "matchManagers": ["mise", "custom.regex"],
+      "postUpgradeTasks": {
+        "commands": [
+          "env MISE_LOCKED=0 mise install --yes python",
+          "env MISE_LOCKED=0 mise lock --yes --platform linux-x64,linux-x64-musl,linux-arm64,linux-arm64-musl,macos-x64,macos-arm64,windows-x64"
+        ],
+        "fileFilters": ["mise.lock"],
+        "executionMode": "branch"
+      }
+    }
+  ]
+}
