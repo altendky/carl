@@ -25,6 +25,8 @@ jobs:
   python:
     name: Python
     uses: ./.github/workflows/reflow-python.yml
+    secrets:
+      MERGIFY_TOKEN: ${{ secrets.MERGIFY_TOKEN }}
 
   all:
     name: all

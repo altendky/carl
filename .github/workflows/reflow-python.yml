@@ -2,6 +2,9 @@ name: Python
 
 on:
   workflow_call:
+    secrets:
+      MERGIFY_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -34,6 +37,8 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    env:
+      MERGIFY_TOKEN_AVAILABLE: ${{ secrets.MERGIFY_TOKEN != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,8 +59,19 @@ jobs:
 
       - name: Run tests
         if: ${{ !matrix.coverage }}
-        run: uv run --locked --python ${{ matrix.python-version }} pytest --durations=30
+        run: uv run --locked --python ${{ matrix.python-version }} pytest --durations=30 --junitxml=test-results.xml
 
       - name: Run tests with terminal coverage
         if: ${{ matrix.coverage }}
-        run: uv run --locked --python ${{ matrix.python-version }} pytest --cov=carl --cov-report=term-missing --durations=30
+        run: >-
+          uv run --locked --python ${{ matrix.python-version }} pytest
+          --cov=carl --cov-report=term-missing --durations=30
+          --junitxml=test-results.xml
+
+      - name: Upload test results to Mergify CI Insights
+        if: ${{ !cancelled() && env.MERGIFY_TOKEN_AVAILABLE == 'true' && hashFiles('test-results.xml') != '' }}
+        uses: mergifyio/gha-mergify-ci@5e8176734bc525c7fd8b2e812f0fa47246f601b7 # v25
+        with:
+          token: ${{ secrets.MERGIFY_TOKEN }}
+          report_path: test-results.xml
+          job_name: Test (Python ${{ matrix.python-version }})
