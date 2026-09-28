@@ -62,13 +62,17 @@ verify the scope before queueing.
 removes a track from or restores it to the active union without deleting its
 search or refresh history.
 
-`list_workspace_listings` composes the deduplicated union of every completed
-track and its bounded refresh ancestry. An item present in several phrases is
-returned once. Both old-only and new-only results remain candidates; absence
-from a newer run is recorded as membership history rather than interpreted as
-sold or gone. Normalized availability evidence still controls the default
-available-only filter. `get_workspace_listing` applies the same active-track
-scope and workspace guide when retrieving one exact listing.
+`list_workspace_listings` returns a compact, cursor-paged index over the
+deduplicated union of every completed track and its bounded refresh ancestry.
+Its rows contain browsing fields, availability, image and analysis presence,
+and one aggregate revision token without repeating field-level evidence.
+`get_workspace_listing` is the drill-down for the full composed projection and
+its evidence. An item present in several phrases is returned once. Both
+old-only and new-only results remain candidates; absence from a newer run is
+recorded as membership history rather than interpreted as sold or gone.
+Normalized availability evidence still controls the default available-only
+filter. The exact-listing operation applies the same active-track scope and
+workspace guide.
 
 A newer usable search-card price supersedes an older item-page price, while a
 newer item-page price likewise supersedes an older card price. This applies only

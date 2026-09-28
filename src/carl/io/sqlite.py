@@ -7238,12 +7238,15 @@ class Database:
                           reference_record.value_json,
                           '$.listing_observation_record_identifier'
                       ) = requested.value
-                    JOIN objects AS reference
+                    -- Preserve the requested-ID-driven expression-index lookup.  An ordinary
+                    -- JOIN lets SQLite scan every object of this kind before applying the
+                    -- small requested observation set.
+                    CROSS JOIN objects AS reference
                       ON reference.id = reference_record.object_id
                      AND reference.kind_parts_json = ?
-                    JOIN work_operations AS producing_work
+                    CROSS JOIN work_operations AS producing_work
                       ON producing_work.operation_id = reference.created_by_operation_id
-                    JOIN work_events AS completed
+                    CROSS JOIN work_events AS completed
                       ON completed.work_item_id = producing_work.work_item_id
                      AND completed.event_kind = 'completed'
                      AND completed.sequence <= ?
@@ -7299,15 +7302,17 @@ class Database:
                   ON json_extract(
                       result_record.value_json, '$.image_reference_record_identifier'
                   ) = requested.value
-                JOIN objects AS result
+                -- Keep requested references first so SQLite uses the expression index before
+                -- joining the comparatively large image-result object population.
+                CROSS JOIN objects AS result
                   ON result.id = result_record.object_id
                  AND result.kind_parts_json = ?
-                JOIN work_operations AS producing_work
+                CROSS JOIN work_operations AS producing_work
                   ON producing_work.operation_id = result.created_by_operation_id
-                JOIN operations AS operation
+                CROSS JOIN operations AS operation
                   ON operation.id = result.created_by_operation_id
                  AND operation.state = 'completed'
-                JOIN work_events AS completed
+                CROSS JOIN work_events AS completed
                   ON completed.work_item_id = producing_work.work_item_id
                  AND completed.event_kind = 'completed'
                  AND completed.sequence <= ?
@@ -7383,15 +7388,17 @@ class Database:
                      json_extract(requested.value, '$.original_url')
                  AND json_extract(result_record.value_json, '$.source_photo_id') IS
                      json_extract(requested.value, '$.source_photo_id')
-                JOIN objects AS result
+                -- Keep requested renditions first so SQLite uses the expression index before
+                -- joining the comparatively large image-result object population.
+                CROSS JOIN objects AS result
                   ON result.id = result_record.object_id
                  AND result.kind_parts_json = ?
-                JOIN work_operations AS producing_work
+                CROSS JOIN work_operations AS producing_work
                   ON producing_work.operation_id = result.created_by_operation_id
-                JOIN operations AS operation
+                CROSS JOIN operations AS operation
                   ON operation.id = result.created_by_operation_id
                  AND operation.state = 'completed'
-                JOIN work_events AS completed
+                CROSS JOIN work_events AS completed
                   ON completed.work_item_id = producing_work.work_item_id
                  AND completed.event_kind = 'completed'
                  AND completed.sequence <= ?

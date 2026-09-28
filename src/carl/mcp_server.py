@@ -88,6 +88,7 @@ from carl.core.review_workspace import (
     SetWorkspaceSearchTrackEnabledRequest,
     UpdateReviewWorksetRequest,
     UpdateWorkspaceProductGuideBindingRequest,
+    WorkspaceListingPage,
     WorkspaceProductGuideBinding,
     WorkspaceSearchTrack,
     WorkspaceWorkStatus,
@@ -188,10 +189,11 @@ versions remain readable, and include_retired=true reveals them in list_product_
 For multi-step agent review, create a review workspace from one search run and optional guide. That
 run becomes its first search track. Add another phrase with create_workspace_search; after it
 completes, refresh that track with request_workspace_refresh before requesting analysis. Refreshes
-advance the selected track without replacing the workspace. Use list_workspace_listings for the
-available-only deduplicated union of every track and its refresh ancestry; search absence alone does
-not mark an older listing unavailable, and use get_workspace_listing for exact drill-down in the
-same scope. Use set_workspace_search_track_enabled to remove a track from
+advance the selected track without replacing the workspace. Use list_workspace_listings for a
+compact, available-only page over the deduplicated union of every track and its refresh ancestry;
+search absence alone does not mark an older listing unavailable. Use get_workspace_listing only
+when the full composed fields and evidence for one exact listing are needed. Use
+set_workspace_search_track_enabled to remove a track from
 or restore it to the active union without deleting its retained history.
 Search acquisition is limited to one active job per proxy route. If an initial track search
 exhausts a transient transport or session failure, get_workspace_work_status reports it under
@@ -428,8 +430,8 @@ def tool_definitions(
 
     async def list_workspace_listings(
         request: ListWorkspaceListingsRequest,
-    ) -> ComposedListingPage:
-        """Page through the available-only deduplicated union of workspace search tracks."""
+    ) -> WorkspaceListingPage:
+        """Page through compact workspace listings; use get_workspace_listing for details."""
 
         return await expected(lambda: application.list_workspace_listings(request))
 

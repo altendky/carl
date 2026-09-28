@@ -375,12 +375,54 @@ class ListWorkspaceListingsRequest(StrictModel):
     workspace_record_identifier: str = Field(min_length=1)
     filters: ComposedListingFilters = ComposedListingFilters()
     maximum_search_runs: int = Field(default=100, ge=1, le=100)
-    maximum_gallery_images_per_listing: int = Field(default=0, ge=0, le=10)
-    maximum_analyses_per_listing: int = Field(default=1, ge=0, le=5)
+    maximum_gallery_images_per_listing: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        deprecated=True,
+        description="Accepted for compatibility; compact rows return gallery counts only.",
+    )
+    maximum_analyses_per_listing: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        deprecated=True,
+        description="Accepted for compatibility; compact rows return analysis presence only.",
+    )
     maximum_observations_per_listing: int = Field(default=100, ge=100, le=100)
     maximum_candidate_listings_examined: int = Field(default=2_500, ge=1, le=10_000)
     page_size: int = Field(default=25, ge=1, le=100)
     cursor: str | None = None
+
+
+class WorkspaceListingSummary(StrictModel):
+    """Compact workspace index entry; use get_workspace_listing for evidence."""
+
+    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    canonical_source_url: str = Field(min_length=1)
+    status: ListingStatus
+    title: JsonValue
+    price: JsonValue
+    location: JsonValue
+    preview_image_url: str | None
+    description_available: bool
+    seller_available: bool
+    referenced_image_count: int | None = Field(default=None, ge=0)
+    saved_image_count: int | None = Field(default=None, ge=0)
+    analysis_available: bool
+    projection_revision_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    warnings: tuple[str, ...] = Field(default=(), max_length=20)
+
+
+class WorkspaceListingPage(StrictModel):
+    as_of_completion_sequence: int = Field(ge=0)
+    selected_search_run_record_identifier: str = Field(min_length=1)
+    included_ancestry_run_count: int = Field(ge=1)
+    older_ancestry_truncated: bool
+    examined_candidate_listing_count: int = Field(ge=0, le=10_000)
+    candidate_examination_limit_reached: bool
+    listings: tuple[WorkspaceListingSummary, ...] = Field(max_length=100)
+    next_cursor: str | None
 
 
 class GetWorkspaceListingRequest(StrictModel):

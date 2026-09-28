@@ -210,6 +210,8 @@ from carl.core.review_workspace import (
     UpdateWorkspaceProductGuideBindingRequest,
     WorksetSelection,
     WorkspaceDefaultProductGuideStateRecord,
+    WorkspaceListingPage,
+    WorkspaceListingSummary,
     WorkspaceProductGuideBinding,
     WorkspaceProductGuideBindingRecord,
     WorkspaceProductGuideVersionPolicy,
@@ -338,8 +340,8 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=32),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=21),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=33),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=22),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=2),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=2),
                 ServerCapability(identity=("carl", "facebook", "create_search"), version=1),
@@ -366,7 +368,7 @@ class ReviewApplication:
                 ServerCapability(identity=("carl", "facebook", "listing_availability"), version=1),
                 ServerCapability(identity=("carl", "review", "provenance_summary"), version=1),
                 ServerCapability(identity=("carl", "review", "composed_projection"), version=4),
-                ServerCapability(identity=("carl", "review", "workspace"), version=5),
+                ServerCapability(identity=("carl", "review", "workspace"), version=6),
                 ServerCapability(
                     identity=("carl", "review", "workspace_product_guides"), version=1
                 ),
@@ -1122,8 +1124,8 @@ class ReviewApplication:
 
     async def list_workspace_listings(
         self, request: ListWorkspaceListingsRequest
-    ) -> ComposedListingPage:
-        """Compose the deduplicated union of every completed search track in a workspace."""
+    ) -> WorkspaceListingPage:
+        """Return a compact index over completed search tracks in a workspace."""
 
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
         current_runs = tuple(
@@ -1144,19 +1146,55 @@ class ReviewApplication:
         filters = request.filters.model_copy(
             update={"product_guide_record_identifier": workspace.product_guide_record_identifier}
         )
-        return await self.list_composed_search(
+        page = await self.list_composed_search(
             ListComposedSearchRequest(
                 search_run_record_identifier=current_runs[0],
                 additional_search_run_record_identifiers=current_runs[1:],
                 filters=filters,
                 maximum_ancestry_runs=request.maximum_search_runs,
-                maximum_gallery_images_per_listing=(request.maximum_gallery_images_per_listing),
-                maximum_analyses_per_listing=request.maximum_analyses_per_listing,
+                maximum_gallery_images_per_listing=0,
+                maximum_analyses_per_listing=0,
                 maximum_observations_per_listing=(request.maximum_observations_per_listing),
                 maximum_candidate_listings_examined=(request.maximum_candidate_listings_examined),
                 page_size=request.page_size,
                 cursor=request.cursor,
             )
+        )
+        return WorkspaceListingPage(
+            as_of_completion_sequence=page.as_of_completion_sequence,
+            selected_search_run_record_identifier=(page.selected_search_run_record_identifier),
+            included_ancestry_run_count=page.included_ancestry_run_count,
+            older_ancestry_truncated=page.older_ancestry_truncated,
+            examined_candidate_listing_count=page.examined_candidate_listing_count,
+            candidate_examination_limit_reached=(page.candidate_examination_limit_reached),
+            listings=tuple(
+                WorkspaceListingSummary(
+                    listing_identifier=listing.listing_identifier,
+                    canonical_source_url=listing.canonical_source_url,
+                    status=listing.status.value,
+                    title=None if listing.title is None else listing.title.value,
+                    price=None if listing.price is None else listing.price.value,
+                    location=None if listing.location is None else listing.location.value,
+                    preview_image_url=(
+                        None
+                        if listing.preview_image is None
+                        else listing.preview_image.descriptor.original_url
+                    ),
+                    description_available=listing.description is not None,
+                    seller_available=listing.seller is not None,
+                    referenced_image_count=(
+                        None if listing.gallery is None else listing.gallery.referenced_image_count
+                    ),
+                    saved_image_count=(
+                        None if listing.gallery is None else listing.gallery.saved_image_count
+                    ),
+                    analysis_available=(bool(listing.analyses) or listing.analyses_truncated),
+                    projection_revision_sha256=(listing.projection_revision.aggregate_sha256),
+                    warnings=listing.warnings,
+                )
+                for listing in page.listings
+            ),
+            next_cursor=page.next_cursor,
         )
 
     async def get_workspace_listing(

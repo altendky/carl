@@ -14,6 +14,7 @@ from carl.core.analysis_batch import (
 )
 from carl.core.components import Component, ComponentId
 from carl.core.composed_projection import (
+    ComposedGallery,
     ComposedListingPage,
     ComposedListingProjection,
     ComposedStatus,
@@ -48,6 +49,7 @@ from carl.core.review_workspace import (
     CreateWorkspaceSearchRequest,
     ListingReviewInput,
     ListingReviewRecord,
+    ListWorkspaceListingsRequest,
     ProjectionRevisionComponent,
     RecordListingReviewsRequest,
     ReleaseReviewClaimRequest,
@@ -1002,9 +1004,22 @@ async def test_application_persists_review_workflow(
         description=None,
         seller=None,
         preview_image=None,
-        gallery=None,
+        gallery=ComposedGallery(
+            referenced_image_count=3,
+            saved_image_count=2,
+            all_referenced_images_saved=False,
+            images=(),
+            images_truncated=True,
+            reference_set_truncated=False,
+            reference_set_evidence=ProjectionEvidence(
+                evidence_record_identifier="gallery",
+                acquisition_completion_sequence=1,
+                observation_completion_sequence=1,
+                source_kind=ProjectionSourceKind.ITEM_PAGE,
+            ),
+        ),
         analyses=(),
-        analyses_truncated=False,
+        analyses_truncated=True,
         search_membership=None,
     )
     second_projection = projection.model_copy(
@@ -1064,6 +1079,21 @@ async def test_application_persists_review_workflow(
         workspace = await application.create_review_workspace(
             CreateReviewWorkspaceRequest(name="Fridges", search_run_record_identifier="search-run")
         )
+        listing_page = await application.list_workspace_listings(
+            ListWorkspaceListingsRequest(
+                workspace_record_identifier=workspace.record_identifier,
+                page_size=2,
+            )
+        )
+        assert [listing.listing_identifier for listing in listing_page.listings] == ["123", "456"]
+        assert listing_page.listings[0].status is ListingStatus.AVAILABLE
+        assert listing_page.listings[0].projection_revision_sha256 == "0" * 64
+        assert listing_page.listings[0].title is None
+        assert listing_page.listings[0].analysis_available
+        assert listing_page.listings[0].referenced_image_count == 3
+        assert listing_page.listings[0].saved_image_count == 2
+        assert "raw_flags" not in listing_page.listings[0].model_dump(mode="json")
+        assert "evidence" not in listing_page.listings[0].model_dump(mode="json")
         acquisition_request = AcquireReviewBatchRequest(
             workspace_record_identifier=workspace.record_identifier,
             request_identifier="agent-a-batch-1",
