@@ -1,0 +1,61 @@
+name: Python
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Format, lint, and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.13.15
+
+      - name: Check formatting
+        run: uv run --locked --python 3.13.15 ruff format --check .
+
+      - name: Lint
+        run: uv run --locked --python 3.13.15 ruff check .
+
+      - name: Type check
+        # Basedpyright makes warnings fatal whenever GITHUB_ACTIONS is present,
+        # even when --level error hides them. Keep the local error-only policy.
+        run: env --unset=GITHUB_ACTIONS uv run --locked --python 3.13.15 basedpyright --level error
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: 3.13.15
+            coverage: true
+          - python-version: 3.14.3
+            coverage: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+
+      - name: Install dependencies
+        run: uv sync --locked --python ${{ matrix.python-version }}
+
+      - name: Run tests
+        if: ${{ !matrix.coverage }}
+        run: uv run --locked --python ${{ matrix.python-version }} pytest --durations=30
+
+      - name: Run tests with terminal coverage
+        if: ${{ matrix.coverage }}
+        run: uv run --locked --python ${{ matrix.python-version }} pytest --cov=carl --cov-report=term-missing --durations=30

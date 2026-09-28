@@ -1,0 +1,66 @@
+[project]
+name = "carl"
+version = "0.0.0.dev0"
+description = "Source evidence and repeatable extraction for web research"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE*"]
+dependencies = [
+  "anyio>=4.8",
+  "apsw>=3.53.4.0,<3.54",
+  "brotli>=1.1",
+  "cyclopts>=4.22",
+  "httpcore>=1,<2",
+  "httpx[http2,socks]>=0.28",
+  "mcp>=2,<3",
+  "pillow>=11.3",
+  "platformdirs>=4.3",
+  "pydantic>=2.13",
+  "rich>=14",
+  "trio>=0.30",
+  "zstandard>=0.23",
+]
+
+[dependency-groups]
+dev = [
+  "basedpyright>=1.31",
+  "pytest>=8.4",
+  "pytest-cov>=7.0",
+  "ruff>=0.12",
+]
+
+[project.scripts]
+carl = "carl.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["src/carl/_tests"]
+
+[tool.coverage.run]
+branch = true
+omit = ["src/carl/_tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.basedpyright]
+typeCheckingMode = "recommended"
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+include = ["src"]
+reportAny = false
+reportExplicitAny = false

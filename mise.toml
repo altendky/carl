@@ -1,0 +1,25 @@
+[settings]
+locked = true
+
+[tools]
+python = ["3.13.15", "3.14.3"]
+uv = "0.12.17"
+"pipx:pre-commit" = "4.6.2"
+"cargo:lychee" = "0.24.2"
+
+[tasks.check]
+description = "Run formatting, lint, type checks, and tests"
+run = [
+  "uv run ruff format --check .",
+  "uv run ruff check .",
+  "uv run basedpyright --level error",
+  "uv run pytest",
+]
+
+[tasks.coverage]
+description = "Run tests with production-code branch coverage"
+run = "uv run pytest --cov=carl --cov-report=term-missing"
+
+[tasks.pre-commit]
+description = "Run all default pre-commit hooks"
+run = "pre-commit run --all-files --show-diff-on-failure"

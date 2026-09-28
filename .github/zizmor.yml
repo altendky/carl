@@ -1,0 +1,6 @@
+rules:
+  self-repository:
+    ignore:
+      # actionlint v1.7.12 rejects self-repository workflow references.
+      # Migrate and remove this exception when actionlint supports them.
+      - ci.yml

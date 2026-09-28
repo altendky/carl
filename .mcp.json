@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "carl": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "carl",
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}

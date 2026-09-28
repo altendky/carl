@@ -1,0 +1,26 @@
+verbose = "warn"
+no_progress = true
+cache = true
+max_cache_age = "1d"
+max_redirects = 10
+max_retries = 2
+max_concurrency = 8
+timeout = 20
+retry_wait_time = 2
+insecure = false
+method = "get"
+include_fragments = "anchor-only"
+include_mail = false
+exclude_all_private = true
+
+exclude = [
+  "^https?://localhost",
+  "^https?://127\\.0\\.0\\.1",
+  "^https?://\\[::1\\]",
+  "^https?://example\\.(com|org|net)",
+  "^https://\\.\\.\\.",
+  "\\$\\{",
+  "\\$%7B",
+]
+
+extensions = ["md"]
