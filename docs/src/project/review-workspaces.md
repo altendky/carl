@@ -112,8 +112,20 @@ stale.
 
 An agent explicitly records inspection, an optional disposition
 (`promising`, `rejected`, `waiting_for_data`, or `deferred`), and an optional
-note. A bulk review write validates every listing and revision against its
-source batch and commits all records atomically.
+note. Ordinary per-listing writes validate every listing and revision against
+their source batch and commit the submitted records atomically.
+
+After explicit triage, `record_workspace_bulk_review` can apply one disposition
+and note to the remaining members of a whole workspace, workset, or frozen
+selection snapshot. It defaults to available, unreviewed listings and accepts
+explicit listing exclusions, so promising, deferred, or waiting-for-data
+decisions remain untouched. Carl composes one bounded current snapshot and
+records its revision hashes server-side; the caller does not need to claim or
+send thousands of revisions. The write is all-or-none and aborts if any target
+has an active claim or receives another review before commit. Later changes to
+status, price or other scalar fields, preview image, or gallery make the bulk
+review stale under the same workspace policy as an ordinary review, causing the
+listing to resurface.
 
 For concurrent review, `acquire_review_batch` combines batch publication with a
 per-listing lease in one SQLite writer transaction. Another agent can receive a

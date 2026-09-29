@@ -67,6 +67,8 @@ from carl.core.review_workspace import (
     ListWorkspaceListingsRequest,
     RecordListingReviewsRequest,
     RecordListingReviewsResult,
+    RecordWorkspaceBulkReviewRequest,
+    RecordWorkspaceBulkReviewResult,
     ReleaseReviewClaimRequest,
     ReleaseReviewClaimResult,
     RenameReviewWorkspaceRequest,
@@ -224,7 +226,13 @@ the exact response after interruption. Renew longer work with renew_review_claim
 and owner when recording reviews, using a new stable request identifier for that mutation, and release
 unfinished members with release_review_claim. Successful review recording releases only the submitted
 members; replay its unchanged request identifier after a lost response. MCP review writes require an
-active claim-backed batch; uncoordinated batch issuance and direct review writes are not exposed.
+active claim-backed batch for ordinary per-listing work; uncoordinated batch issuance and direct
+review writes are not exposed. After explicitly triaging the interesting listings, use
+record_workspace_bulk_review to disposition a complete bounded workspace, workset, or selection
+snapshot without acquiring thousands of claims. It defaults to available, unreviewed listings,
+records each current projection revision server-side, and aborts rather than writing a partial scan.
+Exclude explicitly handled listing IDs when needed. Any active claim or intervening review among the
+selected listings aborts the entire mutation.
 Batches distinguish issued work from inspected work. Use
 get_review_workspace_activity to rediscover recent batches, reviews, worksets, snapshots, and active
 claim summaries; claim tokens are intentionally omitted, so retain the acquisition response or replay
@@ -560,6 +568,13 @@ def tool_definitions(
         application_request = RecordListingReviewsRequest.model_validate(request.model_dump())
         return await expected(lambda: application.record_listing_reviews(application_request))
 
+    async def record_workspace_bulk_review(
+        request: RecordWorkspaceBulkReviewRequest,
+    ) -> RecordWorkspaceBulkReviewResult:
+        """Atomically review a bounded selection; defaults to available and unreviewed."""
+
+        return await expected(lambda: application.record_workspace_bulk_review(request))
+
     async def create_review_workset(
         request: CreateReviewWorksetRequest,
     ) -> ReviewWorkset | ReviewWorksetConflict:
@@ -894,6 +909,13 @@ def tool_definitions(
             ("carl", "review", "record_listing_reviews"),
             record_listing_reviews,
             record_listing_reviews.__doc__ or "",
+            _IDEMPOTENT_LOCAL_MUTATION,
+        ),
+        ToolDefinition(
+            "record_workspace_bulk_review",
+            ("carl", "review", "record_workspace_bulk_review"),
+            record_workspace_bulk_review,
+            record_workspace_bulk_review.__doc__ or "",
             _IDEMPOTENT_LOCAL_MUTATION,
         ),
         ToolDefinition(
