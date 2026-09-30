@@ -27,6 +27,13 @@ from carl.core.facebook_images import (
     RetryImageFailuresRequest,
     RetryImageFailuresResult,
 )
+from carl.core.review_workspace import (
+    RecordWorkspaceBulkReviewRequest,
+    RecordWorkspaceBulkReviewResult,
+    ReviewDisposition,
+    ReviewState,
+    WorksetBulkReviewSelection,
+)
 from carl.io.sqlite import Database
 from carl.mcp_server import build_server, managed_mcp_runtime, tool_definitions
 from carl.review import ReviewApplication
@@ -70,6 +77,7 @@ EXPECTED_TOOLS = {
     "set_workspace_search_track_enabled",
     "set_workspace_default_product_guide",
     "record_listing_reviews",
+    "record_workspace_bulk_review",
     "release_review_claim",
     "retry_image_failures",
     "retry_workspace_search_track",
@@ -209,6 +217,63 @@ async def test_composed_projection_tools_accept_real_json_and_return_structured_
 
 
 @pytest.mark.anyio
+async def test_workspace_bulk_review_accepts_real_json_and_returns_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def record_workspace_bulk_review(
+        _application: ReviewApplication, request: RecordWorkspaceBulkReviewRequest
+    ) -> RecordWorkspaceBulkReviewResult:
+        assert isinstance(request.selection, WorksetBulkReviewSelection)
+        assert request.statuses == [ListingStatus.AVAILABLE]
+        assert request.include_review_states == [ReviewState.UNREVIEWED]
+        assert request.disposition is ReviewDisposition.REJECTED
+        assert request.exclude_listing_identifiers == ["123"]
+        return RecordWorkspaceBulkReviewResult(
+            operation_identifier="operation",
+            workspace_record_identifier=request.workspace_record_identifier,
+            selection_kind=request.selection.kind,
+            as_of_completion_sequence=7,
+            candidate_listings_examined=2,
+            selection_member_count=2,
+            explicitly_excluded_count=1,
+            status_excluded_count=0,
+            review_state_excluded_count=0,
+            recorded_count=1,
+            recorded_at_utc="2026-09-28T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(
+        ReviewApplication, "record_workspace_bulk_review", record_workspace_bulk_review
+    )
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        application = ReviewApplication(database=database, repository_root=tmp_path)
+        async with Client(build_server(application)) as client:
+            result = await client.call_tool(
+                "record_workspace_bulk_review",
+                {
+                    "request": {
+                        "request_identifier": "bulk-review",
+                        "workspace_record_identifier": "workspace",
+                        "selection": {
+                            "kind": "workset",
+                            "workset_identifier": "workset",
+                        },
+                        "statuses": ["available"],
+                        "include_review_states": ["unreviewed"],
+                        "disposition": "rejected",
+                        "note": "First-pass triage.",
+                        "exclude_listing_identifiers": ["123"],
+                    }
+                },
+            )
+
+    assert not result.is_error
+    assert result.structured_content is not None
+    assert result.structured_content["selection_kind"] == "workset"
+    assert result.structured_content["recorded_count"] == 1
+
+
+@pytest.mark.anyio
 async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         application = ReviewApplication(
@@ -279,6 +344,14 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 "claim_owner_identifier",
                 "reviews",
             } <= set(record_reviews_request["required"])
+            bulk_review_request = tools_by_name["record_workspace_bulk_review"].input_schema[
+                "$defs"
+            ]["RecordWorkspaceBulkReviewRequest"]
+            assert bulk_review_request["properties"]["statuses"]["uniqueItems"] is True
+            assert bulk_review_request["properties"]["include_review_states"]["uniqueItems"] is True
+            exclusions = bulk_review_request["properties"]["exclude_listing_identifiers"]
+            assert exclusions["uniqueItems"] is True
+            assert exclusions["items"]["pattern"] == "^[0-9]+$"
             for name, tool in tools_by_name.items():
                 definition = definitions_by_name[name]
                 assert tool.meta == {
@@ -311,6 +384,7 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 ("carl", "review", "provenance_summary"),
                 ("carl", "review", "composed_projection"),
                 ("carl", "review", "workspace"),
+                ("carl", "review", "workspace_bulk_review"),
                 ("carl", "review", "workspace_product_guides"),
                 ("carl", "review", "product_guides"),
                 ("carl", "review", "claims"),
@@ -331,12 +405,13 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 32
+            assert capability_versions[("carl", "mcp", "instructions")] == 34
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 21
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 23
             assert capability_versions[("carl", "review", "workspace_work")] == 3
             assert capability_versions[("carl", "review", "composed_projection")] == 4
-            assert capability_versions[("carl", "review", "workspace")] == 5
+            assert capability_versions[("carl", "review", "workspace")] == 7
+            assert capability_versions[("carl", "review", "workspace_bulk_review")] == 1
             assert capability_versions[("carl", "review", "workspace_product_guides")] == 1
             assert capability_versions[("carl", "review", "product_guides")] == 1
             assert capability_versions[("carl", "review", "workspace_search_tracks")] == 3
@@ -625,6 +700,21 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                                     "note": "Worth comparing.",
                                 }
                             ],
+                        }
+                    },
+                ),
+                await call_json(
+                    "record_workspace_bulk_review",
+                    {
+                        "request": {
+                            "request_identifier": "mcp-bulk-review-1",
+                            "workspace_record_identifier": "missing-workspace",
+                            "selection": {"kind": "workspace"},
+                            "statuses": ["available"],
+                            "include_review_states": ["unreviewed"],
+                            "disposition": "rejected",
+                            "note": "First-pass triage.",
+                            "exclude_listing_identifiers": ["123", "456"],
                         }
                     },
                 ),

@@ -85,10 +85,13 @@ from carl.core.review import (
 )
 from carl.core.review_workspace import (
     ACQUIRE_REVIEW_BATCH,
+    LISTING_REVIEW_KIND,
     MAXIMUM_WORKSET_LISTINGS,
     REVIEW_BATCH_KIND,
     REVIEW_WORKSET_KIND,
+    ListingReviewRecord,
     RecordListingReviewsResult,
+    RecordWorkspaceBulkReviewResult,
     ReleaseReviewClaimResult,
     ReviewBatch,
     ReviewBatchAcquisition,
@@ -145,9 +148,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=7,
+    version=8,
 )
 
+_V7_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 7})
+_V7_SCHEMA_DEFINITION_SHA256 = "98ee0b3ee6f75ad08cc657e740762e0f752165cba67f12dd832c548df33e8dbc"
 _V6_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 6})
 _V6_SCHEMA_DEFINITION_SHA256 = "78a8206e8c39e88566ddb364c3e1db62d0c58359edd9ea6e170dbd3a468cf514"
 _V5_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 5})
@@ -542,7 +547,10 @@ ON review_listing_claims(batch_record_id, claim_token, lease_expires_at_utc_ns);
 
 CREATE TABLE IF NOT EXISTS review_mutation_requests (
     action TEXT NOT NULL CHECK (
-        action IN ('acquire_batch', 'renew_claim', 'release_claim', 'record_reviews')
+        action IN (
+            'acquire_batch', 'renew_claim', 'release_claim', 'record_reviews',
+            'record_workspace_bulk_review'
+        )
     ),
     request_identifier TEXT NOT NULL CHECK (length(request_identifier) > 0),
     request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
@@ -557,6 +565,15 @@ CREATE TABLE IF NOT EXISTS review_mutation_requests (
 
 CREATE INDEX IF NOT EXISTS review_mutation_requests_operation
 ON review_mutation_requests(operation_id);
+
+CREATE INDEX IF NOT EXISTS records_listing_review_workspace_listing
+ON records(
+    json_extract(value_json, '$.workspace_record_identifier'),
+    json_extract(value_json, '$.listing_identifier'),
+    object_id
+)
+WHERE json_extract(value_json, '$.workspace_record_identifier') IS NOT NULL
+  AND json_extract(value_json, '$.listing_identifier') IS NOT NULL;
 """
 
 _SCHEMA_DEFINITION_SHA256 = hashlib.sha256(_SCHEMA.encode()).hexdigest()
@@ -740,6 +757,14 @@ class Database:
         }
 
     @staticmethod
+    def _v7_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V7_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": str(_V7_DATABASE_SCHEMA.version),
+            "schema_definition_sha256": _V7_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v1_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V1_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -782,6 +807,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v7_metadata())
                 and not await cls._metadata_matches(connection, cls._v6_metadata())
                 and not await cls._metadata_matches(connection, cls._v5_metadata())
                 and not await cls._metadata_matches(connection, cls._v4_metadata())
@@ -1025,6 +1051,68 @@ class Database:
                     ON work_requests(
                         requester_identifier, requester_kind_parts_json, work_item_id
                     )
+                    """
+                )
+                for key, value in self._v7_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v7_metadata()):
+                await connection.execute(
+                    "ALTER TABLE review_mutation_requests RENAME TO review_mutation_requests_v7"
+                )
+                await connection.execute(
+                    """
+                    CREATE TABLE review_mutation_requests (
+                        action TEXT NOT NULL CHECK (
+                            action IN (
+                                'acquire_batch', 'renew_claim', 'release_claim',
+                                'record_reviews', 'record_workspace_bulk_review'
+                            )
+                        ),
+                        request_identifier TEXT NOT NULL CHECK (
+                            length(request_identifier) > 0
+                        ),
+                        request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+                        request_schema_version INTEGER NOT NULL CHECK (
+                            request_schema_version >= 1
+                        ),
+                        response_schema_version INTEGER NOT NULL CHECK (
+                            response_schema_version >= 1
+                        ),
+                        response_json TEXT NOT NULL CHECK (json_valid(response_json)),
+                        operation_id TEXT NOT NULL,
+                        created_at_utc_ns INTEGER NOT NULL CHECK (created_at_utc_ns >= 0),
+                        PRIMARY KEY (action, request_identifier),
+                        FOREIGN KEY (operation_id) REFERENCES operations(id)
+                    ) STRICT
+                    """
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO review_mutation_requests
+                    SELECT * FROM review_mutation_requests_v7
+                    """
+                )
+                await connection.execute("DROP TABLE review_mutation_requests_v7")
+                await connection.execute(
+                    """
+                    CREATE INDEX review_mutation_requests_operation
+                    ON review_mutation_requests(operation_id)
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS records_listing_review_workspace_listing
+                    ON records(
+                        json_extract(value_json, '$.workspace_record_identifier'),
+                        json_extract(value_json, '$.listing_identifier'),
+                        object_id
+                    )
+                    WHERE json_extract(
+                              value_json, '$.workspace_record_identifier'
+                          ) IS NOT NULL
+                      AND json_extract(value_json, '$.listing_identifier') IS NOT NULL
                     """
                 )
                 for key, value in self._expected_metadata().items():
@@ -3442,14 +3530,17 @@ class Database:
         artifacts: Sequence[ArtifactDraft],
         outputs: Sequence[NamedOutput],
     ) -> None:
-        for record in records:
-            await connection.execute(
+        if records:
+            await connection.executemany(
                 "INSERT INTO objects VALUES (?, 'record', ?, ?)",
-                (record.identifier, _json(list(record.kind)), operation_id),
+                ((record.identifier, _json(list(record.kind)), operation_id) for record in records),
             )
-            await connection.execute(
+            await connection.executemany(
                 "INSERT INTO records VALUES (?, ?, ?)",
-                (record.identifier, record.schema_version, _json(record.value)),
+                (
+                    (record.identifier, record.schema_version, _json(record.value))
+                    for record in records
+                ),
             )
         for artifact in artifacts:
             await connection.execute(
@@ -3491,10 +3582,13 @@ class Database:
                 )
             else:
                 raise TypeError("Unsupported artifact draft")
-        for output in outputs:
-            await connection.execute(
+        if outputs:
+            await connection.executemany(
                 "INSERT INTO operation_outputs VALUES (?, ?, ?)",
-                (operation_id, _json(list(output.name)), output.object_identifier),
+                (
+                    (operation_id, _json(list(output.name)), output.object_identifier)
+                    for output in outputs
+                ),
             )
 
     async def _complete_operation(
@@ -4026,6 +4120,72 @@ class Database:
                 action=action,
                 request_identifier=request_identifier,
                 request_sha256=request_sha256,
+            )
+
+    @staticmethod
+    async def _latest_listing_reviews(
+        connection: AsyncConnection,
+        *,
+        workspace_record_identifier: str,
+        listing_identifiers: Sequence[str],
+    ) -> dict[str, ListingReviewRecord]:
+        """Return current review heads for one workspace and exact listing subset."""
+
+        if len(listing_identifiers) > 10_000 or any(
+            not identifier.isascii() or not identifier.isdecimal()
+            for identifier in listing_identifiers
+        ):
+            raise ValueError("Listing-review lookup identifiers are invalid")
+        if not listing_identifiers:
+            return {}
+        parameters: list[apsw.SQLiteValue] = [
+            _json(list(LISTING_REVIEW_KIND)),
+            workspace_record_identifier,
+            _json(list(dict.fromkeys(listing_identifiers))),
+        ]
+        cursor = await connection.execute(
+            """
+            SELECT review_record.value_json
+            FROM records AS review_record
+                INDEXED BY records_listing_review_workspace_listing
+            CROSS JOIN objects AS review
+              ON review.id = review_record.object_id
+             AND review.kind_parts_json = ?
+            WHERE json_extract(
+                      review_record.value_json, '$.workspace_record_identifier'
+                  ) = ?
+              AND json_extract(
+                      review_record.value_json, '$.workspace_record_identifier'
+                  ) IS NOT NULL
+              AND json_extract(
+                      review_record.value_json, '$.listing_identifier'
+                  ) IS NOT NULL
+              AND json_extract(review_record.value_json, '$.listing_identifier')
+                  IN (SELECT value FROM json_each(?))
+            ORDER BY review.rowid, review.id
+            """,
+            parameters,
+        )
+        rows = await cursor.fetchall()
+        latest: dict[str, ListingReviewRecord] = {}
+        for row in rows:
+            review = ListingReviewRecord.model_validate_json(_text(row[0]))
+            latest[review.listing_identifier] = review
+        return latest
+
+    async def latest_listing_reviews(
+        self,
+        *,
+        workspace_record_identifier: str,
+        listing_identifiers: Sequence[str],
+    ) -> dict[str, ListingReviewRecord]:
+        """Return current review heads for one workspace and exact listing subset."""
+
+        async with self._connections.reader() as connection:
+            return await self._latest_listing_reviews(
+                connection,
+                workspace_record_identifier=workspace_record_identifier,
+                listing_identifiers=listing_identifiers,
             )
 
     @staticmethod
@@ -4610,6 +4770,118 @@ class Database:
                 )
                 if await connection.changes() != len(listing_identifiers):
                     raise RuntimeError("Review claims changed while reviews were published")
+            await self._record_review_mutation_response(
+                connection,
+                action=action,
+                request_identifier=request_identifier,
+                request_sha256=request_sha256,
+                response=response.model_dump(mode="json"),
+                operation_identifier=operation_identifier,
+                created_at_utc_ns=now_utc_ns,
+            )
+            return response
+
+    async def publish_workspace_bulk_review_records(
+        self,
+        *,
+        request_identifier: str,
+        request_sha256: str,
+        workspace_record_identifier: str,
+        expected_prior_review_identifiers: dict[str, str | None],
+        component: Component,
+        operation_identifier: str,
+        records: Sequence[RecordDraft],
+        source_input: NamedInput | None,
+        response: RecordWorkspaceBulkReviewResult,
+        provenance: CodeProvenance,
+        invocation: dict[str, JsonValue],
+        started_at_utc: str,
+        ended_at_utc: str,
+        duration_ns: int,
+        utc_now_ns: Callable[[], int],
+    ) -> RecordWorkspaceBulkReviewResult | None:
+        """Atomically publish a bulk review after claim and review-head fences."""
+
+        action = "record_workspace_bulk_review"
+        listing_identifiers = tuple(expected_prior_review_identifiers)
+        if len(records) != len(listing_identifiers) or len(records) > 10_000:
+            raise ValueError("Bulk review publication bounds are invalid")
+        async with self._connections.writer() as connection:
+            replay = await self._review_mutation_replay(
+                connection,
+                action=action,
+                request_identifier=request_identifier,
+                request_sha256=request_sha256,
+            )
+            if replay is not None:
+                return RecordWorkspaceBulkReviewResult.model_validate_json(encode_json(replay))
+
+            now_utc_ns = utc_now_ns()
+            if listing_identifiers:
+                cursor = await connection.execute(
+                    """
+                    SELECT 1
+                    FROM review_listing_claims
+                    WHERE workspace_record_id = ?
+                      AND lease_expires_at_utc_ns > ?
+                      AND listing_identifier IN (SELECT value FROM json_each(?))
+                    LIMIT 1
+                    """,
+                    (
+                        workspace_record_identifier,
+                        now_utc_ns,
+                        _json(list(listing_identifiers)),
+                    ),
+                )
+                if await cursor.fetchone() is not None:
+                    return None
+                current_reviews = await self._latest_listing_reviews(
+                    connection,
+                    workspace_record_identifier=workspace_record_identifier,
+                    listing_identifiers=listing_identifiers,
+                )
+                actual = {
+                    identifier: (
+                        None
+                        if current_reviews.get(identifier) is None
+                        else current_reviews[identifier].record_identifier
+                    )
+                    for identifier in listing_identifiers
+                }
+                if actual != expected_prior_review_identifiers:
+                    return None
+
+            await self._begin_operation(
+                connection,
+                operation_id=operation_identifier,
+                component=component,
+                provenance=provenance,
+                invocation=invocation,
+                configuration={},
+                started_at_utc=started_at_utc,
+            )
+            inputs = [
+                NamedInput(name=("workspace",), object_identifier=workspace_record_identifier)
+            ]
+            if source_input is not None:
+                inputs.append(source_input)
+            await self._complete_operation(
+                connection,
+                operation_id=operation_identifier,
+                records=records,
+                artifacts=(),
+                inputs=inputs,
+                outputs=tuple(
+                    NamedOutput(
+                        name=("listing_review", str(index)),
+                        object_identifier=record.identifier,
+                    )
+                    for index, record in enumerate(records)
+                ),
+                result={"state": "completed", "recorded_count": len(records)},
+                ended_at_utc=ended_at_utc,
+                duration_ns=duration_ns,
+            )
             await self._record_review_mutation_response(
                 connection,
                 action=action,
@@ -7238,12 +7510,15 @@ class Database:
                           reference_record.value_json,
                           '$.listing_observation_record_identifier'
                       ) = requested.value
-                    JOIN objects AS reference
+                    -- Preserve the requested-ID-driven expression-index lookup.  An ordinary
+                    -- JOIN lets SQLite scan every object of this kind before applying the
+                    -- small requested observation set.
+                    CROSS JOIN objects AS reference
                       ON reference.id = reference_record.object_id
                      AND reference.kind_parts_json = ?
-                    JOIN work_operations AS producing_work
+                    CROSS JOIN work_operations AS producing_work
                       ON producing_work.operation_id = reference.created_by_operation_id
-                    JOIN work_events AS completed
+                    CROSS JOIN work_events AS completed
                       ON completed.work_item_id = producing_work.work_item_id
                      AND completed.event_kind = 'completed'
                      AND completed.sequence <= ?
@@ -7299,15 +7574,17 @@ class Database:
                   ON json_extract(
                       result_record.value_json, '$.image_reference_record_identifier'
                   ) = requested.value
-                JOIN objects AS result
+                -- Keep requested references first so SQLite uses the expression index before
+                -- joining the comparatively large image-result object population.
+                CROSS JOIN objects AS result
                   ON result.id = result_record.object_id
                  AND result.kind_parts_json = ?
-                JOIN work_operations AS producing_work
+                CROSS JOIN work_operations AS producing_work
                   ON producing_work.operation_id = result.created_by_operation_id
-                JOIN operations AS operation
+                CROSS JOIN operations AS operation
                   ON operation.id = result.created_by_operation_id
                  AND operation.state = 'completed'
-                JOIN work_events AS completed
+                CROSS JOIN work_events AS completed
                   ON completed.work_item_id = producing_work.work_item_id
                  AND completed.event_kind = 'completed'
                  AND completed.sequence <= ?
@@ -7383,15 +7660,17 @@ class Database:
                      json_extract(requested.value, '$.original_url')
                  AND json_extract(result_record.value_json, '$.source_photo_id') IS
                      json_extract(requested.value, '$.source_photo_id')
-                JOIN objects AS result
+                -- Keep requested renditions first so SQLite uses the expression index before
+                -- joining the comparatively large image-result object population.
+                CROSS JOIN objects AS result
                   ON result.id = result_record.object_id
                  AND result.kind_parts_json = ?
-                JOIN work_operations AS producing_work
+                CROSS JOIN work_operations AS producing_work
                   ON producing_work.operation_id = result.created_by_operation_id
-                JOIN operations AS operation
+                CROSS JOIN operations AS operation
                   ON operation.id = result.created_by_operation_id
                  AND operation.state = 'completed'
-                JOIN work_events AS completed
+                CROSS JOIN work_events AS completed
                   ON completed.work_item_id = producing_work.work_item_id
                  AND completed.event_kind = 'completed'
                  AND completed.sequence <= ?

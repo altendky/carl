@@ -36,5 +36,5 @@ def test_schema_identity_uses_typed_segments_and_serializes_strings() -> None:
         "namespace": "carl",
         "domain": "storage",
         "backend": "sqlite",
-        "version": 7,
+        "version": 8,
     }

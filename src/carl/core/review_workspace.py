@@ -37,6 +37,7 @@ SET_PRODUCT_GUIDE_IDENTITY_RETIRED = ComponentId(
 )
 CREATE_REVIEW_BATCH = ComponentId(("carl", "review", "create", "batch"))
 RECORD_LISTING_REVIEWS = ComponentId(("carl", "review", "record", "listing_reviews"))
+RECORD_WORKSPACE_BULK_REVIEW = ComponentId(("carl", "review", "record", "workspace_bulk_review"))
 CREATE_REVIEW_WORKSET = ComponentId(("carl", "review", "create", "workset"))
 UPDATE_REVIEW_WORKSET = ComponentId(("carl", "review", "update", "workset"))
 CREATE_SELECTION_SNAPSHOT = ComponentId(("carl", "review", "create", "selection_snapshot"))
@@ -86,6 +87,7 @@ def build_review_workspace_component_registry() -> Registry:
                 SET_PRODUCT_GUIDE_IDENTITY_RETIRED,
                 CREATE_REVIEW_BATCH,
                 RECORD_LISTING_REVIEWS,
+                RECORD_WORKSPACE_BULK_REVIEW,
                 CREATE_REVIEW_WORKSET,
                 UPDATE_REVIEW_WORKSET,
                 CREATE_SELECTION_SNAPSHOT,
@@ -375,12 +377,54 @@ class ListWorkspaceListingsRequest(StrictModel):
     workspace_record_identifier: str = Field(min_length=1)
     filters: ComposedListingFilters = ComposedListingFilters()
     maximum_search_runs: int = Field(default=100, ge=1, le=100)
-    maximum_gallery_images_per_listing: int = Field(default=0, ge=0, le=10)
-    maximum_analyses_per_listing: int = Field(default=1, ge=0, le=5)
+    maximum_gallery_images_per_listing: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        deprecated=True,
+        description="Accepted for compatibility; compact rows return gallery counts only.",
+    )
+    maximum_analyses_per_listing: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        deprecated=True,
+        description="Accepted for compatibility; compact rows return analysis presence only.",
+    )
     maximum_observations_per_listing: int = Field(default=100, ge=100, le=100)
     maximum_candidate_listings_examined: int = Field(default=2_500, ge=1, le=10_000)
     page_size: int = Field(default=25, ge=1, le=100)
     cursor: str | None = None
+
+
+class WorkspaceListingSummary(StrictModel):
+    """Compact workspace index entry; use get_workspace_listing for evidence."""
+
+    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    canonical_source_url: str = Field(min_length=1)
+    status: ListingStatus
+    title: JsonValue
+    price: JsonValue
+    location: JsonValue
+    preview_image_url: str | None
+    description_available: bool
+    seller_available: bool
+    referenced_image_count: int | None = Field(default=None, ge=0)
+    saved_image_count: int | None = Field(default=None, ge=0)
+    analysis_available: bool
+    projection_revision_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    warnings: tuple[str, ...] = Field(default=(), max_length=20)
+
+
+class WorkspaceListingPage(StrictModel):
+    as_of_completion_sequence: int = Field(ge=0)
+    selected_search_run_record_identifier: str = Field(min_length=1)
+    included_ancestry_run_count: int = Field(ge=1)
+    older_ancestry_truncated: bool
+    examined_candidate_listing_count: int = Field(ge=0, le=10_000)
+    candidate_examination_limit_reached: bool
+    listings: tuple[WorkspaceListingSummary, ...] = Field(max_length=100)
+    next_cursor: str | None
 
 
 class GetWorkspaceListingRequest(StrictModel):
@@ -468,6 +512,96 @@ class RecordListingReviewsRequest(StrictModel):
 
 class RecordListingReviewsResult(StrictModel):
     records: tuple[ListingReviewRecord, ...] = Field(max_length=100)
+
+
+class WorkspaceBulkReviewSelection(StrictModel):
+    kind: Literal["workspace"] = "workspace"
+
+
+class WorksetBulkReviewSelection(StrictModel):
+    kind: Literal["workset"] = "workset"
+    workset_identifier: str = Field(min_length=1)
+
+
+class SelectionSnapshotBulkReviewSelection(StrictModel):
+    kind: Literal["selection_snapshot"] = "selection_snapshot"
+    selection_snapshot_record_identifier: str = Field(min_length=1)
+
+
+BulkReviewSelection = Annotated[
+    WorkspaceBulkReviewSelection
+    | WorksetBulkReviewSelection
+    | SelectionSnapshotBulkReviewSelection,
+    Field(discriminator="kind"),
+]
+
+
+class RecordWorkspaceBulkReviewRequest(StrictModel):
+    request_identifier: str = Field(min_length=1, max_length=200)
+    workspace_record_identifier: str = Field(min_length=1)
+    selection: BulkReviewSelection = WorkspaceBulkReviewSelection()
+    statuses: Sequence[ListingStatus] = Field(
+        default=(ListingStatus.AVAILABLE,),
+        min_length=1,
+        max_length=5,
+        json_schema_extra={"uniqueItems": True},
+    )
+    include_review_states: Sequence[ReviewState] = Field(
+        default=(ReviewState.UNREVIEWED,),
+        min_length=1,
+        max_length=3,
+        json_schema_extra={"uniqueItems": True},
+    )
+    disposition: ReviewDisposition
+    note: str | None = Field(default=None, max_length=4_000)
+    exclude_listing_identifiers: Sequence[Annotated[str, Field(pattern=r"^[0-9]+$")]] = Field(
+        default=(), max_length=10_000, json_schema_extra={"uniqueItems": True}
+    )
+    maximum_candidate_listings_examined: int = Field(default=10_000, ge=1, le=10_000)
+
+    @field_validator("request_identifier")
+    @classmethod
+    def validate_request_identifier(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("The request identifier must be trimmed")
+        return value
+
+    @field_validator("note")
+    @classmethod
+    def validate_note(cls, value: str | None) -> str | None:
+        if value is not None and (not value or value != value.strip()):
+            raise ValueError("Review notes must be nonempty and trimmed")
+        return value
+
+    @field_validator("statuses", "include_review_states")
+    @classmethod
+    def validate_unique_filters(cls, value: Sequence[object]) -> Sequence[object]:
+        if len(set(value)) != len(value):
+            raise ValueError("Bulk-review filters must be unique")
+        return value
+
+    @field_validator("exclude_listing_identifiers")
+    @classmethod
+    def validate_excluded_listing_identifiers(cls, value: Sequence[str]) -> Sequence[str]:
+        if any(not identifier.isascii() or not identifier.isdecimal() for identifier in value):
+            raise ValueError("Excluded listing identifiers must be decimal strings")
+        if len(set(value)) != len(value):
+            raise ValueError("Excluded listing identifiers must be unique")
+        return value
+
+
+class RecordWorkspaceBulkReviewResult(StrictModel):
+    operation_identifier: str = Field(min_length=1)
+    workspace_record_identifier: str = Field(min_length=1)
+    selection_kind: str = Field(min_length=1)
+    as_of_completion_sequence: int = Field(ge=0)
+    candidate_listings_examined: int = Field(ge=0, le=10_000)
+    selection_member_count: int = Field(ge=0, le=10_000)
+    explicitly_excluded_count: int = Field(ge=0, le=10_000)
+    status_excluded_count: int = Field(ge=0, le=10_000)
+    review_state_excluded_count: int = Field(ge=0, le=10_000)
+    recorded_count: int = Field(ge=0, le=10_000)
+    recorded_at_utc: str
 
 
 class ReviewBatchItem(StrictModel):

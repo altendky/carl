@@ -148,6 +148,7 @@ from carl.core.review_workspace import (
     MAXIMUM_WORKSET_LISTINGS,
     PRODUCT_GUIDE_IDENTITY_STATE_KIND,
     RECORD_LISTING_REVIEWS,
+    RECORD_WORKSPACE_BULK_REVIEW,
     RELEASE_REVIEW_CLAIM,
     RENAME_REVIEW_WORKSPACE,
     RENEW_REVIEW_CLAIM,
@@ -179,6 +180,8 @@ from carl.core.review_workspace import (
     ListWorkspaceListingsRequest,
     RecordListingReviewsRequest,
     RecordListingReviewsResult,
+    RecordWorkspaceBulkReviewRequest,
+    RecordWorkspaceBulkReviewResult,
     ReleaseReviewClaimRequest,
     ReleaseReviewClaimResult,
     RenameReviewWorkspaceRequest,
@@ -201,6 +204,7 @@ from carl.core.review_workspace import (
     ReviewWorkspaceActivity,
     ReviewWorkspaceIdentityStateRecord,
     SelectionSnapshot,
+    SelectionSnapshotBulkReviewSelection,
     SelectionSnapshotItem,
     SelectionSnapshotSummary,
     SetReviewWorkspaceArchivedRequest,
@@ -208,8 +212,11 @@ from carl.core.review_workspace import (
     SetWorkspaceSearchTrackEnabledRequest,
     UpdateReviewWorksetRequest,
     UpdateWorkspaceProductGuideBindingRequest,
+    WorksetBulkReviewSelection,
     WorksetSelection,
     WorkspaceDefaultProductGuideStateRecord,
+    WorkspaceListingPage,
+    WorkspaceListingSummary,
     WorkspaceProductGuideBinding,
     WorkspaceProductGuideBindingRecord,
     WorkspaceProductGuideVersionPolicy,
@@ -338,8 +345,8 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=32),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=21),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=34),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=23),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=2),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=2),
                 ServerCapability(identity=("carl", "facebook", "create_search"), version=1),
@@ -366,7 +373,8 @@ class ReviewApplication:
                 ServerCapability(identity=("carl", "facebook", "listing_availability"), version=1),
                 ServerCapability(identity=("carl", "review", "provenance_summary"), version=1),
                 ServerCapability(identity=("carl", "review", "composed_projection"), version=4),
-                ServerCapability(identity=("carl", "review", "workspace"), version=5),
+                ServerCapability(identity=("carl", "review", "workspace"), version=7),
+                ServerCapability(identity=("carl", "review", "workspace_bulk_review"), version=1),
                 ServerCapability(
                     identity=("carl", "review", "workspace_product_guides"), version=1
                 ),
@@ -1122,8 +1130,8 @@ class ReviewApplication:
 
     async def list_workspace_listings(
         self, request: ListWorkspaceListingsRequest
-    ) -> ComposedListingPage:
-        """Compose the deduplicated union of every completed search track in a workspace."""
+    ) -> WorkspaceListingPage:
+        """Return a compact index over completed search tracks in a workspace."""
 
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
         current_runs = tuple(
@@ -1144,19 +1152,55 @@ class ReviewApplication:
         filters = request.filters.model_copy(
             update={"product_guide_record_identifier": workspace.product_guide_record_identifier}
         )
-        return await self.list_composed_search(
+        page = await self.list_composed_search(
             ListComposedSearchRequest(
                 search_run_record_identifier=current_runs[0],
                 additional_search_run_record_identifiers=current_runs[1:],
                 filters=filters,
                 maximum_ancestry_runs=request.maximum_search_runs,
-                maximum_gallery_images_per_listing=(request.maximum_gallery_images_per_listing),
-                maximum_analyses_per_listing=request.maximum_analyses_per_listing,
+                maximum_gallery_images_per_listing=0,
+                maximum_analyses_per_listing=0,
                 maximum_observations_per_listing=(request.maximum_observations_per_listing),
                 maximum_candidate_listings_examined=(request.maximum_candidate_listings_examined),
                 page_size=request.page_size,
                 cursor=request.cursor,
             )
+        )
+        return WorkspaceListingPage(
+            as_of_completion_sequence=page.as_of_completion_sequence,
+            selected_search_run_record_identifier=(page.selected_search_run_record_identifier),
+            included_ancestry_run_count=page.included_ancestry_run_count,
+            older_ancestry_truncated=page.older_ancestry_truncated,
+            examined_candidate_listing_count=page.examined_candidate_listing_count,
+            candidate_examination_limit_reached=(page.candidate_examination_limit_reached),
+            listings=tuple(
+                WorkspaceListingSummary(
+                    listing_identifier=listing.listing_identifier,
+                    canonical_source_url=listing.canonical_source_url,
+                    status=listing.status.value,
+                    title=None if listing.title is None else listing.title.value,
+                    price=None if listing.price is None else listing.price.value,
+                    location=None if listing.location is None else listing.location.value,
+                    preview_image_url=(
+                        None
+                        if listing.preview_image is None
+                        else listing.preview_image.descriptor.original_url
+                    ),
+                    description_available=listing.description is not None,
+                    seller_available=listing.seller is not None,
+                    referenced_image_count=(
+                        None if listing.gallery is None else listing.gallery.referenced_image_count
+                    ),
+                    saved_image_count=(
+                        None if listing.gallery is None else listing.gallery.saved_image_count
+                    ),
+                    analysis_available=(bool(listing.analyses) or listing.analyses_truncated),
+                    projection_revision_sha256=(listing.projection_revision.aggregate_sha256),
+                    warnings=listing.warnings,
+                )
+                for listing in page.listings
+            ),
+            next_cursor=page.next_cursor,
         )
 
     async def get_workspace_listing(
@@ -2148,16 +2192,10 @@ class ReviewApplication:
     async def _latest_listing_reviews(
         self, workspace_record_identifier: str, listing_identifiers: tuple[str, ...]
     ) -> dict[str, ListingReviewRecord]:
-        requested = set(listing_identifiers)
-        latest: dict[str, ListingReviewRecord] = {}
-        for _, value in await self.database.records_by_kind(LISTING_REVIEW_KIND):
-            review = ListingReviewRecord.model_validate_json(encode_json(value))
-            if (
-                review.workspace_record_identifier == workspace_record_identifier
-                and review.listing_identifier in requested
-            ):
-                latest[review.listing_identifier] = review
-        return latest
+        return await self.database.latest_listing_reviews(
+            workspace_record_identifier=workspace_record_identifier,
+            listing_identifiers=listing_identifiers,
+        )
 
     async def _build_review_batch_candidate(
         self,
@@ -2512,6 +2550,333 @@ class ReviewApplication:
         if published is None:
             raise ReviewInputError(
                 "An active review claim blocks these listings, or the supplied claim was lost"
+            )
+        return published
+
+    async def _workspace_bulk_review_projections(
+        self,
+        workspace: ReviewWorkspace,
+        *,
+        maximum_candidate_listings_examined: int,
+        selected_listing_identifiers: tuple[str, ...] | None = None,
+    ) -> tuple[int, int, tuple[ComposedListingProjection, ...]]:
+        """Compose one bounded workspace snapshot without per-page repeated evidence queries."""
+
+        current_runs = self._workspace_current_search_runs(workspace)
+        if not current_runs:
+            raise ReviewInputError("The workspace has no completed active search track")
+        as_of = await self.database.current_completion_boundary()
+        ancestry = await self._projection_search_scope(
+            current_runs[0],
+            current_runs[1:],
+            as_of_completion_sequence=as_of,
+            maximum_runs=100,
+        )
+        if ancestry.older_ancestry_truncated:
+            raise ReviewInputError(
+                "Bulk review requires complete workspace search ancestry within 100 runs"
+            )
+        included_runs = tuple(
+            (run.record_identifier, run.internal_search_run_identifier) for run in ancestry.runs
+        )
+        if selected_listing_identifiers is None:
+            membership_with_lookahead = (
+                await self.database.facebook_projection_membership_candidates(
+                    included_runs,
+                    as_of_completion_sequence=as_of,
+                    maximum_listings=maximum_candidate_listings_examined + 1,
+                )
+            )
+            if len(membership_with_lookahead) > maximum_candidate_listings_examined:
+                raise ReviewInputError(
+                    "Bulk review candidate limit reached; no reviews were recorded"
+                )
+            listing_identifiers = tuple(
+                candidate.candidate.listing_identifier for candidate in membership_with_lookahead
+            )
+            candidate_listings_examined = len(listing_identifiers)
+        else:
+            listing_identifiers = tuple(dict.fromkeys(selected_listing_identifiers))
+            if len(listing_identifiers) > maximum_candidate_listings_examined:
+                raise ReviewInputError(
+                    "Bulk review selection exceeds the candidate limit; no reviews were recorded"
+                )
+            candidate_listings_examined = len(listing_identifiers)
+        if not listing_identifiers:
+            return as_of, 0, ()
+
+        membership_occurrences: list[SearchMembershipOccurrenceCandidate] = []
+        chunk_size = 100
+        for start in range(0, len(listing_identifiers), chunk_size):
+            membership_occurrences.extend(
+                await self.database.facebook_projection_membership_occurrences(
+                    listing_identifiers[start : start + chunk_size],
+                    included_runs,
+                    as_of_completion_sequence=as_of,
+                )
+            )
+        membership_by_listing: dict[str, list[SearchMembershipOccurrenceCandidate]] = {}
+        for occurrence in membership_occurrences:
+            membership_by_listing.setdefault(occurrence.listing_identifier, []).append(occurrence)
+        listing_identifiers = tuple(
+            identifier for identifier in listing_identifiers if identifier in membership_by_listing
+        )
+        if not listing_identifiers:
+            return as_of, candidate_listings_examined, ()
+
+        observations = await self.database.facebook_projection_item_observations(
+            listing_identifiers,
+            as_of_completion_sequence=as_of,
+            maximum_per_listing=101,
+        )
+        search_statuses = await self.database.facebook_projection_search_occurrences(
+            listing_identifiers,
+            as_of_completion_sequence=as_of,
+        )
+        search_cards = await self.database.facebook_projection_search_cards(
+            listing_identifiers,
+            as_of_completion_sequence=as_of,
+            maximum_per_listing=101,
+        )
+        frozen_observations, truncated_observations = self._bounded_observations_by_listing(
+            observations,
+            maximum_per_listing=100,
+        )
+        frozen_search_cards, truncated_search_cards = self._bounded_search_cards_by_listing(
+            search_cards,
+            maximum_per_listing=100,
+        )
+        analyses_by_listing = await self._projection_analyses_by_listing(
+            listing_identifiers,
+            product_guide_record_identifier=workspace.product_guide_record_identifier,
+            maximum_per_listing=21,
+            as_of_completion_sequence=as_of,
+        )
+        statuses_by_listing: dict[str, list[StatusObservationCandidate]] = {}
+        for status in search_statuses:
+            statuses_by_listing.setdefault(status.listing_identifier, []).append(status)
+
+        galleries: dict[str, ComposedGallery | None] = {}
+        for start in range(0, len(listing_identifiers), chunk_size):
+            chunk = listing_identifiers[start : start + chunk_size]
+            galleries.update(
+                await self._projection_galleries(
+                    {identifier: frozen_observations.get(identifier, ()) for identifier in chunk},
+                    as_of_completion_sequence=as_of,
+                )
+            )
+
+        projections: list[ComposedListingProjection] = []
+        for listing_identifier in listing_identifiers:
+            warnings = tuple(
+                warning
+                for condition, warning in (
+                    (
+                        listing_identifier in truncated_observations,
+                        "item_observation_history_truncated",
+                    ),
+                    (
+                        listing_identifier in truncated_search_cards,
+                        "search_card_history_truncated",
+                    ),
+                )
+                if condition
+            )
+            projection, _ = self._compose_listing_projection(
+                listing_identifier,
+                observations=frozen_observations.get(listing_identifier, ()),
+                search_cards=frozen_search_cards.get(listing_identifier, ()),
+                search_statuses=tuple(statuses_by_listing.get(listing_identifier, ())),
+                analyses=analyses_by_listing.get(listing_identifier, ()),
+                as_of_completion_sequence=as_of,
+                product_guide_record_identifier=workspace.product_guide_record_identifier,
+                maximum_analyses=0,
+                maximum_gallery_images=0,
+                gallery=galleries.get(listing_identifier),
+                membership=compose_search_membership(
+                    listing_identifier=listing_identifier,
+                    ancestry=ancestry,
+                    occurrences=membership_by_listing.get(listing_identifier, ()),
+                ),
+                warnings=warnings,
+            )
+            projections.append(projection)
+        return as_of, candidate_listings_examined, tuple(projections)
+
+    async def record_workspace_bulk_review(
+        self, request: RecordWorkspaceBulkReviewRequest
+    ) -> RecordWorkspaceBulkReviewResult:
+        """Record one server-snapshotted disposition over a bounded workspace selection."""
+
+        action = "record_workspace_bulk_review"
+        request_sha256 = review_mutation_request_sha256(action, request)
+        try:
+            replay = await self.database.review_mutation_replay(
+                action=action,
+                request_identifier=request.request_identifier,
+                request_sha256=request_sha256,
+            )
+        except ValueError as error:
+            raise ReviewInputError(str(error)) from error
+        if replay is not None:
+            return RecordWorkspaceBulkReviewResult.model_validate_json(encode_json(replay))
+
+        started_at_utc_ns = self.utc_now_ns()
+        started_monotonic_ns = self.monotonic_ns()
+        workspace = await self.get_review_workspace(request.workspace_record_identifier)
+        source_input: NamedInput | None = None
+        selected_identifiers: tuple[str, ...] | None
+        if isinstance(request.selection, WorksetBulkReviewSelection):
+            workset = (await self._current_review_worksets()).get(
+                request.selection.workset_identifier
+            )
+            if workset is None:
+                raise KeyError(request.selection.workset_identifier)
+            if workset.workspace_record_identifier != workspace.record_identifier:
+                raise ReviewInputError("The review workset belongs to a different workspace")
+            source_input = NamedInput(
+                name=("workset",), object_identifier=workset.record_identifier
+            )
+            selected_identifiers = workset.listing_identifiers
+        elif isinstance(request.selection, SelectionSnapshotBulkReviewSelection):
+            snapshot = await self.get_selection_snapshot(
+                request.selection.selection_snapshot_record_identifier
+            )
+            if snapshot.workspace_record_identifier != workspace.record_identifier:
+                raise ReviewInputError("The selection snapshot belongs to a different workspace")
+            source_input = NamedInput(
+                name=("selection_snapshot",), object_identifier=snapshot.record_identifier
+            )
+            selected_identifiers = tuple(item.listing_identifier for item in snapshot.items)
+        else:
+            selected_identifiers = None
+
+        as_of, examined, projections = await self._workspace_bulk_review_projections(
+            workspace,
+            maximum_candidate_listings_examined=(request.maximum_candidate_listings_examined),
+            selected_listing_identifiers=selected_identifiers,
+        )
+        projections_by_identifier = {
+            projection.listing_identifier: projection for projection in projections
+        }
+        excluded_identifiers = set(request.exclude_listing_identifiers)
+        unknown_exclusions = excluded_identifiers - projections_by_identifier.keys()
+        if unknown_exclusions:
+            raise ReviewInputError(
+                f"{len(unknown_exclusions)} excluded listings are outside the selected workspace scope"
+            )
+        if selected_identifiers is not None:
+            missing = set(selected_identifiers) - projections_by_identifier.keys()
+            if missing:
+                raise ReviewInputError(
+                    f"{len(missing)} selected listings are outside the active workspace scope"
+                )
+            selected_projections = tuple(
+                projection
+                for projection in projections
+                if projection.listing_identifier in selected_identifiers
+            )
+        else:
+            selected_projections = projections
+
+        prior_by_listing = await self.database.latest_listing_reviews(
+            workspace_record_identifier=workspace.record_identifier,
+            listing_identifiers=tuple(
+                projection.listing_identifier for projection in selected_projections
+            ),
+        )
+        explicitly_excluded_count = 0
+        status_excluded_count = 0
+        review_state_excluded_count = 0
+        selected: list[tuple[ComposedListingProjection, ListingReviewRecord | None]] = []
+        for projection in selected_projections:
+            if projection.listing_identifier in excluded_identifiers:
+                explicitly_excluded_count += 1
+                continue
+            if projection.status.value not in request.statuses:
+                status_excluded_count += 1
+                continue
+            prior = prior_by_listing.get(projection.listing_identifier)
+            review_state, _ = classify_review_state(
+                current_revision=projection.projection_revision,
+                previous_review=prior,
+                policy=workspace.staleness_policy,
+            )
+            if review_state not in request.include_review_states:
+                review_state_excluded_count += 1
+                continue
+            selected.append((projection, prior))
+
+        operation_identifier = self.new_identifier()
+        recorded_at_utc_ns = self.utc_now_ns()
+        recorded_at_utc = _utc_text(recorded_at_utc_ns)
+        review_records = tuple(
+            ListingReviewRecord(
+                record_identifier=self.new_identifier(),
+                workspace_record_identifier=workspace.record_identifier,
+                batch_record_identifier=None,
+                listing_identifier=projection.listing_identifier,
+                projection_revision=projection.projection_revision,
+                inspected=True,
+                disposition=request.disposition,
+                note=request.note,
+                recorded_at_utc=recorded_at_utc,
+            )
+            for projection, _ in selected
+        )
+        result = RecordWorkspaceBulkReviewResult(
+            operation_identifier=operation_identifier,
+            workspace_record_identifier=workspace.record_identifier,
+            selection_kind=request.selection.kind,
+            as_of_completion_sequence=as_of,
+            candidate_listings_examined=examined,
+            selection_member_count=len(selected_projections),
+            explicitly_excluded_count=explicitly_excluded_count,
+            status_excluded_count=status_excluded_count,
+            review_state_excluded_count=review_state_excluded_count,
+            recorded_count=len(review_records),
+            recorded_at_utc=recorded_at_utc,
+        )
+        provenance = await self._code_provenance()
+        ended_at_utc_ns = self.utc_now_ns()
+        try:
+            published = await self.database.publish_workspace_bulk_review_records(
+                request_identifier=request.request_identifier,
+                request_sha256=request_sha256,
+                workspace_record_identifier=workspace.record_identifier,
+                expected_prior_review_identifiers={
+                    projection.listing_identifier: (
+                        None if prior is None else prior.record_identifier
+                    )
+                    for projection, prior in selected
+                },
+                component=build_review_workspace_component_registry().require(
+                    RECORD_WORKSPACE_BULK_REVIEW
+                ),
+                operation_identifier=operation_identifier,
+                records=tuple(
+                    RecordDraft(
+                        identifier=record.record_identifier,
+                        kind=LISTING_REVIEW_KIND,
+                        schema_version=1,
+                        value=record.model_dump(mode="json"),
+                    )
+                    for record in review_records
+                ),
+                source_input=source_input,
+                response=result,
+                provenance=provenance,
+                invocation=process_invocation(),
+                started_at_utc=_utc_text(started_at_utc_ns),
+                ended_at_utc=_utc_text(ended_at_utc_ns),
+                duration_ns=max(0, self.monotonic_ns() - started_monotonic_ns),
+                utc_now_ns=self.utc_now_ns,
+            )
+        except ValueError as error:
+            raise ReviewInputError(str(error)) from error
+        if published is None:
+            raise ReviewInputError(
+                "A selected listing was claimed or reviewed concurrently; no reviews were recorded"
             )
         return published
 

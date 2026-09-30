@@ -11312,7 +11312,7 @@
   },
   {
     "name": "list_workspace_listings",
-    "description": "Page through the available-only deduplicated union of workspace search tracks.",
+    "description": "Page through compact workspace listings; use get_workspace_listing for details.",
     "inputSchema": {
       "type": "object",
       "$defs": {
@@ -11388,6 +11388,8 @@
             },
             "maximum_gallery_images_per_listing": {
               "default": 0,
+              "deprecated": true,
+              "description": "Accepted for compatibility; compact rows return gallery counts only.",
               "maximum": 10,
               "minimum": 0,
               "title": "Maximum Gallery Images Per Listing",
@@ -11395,6 +11397,8 @@
             },
             "maximum_analyses_per_listing": {
               "default": 1,
+              "deprecated": true,
+              "description": "Accepted for compatibility; compact rows return analysis presence only.",
               "maximum": 5,
               "minimum": 0,
               "title": "Maximum Analyses Per Listing",
@@ -11464,134 +11468,21 @@
     },
     "outputSchema": {
       "$defs": {
-        "AnalysisApplicability": {
+        "JsonValue": {},
+        "ListingStatus": {
           "enum": [
-            "exact",
-            "assumed",
-            "stale",
-            "indeterminate"
+            "available",
+            "pending",
+            "sold",
+            "unavailable",
+            "unknown"
           ],
-          "title": "AnalysisApplicability",
+          "title": "ListingStatus",
           "type": "string"
         },
-        "ComposedAnalysis": {
+        "WorkspaceListingSummary": {
           "additionalProperties": false,
-          "properties": {
-            "descriptor": {
-              "$ref": "#/$defs/ProjectionAnalysisDescriptor"
-            },
-            "applicability": {
-              "$ref": "#/$defs/AnalysisApplicability"
-            },
-            "applicability_reasons": {
-              "items": {
-                "type": "string"
-              },
-              "maxItems": 10,
-              "title": "Applicability Reasons",
-              "type": "array"
-            }
-          },
-          "required": [
-            "descriptor",
-            "applicability",
-            "applicability_reasons"
-          ],
-          "title": "ComposedAnalysis",
-          "type": "object"
-        },
-        "ComposedField": {
-          "additionalProperties": false,
-          "properties": {
-            "value": {
-              "$ref": "#/$defs/JsonValue"
-            },
-            "evidence": {
-              "$ref": "#/$defs/ProjectionEvidence"
-            }
-          },
-          "required": [
-            "value",
-            "evidence"
-          ],
-          "title": "ComposedField",
-          "type": "object"
-        },
-        "ComposedGallery": {
-          "additionalProperties": false,
-          "properties": {
-            "referenced_image_count": {
-              "minimum": 0,
-              "title": "Referenced Image Count",
-              "type": "integer"
-            },
-            "saved_image_count": {
-              "minimum": 0,
-              "title": "Saved Image Count",
-              "type": "integer"
-            },
-            "all_referenced_images_saved": {
-              "title": "All Referenced Images Saved",
-              "type": "boolean"
-            },
-            "images": {
-              "items": {
-                "$ref": "#/$defs/ComposedGalleryImage"
-              },
-              "maxItems": 100,
-              "title": "Images",
-              "type": "array"
-            },
-            "images_truncated": {
-              "title": "Images Truncated",
-              "type": "boolean"
-            },
-            "reference_set_truncated": {
-              "title": "Reference Set Truncated",
-              "type": "boolean"
-            },
-            "reference_set_evidence": {
-              "$ref": "#/$defs/ProjectionEvidence"
-            }
-          },
-          "required": [
-            "referenced_image_count",
-            "saved_image_count",
-            "all_referenced_images_saved",
-            "images",
-            "images_truncated",
-            "reference_set_truncated",
-            "reference_set_evidence"
-          ],
-          "title": "ComposedGallery",
-          "type": "object"
-        },
-        "ComposedGalleryImage": {
-          "additionalProperties": false,
-          "properties": {
-            "descriptor": {
-              "$ref": "#/$defs/ProjectionGalleryImageDescriptor"
-            },
-            "evidence": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ProjectionEvidence"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "descriptor",
-            "evidence"
-          ],
-          "title": "ComposedGalleryImage",
-          "type": "object"
-        },
-        "ComposedListingProjection": {
-          "additionalProperties": false,
+          "description": "Compact workspace index entry; use get_workspace_listing for evidence.",
           "properties": {
             "listing_identifier": {
               "pattern": "^[0-9]+$",
@@ -11603,108 +11494,71 @@
               "title": "Canonical Source Url",
               "type": "string"
             },
-            "as_of_completion_sequence": {
-              "minimum": 0,
-              "title": "As Of Completion Sequence",
-              "type": "integer"
-            },
-            "projection_revision": {
-              "$ref": "#/$defs/ProjectionRevision"
-            },
             "status": {
-              "$ref": "#/$defs/ComposedStatus"
+              "$ref": "#/$defs/ListingStatus"
             },
             "title": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ComposedField"
-                },
-                {
-                  "type": "null"
-                }
-              ]
+              "$ref": "#/$defs/JsonValue"
             },
             "price": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ComposedField"
-                },
-                {
-                  "type": "null"
-                }
-              ]
+              "$ref": "#/$defs/JsonValue"
             },
             "location": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "preview_image_url": {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/ComposedField"
+                  "type": "string"
                 },
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "title": "Preview Image Url"
             },
-            "description": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ComposedField"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "seller": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ComposedField"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "preview_image": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ComposedPreviewImage"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "gallery": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ComposedGallery"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "analyses": {
-              "items": {
-                "$ref": "#/$defs/ComposedAnalysis"
-              },
-              "maxItems": 20,
-              "title": "Analyses",
-              "type": "array"
-            },
-            "analyses_truncated": {
-              "title": "Analyses Truncated",
+            "description_available": {
+              "title": "Description Available",
               "type": "boolean"
             },
-            "search_membership": {
+            "seller_available": {
+              "title": "Seller Available",
+              "type": "boolean"
+            },
+            "referenced_image_count": {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/SearchMembershipProjection"
+                  "minimum": 0,
+                  "type": "integer"
                 },
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "default": null,
+              "title": "Referenced Image Count"
+            },
+            "saved_image_count": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Saved Image Count"
+            },
+            "analysis_available": {
+              "title": "Analysis Available",
+              "type": "boolean"
+            },
+            "projection_revision_sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Projection Revision Sha256",
+              "type": "string"
             },
             "warnings": {
               "default": [],
@@ -11719,606 +11573,17 @@
           "required": [
             "listing_identifier",
             "canonical_source_url",
-            "as_of_completion_sequence",
-            "projection_revision",
             "status",
             "title",
             "price",
             "location",
-            "description",
-            "seller",
-            "preview_image",
-            "gallery",
-            "analyses",
-            "analyses_truncated",
-            "search_membership"
+            "preview_image_url",
+            "description_available",
+            "seller_available",
+            "analysis_available",
+            "projection_revision_sha256"
           ],
-          "title": "ComposedListingProjection",
-          "type": "object"
-        },
-        "ComposedPreviewImage": {
-          "additionalProperties": false,
-          "properties": {
-            "descriptor": {
-              "$ref": "#/$defs/ProjectionGalleryImageDescriptor"
-            },
-            "evidence": {
-              "$ref": "#/$defs/ProjectionEvidence"
-            }
-          },
-          "required": [
-            "descriptor",
-            "evidence"
-          ],
-          "title": "ComposedPreviewImage",
-          "type": "object"
-        },
-        "ComposedStatus": {
-          "additionalProperties": false,
-          "properties": {
-            "value": {
-              "$ref": "#/$defs/ListingStatus"
-            },
-            "raw_flags": {
-              "$ref": "#/$defs/JsonValue"
-            },
-            "evidence": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ProjectionEvidence"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "value",
-            "raw_flags",
-            "evidence"
-          ],
-          "title": "ComposedStatus",
-          "type": "object"
-        },
-        "JsonValue": {},
-        "ListingStatus": {
-          "enum": [
-            "available",
-            "pending",
-            "sold",
-            "unavailable",
-            "unknown"
-          ],
-          "title": "ListingStatus",
-          "type": "string"
-        },
-        "ProjectionAnalysisDescriptor": {
-          "additionalProperties": false,
-          "properties": {
-            "analysis_record_identifier": {
-              "minLength": 1,
-              "title": "Analysis Record Identifier",
-              "type": "string"
-            },
-            "evidence_set_record_identifier": {
-              "minLength": 1,
-              "title": "Evidence Set Record Identifier",
-              "type": "string"
-            },
-            "listing_observation_record_identifier": {
-              "minLength": 1,
-              "title": "Listing Observation Record Identifier",
-              "type": "string"
-            },
-            "product_guide_record_identifier": {
-              "minLength": 1,
-              "title": "Product Guide Record Identifier",
-              "type": "string"
-            },
-            "completion_sequence": {
-              "minimum": 0,
-              "title": "Completion Sequence",
-              "type": "integer"
-            },
-            "completed_at_utc": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Completed At Utc"
-            },
-            "state": {
-              "title": "State",
-              "type": "string"
-            },
-            "warnings": {
-              "default": [],
-              "items": {
-                "type": "string"
-              },
-              "maxItems": 20,
-              "title": "Warnings",
-              "type": "array"
-            },
-            "model": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Model"
-            }
-          },
-          "required": [
-            "analysis_record_identifier",
-            "evidence_set_record_identifier",
-            "listing_observation_record_identifier",
-            "product_guide_record_identifier",
-            "completion_sequence",
-            "completed_at_utc",
-            "state",
-            "model"
-          ],
-          "title": "ProjectionAnalysisDescriptor",
-          "type": "object"
-        },
-        "ProjectionEvidence": {
-          "additionalProperties": false,
-          "description": "Repository ordering and drill-down identity for one selected value.",
-          "properties": {
-            "evidence_record_identifier": {
-              "minLength": 1,
-              "title": "Evidence Record Identifier",
-              "type": "string"
-            },
-            "observation_record_identifier": {
-              "anyOf": [
-                {
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Observation Record Identifier"
-            },
-            "acquisition_record_identifier": {
-              "anyOf": [
-                {
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Acquisition Record Identifier"
-            },
-            "producing_operation_identifier": {
-              "anyOf": [
-                {
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Producing Operation Identifier"
-            },
-            "acquisition_completion_sequence": {
-              "minimum": 0,
-              "title": "Acquisition Completion Sequence",
-              "type": "integer"
-            },
-            "observation_completion_sequence": {
-              "minimum": 0,
-              "title": "Observation Completion Sequence",
-              "type": "integer"
-            },
-            "observed_at_utc": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Observed At Utc"
-            },
-            "completed_at_utc": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Completed At Utc"
-            },
-            "source_kind": {
-              "$ref": "#/$defs/ProjectionSourceKind"
-            },
-            "warnings": {
-              "default": [],
-              "items": {
-                "type": "string"
-              },
-              "maxItems": 20,
-              "title": "Warnings",
-              "type": "array"
-            }
-          },
-          "required": [
-            "evidence_record_identifier",
-            "acquisition_completion_sequence",
-            "observation_completion_sequence",
-            "source_kind"
-          ],
-          "title": "ProjectionEvidence",
-          "type": "object"
-        },
-        "ProjectionGalleryImageDescriptor": {
-          "additionalProperties": false,
-          "properties": {
-            "gallery_order": {
-              "minimum": 0,
-              "title": "Gallery Order",
-              "type": "integer"
-            },
-            "gallery_reference_record_identifier": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Gallery Reference Record Identifier"
-            },
-            "original_url": {
-              "title": "Original Url",
-              "type": "string"
-            },
-            "photo_identifier": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Photo Identifier"
-            },
-            "declared_width": {
-              "anyOf": [
-                {
-                  "exclusiveMinimum": 0,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Declared Width"
-            },
-            "declared_height": {
-              "anyOf": [
-                {
-                  "exclusiveMinimum": 0,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Declared Height"
-            },
-            "image_result_record_identifier": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Image Result Record Identifier"
-            },
-            "image_artifact_identifier": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Image Artifact Identifier"
-            },
-            "download_state": {
-              "title": "Download State",
-              "type": "string"
-            },
-            "sha256": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Sha256"
-            },
-            "media_type": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Media Type"
-            },
-            "width": {
-              "anyOf": [
-                {
-                  "exclusiveMinimum": 0,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Width"
-            },
-            "height": {
-              "anyOf": [
-                {
-                  "exclusiveMinimum": 0,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Height"
-            }
-          },
-          "required": [
-            "gallery_order",
-            "gallery_reference_record_identifier",
-            "original_url",
-            "photo_identifier",
-            "image_result_record_identifier",
-            "image_artifact_identifier",
-            "download_state",
-            "sha256",
-            "media_type"
-          ],
-          "title": "ProjectionGalleryImageDescriptor",
-          "type": "object"
-        },
-        "ProjectionRevision": {
-          "additionalProperties": false,
-          "properties": {
-            "recipe_version": {
-              "default": 1,
-              "minimum": 1,
-              "title": "Recipe Version",
-              "type": "integer"
-            },
-            "status_sha256": {
-              "pattern": "^[0-9a-f]{64}$",
-              "title": "Status Sha256",
-              "type": "string"
-            },
-            "scalar_fields_sha256": {
-              "pattern": "^[0-9a-f]{64}$",
-              "title": "Scalar Fields Sha256",
-              "type": "string"
-            },
-            "preview_image_sha256": {
-              "pattern": "^[0-9a-f]{64}$",
-              "title": "Preview Image Sha256",
-              "type": "string"
-            },
-            "gallery_sha256": {
-              "pattern": "^[0-9a-f]{64}$",
-              "title": "Gallery Sha256",
-              "type": "string"
-            },
-            "analyses_sha256": {
-              "pattern": "^[0-9a-f]{64}$",
-              "title": "Analyses Sha256",
-              "type": "string"
-            },
-            "search_membership_sha256": {
-              "pattern": "^[0-9a-f]{64}$",
-              "title": "Search Membership Sha256",
-              "type": "string"
-            },
-            "aggregate_sha256": {
-              "pattern": "^[0-9a-f]{64}$",
-              "title": "Aggregate Sha256",
-              "type": "string"
-            }
-          },
-          "required": [
-            "status_sha256",
-            "scalar_fields_sha256",
-            "preview_image_sha256",
-            "gallery_sha256",
-            "analyses_sha256",
-            "search_membership_sha256",
-            "aggregate_sha256"
-          ],
-          "title": "ProjectionRevision",
-          "type": "object"
-        },
-        "ProjectionSourceKind": {
-          "enum": [
-            "search_card",
-            "pdp_probe",
-            "item_page",
-            "image_download"
-          ],
-          "title": "ProjectionSourceKind",
-          "type": "string"
-        },
-        "SearchComparisonCoverage": {
-          "enum": [
-            "complete",
-            "bounded",
-            "incomplete",
-            "unknown"
-          ],
-          "title": "SearchComparisonCoverage",
-          "type": "string"
-        },
-        "SearchMembershipProjection": {
-          "additionalProperties": false,
-          "properties": {
-            "lineage_root_search_run_record_identifier": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Lineage Root Search Run Record Identifier"
-            },
-            "selected_search_run_record_identifier": {
-              "minLength": 1,
-              "title": "Selected Search Run Record Identifier",
-              "type": "string"
-            },
-            "oldest_included_search_run_record_identifier": {
-              "minLength": 1,
-              "title": "Oldest Included Search Run Record Identifier",
-              "type": "string"
-            },
-            "included_ancestry_run_count": {
-              "minimum": 1,
-              "title": "Included Ancestry Run Count",
-              "type": "integer"
-            },
-            "older_ancestry_truncated": {
-              "title": "Older Ancestry Truncated",
-              "type": "boolean"
-            },
-            "first_seen_search_run_record_identifier": {
-              "minLength": 1,
-              "title": "First Seen Search Run Record Identifier",
-              "type": "string"
-            },
-            "last_seen_search_run_record_identifier": {
-              "minLength": 1,
-              "title": "Last Seen Search Run Record Identifier",
-              "type": "string"
-            },
-            "first_seen_at_utc": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "First Seen At Utc"
-            },
-            "last_seen_at_utc": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Last Seen At Utc"
-            },
-            "seen_in_selected_run": {
-              "title": "Seen In Selected Run",
-              "type": "boolean"
-            },
-            "seen_run_count": {
-              "minimum": 1,
-              "title": "Seen Run Count",
-              "type": "integer"
-            },
-            "selected_run_stopping_reason": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Selected Run Stopping Reason"
-            },
-            "comparison_coverage": {
-              "$ref": "#/$defs/SearchComparisonCoverage"
-            },
-            "absence_comparison_valid": {
-              "title": "Absence Comparison Valid",
-              "type": "boolean"
-            },
-            "warnings": {
-              "default": [],
-              "items": {
-                "type": "string"
-              },
-              "maxItems": 20,
-              "title": "Warnings",
-              "type": "array"
-            }
-          },
-          "required": [
-            "lineage_root_search_run_record_identifier",
-            "selected_search_run_record_identifier",
-            "oldest_included_search_run_record_identifier",
-            "included_ancestry_run_count",
-            "older_ancestry_truncated",
-            "first_seen_search_run_record_identifier",
-            "last_seen_search_run_record_identifier",
-            "first_seen_at_utc",
-            "last_seen_at_utc",
-            "seen_in_selected_run",
-            "seen_run_count",
-            "selected_run_stopping_reason",
-            "comparison_coverage",
-            "absence_comparison_valid"
-          ],
-          "title": "SearchMembershipProjection",
+          "title": "WorkspaceListingSummary",
           "type": "object"
         }
       },
@@ -12355,7 +11620,7 @@
         },
         "listings": {
           "items": {
-            "$ref": "#/$defs/ComposedListingProjection"
+            "$ref": "#/$defs/WorkspaceListingSummary"
           },
           "maxItems": 100,
           "title": "Listings",
@@ -12383,7 +11648,7 @@
         "listings",
         "next_cursor"
       ],
-      "title": "ComposedListingPage",
+      "title": "WorkspaceListingPage",
       "type": "object"
     },
     "annotations": {
@@ -13296,6 +12561,310 @@
         "carl",
         "review",
         "record_listing_reviews"
+      ]
+    }
+  },
+  {
+    "name": "record_workspace_bulk_review",
+    "description": "Atomically review a bounded selection; defaults to available and unreviewed.",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "ListingStatus": {
+          "enum": [
+            "available",
+            "pending",
+            "sold",
+            "unavailable",
+            "unknown"
+          ],
+          "title": "ListingStatus",
+          "type": "string"
+        },
+        "RecordWorkspaceBulkReviewRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "request_identifier": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Request Identifier",
+              "type": "string"
+            },
+            "workspace_record_identifier": {
+              "minLength": 1,
+              "title": "Workspace Record Identifier",
+              "type": "string"
+            },
+            "selection": {
+              "default": {
+                "kind": "workspace"
+              },
+              "discriminator": {
+                "mapping": {
+                  "selection_snapshot": "#/$defs/SelectionSnapshotBulkReviewSelection",
+                  "workset": "#/$defs/WorksetBulkReviewSelection",
+                  "workspace": "#/$defs/WorkspaceBulkReviewSelection"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/WorkspaceBulkReviewSelection"
+                },
+                {
+                  "$ref": "#/$defs/WorksetBulkReviewSelection"
+                },
+                {
+                  "$ref": "#/$defs/SelectionSnapshotBulkReviewSelection"
+                }
+              ],
+              "title": "Selection"
+            },
+            "statuses": {
+              "default": [
+                "available"
+              ],
+              "items": {
+                "$ref": "#/$defs/ListingStatus"
+              },
+              "maxItems": 5,
+              "minItems": 1,
+              "title": "Statuses",
+              "type": "array",
+              "uniqueItems": true
+            },
+            "include_review_states": {
+              "default": [
+                "unreviewed"
+              ],
+              "items": {
+                "$ref": "#/$defs/ReviewState"
+              },
+              "maxItems": 3,
+              "minItems": 1,
+              "title": "Include Review States",
+              "type": "array",
+              "uniqueItems": true
+            },
+            "disposition": {
+              "$ref": "#/$defs/ReviewDisposition"
+            },
+            "note": {
+              "anyOf": [
+                {
+                  "maxLength": 4000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Note"
+            },
+            "exclude_listing_identifiers": {
+              "default": [],
+              "items": {
+                "pattern": "^[0-9]+$",
+                "type": "string"
+              },
+              "maxItems": 10000,
+              "title": "Exclude Listing Identifiers",
+              "type": "array",
+              "uniqueItems": true
+            },
+            "maximum_candidate_listings_examined": {
+              "default": 10000,
+              "maximum": 10000,
+              "minimum": 1,
+              "title": "Maximum Candidate Listings Examined",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "request_identifier",
+            "workspace_record_identifier",
+            "disposition"
+          ],
+          "title": "RecordWorkspaceBulkReviewRequest",
+          "type": "object"
+        },
+        "ReviewDisposition": {
+          "enum": [
+            "promising",
+            "rejected",
+            "waiting_for_data",
+            "deferred"
+          ],
+          "title": "ReviewDisposition",
+          "type": "string"
+        },
+        "ReviewState": {
+          "enum": [
+            "unreviewed",
+            "current",
+            "stale"
+          ],
+          "title": "ReviewState",
+          "type": "string"
+        },
+        "SelectionSnapshotBulkReviewSelection": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "selection_snapshot",
+              "default": "selection_snapshot",
+              "title": "Kind",
+              "type": "string"
+            },
+            "selection_snapshot_record_identifier": {
+              "minLength": 1,
+              "title": "Selection Snapshot Record Identifier",
+              "type": "string"
+            }
+          },
+          "required": [
+            "selection_snapshot_record_identifier"
+          ],
+          "title": "SelectionSnapshotBulkReviewSelection",
+          "type": "object"
+        },
+        "WorksetBulkReviewSelection": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "workset",
+              "default": "workset",
+              "title": "Kind",
+              "type": "string"
+            },
+            "workset_identifier": {
+              "minLength": 1,
+              "title": "Workset Identifier",
+              "type": "string"
+            }
+          },
+          "required": [
+            "workset_identifier"
+          ],
+          "title": "WorksetBulkReviewSelection",
+          "type": "object"
+        },
+        "WorkspaceBulkReviewSelection": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "workspace",
+              "default": "workspace",
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          "title": "WorkspaceBulkReviewSelection",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/RecordWorkspaceBulkReviewRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "record_workspace_bulk_reviewArguments"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "operation_identifier": {
+          "minLength": 1,
+          "title": "Operation Identifier",
+          "type": "string"
+        },
+        "workspace_record_identifier": {
+          "minLength": 1,
+          "title": "Workspace Record Identifier",
+          "type": "string"
+        },
+        "selection_kind": {
+          "minLength": 1,
+          "title": "Selection Kind",
+          "type": "string"
+        },
+        "as_of_completion_sequence": {
+          "minimum": 0,
+          "title": "As Of Completion Sequence",
+          "type": "integer"
+        },
+        "candidate_listings_examined": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Candidate Listings Examined",
+          "type": "integer"
+        },
+        "selection_member_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Selection Member Count",
+          "type": "integer"
+        },
+        "explicitly_excluded_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Explicitly Excluded Count",
+          "type": "integer"
+        },
+        "status_excluded_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Status Excluded Count",
+          "type": "integer"
+        },
+        "review_state_excluded_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Review State Excluded Count",
+          "type": "integer"
+        },
+        "recorded_count": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Recorded Count",
+          "type": "integer"
+        },
+        "recorded_at_utc": {
+          "title": "Recorded At Utc",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_identifier",
+        "workspace_record_identifier",
+        "selection_kind",
+        "as_of_completion_sequence",
+        "candidate_listings_examined",
+        "selection_member_count",
+        "explicitly_excluded_count",
+        "status_excluded_count",
+        "review_state_excluded_count",
+        "recorded_count",
+        "recorded_at_utc"
+      ],
+      "title": "RecordWorkspaceBulkReviewResult",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "review",
+        "record_workspace_bulk_review"
       ]
     }
   },

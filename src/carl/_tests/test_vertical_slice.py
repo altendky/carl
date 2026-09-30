@@ -260,6 +260,86 @@ async def test_version_six_database_adds_work_requester_index(tmp_path: Path) ->
 
 
 @pytest.mark.anyio
+async def test_version_seven_database_adds_bulk_review_storage(tmp_path: Path) -> None:
+    path = tmp_path / "carl.sqlite3"
+    async with Database.managed(path, initialize=True):
+        pass
+
+    version_seven_identity = DATABASE_SCHEMA.model_copy(update={"version": 7})
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO operations VALUES (
+                'legacy-operation', '["test","legacy"]', 1, ?, '{}', '{}',
+                'completed', '2026-09-28T00:00:00+00:00',
+                '2026-09-28T00:00:01+00:00', 1, '{}', NULL
+            )
+            """,
+            (
+                encode_json(
+                    CodeProvenance(
+                        repository_url=None,
+                        commit_hash=None,
+                        worktree_state="unknown",
+                        package_version="test",
+                        python_implementation="CPython",
+                        python_version="test",
+                        dependencies=(),
+                        lockfile_sha256=None,
+                    ).model_dump(mode="json")
+                ),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO review_mutation_requests VALUES (
+                'record_reviews', 'legacy-request', ?, 1, 1, ?,
+                'legacy-operation', 1
+            )
+            """,
+            ("a" * 64, encode_json({"records": []})),
+        )
+        connection.execute("DROP INDEX records_listing_review_workspace_listing")
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_identity_json'",
+            (encode_json(version_seven_identity.model_dump(mode="json")),),
+        )
+        connection.execute("UPDATE schema_metadata SET value = '7' WHERE key = 'schema_version'")
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_definition_sha256'",
+            ("98ee0b3ee6f75ad08cc657e740762e0f752165cba67f12dd832c548df33e8dbc",),
+        )
+        connection.commit()
+
+    async with Database.managed(path):
+        pass
+
+    with closing(sqlite3.connect(path)) as connection:
+        index = connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            ("records_listing_review_workspace_listing",),
+        ).fetchone()
+        mutation_table_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            ("review_mutation_requests",),
+        ).fetchone()
+        legacy_mutation = connection.execute(
+            """
+            SELECT request_sha256, response_json, operation_id
+            FROM review_mutation_requests
+            WHERE action = 'record_reviews' AND request_identifier = 'legacy-request'
+            """
+        ).fetchone()
+        metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
+    assert index == ("records_listing_review_workspace_listing",)
+    assert mutation_table_sql is not None
+    assert "record_workspace_bulk_review" in mutation_table_sql[0]
+    assert legacy_mutation == ("a" * 64, encode_json({"records": []}), "legacy-operation")
+    assert decode_json(metadata["schema_identity_json"]) == DATABASE_SCHEMA.model_dump(mode="json")
+    assert metadata["schema_version"] == str(DATABASE_SCHEMA.version)
+
+
+@pytest.mark.anyio
 async def test_composed_projection_storage_queries_are_targeted_and_bounded(tmp_path: Path) -> None:
     path = tmp_path / "carl.sqlite3"
     async with Database.managed(path, initialize=True):
