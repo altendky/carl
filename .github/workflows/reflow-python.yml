@@ -45,7 +45,7 @@ jobs:
         include:
           - python-version: 3.13.15
             coverage: true
-          - python-version: 3.14.3
+          - python-version: 3.14.7
             coverage: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
