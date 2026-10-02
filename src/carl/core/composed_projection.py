@@ -13,6 +13,7 @@ from pydantic import Field, field_validator, model_validator
 
 from carl.core.facebook_search import SearchStoppingReason
 from carl.core.json import decode_json, encode_json
+from carl.core.listing_identity import LISTING_IDENTIFIER_PATTERN, canonical_listing_url
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
 
 
@@ -49,6 +50,34 @@ class ProjectionEvidence(StrictModel):
 class ComposedField(StrictModel):
     value: JsonValue
     evidence: ProjectionEvidence
+
+
+class ScalarFieldName(JsonStringEnumeration):
+    TITLE = "title"
+    PRICE = "price"
+    LOCATION = "location"
+    DESCRIPTION = "description"
+    SELLER = "seller"
+    LAST_SALE = "last_sale"
+    CONDITION = "condition"
+    SHIPPING = "shipping"
+
+
+class ScalarFieldValues(StrictModel):
+    title: JsonValue = None
+    price: JsonValue = None
+    location: JsonValue = None
+    description: JsonValue = None
+    seller: JsonValue = None
+    last_sale: JsonValue = None
+    condition: JsonValue = None
+    shipping: JsonValue = None
+
+
+class ScalarFieldChange(StrictModel):
+    field: ScalarFieldName
+    previous_value: JsonValue
+    current_value: JsonValue
 
 
 class ComposedStatus(StrictModel):
@@ -192,7 +221,7 @@ class ProjectionRevision(StrictModel):
 
 
 class ComposedListingProjection(StrictModel):
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     canonical_source_url: str = Field(min_length=1)
     as_of_completion_sequence: int = Field(ge=0)
     projection_revision: ProjectionRevision
@@ -202,6 +231,9 @@ class ComposedListingProjection(StrictModel):
     location: ComposedField | None
     description: ComposedField | None
     seller: ComposedField | None
+    last_sale: ComposedField | None = None
+    condition: ComposedField | None = None
+    shipping: ComposedField | None = None
     preview_image: ComposedPreviewImage | None
     gallery: ComposedGallery | None
     analyses: tuple[ComposedAnalysis, ...] = Field(max_length=20)
@@ -211,7 +243,7 @@ class ComposedListingProjection(StrictModel):
 
     @model_validator(mode="after")
     def validate_canonical_url(self) -> ComposedListingProjection:
-        if self.canonical_source_url != canonical_facebook_listing_url(self.listing_identifier):
+        if self.canonical_source_url != canonical_listing_url(self.listing_identifier):
             raise ValueError("Listing source URL is not canonical")
         return self
 
@@ -232,7 +264,7 @@ class ComposedListingFilters(StrictModel):
 
 
 class GetComposedListingRequest(StrictModel):
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     search_run_record_identifier: str | None = Field(default=None, min_length=1)
     additional_search_run_record_identifiers: Sequence[str] = Field(default=(), max_length=20)
     product_guide_record_identifier: str | None = Field(default=None, min_length=1)
@@ -287,27 +319,27 @@ class ComposedListingPage(StrictModel):
 
 
 class ListingObservationCandidate(StrictModel):
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     response_classification: str
     observation: JsonValue
     evidence: ProjectionEvidence
 
 
 class SearchCardCandidate(StrictModel):
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     original: dict[str, JsonValue]
     evidence: ProjectionEvidence
 
 
 class StatusObservationCandidate(StrictModel):
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     value: ListingStatus
     raw_flags: JsonValue
     evidence: ProjectionEvidence
 
 
 class GalleryCandidate(StrictModel):
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     images: tuple[ComposedGalleryImage, ...] = Field(max_length=100)
     referenced_image_count: int = Field(ge=0)
     reference_set_truncated: bool
@@ -348,6 +380,98 @@ def _canonical_sha256(value: JsonValue) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _finite_price_amount(value: JsonValue) -> Decimal | None:
+    if not isinstance(value, dict):
+        return None
+    amount = value.get("amount_decimal")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float, str)):
+        return None
+    try:
+        decimal = Decimal(str(amount))
+    except (InvalidOperation, ValueError):
+        return None
+    return decimal if decimal.is_finite() else None
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    if value.is_zero():
+        return "0"
+    sign, digits, exponent = value.as_tuple()
+    assert isinstance(exponent, int)
+    remaining = list(digits)
+    while remaining[-1] == 0:
+        remaining.pop()
+        exponent += 1
+    exact = Decimal((sign, tuple(remaining), exponent))
+    # Use readable decimal notation for ordinary prices without rounding through
+    # the process-global Decimal context or expanding pathological exponents.
+    return format(exact, "f") if abs(exact.adjusted()) <= 1_000 else str(exact)
+
+
+def normalize_scalar_fields(values: ScalarFieldValues) -> ScalarFieldValues:
+    """Canonicalize equivalent price representations, preserving other facts."""
+
+    updates: dict[str, JsonValue] = {}
+    amount = _finite_price_amount(values.price)
+    if amount is not None and isinstance(values.price, dict):
+        price = dict(cast(dict[str, JsonValue], values.price))
+        price["amount_decimal"] = _canonical_decimal(amount)
+        price.pop("formatted_amount", None)
+        currency = price.get("currency")
+        if isinstance(currency, str) and currency.strip():
+            price["currency"] = currency.strip().upper()
+        updates["price"] = price
+    if isinstance(values.last_sale, dict):
+        sale = dict(cast(dict[str, JsonValue], values.last_sale))
+        structured_price = sale.get("sold_price_value")
+        if _finite_price_amount(structured_price) is not None:
+            # Keep the original display in the projection, but compare the actual
+            # sale amount/currency in snapshots rather than its presentation.
+            sale["sold_price"] = normalize_scalar_fields(
+                ScalarFieldValues(price=structured_price)
+            ).price
+            sale.pop("sold_price_value")
+            updates["last_sale"] = sale
+    return values.model_copy(update=updates) if updates else values
+
+
+def projection_scalar_fields(projection: ComposedListingProjection) -> ScalarFieldValues:
+    return normalize_scalar_fields(
+        ScalarFieldValues(
+            **{
+                name.value: None
+                if (field := getattr(projection, name.value)) is None
+                else field.value
+                for name in ScalarFieldName
+            }
+        )
+    )
+
+
+def scalar_fields_sha256(values: ScalarFieldValues, *, normalize: bool = True) -> str:
+    values = normalize_scalar_fields(values) if normalize else values
+    fields = values.model_dump(mode="json")
+    for name in ("last_sale", "condition", "shipping"):
+        if fields[name] is None:
+            fields.pop(name)
+    return _canonical_sha256(fields)
+
+
+def scalar_field_changes(
+    previous: ScalarFieldValues, current: ScalarFieldValues
+) -> tuple[ScalarFieldChange, ...]:
+    previous, current = normalize_scalar_fields(previous), normalize_scalar_fields(current)
+    return tuple(
+        ScalarFieldChange(
+            field=name,
+            previous_value=getattr(previous, name.value),
+            current_value=getattr(current, name.value),
+        )
+        for name in ScalarFieldName
+        if getattr(previous, name.value) != getattr(current, name.value)
+    )
+
+
 def _semantic_image_descriptor(
     descriptor: ProjectionGalleryImageDescriptor,
 ) -> dict[str, JsonValue]:
@@ -385,18 +509,24 @@ def projection_revision(
     analyses: Sequence[ComposedAnalysis],
     analyses_truncated: bool,
     search_membership: SearchMembershipProjection | None,
+    last_sale: ComposedField | None = None,
+    condition: ComposedField | None = None,
+    shipping: ComposedField | None = None,
 ) -> ProjectionRevision:
     """Hash semantic components without transport limits or evidence-record churn."""
 
     status_sha256 = _canonical_sha256({"value": status.value.value, "raw_flags": status.raw_flags})
-    scalar_fields_sha256 = _canonical_sha256(
-        {
-            "title": None if title is None else title.value,
-            "price": None if price is None else price.value,
-            "location": None if location is None else location.value,
-            "description": None if description is None else description.value,
-            "seller": None if seller is None else seller.value,
-        }
+    scalar_sha256 = scalar_fields_sha256(
+        ScalarFieldValues(
+            title=None if title is None else title.value,
+            price=None if price is None else price.value,
+            location=None if location is None else location.value,
+            description=None if description is None else description.value,
+            seller=None if seller is None else seller.value,
+            last_sale=None if last_sale is None else last_sale.value,
+            condition=None if condition is None else condition.value,
+            shipping=None if shipping is None else shipping.value,
+        )
     )
     preview_image_sha256 = _canonical_sha256(
         None if preview_image is None else _semantic_image_descriptor(preview_image.descriptor)
@@ -422,18 +552,19 @@ def projection_revision(
         None if search_membership is None else search_membership.model_dump(mode="json")
     )
     component_hashes: dict[str, JsonValue] = {
-        "recipe_version": 1,
+        "recipe_version": 2,
         "listing_identifier": listing_identifier,
         "status_sha256": status_sha256,
-        "scalar_fields_sha256": scalar_fields_sha256,
+        "scalar_fields_sha256": scalar_sha256,
         "preview_image_sha256": preview_image_sha256,
         "gallery_sha256": gallery_sha256,
         "analyses_sha256": analyses_sha256,
         "search_membership_sha256": search_membership_sha256,
     }
     return ProjectionRevision(
+        recipe_version=2,
         status_sha256=status_sha256,
-        scalar_fields_sha256=scalar_fields_sha256,
+        scalar_fields_sha256=scalar_sha256,
         preview_image_sha256=preview_image_sha256,
         gallery_sha256=gallery_sha256,
         analyses_sha256=analyses_sha256,
@@ -454,7 +585,7 @@ class SearchRunCandidate(StrictModel):
 
 class SearchMembershipOccurrenceCandidate(StrictModel):
     occurrence_record_identifier: str = Field(min_length=1)
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     search_run_record_identifier: str = Field(min_length=1)
     search_run_completion_sequence: int = Field(ge=0)
     acquisition_completion_sequence: int = Field(ge=0)
@@ -472,7 +603,7 @@ class ComposedListingCursor(StrictModel):
     as_of_completion_sequence: int = Field(ge=0)
     scope_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     after_membership_completion_sequence: int = Field(ge=0)
-    after_listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    after_listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
 
 
 def canonical_facebook_listing_url(listing_identifier: str) -> str:
@@ -723,6 +854,7 @@ def select_composed_field(
     search_cards: Sequence[SearchCardCandidate],
     *,
     as_of_completion_sequence: int,
+    inherit_price_currency: bool = True,
 ) -> ComposedField | None:
     """Select one usable scalar value under the field's source policy.
 
@@ -749,7 +881,40 @@ def select_composed_field(
         candidates.append(item_field)
     if not candidates:
         return None
-    return max(candidates, key=lambda candidate: evidence_recency_key(candidate.evidence))
+    selected = max(candidates, key=lambda candidate: evidence_recency_key(candidate.evidence))
+    if name != "price" or not inherit_price_currency:
+        return selected
+    if _finite_price_amount(selected.value) is None or not isinstance(selected.value, dict):
+        return selected
+    if "currency" in selected.value:
+        return selected
+    currency_candidates = candidates + [
+        field
+        for observation in observations
+        if (
+            field := select_field(
+                "price", (observation,), as_of_completion_sequence=as_of_completion_sequence
+            )
+        )
+        is not None
+    ]
+    known_currencies = tuple(
+        candidate
+        for candidate in currency_candidates
+        if _finite_price_amount(candidate.value) is not None
+        and isinstance(candidate.value, dict)
+        and isinstance(candidate.value.get("currency"), str)
+        and str(candidate.value["currency"]).strip()
+    )
+    if not known_currencies:
+        return selected
+    currency_source = max(
+        known_currencies, key=lambda candidate: evidence_recency_key(candidate.evidence)
+    )
+    assert isinstance(currency_source.value, dict)
+    return selected.model_copy(
+        update={"value": {**selected.value, "currency": currency_source.value["currency"]}}
+    )
 
 
 def select_search_card_preview(

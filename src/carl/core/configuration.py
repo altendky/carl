@@ -136,6 +136,12 @@ class DecodoRouteConfiguration(StrictModel):
             part in self.proxy_username for part in managed_parts
         ):
             raise ValueError("Decodo username prefix, country, and session options are managed")
+        if self.product == DecodoProduct.DATACENTER_PROXY and not (
+            10000 <= self.endpoint.port <= 63000
+        ):
+            raise ValueError(
+                "Decodo datacenter requires rotating port 10000 or static port 10001-63000"
+            )
         return self
 
     def credential_reference(self) -> tuple[str, ...]:
@@ -236,23 +242,117 @@ type RouteConfiguration = Annotated[
 ]
 
 
+class HttpxTransportConfiguration(StrictModel):
+    identifier: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    implementation: Literal["httpx"]
+
+
+class WreqTransportConfiguration(StrictModel):
+    identifier: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    implementation: Literal["wreq"]
+    emulation_profile: Literal["chrome_153"] = "chrome_153"
+
+
+type HttpTransportConfiguration = Annotated[
+    HttpxTransportConfiguration | WreqTransportConfiguration,
+    Field(discriminator="implementation"),
+]
+
+
+class AcquisitionStackConfiguration(StrictModel):
+    identifier: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    http_transport: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    network_path: TomlParts
+
+    @field_validator("network_path")
+    @classmethod
+    def validate_network_path(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or any(not part for part in value):
+            raise ValueError("Structured references require nonempty parts")
+        return value
+
+
+class NetworkRouteOverride(StrictModel):
+    """Explicit runtime cutover, including work queued before a provider change."""
+
+    requested_network_path: TomlParts
+    network_path: TomlParts
+
+    @field_validator("requested_network_path", "network_path")
+    @classmethod
+    def validate_parts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or any(not part for part in value):
+            raise ValueError("Structured references require nonempty parts")
+        return value
+
+
 class CarlConfiguration(StrictModel):
     schema_identity: ConfigurationSchemaIdentity = Field(alias="schema")
     wireproxy: WireproxyToolConfiguration
+    http_transports: Annotated[
+        tuple[HttpTransportConfiguration, ...], BeforeValidator(_tuple_from_toml)
+    ] = ()
+    acquisition_stacks: Annotated[
+        tuple[AcquisitionStackConfiguration, ...], BeforeValidator(_tuple_from_toml)
+    ] = ()
     routes: Annotated[tuple[RouteConfiguration, ...], BeforeValidator(_tuple_from_toml)]
+    route_overrides: Annotated[
+        tuple[NetworkRouteOverride, ...], BeforeValidator(_tuple_from_toml)
+    ] = ()
 
     @model_validator(mode="after")
-    def validate_unique_routes(self) -> "CarlConfiguration":
+    def validate_unique_components(self) -> "CarlConfiguration":
         paths = tuple(route.network_path for route in self.routes)
         if len(paths) != len(set(paths)):
             raise ValueError("Duplicate network_path")
+        transport_identifiers = tuple(item.identifier for item in self.http_transports)
+        if len(transport_identifiers) != len(set(transport_identifiers)):
+            raise ValueError("Duplicate HTTP transport identifier")
+        stack_identifiers = tuple(item.identifier for item in self.acquisition_stacks)
+        if len(stack_identifiers) != len(set(stack_identifiers)):
+            raise ValueError("Duplicate acquisition stack identifier")
+        available_transports = set(transport_identifiers)
+        available_paths = set(paths)
+        overridden_paths = tuple(item.requested_network_path for item in self.route_overrides)
+        if len(overridden_paths) != len(set(overridden_paths)):
+            raise ValueError("Duplicate network route override")
+        for override in self.route_overrides:
+            if override.requested_network_path not in available_paths:
+                raise ValueError("Route override references an unknown requested network path")
+            if override.network_path not in available_paths:
+                raise ValueError("Route override references an unknown network path")
+            if override.network_path in overridden_paths:
+                raise ValueError("Network route overrides must not chain or cycle")
+        for stack in self.acquisition_stacks:
+            if stack.http_transport not in available_transports:
+                raise ValueError("Acquisition stack references an unknown HTTP transport")
+            if stack.network_path not in available_paths:
+                raise ValueError("Acquisition stack references an unknown network path")
         return self
+
+    def resolve_network_path(self, requested_network_path: tuple[str, ...]) -> tuple[str, ...]:
+        for override in self.route_overrides:
+            if override.requested_network_path == requested_network_path:
+                return override.network_path
+        return requested_network_path
 
     def require_route(self, network_path: tuple[str, ...]) -> RouteConfiguration:
         for route in self.routes:
             if route.network_path == network_path:
                 return route
         raise KeyError(network_path)
+
+    def require_http_transport(self, identifier: str) -> HttpTransportConfiguration:
+        for transport in self.http_transports:
+            if transport.identifier == identifier:
+                return transport
+        raise KeyError(identifier)
+
+    def require_acquisition_stack(self, identifier: str) -> AcquisitionStackConfiguration:
+        for stack in self.acquisition_stacks:
+            if stack.identifier == identifier:
+                return stack
+        raise KeyError(identifier)
 
     def as_json(self) -> dict[str, JsonValue]:
         return self.model_dump(mode="json", by_alias=True)

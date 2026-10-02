@@ -69,7 +69,7 @@ def _collect_component() -> None:
 def build_image_component_registry() -> Registry:
     return Registry(
         (
-            Component(COLLECT_FACEBOOK_IMAGE, 2, _collect_component),
+            Component(COLLECT_FACEBOOK_IMAGE, 3, _collect_component),
             Component(EXTRACT_FACEBOOK_IMAGE, 1, verify_image),
             Component(PLAN_FACEBOOK_IMAGE_FOLLOWUPS, 2, plan_image_followups),
             Component(EXTRACT_FACEBOOK_GALLERY_REFERENCES, 1, gallery_references),
@@ -108,9 +108,9 @@ def image_session_failure_work(
         "state": "image_session_failed",
         "session_failure": failure,
     }
-    if retryable and context.attempt < MAX_IMAGE_TRANSPORT_ATTEMPTS:
+    if retryable and context.retry_attempt() < MAX_IMAGE_TRANSPORT_ATTEMPTS:
         return RetryWork(
-            delay_ns=min(30, 2 ** (context.attempt - 1)) * 1_000_000_000,
+            delay_ns=min(30, 2 ** (context.retry_attempt() - 1)) * 1_000_000_000,
             reason={**failure, "decision": "retry"},
             result=result,
         )
@@ -269,7 +269,7 @@ async def _collect(
         }
         if (
             error.result.get("stopping_condition") == "transport_failure"
-            and context.attempt < MAX_IMAGE_TRANSPORT_ATTEMPTS
+            and context.retry_attempt() < MAX_IMAGE_TRANSPORT_ATTEMPTS
         ):
             return RetryWork(
                 delay_ns=1_000_000_000,

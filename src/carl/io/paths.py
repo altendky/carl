@@ -35,6 +35,10 @@ class CarlDirectories(StrictModel):
         return self.data / "images"
 
     @property
+    def mcp_error_log_file(self) -> Path:
+        return self.state / "mcp-errors.jsonl"
+
+    @property
     def proton_configuration_directory(self) -> Path:
         return self.config / "private" / "proton"
 

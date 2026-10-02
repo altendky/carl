@@ -751,11 +751,22 @@ async def test_workspace_analysis_preview_resolves_claimed_batch(
         replayed_request = await application.request_selection_analyses(request)
         workspace_work = await application.get_workspace_work_status("workspace")
         timed_out_wait = await application.wait_for_workspace_work("workspace", timeout_seconds=0)
-        progress_wait = await application.wait_for_workspace_work(
-            "workspace",
-            timeout_seconds=0.01,
-            progress=record_wait_progress,
-        )
+
+        async def queued_status(
+            _application: ReviewApplication, record_identifier: str
+        ) -> WorkspaceWorkStatus:
+            assert record_identifier == "workspace"
+            return workspace_work
+
+        # Test progress delivery and timeout, not whether SQLite finishes within 10 ms.
+        # The real queued status and zero-timeout read are verified above.
+        with monkeypatch.context() as wait_patch:
+            wait_patch.setattr(ReviewApplication, "get_workspace_work_status", queued_status)
+            progress_wait = await application.wait_for_workspace_work(
+                "workspace",
+                timeout_seconds=0.01,
+                progress=record_wait_progress,
+            )
         idle_wait = await application.wait_for_workspace_work("idle-workspace")
 
     low_level_request = observed_requests[0]
@@ -1572,6 +1583,12 @@ async def test_workset_bulk_projection_does_not_scan_the_whole_workspace(
 ) -> None:
     membership_scan_called = False
 
+    async def source_record(
+        _database: Database, identifier: str
+    ) -> tuple[tuple[str, ...], int, object]:
+        assert identifier == "search-run"
+        return ("carl", "facebook", "search_run"), 1, {}
+
     async def current_completion_boundary(_database: Database) -> int:
         return 7
 
@@ -1632,6 +1649,7 @@ async def test_workset_bulk_projection_does_not_scan_the_whole_workspace(
     async def no_projection_rows(*_args: object, **_kwargs: object) -> tuple[object, ...]:
         return ()
 
+    monkeypatch.setattr(Database, "get_record", source_record)
     monkeypatch.setattr(Database, "current_completion_boundary", current_completion_boundary)
     monkeypatch.setattr(ReviewApplication, "_projection_search_scope", projection_search_scope)
     monkeypatch.setattr(

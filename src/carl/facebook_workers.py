@@ -86,7 +86,7 @@ def build_component_registry() -> Registry:
         (
             Component(ACQUIRE_HTTP, 1, _acquire_component),
             Component(COLLECT_FACEBOOK_ITEM, 1, _collect_item_component),
-            Component(COLLECT_FACEBOOK_SEARCH, 1, _collect_search_component),
+            Component(COLLECT_FACEBOOK_SEARCH, 2, _collect_search_component),
             Component(EXTRACT_FACEBOOK, 1, extract_listing),
             Component(EXTRACT_FACEBOOK_JSON_BLOCKS, 1, parse_json_blocks),
             Component(EXTRACT_FACEBOOK_SEARCH_BOOTSTRAP, 1, extract_search_bootstrap),
@@ -286,7 +286,10 @@ def _acquisition_failure_outcome(
         NamedOutput(name=("response", str(index), "body"), object_identifier=body.identifier)
         for index, body in enumerate(error.bodies)
     )
-    if stopping_condition == "transport_failure" and context.attempt < MAX_ACQUISITION_ATTEMPTS:
+    if (
+        stopping_condition == "transport_failure"
+        and context.retry_attempt() < MAX_ACQUISITION_ATTEMPTS
+    ):
         return RetryWork(
             artifacts=artifacts,
             outputs=outputs,
