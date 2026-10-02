@@ -29,6 +29,52 @@ initial search exhausts a transient transport or session failure,
 retry budget rather than creating another track. Retried legacy work gains the
 current per-route scheduler scope. Transport failures invalidate the shared
 Proton transport and defer queued searches on that route before replacement.
+For eBay, the optional `acquisition_stack` retry field selects another existing
+configured Decodo/wreq stack while retaining the track, attempt history, and
+active/sold/completed mode. It changes the retried work, not the original search-group
+target specification. Refreshes whose search acquisition failed require a new
+`request_workspace_refresh` with that override. Search and item pages already
+use the configured Decodo browser stack; a new name for the same route does not
+provide a different acquisition path.
+Each eBay search attempt shares one sticky Decodo session and cookie-preserving
+HTTP client across its pages. Independent searches and retries use fresh
+sessions; expiry stops traversal rather than silently changing the exit during
+pagination. Page acquisitions retain the shared safe session record identifier
+and request counters as observed at acquisition time, before session cleanup.
+
+eBay challenges and HTTP 403/429 impose stack-wide cooldowns of two, four, then
+eight minutes after successive failed attempts, including terminal failure.
+Pending siblings, new work, and same-stack manual retries respect these durable
+deadlines across restarts without consuming attempts while waiting. Other
+response failures retain short bounded backoff. Retrying or refreshing makes
+real provider calls; inspect retained evidence and choose a justified route
+change before requeueing rather than repeatedly probing paid acquisitions.
+
+Transport/session failures also trigger a shared basic-Internet DNS/TCP probe.
+If neither independent endpoint is reachable, marketplace acquisitions pause
+across worker processes, retry every 30 seconds, and do not consume their
+bounded retry budgets. Offline extraction remains runnable. Physical attempt
+ordinals and evidence remain immutable; outage attempts are excluded from the
+retry budget. Connectivity pause and probe diagnostics are exposed through
+`get_activity_snapshot.connectivity`. Acquisition activity is recorded before
+opening eBay sessions and before Facebook proxy bootstrap, so connection
+failures appear in the activity ledger. Historical missing rows are not invented.
+
+A refresh with at least half its selected items failing ends in
+`terminal_failure` (`mostly_failed_refresh`); smaller losses remain completed
+with partial failures. `get_work_status.outcome` and `refresh_failure_summary`
+also identify historical mostly-failed refreshes without rewriting their history.
+`retry_item_failures` accepts an exact settled Facebook/eBay refresh work ID
+and a bounded `maximum_items` (default 1,000; maximum 10,000). It atomically
+requeues linked terminal collection jobs with transient transport/session errors,
+gives them fresh retry budgets, and resumes the same coordinator after its search.
+It excludes permanent authentication/configuration and extraction/challenge
+failures. The original image budget is retained conservatively, including reuse
+jobs in the carried count. Recovery retains old operations and evidence and
+creates generation-specific image plans/results to avoid immutable-ID collisions.
+The response distinguishes matching, retryable, retried, and remaining terminal
+item-page jobs. Wait until the resumed refresh settles before retrying another
+bounded chunk. CLI equivalent: `carl retry-item-failures REFRESH_WORK_ID`.
 The stable workspace record can be renamed through an immutable identity-state
 record. It can also be archived or restored without deleting any retained
 objects. Ordinary workspace listing hides archived workspaces by default;
@@ -90,6 +136,21 @@ an identical refetch. A changed description or source image set changes the
 relevant component; simply reading the same data through a smaller response
 limit does not.
 
+Scalar recipe version 2 compares normalized values rather than source-specific price envelopes.
+Equivalent decimal spellings and redundant price display formatting do not change a revision.
+When a new price omits currency, composition carries forward the newest retained known currency;
+explicit currencies still take precedence, and no currency is assumed from a dollar symbol.
+New reviews retain normalized scalar snapshots. Existing batch-backed reviews use their retained
+projections, while legacy Facebook bulk reviews reconstruct values at the mutation's recorded
+completion boundary and verify the old scalar hash before using that baseline. Historical records
+are not rewritten. Unknown baselines remain conservative rather than suppressing potential changes.
+Recipe changes to scalar normalization do not invalidate unchanged non-scalar components.
+
+Review batches and `get_workspace_listing` report `scalar_field_changes`, with each field's
+`previous_value` and `current_value`, plus `scalar_comparison_available`. An unavailable comparison
+is distinct from a verified empty change list. The single-listing view also reports review state,
+prior review, and policy-relevant changed components without acquiring a claim.
+
 The default workspace policy treats status, scalar fields, preview image,
 gallery, and analyses as review-relevant. Search membership is independently
 visible but does not make a prior review stale by default. A workspace can
@@ -121,7 +182,10 @@ selection snapshot. It defaults to available, unreviewed listings and accepts
 explicit listing exclusions, so promising, deferred, or waiting-for-data
 decisions remain untouched. Carl composes one bounded current snapshot and
 records its revision hashes server-side; the caller does not need to claim or
-send thousands of revisions. The write is all-or-none and aborts if any target
+send thousands of revisions. Mixed Facebook/eBay selections expand their scope
+once and read evidence in bounded batches within one read snapshot, including
+gallery and analysis metadata needed for unchanged revision semantics. The write
+is all-or-none and aborts if any target
 has an active claim or receives another review before commit. Later changes to
 status, price or other scalar fields, preview image, or gallery make the bulk
 review stale under the same workspace policy as an ordinary review, causing the
@@ -207,6 +271,58 @@ without returning every child analysis. Waiting polls this small indexed view
 asynchronously. It does not claim work or keep a worker runtime alive, and an
 idle result means no workspace-root work was queued or leased at the instant of
 the returned snapshot.
+
+## Sold and completed searches; cheap track cards
+
+The eBay request/history schema accepts
+`search.listing_state: "active" | "sold" | "completed"`. Carl does not presently
+support new sold/completed searches: the configured eBay acquisition is anonymous
+and does not support the sign-in/challenge gating encountered by closed-listing
+requests. Creation, group reruns, retries, and refreshes reject them before
+queuing; already queued closed-search work stops without acquisition calls.
+Use `listing_state: "active"` for new searches. Existing sold/completed requests,
+cards, and listings remain readable; no historical evidence is removed.
+Selecting another stack does not bypass this restriction.
+
+Historical sold mode uses `LH_Sold=1&LH_Complete=1`; completed mode uses
+`LH_Complete=1`, including unsold endings. Results are ordinary items,
+not reference-sale entities, and retain the same IDs as prior active results.
+
+Card states describe observed outcomes rather than the requested search mode:
+`sold` requires sale evidence, `completed` requires an explicit Ended marker
+without sale evidence, and missing markers remain unknown. Their composed
+statuses are `sold`, `unavailable`, and `unknown`. Use
+`filters.statuses: ["sold", "unavailable"]` for known closed items. A displayed
+price on an unsold or unclassified card is not a known sale price.
+
+`list_workspace_search_results` reads one workspace track's latest retained
+source run without composing item, image, or AI evidence and without making
+network requests. Supply `workspace_record_identifier`, `track_identifier`, and
+optionally `listing_state: "sold"` or `"completed"` (the latter includes both
+sold and other ended cards). Omit this filter to read unknown cards too.
+Workspace tracks report their marketplace
+and active/sold/completed mode. The result includes condition, shipping text, source-card
+identities, and `last_sale` with the displayed sold price, normalized amount and
+currency when unambiguous, date, and price certainty. Accepted Best Offers do
+not establish a known sale amount.
+
+This is a card view, not the union of a track's refresh ancestry. Pagination
+freezes the source run and evidence boundary, including if a refresh completes
+between pages; page size may change but track and filters may not. Check
+`collection_succeeded`, `response_classification`, `stopping_reason`, and
+`warnings`: zero cards after a challenge or HTTP error is not evidence of an
+empty market.
+
+Read-time `required_title_keywords` requires all case-insensitive substrings;
+`excluded_title_keywords` excludes any matching substring. These inexpensive
+filters do not persist track settings or change the source acquisition query.
+
+The full composed view and compact workspace index also expose condition,
+shipping, and last-sale fields. Single eBay amounts use the same
+`amount_decimal`/`currency` price structure as Facebook, with the original
+`formatted_amount` retained for display. Ambiguous ranges remain display-only.
+Unqualified dollar prices from ebay.com follow its USD display convention;
+this convention is not applied to Facebook.
 
 ## Storage and ordering
 

@@ -1,13 +1,20 @@
-"""One explicitly routed Proton session for a bounded gallery-image batch."""
+"""One explicitly routed provider session for a bounded gallery-image batch."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import final
 
 import anyio
 import httpx
 
 from carl.core.models import JsonValue
+from carl.io.decodo import (
+    DecodoCredentialSource,
+    DecodoProxySettings,
+    DecodoSessionManager,
+    ManagedDecodoSession,
+)
 from carl.io.httpx import AcquisitionFailure, ClientHttpxAcquirer, HttpAcquirer
 from carl.io.proton import (
     ManagedProtonTransportFailure,
@@ -21,7 +28,7 @@ from carl.io.proton import (
 class FacebookImageHttpSession:
     identifier: str
     acquirer: HttpAcquirer
-    provider_session: ProtonSession
+    provider_session: ProtonSession | ManagedDecodoSession
 
     def active_observation(self) -> dict[str, JsonValue]:
         return {
@@ -32,7 +39,11 @@ class FacebookImageHttpSession:
     def completed_observation(self) -> dict[str, JsonValue]:
         return {
             "network_session_identifier": self.identifier,
-            "provider_session": self.provider_session.completed_observation(),
+            "provider_session": (
+                self.provider_session.completed_observation().as_json()
+                if isinstance(self.provider_session, ManagedDecodoSession)
+                else self.provider_session.completed_observation()
+            ),
         }
 
 
@@ -103,3 +114,45 @@ class ProtonFacebookImageSessionFactory:
                 error.diagnostic,
                 exit_code=error.exit_code,
             ) from None
+
+
+@final
+class DecodoFacebookImageSessionFactory:
+    """Use the managed Decodo client without opening a direct connection."""
+
+    def __init__(
+        self,
+        *,
+        manager: DecodoSessionManager,
+        settings: DecodoProxySettings,
+        credential_source: DecodoCredentialSource,
+    ):
+        self.manager = manager
+        self.settings = settings
+        self.credential_source = credential_source
+
+    @asynccontextmanager
+    async def __call__(self, identifier: str) -> AsyncGenerator[FacebookImageHttpSession]:
+        provider_session: ManagedDecodoSession | None = None
+        try:
+            async with self.manager.open(
+                settings=self.settings,
+                credential_source=self.credential_source,
+                new_identifier=lambda: identifier,
+                target_authentication="anonymous",
+            ) as provider_session:
+                yield FacebookImageHttpSession(
+                    identifier=identifier,
+                    acquirer=provider_session,
+                    provider_session=provider_session,
+                )
+        except AcquisitionFailure as error:
+            if provider_session is not None:
+                error.result["routing"] = {
+                    "configured": list(self.settings.route.network_path),
+                    "observed": {
+                        "network_session_identifier": identifier,
+                        "provider_session": provider_session.completed_observation().as_json(),
+                    },
+                }
+            raise

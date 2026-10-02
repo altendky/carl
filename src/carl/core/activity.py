@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pydantic import Field
+
 from carl.core.models import JsonValue, StrictModel
 from carl.core.work import NetworkActivityState, WorkState
 
@@ -81,6 +83,17 @@ class DatabaseProcessActivity(StrictModel):
     source_tree_sha256: str | None
 
 
+class NetworkConnectivityActivity(StrictModel):
+    """Global network-work pause and its latest direct connectivity probe."""
+
+    paused: bool = False
+    reason: str | None = None
+    probe_in_progress: bool = False
+    next_probe_at_utc_ns: int | None = None
+    last_probe_at_utc_ns: int | None = None
+    last_probe_result: JsonValue = None
+
+
 class ActivitySnapshot(StrictModel):
     captured_at_utc_ns: int
     recent_window_ns: int
@@ -91,6 +104,7 @@ class ActivitySnapshot(StrictModel):
     network_paths: tuple[NetworkPathActivity, ...]
     active_network: tuple[ActiveNetworkActivity, ...]
     database_processes: tuple[DatabaseProcessActivity, ...] = ()
+    connectivity: NetworkConnectivityActivity = Field(default_factory=NetworkConnectivityActivity)
 
 
 def _mapping(value: JsonValue | None) -> dict[str, JsonValue] | None:

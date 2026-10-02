@@ -1,11 +1,14 @@
 import base64
+import json
 import os
 import stat
 from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
+from pydantic import ValidationError
 
+from carl.core.configuration import CarlConfiguration
 from carl.core.routing import (
     BrightDataProduct,
     DecodoProduct,
@@ -20,6 +23,7 @@ from carl.io.configuration import (
     bright_data_settings,
     configure_decodo_credential,
     decodo_settings,
+    decodo_wreq_stack_settings,
     import_mullvad_configuration_archive,
     import_proton_configuration,
     load_configuration,
@@ -64,6 +68,16 @@ version = 1
 executable_path = "{wireproxy_path}"
 version = "1.1.3"
 binary_sha256 = "{"a" * 64}"
+
+[[http_transports]]
+identifier = "browser_chrome_153"
+implementation = "wreq"
+emulation_profile = "chrome_153"
+
+[[acquisition_stacks]]
+identifier = "ebay_anonymous"
+http_transport = "browser_chrome_153"
+network_path = ["decodo", "personal", "carl"]
 
 [[routes]]
 provider = "bright_data"
@@ -121,6 +135,65 @@ def _write_configuration(tmp_path: Path) -> tuple[CarlDirectories, Path]:
     return directories, path
 
 
+def test_explicit_network_route_cutover(tmp_path: Path) -> None:
+    directories, path = _write_configuration(tmp_path)
+    with path.open("ab") as stream:
+        stream.write(b"""\n[[route_overrides]]
+requested_network_path = ["proton", "personal", "image"]
+network_path = ["decodo", "personal", "carl"]
+""")
+    config = load_configuration(directories.configuration_file).configuration
+    assert config.resolve_network_path(("proton", "personal", "image")) == (
+        "decodo",
+        "personal",
+        "carl",
+    )
+    assert config.resolve_network_path(("proton", "personal", "other")) == (
+        "proton",
+        "personal",
+        "other",
+    )
+
+
+@pytest.mark.parametrize("invalid_kind", ["duplicate", "missing", "cycle"])
+def test_reject_invalid_network_route_cutovers(tmp_path: Path, invalid_kind: str) -> None:
+    directories, _ = _write_configuration(tmp_path)
+    value = load_configuration(directories.configuration_file).configuration.as_json()
+    override = {
+        "requested_network_path": ["proton", "personal", "image"],
+        "network_path": ["decodo", "personal", "carl"],
+    }
+    if invalid_kind == "duplicate":
+        overrides = [override, override]
+    elif invalid_kind == "missing":
+        overrides = [{**override, "network_path": ["decodo", "personal", "missing"]}]
+    else:
+        overrides = [
+            override,
+            {
+                "requested_network_path": override["network_path"],
+                "network_path": override["requested_network_path"],
+            },
+        ]
+    value["route_overrides"] = overrides
+    with pytest.raises(ValidationError):
+        CarlConfiguration.model_validate_json(json.dumps(value))
+
+
+def test_datacenter_configuration(tmp_path: Path) -> None:
+    directories, path = _write_configuration(tmp_path)
+    path.write_bytes(
+        path.read_bytes()
+        .replace(b'product = "residential_proxy"', b'product = "datacenter_proxy"')
+        .replace(b"port = 7000", b"port = 10001")
+    )
+    loaded = load_configuration(directories.configuration_file)
+    configure_decodo_credential("test-password", credential_id="carl", directories=directories)
+    settings, _ = decodo_settings(loaded, directories, ("decodo", "personal", "carl"))
+    assert settings.route.product == DecodoProduct.DATACENTER_PROXY
+    assert settings.route.endpoint.port == 10001
+
+
 def test_user_directories_follow_platform_conventions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -143,6 +216,7 @@ def test_user_directories_follow_platform_conventions(
     assert directories.runtime == values["XDG_RUNTIME_DIR"] / "carl"
     assert directories.database_file == values["XDG_DATA_HOME"] / "carl" / "carl.sqlite3"
     assert directories.image_directory == values["XDG_DATA_HOME"] / "carl" / "images"
+    assert directories.mcp_error_log_file == values["XDG_STATE_HOME"] / "carl" / "mcp-errors.jsonl"
 
 
 def test_loads_strict_versioned_configuration_and_builds_bright_data_settings(
@@ -201,6 +275,47 @@ def test_configures_and_loads_private_decodo_credential(tmp_path: Path) -> None:
             directories=directories,
             credential_id="carl",
         )
+
+
+def test_resolves_configured_ebay_wreq_decodo_stack(tmp_path: Path) -> None:
+    directories, path = _write_configuration(tmp_path)
+    _ = configure_decodo_credential(
+        "proxy-password-secret",
+        directories=directories,
+        credential_id="carl",
+    )
+
+    route, credential_source, transport = decodo_wreq_stack_settings(
+        load_configuration(path), directories, "ebay_anonymous"
+    )
+
+    assert route.route.network_path == ("decodo", "personal", "carl")
+    assert credential_source.credentials.proxy_password.get_secret_value() == (
+        "proxy-password-secret"
+    )
+    assert transport.implementation == "wreq"
+    assert transport.emulation_profile == "Chrome153"
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b'http_transport = "browser_chrome_153"', b'http_transport = "missing"'),
+        (
+            b'network_path = ["decodo", "personal", "carl"]',
+            b'network_path = ["decodo", "missing"]',
+        ),
+    ],
+)
+def test_configuration_rejects_dangling_acquisition_stack_references(
+    tmp_path: Path, old: bytes, new: bytes
+) -> None:
+    _, path = _write_configuration(tmp_path)
+    path.write_bytes(path.read_bytes().replace(old, new, 1))
+    path.chmod(0o600)
+
+    with pytest.raises(ConfigurationLoadFailure, match="invalid_configuration"):
+        load_configuration(path)
 
 
 @pytest.mark.parametrize(

@@ -528,11 +528,14 @@ async def test_search_worker_uses_one_session_and_checkpoints_every_page(
     assert lsd_evidence["sources"][0]["json_path"] == ["require", 0, 2, "token"]
     assert "synthetic-lsd" not in session_extraction_json
     assert [(json.loads(row[1])[-1], row[2], row[3]) for row in activity_rows] == [
+        ("search_session_open", 1, "completed"),
         ("search_session_bootstrap", 1, "completed"),
         ("search_route_definition", 2, "completed"),
         ("search_pagination", 3, "completed"),
     ]
-    assert acquisition_activity_identifiers == {row[0] for row in activity_rows}
+    assert acquisition_activity_identifiers == {
+        row[0] for row in activity_rows if json.loads(row[1])[-1] != "search_session_open"
+    }
     extractions = [json.loads(row[0]) for row in extraction_rows]
     assert [value["extractor"]["component_parts"] for value in extractions] == [
         ["carl", "facebook", "extract", "search_route_definition"],

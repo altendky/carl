@@ -443,7 +443,7 @@ def image_network_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...
 
 
 def image_session_work_constraint() -> ConcurrencyConstraint:
-    """Bound image work sharing the worker runtime's Proton transport."""
+    """Bound image work independently of the selected provider transport."""
 
     return ConcurrencyConstraint(
         identifier=("carl", "facebook", "image", "work_concurrency", "v2"),

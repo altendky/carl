@@ -1118,7 +1118,7 @@ async def test_image_worker_retains_response_and_validation_result(
                 "collect",
                 "gallery_image",
             ]
-            assert operation["output_schema_version"] == 2
+            assert operation["output_schema_version"] == 3
             acquisition_id = collection["result"]["acquisition_record_identifier"]
             _, _, acquisition = await database.get_record(acquisition_id)
             assert acquisition["request_plan"]["url"] == URL

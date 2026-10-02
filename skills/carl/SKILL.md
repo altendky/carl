@@ -15,6 +15,14 @@ identity's workspace bindings first. Retirement preserves exact records and is r
 Use Carl's MCP tools as the source of record. Keep listing IDs, observation record IDs, guide record
 IDs, analysis record IDs, and image artifact IDs distinct.
 
+Facebook search and both marketplaces' image workers resolve explicit configuration
+`route_overrides` before acquisition, including queued/retried work. A requested Proton route may
+therefore use a separately credentialed Decodo datacenter route. Legacy `proton_route` options name
+the requested path; inspect network activity and acquisition provenance for the effective provider.
+Item pages and eBay search keep their separate mobile/residential route unless explicitly changed.
+There is no automatic fallback. Datacenter Facebook bootstrap and pagination share one client and
+cookie jar; use a static datacenter port to keep the exit stable across the search.
+
 When diagnosing server behavior, call `get_server_info` first and report its instance ID, start time,
 repository, database, source-tree hash, and capability versions. If the tool is absent, the client is
 connected to an older server or is not connected to Carl. Do not substitute shell database queries
@@ -27,8 +35,17 @@ identifiers; pass a relevant identifier to `get_work_status` for compact progres
 `include_details=true` only when the raw payload, checkpoint result, error, or recent operation IDs
 are required. Do not assume a shortened identifier from a terminal display is callable.
 
+Transport failures trigger a shared basic-Internet check using direct DNS/TCP, not a paid proxy
+request. During an outage, marketplace acquisitions pause across workers without spending retry
+budgets; offline extraction continues. Probes run every 30 seconds until connectivity returns.
+Inspect `get_activity_snapshot.connectivity` for the pause and probe result, and its network activity
+for failures including proxy-session startup. Healthy Internet with a blocked site or broken proxy
+still uses ordinary bounded retries. Missing historical activity rows are not backfilled.
+
 For the common current-view workflow, start with `list_composed_search` for an exact retained search
-run or `get_composed_listing` for one numeric listing ID. These tools make no network requests. They
+run or `get_composed_listing` for one returned listing identity. eBay review identities are
+`ebay:<item ID>`; bare numeric identities remain Facebook IDs for compatibility. Copy identities
+unchanged into claims, reviews, worksets, snapshots, and analysis selections. These tools make no network requests. They
 read a fixed database completion boundary and compose status, scalar details, one coherent gallery,
 older completed analyses, and optional refresh-lineage membership from independently timestamped
 evidence. The collection view defaults to normalized status `available`; pass an explicit nonempty
@@ -46,8 +63,11 @@ prices omit currency in the observed source shape, so do not infer a currency wh
 price has none. A preview image is not a complete gallery; `gallery` remains null until item-page
 gallery evidence exists.
 
-For review, call `create_review_workspace` with one exact search-run record and,
-when relevant, one exact guide. That run becomes the workspace's first search track. Call
+For review, call `create_review_workspace` with one exact Facebook/eBay search-run record or a
+marketplace search-group record and, when relevant, one exact guide. A run becomes the first track;
+a search group contributes one track per target. A workspace may mix Facebook and eBay. Refresh
+each enabled track using the same `request_workspace_refresh` call; retained source provenance
+selects collection, description, gallery, and analysis behavior. Call
 `rename_review_workspace` when its scope becomes clearer. Archive inactive workspaces with
 `set_review_workspace_archived`; `list_review_workspaces` hides them by default, while
 `include_archived=true` reveals them for restoration or exact access. Archiving retains all review
@@ -74,7 +94,19 @@ an exact listing with the same active-track scope and the workspace's guide. Sea
 serialized per proxy route. If initial track creation exhausts a transient transport or session
 failure, call `retry_workspace_search_track` with the stable track ID; it preserves the track and its
 history while giving it a fresh retry budget. Retrying legacy work also adds the current route
-scheduler scope. A transport failure invalidates the shared Proton transport and backs off other
+scheduler scope. For eBay initial-track failures, optional `acquisition_stack` selects another
+existing configured Decodo/wreq stack for active searches. Sold/completed acquisitions are disabled;
+do not retry them or suggest another stack to bypass the restriction. eBay search already uses the
+same configured Decodo browser transport as item pages; a renamed stack on the same provider route
+is not an alternative acquisition path. The override applies to the retried work, not the original
+search-group target specification. When a refresh's search acquisition failed, request a new
+`request_workspace_refresh` with `acquisition_stack` instead; item-only transport recovery uses
+`retry_item_failures` below. Challenges and HTTP 403/429 defer searches on the same stack for
+two, four, then eight minutes after successive failures, including the terminal third failure.
+The durable cooldown also applies to new work and operator retries, without consuming attempts
+while waiting. Retries and refreshes spend provider calls: inspect retained evidence and select a
+justified change before queueing; do not make repeated paid probe calls.
+A Facebook transport failure, when Proton is selected, invalidates the shared Proton transport and backs off other
 queued searches on that route before replacement. Use `acquire_review_batch` with a stable caller-generated
 request ID and owner ID. It atomically issues bounded available-only work and
 claims only listings not leased to another agent. Replay the same unchanged
@@ -106,20 +138,78 @@ list and retain the returned snapshot record ID. The snapshot freezes both IDs
 and projection revisions. Pass it as a `selection_snapshot` selection to the
 workspace-native analysis preview and request tools.
 
-For a new search, call `create_search` with the complete search intent and bounded traversal policy,
-then poll its returned work ID. For an existing search, call `list_search_runs`, optionally filter by
+For a new search, call `create_search` with a `targets` array. Each target has a `marketplace`
+discriminator and a `search` object: Facebook uses its complete search intent and bounded traversal
+policy; eBay uses `query`, `stack_identifier`, and `maximum_pages` (default five, maximum twenty).
+The returned search group contains each target's executions and work IDs. Poll those IDs with
+`get_work_status`, then page through `list_search_results` using the group's record ID and returned
+cursors. Results deduplicate within each marketplace and retain all source occurrences at a fixed
+completion boundary. Use `add_search_target` to add and initially execute another target,
+`set_search_target_enabled` to control future scheduling, and `run_search` to execute all enabled
+targets. `get_search` retains execution history even for disabled targets.
+
+For eBay item details, call `request_listing_details` with `marketplace="ebay"`, the exact
+`external_identifier`, and optionally `stack_identifier`, `maximum_images` (default twenty, cap
+fifty), or `refresh=true`. Zero images skips downloads but still retains gallery references.
+The request reprocesses a usable retained item page by default; refresh explicitly fetches a new one.
+Item and seller-description pages use the configured Decodo browser stack; gallery images resolve
+the configured Proton-to-datacenter cutover when present. Poll the root work, its returned `extraction_work_identifier` when present, and the
+extraction result's `image_work_identifiers` and `description_work_identifiers`. Completion of item
+acquisition alone does not mean those follow-ups succeeded. Keep `carl work` active.
+Read either marketplace with `get_listing_details`. Check `classification`, `description_state`,
+and each image's state before describing the result as complete. Older usable detail remains visible
+alongside a newer unavailable/challenge observation; reprocessing does not advance acquisition age.
+Pass saved `artifact_identifier` values to `get_listing_image`. Search-card image URLs alone do not
+mean image bytes have been saved. The detail-request tool accepts either marketplace; Facebook uses route options, eBay its stack.
+The same source-dispatched search-refresh workflow handles bulk follow-up. Review workspaces,
+listing projections, analysis previews, and analysis requests support either source and mixed
+workspaces. eBay analysis includes exact retained seller-description and gallery evidence.
+
+New eBay searches support only `search.listing_state="active"` (the default). Carl does not presently
+support sold/completed search acquisitions: its configured acquisition is anonymous and cannot handle
+the sign-in/challenge gating encountered by closed-listing requests. Create, rerun, retry, and refresh
+reject these modes before acquisition. Retained sold/completed targets, results, and ordinary item
+identities remain readable. To rerun a historical group containing closed targets, disable those
+targets first rather than deleting their history. For retained sale comparables, use
+`list_workspace_search_results` with the workspace and track IDs and optionally
+`listing_state="sold"` or `"completed"`; completed includes both sold and other ended cards.
+Historical sold mode adds both `LH_Sold=1` and `LH_Complete=1`; completed adds only `LH_Complete=1`.
+`list_search_results` retains each card's
+`sold_price`, `sold_date`, `sold_date_text`, and `sold_price_status` with its acquisition/run
+provenance. Summary sale fields come from the single `sold_occurrence_record_identifier`, never
+from independently merged price/date fields. Composed listing views expose `last_sale` separately
+from ordinary price evidence. Use `statuses=["sold"]` to view sold cards; available-only remains
+the default. Keep condition and shipping in comparisons. Missing years are not inferred, and
+recognized Best Offer/crossed-out prices are not reported as known sale amounts. Public sold-card
+prices are evidence, not verified transaction totals; do not promise hidden accepted offer amounts.
+
+For an existing source run from either marketplace, call `list_search_runs`, optionally filter by
 the exact query text, and select the exact baseline search-run record. Each summary includes the
 producing attempt's `started_at_utc` and `ended_at_utc`, whether the originating request was a fresh
 search or refresh, and the direct source run ID for a refresh. Use these summary fields to judge age
 and lineage without fetching provenance. Use `get_search_run_listings` with the exact search-run
 record ID to page through its immutable returned listing IDs; follow `next_offset` until null when a
 complete membership comparison is required.
-Call `request_search_refresh` with that record ID. Omit `traversal` and `traversal_strategy` to reuse
+For Facebook or active-mode eBay, call `request_search_refresh` with its exact source-run record ID.
+`maximum_images` is a global refresh budget, not multiplied per listing. eBay inherits its retained
+stack and page bounds; optional `acquisition_stack` and `maximum_pages` override them. Facebook
+traversal overrides and nondefault proxy-route overrides are rejected for eBay, not silently ignored.
+A refresh with at least half its selected items failing now ends in `terminal_failure` with
+`mostly_failed_refresh`; smaller losses remain `completed_with_failures`. Inspect
+`get_work_status.outcome` and `refresh_failure_summary`, which also flag historical mostly-failed
+refreshes whose stored state is `completed`. Use `retry_item_failures` with the exact settled
+`refresh_work_identifier` and bounded `maximum_items` to requeue linked transport/session item-page
+failures with fresh retry budgets. It resumes extraction, descriptions, and images from the retained
+search, without rerunning search or expanding the original image budget. The carried image count is
+conservative and can include reuse jobs. It does not retry extraction/challenge failures or permanent
+authentication/configuration failures. Wait for the refresh to settle before another recovery call;
+the operation reports matching, retryable, retried, and remaining terminal item-page jobs.
+For Facebook, omit `traversal` and `traversal_strategy` to reuse
 the retained settings. To change bounds, provide a complete traversal object. To use price buckets,
 provide an `overlapping_price_partitions` strategy with decimal `width`, `overlap`, and either
-`balanced` or `ascending` order. Carl searches through Proton, reuses the latest semantically usable
+`balanced` or `ascending` order. Carl searches through the effective configured search route, reuses the latest semantically usable
 retained item page for each exact baseline or newly returned listing ID, and spends Decodo only on
-IDs without one. It then downloads missing images through Proton while reusing validated matching
+IDs without one. It then downloads missing images through the effective configured image route while reusing validated matching
 image evidence. Poll the returned work ID with `get_work_status`; the result
 separates the last durable `checkpoint_stage` from `active_phase` and reports counts for item-page,
 item-extraction, image, and image-extraction child work. A `search_complete` checkpoint can remain
@@ -132,8 +222,8 @@ because the current one is pending or leased. Keep a separate long-running `carl
 `carl monitor --work` process active while queued work should progress. MCP servers never run
 workers implicitly, so concurrent or leaked clients do not multiply worker pools.
 
-Transient Proton search and image session failures retry automatically with exponential backoff.
-A failed request invalidates the shared transport so the next attempt opens and probes a fresh
+Transient search and image session failures retry automatically with exponential backoff.
+When Proton is selected, a failed request invalidates the shared transport so the next attempt opens and probes a fresh
 WireProxy child instead of reusing a dead local endpoint. Search refreshes resume retryable search
 children rather than immediately failing the whole refresh. If a refresh contains older terminal
 image failures, call `retry_image_failures` with
@@ -160,7 +250,7 @@ workspace, a review batch, a workset, a selection snapshot, or an explicit bound
 `selection_policy=never_analyzed_listing` to select only listing IDs with no completed analysis from
 any earlier observation. Available listings are the default; override `statuses` explicitly when
 needed. The preview reports matching, excluded, eligible, and selected counts without queueing work.
-It uses an indexed status-only scan rather than composing full listings. The request examines at
+It uses bounded retained-evidence selection across both marketplaces. The request examines at
 most `maximum_candidate_listings_examined` workspace members (2,500 by default) and reports
 `candidate_examination_limit_reached`; raise the bound, up to 10,000, when an exact larger-workspace
 plan is needed. Use the same bound in the subsequent request so preview and queueing describe the
@@ -171,7 +261,8 @@ revisits each selected observation against its current saved images and the chos
 compatible completed or queued analysis work, and enqueues only what is missing. `maximum_items`
 narrows that snapshot. Use `get_workspace_work_status` for a bounded view of every queued,
 in-progress, or terminally failed root operation requested by the workspace. `idle=true` only says no
-work is active; `successful=false`, `terminal_failure_count`, and `failed_work` expose settled
+work is active; `successful=false`, `terminal_failure_count`, `completed_with_failures_count`,
+and `failed_work` expose settled
 failures. Use `wait_for_workspace_work` for a short wait until the workspace is idle. It reports
 progress every five seconds when the MCP client accepts progress notifications, defaults to a
 30-second timeout, and accepts at most 300 seconds. A timeout returns the still-active status so the
@@ -198,7 +289,8 @@ deeper traversal. It reports the total `output_edge_count` but returns no siblin
 Set `maximum_output_edges` from 1 through 100 for a deterministic bounded prefix, or explicitly pass
 null only when every output edge is truly required.
 
-Use `get_listing_image` only for image artifact IDs returned by a composed listing. Each call returns the
+Use `get_listing_image` only for image artifact IDs returned by a composed listing or
+`get_listing_details`. Each call returns the
 exact validated stored image and may put its bytes into model context, so request only images useful
 to the current judgment.
 

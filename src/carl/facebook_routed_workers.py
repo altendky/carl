@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AsyncExitStack
 from secrets import randbelow
 from time import perf_counter_ns, time_ns
 
@@ -61,11 +62,19 @@ from carl.io.configuration import (
     proton_settings,
 )
 from carl.io.decodo import DecodoSessionManager, ManagedDecodoHttpAcquirer
-from carl.io.facebook_images import FacebookImageSessionFailure, ProtonFacebookImageSessionFactory
-from carl.io.facebook_search import ProtonFacebookSearchSessionFactory
+from carl.io.facebook_images import (
+    DecodoFacebookImageSessionFactory,
+    FacebookImageSessionFailure,
+    ProtonFacebookImageSessionFactory,
+)
+from carl.io.facebook_search import (
+    DecodoFacebookSearchSessionFactory,
+    FacebookSearchSessionFactory,
+    ProtonFacebookSearchSessionFactory,
+)
 from carl.io.httpx import DirectHttpxAcquirer, RouteConfigurationFailure
 from carl.io.image_files import ImageFileStore
-from carl.io.network_activity import NetworkActivityScheduler
+from carl.io.network_activity import NetworkActivityScheduler, network_activity_definition
 from carl.io.paths import CarlDirectories
 from carl.io.proton import ProtonSessionManager, ProtonWireproxyManager
 from carl.io.sqlite import Database
@@ -168,6 +177,9 @@ def build_routed_facebook_worker_registry(
 
     async def collect_search(payload: CollectSearchPayload, context: AttemptContext) -> WorkOutcome:
         try:
+            loaded = load_configuration(directories.configuration_file)
+            routing = loaded.configuration.resolve_network_path(payload.routing)
+            payload = payload.model_copy(update={"routing": routing})
             await database.supersede_constraints(
                 retired_identifiers=legacy_facebook_network_constraint_identifiers(payload.routing),
                 replacements=facebook_network_policy_constraints(payload.routing),
@@ -175,8 +187,19 @@ def build_routed_facebook_worker_registry(
                 at_utc_ns=time_ns(),
                 reason="Apply the current Marketplace page-request policy",
             )
-            loaded = load_configuration(directories.configuration_file)
-            route_settings = proton_settings(loaded, directories, payload.routing)
+            session_factory: FacebookSearchSessionFactory
+            if routing[0] == "decodo":
+                settings, credential_source = decodo_settings(loaded, directories, routing)
+                session_factory = DecodoFacebookSearchSessionFactory(
+                    manager=DecodoSessionManager(),
+                    settings=settings,
+                    credential_source=credential_source,
+                )
+            else:
+                route_settings = proton_settings(loaded, directories, routing)
+                session_factory = ProtonFacebookSearchSessionFactory(
+                    manager=resolved_proton_manager, settings=route_settings
+                )
             headers = await anyio.to_thread.run_sync(
                 brave_navigation_headers, abandon_on_cancel=True
             )
@@ -188,9 +211,7 @@ def build_routed_facebook_worker_registry(
                 ),
                 FacebookSearchWorkerDependencies(
                     database=database,
-                    session_factory=ProtonFacebookSearchSessionFactory(
-                        manager=resolved_proton_manager, settings=route_settings
-                    ),
+                    session_factory=session_factory,
                     navigation_headers=headers,
                     new_identifier=new_identifier,
                     utc_now_ns=time_ns,
@@ -251,6 +272,13 @@ def build_routed_facebook_worker_registry(
 
     async def collect_image(payload: CollectImagePayload, context: AttemptContext) -> WorkOutcome:
         try:
+            loaded = load_configuration(directories.configuration_file)
+            routing = loaded.configuration.resolve_network_path(payload.request_plan.routing)
+            payload = payload.model_copy(
+                update={
+                    "request_plan": payload.request_plan.model_copy(update={"routing": routing})
+                }
+            )
             await database.supersede_constraints(
                 retired_identifiers=legacy_image_network_constraint_identifiers(
                     payload.request_plan.routing
@@ -258,15 +286,33 @@ def build_routed_facebook_worker_registry(
                 replacements=image_network_constraints(payload.request_plan.routing),
                 operation_identifier=context.operation_identifier,
                 at_utc_ns=time_ns(),
-                reason="Share Proton transport across bounded concurrent image requests",
+                reason="Apply bounded concurrent image-request policy to the effective route",
             )
-            loaded = load_configuration(directories.configuration_file)
-            route_settings = proton_settings(loaded, directories, payload.request_plan.routing)
             session_identifier = new_identifier()
-            factory = ProtonFacebookImageSessionFactory(
-                manager=resolved_proton_manager, settings=route_settings
-            )
-            async with factory(session_identifier) as session:
+            if routing[0] == "decodo":
+                settings, credential_source = decodo_settings(loaded, directories, routing)
+                factory = DecodoFacebookImageSessionFactory(
+                    manager=DecodoSessionManager(),
+                    settings=settings,
+                    credential_source=credential_source,
+                )
+            else:
+                route_settings = proton_settings(loaded, directories, routing)
+                factory = ProtonFacebookImageSessionFactory(
+                    manager=resolved_proton_manager, settings=route_settings
+                )
+            async with AsyncExitStack() as session_stack:
+                setup_activity = network_activity_definition(
+                    identifier=new_identifier(),
+                    kind=("carl", "facebook", "network_activity", "image_session_open"),
+                    operation_identifier=context.operation_identifier,
+                    network_session_identifier=session_identifier,
+                    network_path=payload.request_plan.routing,
+                    attempt=context.attempt,
+                )
+                async with _scheduler(database, new_identifier).admit(setup_activity) as permit:
+                    permit.mark_dispatched()
+                    session = await session_stack.enter_async_context(factory(session_identifier))
                 registry = build_image_worker_registry(
                     ImageWorkerDependencies(
                         database=database,

@@ -40,6 +40,7 @@ from carl.review import ReviewApplication
 
 EXPECTED_TOOLS = {
     "acquire_review_batch",
+    "add_search_target",
     "add_workspace_product_guide",
     "create_review_workspace",
     "create_review_workset",
@@ -51,35 +52,43 @@ EXPECTED_TOOLS = {
     "get_composed_listing",
     "get_listing_analysis",
     "get_listing_image",
+    "get_listing_details",
     "get_product_guide",
     "get_review_batch",
     "get_review_workspace_activity",
     "get_workspace_work_status",
     "get_workspace_listing",
     "get_server_info",
+    "get_search",
     "get_search_run_listings",
     "get_provenance",
     "get_work_status",
     "list_composed_search",
+    "list_search_results",
     "list_search_runs",
     "list_product_guides",
     "list_review_worksets",
     "list_review_workspaces",
     "list_workspace_listings",
+    "list_workspace_search_results",
     "list_workspace_product_guides",
     "preview_selection_analyses",
     "request_selection_analyses",
     "request_search_refresh",
+    "request_listing_details",
     "request_workspace_refresh",
     "rename_review_workspace",
+    "run_search",
     "set_review_workspace_archived",
     "set_product_guide_identity_retired",
+    "set_search_target_enabled",
     "set_workspace_search_track_enabled",
     "set_workspace_default_product_guide",
     "record_listing_reviews",
     "record_workspace_bulk_review",
     "release_review_claim",
     "retry_image_failures",
+    "retry_item_failures",
     "retry_workspace_search_track",
     "revise_product_guide",
     "renew_review_claim",
@@ -306,6 +315,15 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 return await client.call_tool(name, decoded_arguments)
 
             assert client.server_info is not None
+            item_recovery = await call_json(
+                "retry_item_failures",
+                {
+                    "request": {"refresh_work_identifier": "missing-refresh", "maximum_items": 10},
+                },
+            )
+            assert item_recovery.is_error
+            assert isinstance(item_recovery.content[0], TextContent)
+            assert "exact Facebook or eBay refresh work ID" in item_recovery.content[0].text
             assert client.server_info.version.endswith("+source.aaaaaaaaaaaa")
             listing = await client.list_tools()
             assert {tool.name for tool in listing.tools} == EXPECTED_TOOLS
@@ -351,7 +369,7 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert bulk_review_request["properties"]["include_review_states"]["uniqueItems"] is True
             exclusions = bulk_review_request["properties"]["exclude_listing_identifiers"]
             assert exclusions["uniqueItems"] is True
-            assert exclusions["items"]["pattern"] == "^[0-9]+$"
+            assert exclusions["items"]["pattern"] == "^(?:[0-9]+|ebay:[0-9]{9,15})$"
             for name, tool in tools_by_name.items():
                 definition = definitions_by_name[name]
                 assert tool.meta == {
@@ -371,7 +389,10 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 ("carl", "mcp", "instructions"),
                 ("carl", "mcp", "tool_contracts"),
                 ("carl", "activity", "snapshot"),
-                ("carl", "facebook", "create_search"),
+                ("carl", "marketplace", "create_search"),
+                ("carl", "marketplace", "search_group"),
+                ("carl", "marketplace", "search_results_projection"),
+                ("carl", "ebay", "collect_search_work"),
                 ("carl", "facebook", "search_run_summary"),
                 ("carl", "facebook", "search_run_membership"),
                 ("carl", "facebook", "search_refresh", "child_progress"),
@@ -396,28 +417,33 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 tuple(capability["identity"]): capability["version"]
                 for capability in server_info.structured_content["capabilities"]
             }
-            assert capability_versions[("carl", "activity", "snapshot")] == 2
+            assert capability_versions[("carl", "activity", "snapshot")] == 3
+            assert capability_versions[("carl", "work", "connectivity_outage_pause")] == 1
+            assert capability_versions[("carl", "marketplace", "item_failure_retry")] == 1
             assert capability_versions[("carl", "facebook", "image_failure_retry")] == 2
-            assert capability_versions[("carl", "facebook", "collect_image_work")] == 2
-            assert capability_versions[("carl", "facebook", "create_search")] == 1
-            assert capability_versions[("carl", "facebook", "search_transport_retry")] == 3
+            assert capability_versions[("carl", "facebook", "collect_image_work")] == 3
+            assert capability_versions[("carl", "marketplace", "create_search")] == 1
+            assert capability_versions[("carl", "marketplace", "search_group")] == 2
+            assert capability_versions[("carl", "marketplace", "search_results_projection")] == 4
+            assert capability_versions[("carl", "ebay", "collect_search_work")] == 9
+            assert capability_versions[("carl", "facebook", "search_transport_retry")] == 4
             assert capability_versions[("carl", "facebook", "search_run_summary")] == 1
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 34
+            assert capability_versions[("carl", "mcp", "instructions")] == 49
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 23
-            assert capability_versions[("carl", "review", "workspace_work")] == 3
-            assert capability_versions[("carl", "review", "composed_projection")] == 4
-            assert capability_versions[("carl", "review", "workspace")] == 7
-            assert capability_versions[("carl", "review", "workspace_bulk_review")] == 1
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 36
+            assert capability_versions[("carl", "review", "workspace_work")] == 4
+            assert capability_versions[("carl", "review", "composed_projection")] == 9
+            assert capability_versions[("carl", "review", "workspace")] == 10
+            assert capability_versions[("carl", "review", "workspace_bulk_review")] == 4
             assert capability_versions[("carl", "review", "workspace_product_guides")] == 1
             assert capability_versions[("carl", "review", "product_guides")] == 1
-            assert capability_versions[("carl", "review", "workspace_search_tracks")] == 3
-            assert capability_versions[("carl", "review", "claims")] == 1
-            assert capability_versions[("carl", "review", "selection_snapshot")] == 1
-            assert capability_versions[("carl", "review", "selection_analysis")] == 4
+            assert capability_versions[("carl", "review", "workspace_search_tracks")] == 7
+            assert capability_versions[("carl", "review", "claims")] == 2
+            assert capability_versions[("carl", "review", "selection_snapshot")] == 2
+            assert capability_versions[("carl", "review", "selection_analysis")] == 5
             result = await call_json("list_product_guides")
             assert not result.is_error
             assert result.structured_content is not None
@@ -535,51 +561,171 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 "create_search",
                 {
                     "request": {
-                        "request": {
-                            "query": "beverage cooler",
-                            "location": {
-                                "kind": "facebook_location",
-                                "identifier": "123",
-                                "label": "Example City, PA",
+                        "targets": [
+                            {
+                                "marketplace": "facebook",
+                                "search": {
+                                    "request": {
+                                        "query": "beverage cooler",
+                                        "location": {
+                                            "kind": "facebook_location",
+                                            "identifier": "123",
+                                            "label": "Example City, PA",
+                                        },
+                                        "radius": {"value": 30, "unit": "miles"},
+                                        "price": {
+                                            "currency": "USD",
+                                            "minimum": "0",
+                                            "maximum": 150,
+                                        },
+                                    },
+                                    "traversal": {
+                                        "maximum_results": 600,
+                                        "maximum_pages": 200,
+                                    },
+                                    "traversal_strategy": {
+                                        "kind": "overlapping_price_partitions",
+                                        "width": "10",
+                                        "overlap": "0",
+                                        "order": "balanced",
+                                    },
+                                },
                             },
-                            "radius": {"value": 30, "unit": "miles"},
-                            "price": {
-                                "currency": "USD",
-                                "minimum": "0",
-                                "maximum": 150,
+                            {
+                                "marketplace": "ebay",
+                                "search": {
+                                    "query": "oscilloscope",
+                                    "listing_state": "active",
+                                    "stack_identifier": "ebay_anonymous",
+                                },
                             },
-                        },
-                        "traversal": {"maximum_results": 600, "maximum_pages": 200},
-                        "traversal_strategy": {
-                            "kind": "overlapping_price_partitions",
-                            "width": "10",
-                            "overlap": "0",
-                            "order": "balanced",
-                        },
-                    }
+                        ]
+                    },
                 },
             )
-            assert not created_search.is_error
+            assert not created_search.is_error, created_search.content[0].text
             assert created_search.structured_content is not None
-            assert created_search.structured_content["created"]
-            assert created_search.structured_content["state"] == "pending"
-            created_search_work = await database.work(
-                created_search.structured_content["work_identifier"]
-            )
-            assert created_search_work["payload"]["routing"] == [
+            search_identifier = created_search.structured_content["record_identifier"]
+            targets = created_search.structured_content["targets"]
+            assert len(targets) == 2
+            facebook_target, ebay_target = targets
+            assert facebook_target["specification"]["marketplace"] == "facebook"
+            assert ebay_target["specification"]["marketplace"] == "ebay"
+            assert len(facebook_target["executions"]) == len(ebay_target["executions"]) == 1
+            facebook_work_identifier = facebook_target["executions"][0]["work_identifier"]
+            ebay_work_identifier = ebay_target["executions"][0]["work_identifier"]
+            facebook_work = await database.work(facebook_work_identifier)
+            assert facebook_work["payload"]["routing"] == [
                 "proton",
                 "personal",
                 "carl",
             ]
-            assert created_search_work["payload"]["request"]["price"] == {
+            assert facebook_work["payload"]["request"]["price"] == {
                 "currency": "USD",
                 "minimum": "0",
                 "maximum": "150",
             }
+            ebay_work = await database.work(ebay_work_identifier)
+            assert ebay_work["kind"] == ["carl", "ebay", "collect", "search"]
+            assert ebay_work["payload"] == {
+                "request": {
+                    "query": "oscilloscope",
+                    "listing_state": "active",
+                    "stack_identifier": "ebay_anonymous",
+                    "maximum_pages": 5,
+                },
+                "retry_attempt_offset": 0,
+            }
+            for closed_mode in ("sold", "completed"):
+                unsupported = await call_json(
+                    "create_search",
+                    {
+                        "request": {
+                            "targets": [
+                                {
+                                    "marketplace": "ebay",
+                                    "search": {
+                                        "query": "oscilloscope",
+                                        "listing_state": closed_mode,
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                )
+                assert unsupported.is_error
+                message = unsupported.content[0].text
+                assert "does not presently support eBay sold/completed" in message
+                assert "anonymous" in message and "sign-in/challenge" in message
+                assert "Retained sold/completed evidence remains readable" in message
+            disabled = await call_json(
+                "set_search_target_enabled",
+                {
+                    "request": {
+                        "search_record_identifier": search_identifier,
+                        "target_record_identifier": facebook_target["record_identifier"],
+                        "enabled": False,
+                    },
+                },
+            )
+            assert not disabled.is_error
+            assert disabled.structured_content is not None
+            assert disabled.structured_content["targets"][0]["enabled"] is False
+            assert len(disabled.structured_content["targets"][0]["executions"]) == 1
+            rerun = await call_json(
+                "run_search",
+                {"request": {"search_record_identifier": search_identifier}},
+            )
+            assert not rerun.is_error
+            assert rerun.structured_content is not None
+            assert len(rerun.structured_content["targets"][0]["executions"]) == 1
+            assert len(rerun.structured_content["targets"][1]["executions"]) == 2
+            added = await call_json(
+                "add_search_target",
+                {
+                    "request": {
+                        "search_record_identifier": search_identifier,
+                        "target": {
+                            "marketplace": "ebay",
+                            "search": {"query": "logic analyzer"},
+                        },
+                    }
+                },
+            )
+            assert not added.is_error
+            assert added.structured_content is not None
+            assert len(added.structured_content["targets"]) == 3
+            retained = await call_json(
+                "get_search",
+                {"search_record_identifier": search_identifier},
+            )
+            assert not retained.is_error
+            assert retained.structured_content == added.structured_content
+            results = await call_json(
+                "list_search_results",
+                {"request": {"search_record_identifier": search_identifier}},
+            )
+            assert not results.is_error
+            assert results.structured_content == {
+                "search_record_identifier": search_identifier,
+                "as_of_completion_sequence": 0,
+                "total_distinct_results": 0,
+                "results": [],
+                "next_cursor": None,
+                "execution_warnings": [
+                    {
+                        "target_record_identifier": target["record_identifier"],
+                        "reason": "collection_pending",
+                        "execution": execution,
+                    }
+                    for target in added.structured_content["targets"]
+                    for execution in target["executions"]
+                ],
+            }
             work_status = await call_json(
                 "get_work_status",
                 {
-                    "work_identifier": created_search.structured_content["work_identifier"],
+                    "work_identifier": facebook_work_identifier,
                     "include_details": True,
                 },
             )
@@ -893,6 +1039,16 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                     },
                 ),
                 (
+                    "list_workspace_search_results",
+                    {
+                        "request": {
+                            "workspace_record_identifier": "missing-workspace",
+                            "track_identifier": "missing-track",
+                            "listing_state": "sold",
+                        }
+                    },
+                ),
+                (
                     "wait_for_workspace_work",
                     {
                         "workspace_record_identifier": "missing-workspace",
@@ -979,6 +1135,25 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             missing_image = await call_json(
                 "get_listing_image", {"artifact_identifier": "missing-image"}
             )
+            item_details = await call_json(
+                "get_listing_details",
+                {"request": {"marketplace": "ebay", "external_identifier": "256123456789"}},
+            )
+            assert not item_details.is_error
+            assert item_details.structured_content["classification"] == "not_collected"
+            queued_item = await call_json(
+                "request_listing_details",
+                {
+                    "request": {
+                        "marketplace": "ebay",
+                        "external_identifier": "256123456789",
+                        "maximum_images": 0,
+                    }
+                },
+            )
+            assert not queued_item.is_error
+            assert queued_item.structured_content["created"]
+            assert not queued_item.structured_content["reused_item_page"]
             requested_batch = await call_json(
                 "request_selection_analyses",
                 {
@@ -1109,6 +1284,7 @@ async def test_concurrent_tool_call_survives_slow_failing_call(
 ) -> None:
     slow_started = anyio.Event()
     release_slow = anyio.Event()
+    error_log = tmp_path / "mcp-errors.jsonl"
 
     async def controlled_retry(
         self: ReviewApplication, request: RetryImageFailuresRequest
@@ -1135,7 +1311,7 @@ async def test_concurrent_tool_call_survives_slow_failing_call(
             server_source_tree_sha256="a" * 64,
         )
         slow_results: list[Any] = []
-        async with Client(build_server(application)) as client:
+        async with Client(build_server(application, error_log_path=error_log)) as client:
 
             async def call_slow() -> None:
                 slow_results.append(
@@ -1160,6 +1336,10 @@ async def test_concurrent_tool_call_survives_slow_failing_call(
             assert slow_results[0].is_error
             assert isinstance(slow_results[0].content[0], TextContent)
             assert "internal error" in slow_results[0].content[0].text
+            assert "Traceback (most recent call last)" in slow_results[0].content[0].text
+            assert (
+                "RuntimeError: simulated concurrent tool failure" in slow_results[0].content[0].text
+            )
             with anyio.fail_after(2):
                 info = await client.call_tool("get_server_info")
             assert not info.is_error
@@ -1167,3 +1347,12 @@ async def test_concurrent_tool_call_survives_slow_failing_call(
     stderr = capsys.readouterr().err
     assert "Carl MCP tool failure" in stderr
     assert "simulated concurrent tool failure" in stderr
+    failures = [json.loads(line) for line in error_log.read_text().splitlines()]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["error_identifier"] in slow_results[0].content[0].text
+    assert failure["error_identifier"] in stderr
+    assert failure["traceback"] in slow_results[0].content[0].text
+    assert failure["tool_name"] == "retry_image_failures"
+    assert failure["duration_ns"] > 0
+    assert failure["source_tree_sha256"] == "a" * 64

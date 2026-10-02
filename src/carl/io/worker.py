@@ -11,6 +11,7 @@ from typing import Protocol
 import anyio
 
 from carl.core.components import Component
+from carl.core.connectivity import connectivity_failure, network_work_kind
 from carl.core.json import encode_json
 from carl.core.models import CodeProvenance, JsonValue, StrictModel
 from carl.core.work import WorkCapability, WorkLease
@@ -22,6 +23,7 @@ from carl.core.worker import (
     WorkerSettings,
     WorkOutcome,
 )
+from carl.io.connectivity import PROBE_INTERVAL_NS, ConnectivityMonitor, work_retry_budget
 from carl.io.sqlite import Database, LeaseLostError
 
 
@@ -78,6 +80,7 @@ class WorkerRuntimeServices:
     monotonic_ns: Callable[[], int]
     code_provenance: Callable[[], Awaitable[CodeProvenance]]
     invocation: Callable[[], dict[str, JsonValue]]
+    connectivity_monitor: ConnectivityMonitor | None = None
 
 
 def _utc_text(utc_ns: int) -> str:
@@ -164,12 +167,17 @@ async def execute_lease(
     operation_identifier = services.new_identifier()
     started_utc_ns = services.utc_now_ns()
     started_monotonic_ns = services.monotonic_ns()
+    outage_attempts, retry_budget_start_attempt = await work_retry_budget(
+        database, lease.work_item_identifier
+    )
     context = AttemptContext(
         work_item_identifier=lease.work_item_identifier,
         lease_token=lease.token,
         worker_identifier=lease.worker_identifier,
         attempt=lease.attempt,
         operation_identifier=operation_identifier,
+        outage_attempts=outage_attempts,
+        retry_budget_start_attempt=retry_budget_start_attempt,
     )
     stop_renewal = anyio.Event()
     lease_lost = anyio.Event()
@@ -221,7 +229,37 @@ async def execute_lease(
                 task_group.start_soon(renew, attempt_scope)
                 try:
                     try:
-                        outcome = await handler.execute(lease.payload, context)
+                        monitor = services.connectivity_monitor
+                        if (
+                            monitor is not None
+                            and network_work_kind(lease.kind)
+                            and not await monitor.available()
+                        ):
+                            outcome = RetryWork(
+                                delay_ns=PROBE_INTERVAL_NS,
+                                reason={"kind": "connectivity_outage", "dispatched": False},
+                                result={"state": "waiting_for_connectivity"},
+                            )
+                        else:
+                            outcome = await handler.execute(lease.payload, context)
+                            if (
+                                monitor is not None
+                                and network_work_kind(lease.kind)
+                                and connectivity_failure(outcome)
+                                and not await monitor.available(after_failure=True)
+                            ):
+                                outcome = RetryWork(
+                                    inputs=outcome.inputs,
+                                    records=outcome.records,
+                                    artifacts=outcome.artifacts,
+                                    outputs=outcome.outputs,
+                                    delay_ns=PROBE_INTERVAL_NS,
+                                    reason={"kind": "connectivity_outage", "dispatched": True},
+                                    result={
+                                        "state": "waiting_for_connectivity",
+                                        "failure": outcome.result,
+                                    },
+                                )
                     except anyio.get_cancelled_exc_class():
                         raise
                     except Exception as error:
@@ -363,6 +401,10 @@ async def run_worker_pool(
             async with claim_gate:
                 if stop.is_set():
                     return
+                if services.connectivity_monitor is not None:
+                    # A paused queue probes at most once per durable interval.
+                    # claim_work still admits offline work during the pause.
+                    await services.connectivity_monitor.available()
                 claim = await database.claim_work(
                     supported_capabilities=registry.capabilities,
                     worker_identifier=worker_identifier,

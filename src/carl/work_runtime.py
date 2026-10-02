@@ -17,13 +17,27 @@ from carl.analysis_batch_workers import (
     build_analysis_batch_worker_registry,
 )
 from carl.core.analysis_batch import request_missing_analyses_work_constraints
+from carl.core.ebay import ebay_search_work_constraint
+from carl.core.ebay_items import ebay_item_work_constraints
+from carl.core.ebay_refresh import refresh_ebay_search_work_constraints
 from carl.core.facebook_images import image_session_work_constraint
 from carl.core.facebook_refresh import refresh_search_work_constraints
 from carl.core.item_analysis import analysis_work_constraints
 from carl.core.worker import WorkerSettings
+from carl.ebay_analysis_workers import build_ebay_analysis_worker_registry
+from carl.ebay_item_workers import EbayItemWorkerDependencies, build_ebay_item_worker_registry
+from carl.ebay_refresh_workers import (
+    EbayRefreshWorkerDependencies,
+    build_ebay_refresh_worker_registry,
+)
+from carl.ebay_workers import EbaySearchWorkerDependencies, build_ebay_worker_registry
 from carl.facebook_analysis_workers import (
     AnalysisWorkerDependencies,
     build_analysis_worker_registry,
+)
+from carl.facebook_listing_workers import (
+    FacebookListingWorkerDependencies,
+    build_facebook_listing_worker_registry,
 )
 from carl.facebook_refresh_workers import (
     RefreshWorkerDependencies,
@@ -31,6 +45,7 @@ from carl.facebook_refresh_workers import (
 )
 from carl.facebook_routed_workers import build_routed_facebook_worker_registry
 from carl.io.claude import ClaudeCli
+from carl.io.connectivity import ConnectivityMonitor
 from carl.io.paths import user_directories
 from carl.io.proton import SharedProtonWireproxyManager
 from carl.io.provenance import collect_code_provenance_async, process_invocation
@@ -70,6 +85,9 @@ async def managed_worker_pool(
         *refresh_search_work_constraints(),
         *request_missing_analyses_work_constraints(),
         image_session_work_constraint(),
+        ebay_search_work_constraint(),
+        *ebay_item_work_constraints(),
+        *refresh_ebay_search_work_constraints(),
     ):
         await database.register_constraint(constraint, registered_at_utc_ns=time_ns())
     analysis_registry = build_analysis_worker_registry(
@@ -86,12 +104,28 @@ async def managed_worker_pool(
             code_provenance=lambda: collect_code_provenance_async(repository_root),
         )
     )
+    ebay_analysis_registry = build_ebay_analysis_worker_registry(
+        AnalysisWorkerDependencies(database=database, claude=claude, new_identifier=_identifier)
+    )
+    ebay_refresh_registry = build_ebay_refresh_worker_registry(
+        EbayRefreshWorkerDependencies(database=database, new_identifier=_identifier)
+    )
+    facebook_listing_registry = build_facebook_listing_worker_registry(
+        FacebookListingWorkerDependencies(database=database, new_identifier=_identifier)
+    )
     proton_manager = SharedProtonWireproxyManager()
     facebook_registry = build_routed_facebook_worker_registry(
         database=database,
         directories=user_directories(),
         new_identifier=_identifier,
         proton_manager=proton_manager,
+    )
+    ebay_registry = build_ebay_worker_registry(
+        EbaySearchWorkerDependencies(
+            database=database,
+            directories=user_directories(),
+            new_identifier=_identifier,
+        )
     )
     analysis_batch_registry = build_analysis_batch_worker_registry(
         AnalysisBatchWorkerDependencies(
@@ -103,12 +137,25 @@ async def managed_worker_pool(
             ),
         )
     )
+    ebay_item_registry = build_ebay_item_worker_registry(
+        EbayItemWorkerDependencies(
+            database=database,
+            directories=user_directories(),
+            new_identifier=_identifier,
+            proton_manager=proton_manager,
+        )
+    )
     registry = WorkHandlerRegistry(
         handlers=(
             *analysis_registry.handlers,
             *refresh_registry.handlers,
             *facebook_registry.handlers,
+            *ebay_registry.handlers,
+            *ebay_item_registry.handlers,
             *analysis_batch_registry.handlers,
+            *ebay_analysis_registry.handlers,
+            *ebay_refresh_registry.handlers,
+            *facebook_listing_registry.handlers,
         )
     )
     services = WorkerRuntimeServices(
@@ -117,6 +164,9 @@ async def managed_worker_pool(
         monotonic_ns=perf_counter_ns,
         code_provenance=lambda: collect_code_provenance_async(repository_root),
         invocation=process_invocation,
+        connectivity_monitor=ConnectivityMonitor(
+            database=database, new_identifier=_identifier, utc_now_ns=time_ns
+        ),
     )
     stop = anyio.Event()
     async with anyio.create_task_group() as task_group:

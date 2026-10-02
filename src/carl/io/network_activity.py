@@ -1,8 +1,10 @@
 """Cancellation-safe admission for durable network activities."""
 
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from secrets import randbelow
+from time import time_ns
 
 import anyio
 
@@ -11,8 +13,94 @@ from carl.core.work import (
     NetworkActivityAdmission,
     NetworkActivityDefinition,
     NetworkActivityState,
+    SchedulingScope,
+    SchedulingScopeKind,
 )
+from carl.io.httpx import Acquisition, AcquisitionFailure
 from carl.io.sqlite import Database
+
+
+def network_activity_definition(
+    *,
+    identifier: str,
+    kind: tuple[str, ...],
+    operation_identifier: str,
+    network_session_identifier: str,
+    network_path: tuple[str, ...],
+    ordinal: int = 1,
+    attempt: int = 1,
+) -> NetworkActivityDefinition:
+    """Describe an attempt, including connection/session setup before HTTP exists."""
+
+    return NetworkActivityDefinition(
+        identifier=identifier,
+        kind=kind,
+        operation_identifier=operation_identifier,
+        network_session_identifier=network_session_identifier,
+        ordinal=ordinal,
+        attempt=attempt,
+        scopes=(
+            SchedulingScope(kind=SchedulingScopeKind.OVERALL, identity=()),
+            SchedulingScope(kind=SchedulingScopeKind.NETWORK_PATH, identity=network_path),
+            SchedulingScope(kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND, identity=kind),
+        ),
+    )
+
+
+def network_activity_scheduler(
+    database: Database, new_identifier: Callable[[], str]
+) -> "NetworkActivityScheduler":
+    """Use the shared durable scheduler for collectors without source-specific policy."""
+
+    return NetworkActivityScheduler(
+        database=database,
+        new_identifier=new_identifier,
+        utc_now_ns=time_ns,
+        sample_uniform_holdoff_ns=lambda minimum, maximum: (
+            minimum + randbelow(maximum - minimum + 1)
+        ),
+        permit_duration_ns=600_000_000_000,
+    )
+
+
+def _failure_result(error: BaseException) -> dict[str, JsonValue]:
+    result: dict[str, JsonValue] = {"kind": "exception", "type": type(error).__name__}
+    # Acquisition diagnostics are structured; never retain exception messages,
+    # URLs, headers, or provider credentials in the activity ledger.
+    acquisition = error.result if isinstance(error, AcquisitionFailure) else None
+    if acquisition is not None:
+        for key in ("exception_type", "stopping_condition", "failure_phase"):
+            value = acquisition.get(key)
+            if isinstance(value, str):
+                result[key] = value
+    code = getattr(error, "code", None)
+    if isinstance(code, str):
+        result["code"] = code
+    return result
+
+
+async def acquire_for_network_activity(
+    acquisition: Awaitable[Acquisition], admission: NetworkActivityAdmission
+) -> Acquisition:
+    """Link acquisition evidence, including failures without any HTTP response."""
+
+    try:
+        result = await acquisition
+    except AcquisitionFailure as error:
+        error.result.update(
+            {
+                "network_activity_identifier": admission.activity_identifier,
+                "network_activity_admitted_at_utc_ns": admission.admitted_at_utc_ns,
+            }
+        )
+        raise
+    result.record.update(
+        {
+            "network_activity_identifier": admission.activity_identifier,
+            "network_activity_admitted_at_utc_ns": admission.admitted_at_utc_ns,
+        }
+    )
+    return result
 
 
 @dataclass(slots=True)
@@ -127,7 +215,7 @@ class NetworkActivityScheduler:
                         definition=definition,
                         admission=admission,
                         state=NetworkActivityState.FAILED,
-                        result={"kind": "exception", "type": type(error).__name__},
+                        result=_failure_result(error),
                     )
                 raise
             else:
