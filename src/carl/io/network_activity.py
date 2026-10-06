@@ -8,6 +8,7 @@ from time import time_ns
 
 import anyio
 
+from carl.core.marketplace_images import MARKETPLACE_IMAGE_SCOPE
 from carl.core.models import JsonValue
 from carl.core.work import (
     NetworkActivityAdmission,
@@ -16,6 +17,7 @@ from carl.core.work import (
     SchedulingScope,
     SchedulingScopeKind,
 )
+from carl.io.cleanup import shielded_cleanup
 from carl.io.httpx import Acquisition, AcquisitionFailure
 from carl.io.sqlite import Database
 
@@ -194,14 +196,17 @@ class NetworkActivityScheduler:
                     break
                 if result.next_eligible_at_utc_ns is None:
                     raise RuntimeError("Blocked network activity has no eligibility time")
-                await anyio.sleep(
-                    max(0, result.next_eligible_at_utc_ns - now_utc_ns) / 1_000_000_000
-                )
+                delay_seconds = max(0, result.next_eligible_at_utc_ns - now_utc_ns) / 1_000_000_000
+                if MARKETPLACE_IMAGE_SCOPE in definition.scopes:
+                    # A completed image releases its slot before the lease expiry;
+                    # waiting downloads must notice it without sleeping ten minutes.
+                    delay_seconds = min(delay_seconds, 1.0)
+                await anyio.sleep(delay_seconds)
             permit = NetworkActivityPermit(admission=admission)
             try:
                 yield permit
-            except anyio.get_cancelled_exc_class():
-                with anyio.move_on_after(10, shield=True):
+            except anyio.get_cancelled_exc_class() as error:
+                async with shielded_cleanup("cancelled network activity", primary_error=error):
                     await self._finish(
                         definition=definition,
                         admission=admission,
@@ -210,7 +215,7 @@ class NetworkActivityScheduler:
                     )
                 raise
             except BaseException as error:
-                with anyio.move_on_after(10, shield=True):
+                async with shielded_cleanup("failed network activity", primary_error=error):
                     await self._finish(
                         definition=definition,
                         admission=admission,
@@ -219,23 +224,26 @@ class NetworkActivityScheduler:
                     )
                 raise
             else:
-                if permit.dispatched:
+                async with shielded_cleanup("network activity completion", primary_error=None):
                     await self._finish(
                         definition=definition,
                         admission=admission,
-                        state=NetworkActivityState.COMPLETED,
-                        result={"kind": "request_attempt_completed"},
+                        state=(
+                            NetworkActivityState.COMPLETED
+                            if permit.dispatched
+                            else NetworkActivityState.SKIPPED
+                        ),
+                        result={
+                            "kind": (
+                                "request_attempt_completed"
+                                if permit.dispatched
+                                else "not_dispatched"
+                            )
+                        },
                     )
-                else:
-                    await self._finish(
-                        definition=definition,
-                        admission=admission,
-                        state=NetworkActivityState.SKIPPED,
-                        result={"kind": "not_dispatched"},
-                    )
-        except anyio.get_cancelled_exc_class():
+        except anyio.get_cancelled_exc_class() as error:
             if admission is None:
-                with anyio.move_on_after(10, shield=True):
+                async with shielded_cleanup("cancelled network admission", primary_error=error):
                     await self._finish_if_present(
                         definition=definition,
                         state=NetworkActivityState.CANCELLED,
@@ -244,7 +252,7 @@ class NetworkActivityScheduler:
             raise
         except BaseException as error:
             if admission is None:
-                with anyio.move_on_after(10, shield=True):
+                async with shielded_cleanup("failed network admission", primary_error=error):
                     await self._finish_if_present(
                         definition=definition,
                         state=NetworkActivityState.FAILED,

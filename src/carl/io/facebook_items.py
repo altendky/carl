@@ -1,11 +1,11 @@
 """Coherent HTTP sessions for Facebook Marketplace item collection."""
 
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
-import anyio
 import httpx
 
 from carl.core.models import JsonValue
@@ -15,7 +15,7 @@ from carl.io.decodo import (
     DecodoSessionManager,
     ManagedDecodoHttpAcquirer,
 )
-from carl.io.httpx import ClientHttpxAcquirer, HttpAcquirer
+from carl.io.httpx import ClientHttpxAcquirer, HttpAcquirer, close_httpx_client
 from carl.io.mullvad import (
     ManagedMullvadSession,
     ManagedMullvadTransportFailure,
@@ -129,9 +129,7 @@ class MullvadFacebookItemSessionFactory:
                         provider_session=provider_session,
                     )
                 finally:
-                    with anyio.CancelScope(shield=True):
-                        client.cookies.clear()
-                        await client.aclose()
+                    await close_httpx_client(client, primary_error=sys.exception())
         except ManagedMullvadTransportFailure as error:
             raise FacebookItemSessionFailure(
                 error.code,

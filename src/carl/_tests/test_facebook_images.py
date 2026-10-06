@@ -412,8 +412,8 @@ def test_image_url_and_route_are_validated() -> None:
         if isinstance(constraint, ConcurrencyConstraint)
     }
     assert concurrency == {
-        (SchedulingSubjectKind.WORK_ITEM, SchedulingScopeKind.WORK_KIND): 10,
-        (SchedulingSubjectKind.NETWORK_ACTIVITY, SchedulingScopeKind.NETWORK_ACTIVITY_KIND): 10,
+        (SchedulingSubjectKind.WORK_ITEM, SchedulingScopeKind.WORK_KIND): 25,
+        (SchedulingSubjectKind.NETWORK_ACTIVITY, SchedulingScopeKind.NETWORK_ACTIVITY_KIND): 25,
     }
     assert {
         (constraint.maximum_starts, constraint.period_ns)

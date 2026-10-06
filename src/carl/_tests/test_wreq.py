@@ -727,6 +727,53 @@ async def test_shared_decodo_session_cleanup_and_cookie_client_lifetime(ending: 
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("ending", ("normal", "body_error", "cancel"))
+async def test_shared_wreq_close_failure_reports_safely_and_preserves_primary(
+    ending: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    factory = _Factory([_response()])
+    factory.client.close_error = OSError("secret provider diagnostic")
+    acquirer = ManagedDecodoWreqAcquirer(
+        settings=_decodo_settings(),
+        credential_source=StaticDecodoCredentialSource(
+            DecodoCredentials(proxy_password=SecretStr("secret"))
+        ),
+        client_factory=cast(WreqClientFactory, cast(object, factory)),
+    )
+    original = RuntimeError("original body error")
+
+    async def run(scope: anyio.CancelScope) -> None:
+        async with acquirer.session(lambda: str(uuid4())) as session:
+            _ = await session.acquire(
+                RequestPlan(url="https://www.ebay.com/", routing=("decodo", "personal", "carl")),
+                lambda: str(uuid4()),
+            )
+            if ending == "cancel":
+                scope.cancel()
+                await anyio.sleep_forever()
+            if ending == "body_error":
+                raise original
+
+    with anyio.CancelScope() as scope:
+        if ending == "normal":
+            with pytest.raises(AcquisitionFailure) as raised_close:
+                await run(scope)
+            assert raised_close.value.result["failure_phase"] == "client_close"
+        elif ending == "body_error":
+            with pytest.raises(RuntimeError) as raised_body:
+                await run(scope)
+            assert raised_body.value is original
+            assert original.__notes__ == ["Carl cleanup failed during wreq_client_close: OSError"]
+        else:
+            await run(scope)
+    assert scope.cancelled_caught is (ending == "cancel")
+    assert factory.client.closed
+    assert factory.client.close_thread != get_ident()
+    assert "secret provider diagnostic" not in caplog.text
+    assert "wreq_client_close: OSError" in caplog.text
+
+
+@pytest.mark.anyio
 async def test_shared_session_expiration_does_not_rotate_mid_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

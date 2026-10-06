@@ -19,6 +19,7 @@ import wreq.exceptions
 from carl.core.http import RequestPlan, header_values, redirect_target
 from carl.core.models import Header, JsonValue, StrictModel
 from carl.core.routing import LocalSocks5Endpoint
+from carl.io.cleanup import report_cleanup_failure
 from carl.io.httpx import (
     AcquiredBody,
     Acquisition,
@@ -574,11 +575,11 @@ class ProxyWreqAcquirer:
             client_factory=self.client_factory,
         )
         session._managed_session = True
-        exceptional_exit = False
+        primary_error: BaseException | None = None
         try:
             yield session
-        except BaseException:
-            exceptional_exit = True
+        except BaseException as error:
+            primary_error = error
             raise
         finally:
             with anyio.CancelScope(shield=True):
@@ -588,8 +589,9 @@ class ProxyWreqAcquirer:
                     if client is not None:
                         try:
                             await anyio.to_thread.run_sync(client.close, abandon_on_cancel=False)
-                        except Exception:
-                            if not exceptional_exit:
+                        except Exception as error:
+                            report_cleanup_failure(primary_error, error, "wreq_client_close")
+                            if primary_error is None:
                                 raise AcquisitionFailure(
                                     "HTTP transport failed while closing the wreq session",
                                     result={

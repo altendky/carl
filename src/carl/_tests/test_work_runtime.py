@@ -8,7 +8,7 @@ from typing import Any, cast
 import anyio
 import pytest
 
-from carl import cli
+from carl import cli, work_runtime
 from carl.core.facebook_images import (
     COLLECT_IMAGE_WORK_KIND,
     COLLECT_IMAGE_WORK_SCHEMA_VERSION,
@@ -156,12 +156,20 @@ async def test_work_runtime_starts_and_cancels_cleanly(tmp_path: Path) -> None:
 
     async with managed_work_runtime(database_path, tmp_path) as runtime:
         assert {capability.kind for capability in runtime.registry.capabilities} == {
+            ("carl", "ebay", "collect", "description"),
+            ("carl", "ebay", "collect", "image"),
+            ("carl", "ebay", "collect", "item"),
+            ("carl", "ebay", "collect", "search"),
+            ("carl", "ebay", "extract", "item"),
+            ("carl", "ebay", "work", "analyze_item"),
+            ("carl", "ebay", "work", "refresh_search"),
             ("carl", "facebook", "work", "analyze_item"),
             ("carl", "facebook", "work", "collect_image"),
             ("carl", "facebook", "work", "collect_item"),
             ("carl", "facebook", "work", "collect_search"),
             ("carl", "facebook", "work", "extract_image"),
             ("carl", "facebook", "work", "extract_item"),
+            ("carl", "facebook", "work", "listing_details"),
             ("carl", "facebook", "work", "refresh_search"),
             ("carl", "facebook", "work", "request_missing_listing_analyses"),
         }
@@ -198,6 +206,71 @@ async def test_work_runtime_starts_and_cancels_cleanly(tmp_path: Path) -> None:
             LEGACY_REFRESH_SEARCH_PAYLOAD_SCHEMA_VERSION,
             REFRESH_SEARCH_PAYLOAD_SCHEMA_VERSION,
         }
+
+
+@pytest.mark.anyio
+async def test_runtime_joins_workers_and_watchers_before_closing_shared_transports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle: list[str] = []
+    worker_started = anyio.Event()
+    watcher_started = anyio.Event()
+
+    class SharedManager:
+        watcher_task_group: Any = None
+
+        async def __aenter__(self) -> "SharedManager":
+            lifecycle.append("transport_opened")
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            del args
+            assert "worker_closed" in lifecycle
+            assert "watcher_closed" in lifecycle
+            lifecycle.append("transport_closed")
+
+    manager = SharedManager()
+
+    async def watcher() -> None:
+        watcher_started.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            with anyio.CancelScope(shield=True):
+                await anyio.lowlevel.checkpoint()
+                assert "transport_closed" not in lifecycle
+                lifecycle.append("watcher_closed")
+
+    async def worker_pool(**kwargs: Any) -> None:
+        del kwargs
+        assert "transport_opened" in lifecycle
+        manager.watcher_task_group.start_soon(watcher)
+        worker_started.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            with anyio.CancelScope(shield=True):
+                await anyio.lowlevel.checkpoint()
+                assert "transport_closed" not in lifecycle
+                lifecycle.append("worker_closed")
+
+    async def prepare_constraints(*args: Any) -> None:
+        del args
+
+    monkeypatch.setattr(work_runtime, "SharedProtonWireproxyManager", lambda: manager)
+    monkeypatch.setattr(work_runtime, "run_worker_pool", worker_pool)
+    monkeypatch.setattr(work_runtime, "prepare_worker_constraints", prepare_constraints)
+
+    with anyio.fail_after(2):
+        async with (
+            Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database,
+            work_runtime.managed_worker_pool(database, tmp_path),
+        ):
+            await worker_started.wait()
+            await watcher_started.wait()
+
+    assert lifecycle[0] == "transport_opened"
+    assert lifecycle[-1] == "transport_closed"
 
 
 @pytest.mark.anyio

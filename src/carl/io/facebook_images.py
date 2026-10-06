@@ -1,11 +1,11 @@
 """One explicitly routed provider session for a bounded gallery-image batch."""
 
+import sys
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import final
 
-import anyio
 import httpx
 
 from carl.core.models import JsonValue
@@ -15,7 +15,7 @@ from carl.io.decodo import (
     DecodoSessionManager,
     ManagedDecodoSession,
 )
-from carl.io.httpx import AcquisitionFailure, ClientHttpxAcquirer, HttpAcquirer
+from carl.io.httpx import AcquisitionFailure, ClientHttpxAcquirer, HttpAcquirer, close_httpx_client
 from carl.io.proton import (
     ManagedProtonTransportFailure,
     ProtonSession,
@@ -95,9 +95,7 @@ class ProtonFacebookImageSessionFactory:
                         provider_session=provider_session,
                     )
                 finally:
-                    with anyio.CancelScope(shield=True):
-                        client.cookies.clear()
-                        await client.aclose()
+                    await close_httpx_client(client, primary_error=sys.exception())
         except AcquisitionFailure as error:
             if provider_session is not None:
                 error.result["routing"] = {

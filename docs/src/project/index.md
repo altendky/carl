@@ -231,6 +231,11 @@ rewritten. Legacy `proton_route` request options still name the requested route;
 the explicit configuration override determines its effective provider. Other
 Proton aliases are unaffected. There is no automatic provider fallback.
 Overrides must name configured routes and cannot chain or cycle.
+Repeat the override for any older Proton aliases that should also use Decodo.
+Facebook search admission uses the effective route, so aliases converging on
+one route still permit only one active search. Admission waits under the work
+lease without spending another retry attempt; retained request payloads keep
+their original route identity.
 
 Datacenter authentication uses `user-<base>-country-<country>` without mobile
 session or duration controls. [Decodo documents port 10000 as rotating on each
@@ -240,6 +245,20 @@ cookie-preserving client and endpoint throughout the search. Datacenter
 observations record the port and whether a static peer was requested; they do
 not invent a mobile sticky-session lifetime. Import its separate password with
 `carl configure-decodo-credential datacenter` before enabling the override.
+
+Facebook and eBay image downloads share a database-enforced limit of 25
+simultaneous image requests, across network paths and worker processes. Each
+source's image work limit is also 25; these are not two additive pools of 25.
+eBay seller descriptions permit ten concurrent jobs. The worker pool remains
+30 per process, and the existing request-rate and holdoff limits are unchanged.
+Worker startup retires the older immutable image/description constraints and
+records the replacement policy with code provenance, including for work queued
+before the upgrade.
+
+Facebook's `overlapping_price_partitions` strategy requests the first result
+page of each price bucket without cursor pagination. Cursor pagination is
+still available and remains the default when no traversal strategy is supplied;
+a cursor-pagination failure does not establish that bucketed searches fail.
 
 The ordinary document contains credential identities, never proxy passwords.
 HTTP transports and network routes are independently named configuration
@@ -283,7 +302,7 @@ derivation publication, so reprocessing old evidence does not give it a new acqu
 Item and seller-description iframe pages use the configured Decodo/wreq acquisition stack.
 Descriptions are separate provenance-linked follow-ups and must return complete HTML rather than
 a challenge page. Gallery extraction excludes unrelated recommendation images and accepts only
-credential-free HTTPS eBay image-host URLs. Downloads use the existing shared Proton transport,
+credential-free HTTPS eBay image-host URLs. Downloads use the effective configured image route,
 disable redirects, and require the exact requested HTTP 200 resource. The per-item image bound
 defaults to twenty and is capped at fifty; zero retains gallery URLs without downloading images.
 
@@ -717,7 +736,9 @@ its activity's selection policy. Path layers are always ordered from the
 application toward the network; this direction is part of the schema rather
 than a per-record option.
 
-Marketplace searches and image downloads are assigned to Proton. Item-page
+Facebook searches and both marketplaces' images resolve explicit route
+overrides; a Decodo datacenter cutover replaces their requested Proton paths.
+eBay searches and item-page
 collection defaults to Decodo, with Mullvad available as an explicit override
 and Bright Data retained as another native proxy implementation. No adapter
 silently changes its assigned path. A future flow policy may explicitly select
@@ -928,10 +949,11 @@ composed prompt remains model-boundary evidence. The evidence-set and guide prov
 rest of the source graph without copying upstream facts into the analysis result. The queue skips a
 completed analysis of the same evidence set, guide, and analysis configuration. The CLI requires
 an explicit product guide so telescope guidance cannot silently apply to tool storage or another
-product family. The initial model choice is
-Claude Sonnet 5 with medium effort; both are explicit invocation settings, while
+product family. The default model choice is
+Claude Sonnet 5.5 with medium effort; both are explicit invocation settings, while
 Claude's exact output metadata retains reported model usage. Carl uses the
-exact `claude-sonnet-5` model ID for repeatability. Exact analysis-record lookup includes retained
+exact `claude-sonnet-5-5` model ID for repeatability. Existing queued work retains its recorded
+model choice. Exact analysis-record lookup includes retained
 failed attempts for diagnosis, but candidate and dossier analysis summaries remain completed-only.
 
 Web claims in this initial implementation have agent-reported provenance: the report retains page
@@ -966,10 +988,10 @@ retained searches, and accepts one durable refresh request. New-search requests 
 immediately and rely on the explicit shared worker pool just like refreshes. The refresh request inherits the exact search intent, bounds, and traversal
 strategy unless the caller supplies complete typed replacements. This makes overlapping price
 partition width, overlap, and order available without reproducing CLI flags as loosely related
-strings. A refresh repeats the search through Proton, selects the union of the baseline and refreshed
+strings. A refresh repeats the search through the effective configured route, selects the union of the baseline and refreshed
 listing IDs, and reuses the latest semantically usable retained item page for each exact ID. Only an
 ID without a usable `full_listing` or `listing_unavailable` observation causes a new Decodo request.
-The refresh then runs the existing image reuse and Proton collection logic against those latest
+The refresh then runs the existing image reuse and routed collection logic against those latest
 usable observations. Including baseline-only IDs preserves their retained detail evidence without
 treating absence from search as evidence of sale. Optional item and image limits bound experiments;
 the first configured search traversal limit remains decisive.
@@ -1043,8 +1065,24 @@ pure functions. The application layer coordinates those rules with SQLite and ar
 The MCP module translates between official-SDK values and the application; it does not issue SQL,
 traverse provenance itself, or construct storage paths. `carl.cli` selects Trio. MCP owns only its
 database/application lifetime. `carl work` and `carl monitor --work` compose the isolated worker-pool
-runtime with an independently owned database lifetime. AnyIO and `contextlib.asynccontextmanager`
-own cancellation and cleanup in both cases.
+runtime with an independently owned database lifetime. Resource-owning context managers enclose
+their users: the database outlives shared transports, and transports outlive the worker/watch task
+group. Shutdown stops new work, cancels and joins that group, closes transports, then closes the
+database. Borrowers never close their shared dependencies.
+
+Resource finalizers use bounded shielding before their first cleanup await, including ownership
+locks and successful context exits. Independent cleanup obligations are attempted even after a
+failure; incomplete database closure remains retryable. Secondary cleanup failures are reported
+using safe phase/type metadata without replacing an active error or cancellation. Transaction
+rollback failures remain explicit rather than permitting reuse of uncertain transaction state.
+Durable work interruption is reconciled atomically using the lease token and operation binding:
+setup without an operation can release its lease, but committed outcomes and replacement owners
+are never undone. Lease/permit expiry is crash recovery, not the normal shutdown mechanism.
+Ending an operation also cancels any unfinished network activities in the same transaction.
+These fallback records retain the previous state, whether dispatch was possible, and the owner's
+terminal state; the request outcome remains explicitly unknown. Existing terminal activity results
+and event history are preserved. Worker startup reconciles historical activities whose owners
+already ended; an expired permit alone is not enough to cancel an activity with a live owner.
 
 MCP tools are defined by an explicit immutable registry constructed during startup. Registration
 rejects duplicate tool names and duplicate structured operation identities and retains generated

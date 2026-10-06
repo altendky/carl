@@ -180,6 +180,14 @@ def build_routed_facebook_worker_registry(
             loaded = load_configuration(directories.configuration_file)
             routing = loaded.configuration.resolve_network_path(payload.routing)
             payload = payload.model_copy(update={"routing": routing})
+            while not await database.try_admit_facebook_search_route(
+                work_item_identifier=context.work_item_identifier,
+                lease_token=context.lease_token,
+                worker_identifier=context.worker_identifier,
+                routing=routing,
+                utc_now_ns=time_ns,
+            ):
+                await anyio.sleep(1.0)
             await database.supersede_constraints(
                 retired_identifiers=legacy_facebook_network_constraint_identifiers(payload.routing),
                 replacements=facebook_network_policy_constraints(payload.routing),

@@ -1,11 +1,11 @@
 """Coherent HTTP sessions for Facebook Marketplace search collection."""
 
+import sys
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol, final
 
-import anyio
 import httpx
 
 from carl.core.models import JsonValue
@@ -21,6 +21,7 @@ from carl.io.httpx import (
     ClientHttpxAcquirer,
     HttpFormAcquirer,
     RouteConfigurationFailure,
+    close_httpx_client,
 )
 from carl.io.proton import (
     ManagedProtonTransportFailure,
@@ -125,9 +126,7 @@ class ProtonFacebookSearchSessionFactory:
                     )
                 finally:
                     try:
-                        with anyio.CancelScope(shield=True):
-                            client.cookies.clear()
-                            await client.aclose()
+                        await close_httpx_client(client, primary_error=sys.exception())
                     except Exception as error:
                         raise AcquisitionFailure(
                             "HTTP transport failed while closing a search client",

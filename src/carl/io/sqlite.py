@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from time import time_ns
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -57,7 +58,12 @@ from carl.core.facebook_images import (
 )
 from carl.core.facebook_refresh import SearchRunOrigin
 from carl.core.facebook_search import SearchStoppingReason
-from carl.core.facebook_work import COLLECT_SEARCH_WORK_KIND, SuccessfulItemPageResult
+from carl.core.facebook_work import (
+    COLLECT_SEARCH_WORK_KIND,
+    FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY,
+    SuccessfulItemPageResult,
+    facebook_effective_search_work_constraint,
+)
 from carl.core.item_analysis import (
     ANALYZE_ITEM_WORK_SCHEMA_VERSION,
     LEGACY_ANALYZE_ITEM_WORK_SCHEMA_VERSION,
@@ -1612,6 +1618,13 @@ class Database:
         """Persist an activity and sample each applicable holdoff exactly once."""
 
         async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                "SELECT state FROM operations WHERE id = ?",
+                (definition.operation_identifier,),
+            )
+            operation = await cursor.fetchone()
+            if operation is None or operation[0] != "started":
+                raise RuntimeError("Only a started operation can own network activity")
             await connection.execute(
                 """
                 INSERT INTO network_activities(
@@ -1761,15 +1774,18 @@ class Database:
         async with self._connections.writer() as connection:
             cursor = await connection.execute(
                 """
-                SELECT state, eligible_at_utc_ns
-                FROM network_activities
-                WHERE id = ?
+                SELECT activity.state, activity.eligible_at_utc_ns, operation.state
+                FROM network_activities AS activity
+                JOIN operations AS operation ON operation.id = activity.operation_id
+                WHERE activity.id = ?
                 """,
                 (network_activity_identifier,),
             )
             row = await cursor.fetchone()
             if row is None:
                 raise KeyError(network_activity_identifier)
+            if row[2] != "started":
+                raise RuntimeError("Only a started operation can own network activity")
             if _text(row[0]) != NetworkActivityState.PENDING.value:
                 raise RuntimeError("Only a pending network activity can be admitted")
             eligible_at = _integer(row[1])
@@ -1920,6 +1936,94 @@ class Database:
                 event_kind=NetworkActivityEventKind(state.value),
                 recorded_at_utc_ns=ended_at_utc_ns,
                 data=result,
+            )
+
+    async def _reconcile_terminal_network_activities(
+        self,
+        connection: AsyncConnection,
+        *,
+        recorded_at_utc_ns: int,
+        operation_id: str | None = None,
+        activity_identifiers: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Close unknown outcomes, not fabricate request successes or failures."""
+
+        if recorded_at_utc_ns < 0:
+            raise ValueError("Reconciliation time cannot be negative")
+        if activity_identifiers is not None and not activity_identifiers:
+            return ()
+        operation_predicate = "AND activity.operation_id = ?" if operation_id is not None else ""
+        identifier_predicate = (
+            "AND activity.id IN (SELECT value FROM json_each(?))"
+            if activity_identifiers is not None
+            else ""
+        )
+        bindings: list[apsw.SQLiteValue] = []
+        if operation_id is not None:
+            bindings.append(operation_id)
+        if activity_identifiers is not None:
+            bindings.append(_json(list(activity_identifiers)))
+        # The state index restricts this to unfinished activities, rather than
+        # scanning the complete network history on every operation completion.
+        cursor = await connection.execute(
+            f"""
+            SELECT activity.id, activity.state, operation.state
+            FROM network_activities AS activity
+            JOIN operations AS operation ON operation.id = activity.operation_id
+            WHERE activity.state IN ('pending', 'admitted')
+              AND operation.state IN ('completed', 'failed')
+              {operation_predicate} {identifier_predicate}
+            ORDER BY activity.created_at_utc_ns, activity.id
+            """,
+            bindings,
+        )
+        rows = await cursor.fetchall()
+        reconciled: list[str] = []
+        for row in rows:
+            identifier = _text(row[0])
+            previous_state = _text(row[1])
+            result: dict[str, JsonValue] = {
+                "kind": "owning_operation_finished",
+                "operation_state": _text(row[2]),
+                "previous_state": previous_state,
+                "possibly_dispatched": previous_state == "admitted",
+                "outcome": "unknown",
+            }
+            await connection.execute(
+                """
+                UPDATE network_activities
+                SET state = 'cancelled', admission_token = NULL,
+                    permit_expires_at_utc_ns = NULL, ended_at_utc_ns = ?, result_json = ?
+                WHERE id = ? AND state = ?
+                """,
+                (recorded_at_utc_ns, _json(result), identifier, previous_state),
+            )
+            if await connection.changes() != 1:
+                raise RuntimeError("Network activity changed during reconciliation")
+            await self._append_network_activity_event(
+                connection,
+                event_identifier=str(uuid4()),
+                network_activity_identifier=identifier,
+                event_kind=NetworkActivityEventKind.CANCELLED,
+                recorded_at_utc_ns=recorded_at_utc_ns,
+                data=result,
+            )
+            reconciled.append(identifier)
+        return tuple(reconciled)
+
+    async def reconcile_terminal_network_activities(
+        self,
+        *,
+        recorded_at_utc_ns: int,
+        activity_identifiers: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Repair legacy orphans; active owners and finished activities stay untouched."""
+
+        async with self._connections.writer() as connection:
+            return await self._reconcile_terminal_network_activities(
+                connection,
+                recorded_at_utc_ns=recorded_at_utc_ns,
+                activity_identifiers=activity_identifiers,
             )
 
     async def network_activity(self, identifier: str) -> dict[str, JsonValue]:
@@ -3804,6 +3908,66 @@ class Database:
             raise LeaseLostError("The work lease is missing, expired, or owned by another worker")
         return _integer(row[0]), _integer(row[1])
 
+    async def try_admit_facebook_search_route(
+        self,
+        *,
+        work_item_identifier: str,
+        lease_token: str,
+        worker_identifier: str,
+        routing: tuple[str, ...],
+        utc_now_ns: Callable[[], int],
+    ) -> bool:
+        """Atomically bind an effective search route to an active, renewable lease.
+
+        Requested scopes and payloads remain intact. Only previous effective-route
+        scopes are removed, including when waiting for the new route's capacity.
+        """
+
+        constraint = facebook_effective_search_work_constraint(routing)
+        async with self._connections.writer() as connection:
+            scope_json = _json(list(constraint.scope.identity))
+            # Acquire SQLite's writer reservation before reading admission state.
+            # A stale/invalid lease rolls this deletion back with the transaction.
+            await connection.execute(
+                """
+                DELETE FROM work_scopes
+                WHERE work_item_id = ? AND scope_kind = 'network_path'
+                  AND json_extract(scope_identity_json, '$[0]') = ?
+                  AND scope_identity_json != ?
+                """,
+                (work_item_identifier, FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, scope_json),
+            )
+            now_utc_ns = utc_now_ns()
+            await self._require_active_lease(
+                connection,
+                work_item_identifier=work_item_identifier,
+                lease_token=lease_token,
+                worker_identifier=worker_identifier,
+                now_utc_ns=now_utc_ns,
+            )
+            await self._register_constraint(
+                connection, constraint=constraint, registered_at_utc_ns=now_utc_ns
+            )
+            cursor = await connection.execute(
+                """
+                SELECT count(*) FROM work_items
+                JOIN work_scopes ON work_scopes.work_item_id = work_items.id
+                WHERE work_scopes.scope_kind = 'network_path'
+                  AND work_scopes.scope_identity_json = ?
+                  AND work_items.id != ? AND work_items.state = 'leased'
+                  AND work_items.lease_expires_at_utc_ns > ?
+                """,
+                (scope_json, work_item_identifier, now_utc_ns),
+            )
+            rows = await cursor.fetchall()
+            if _integer(rows[0][0]) >= constraint.maximum_active:
+                return False
+            await connection.execute(
+                "INSERT OR IGNORE INTO work_scopes VALUES (?, 'network_path', ?)",
+                (work_item_identifier, scope_json),
+            )
+            return True
+
     async def renew_lease(
         self,
         *,
@@ -3906,6 +4070,93 @@ class Database:
                     "reason": reason,
                 },
             )
+
+    async def finalize_interrupted_work(
+        self,
+        *,
+        work_item_identifier: str,
+        lease_token: str,
+        worker_identifier: str,
+        operation_id: str,
+        utc_now_ns: Callable[[], int],
+        event_identifier: str,
+        reason: str,
+        ended_at_utc: str,
+        duration_ns: int,
+        possibly_dispatched: bool,
+    ) -> bool:
+        """Reconcile interruption atomically; committed outcomes and replacement leases win.
+
+        Setup may not have created an operation yet. Conversely, cancellation
+        may hide a successful commit. Neither case is inferred from local flags.
+        """
+
+        async with self._connections.writer() as connection:
+            now_utc_ns = utc_now_ns()
+            cursor = await connection.execute(
+                """
+                SELECT operations.state, work_operations.work_item_id,
+                       work_operations.lease_token, work_operations.worker_identifier
+                FROM operations
+                LEFT JOIN work_operations ON work_operations.operation_id = operations.id
+                WHERE operations.id = ?
+                """,
+                (operation_id,),
+            )
+            operation = await cursor.fetchone()
+            if operation is not None:
+                if tuple(operation[1:]) != (work_item_identifier, lease_token, worker_identifier):
+                    raise LeaseLostError("The interrupted operation belongs to another attempt")
+                if operation[0] != "started":
+                    return False
+                await self._fail_operation(
+                    connection,
+                    operation_id=operation_id,
+                    error={"kind": reason, "possibly_dispatched": possibly_dispatched},
+                    result={"state": reason},
+                    ended_at_utc=ended_at_utc,
+                    duration_ns=duration_ns,
+                )
+            try:
+                attempt, _ = await self._require_active_lease(
+                    connection,
+                    work_item_identifier=work_item_identifier,
+                    lease_token=lease_token,
+                    worker_identifier=worker_identifier,
+                    now_utc_ns=now_utc_ns,
+                )
+            except LeaseLostError:
+                # A bound old operation can be failed, but never release its successor.
+                return False
+            await connection.execute(
+                """
+                UPDATE work_items
+                SET state = 'pending', eligible_at_utc_ns = ?, lease_token = NULL,
+                    lease_owner = NULL, lease_expires_at_utc_ns = NULL
+                WHERE id = ? AND lease_token = ? AND lease_owner = ?
+                """,
+                (now_utc_ns, work_item_identifier, lease_token, worker_identifier),
+            )
+            await self._append_work_event(
+                connection,
+                event_identifier=event_identifier,
+                work_item_identifier=work_item_identifier,
+                event_kind=WorkEventKind.RELEASED,
+                recorded_at_utc_ns=now_utc_ns,
+                data={
+                    "worker_identifier": worker_identifier,
+                    "lease_token": lease_token,
+                    "attempt": attempt,
+                    "eligible_at_utc_ns": now_utc_ns,
+                    "reason": {
+                        "kind": "worker_cancelled" if reason == "cancelled" else reason,
+                        "operation_identifier": operation_id,
+                        "possibly_dispatched": possibly_dispatched,
+                        "decision": "retry",
+                    },
+                },
+            )
+            return True
 
     async def _begin_operation(
         self,
@@ -4185,6 +4436,10 @@ class Database:
         if await connection.changes() != 1:
             raise RuntimeError("Operation was not in started state")
 
+        await self._reconcile_terminal_network_activities(
+            connection, operation_id=operation_id, recorded_at_utc_ns=time_ns()
+        )
+
     async def publish_leased_operation_checkpoint(
         self,
         *,
@@ -4413,6 +4668,10 @@ class Database:
         )
         if await connection.changes() != 1:
             raise RuntimeError("Operation was not in started state")
+
+        await self._reconcile_terminal_network_activities(
+            connection, operation_id=operation_id, recorded_at_utc_ns=time_ns()
+        )
 
     async def retry_leased_operation(
         self,

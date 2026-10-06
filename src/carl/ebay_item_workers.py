@@ -30,6 +30,7 @@ from carl.core.ebay_items import (
 )
 from carl.core.facebook_images import verify_image
 from carl.core.http import stored_content_encodings, stored_header_values, stored_response_charset
+from carl.core.marketplace_images import MARKETPLACE_IMAGE_SCOPE
 from carl.core.models import (
     BytesDraft,
     ExternalFileDraft,
@@ -600,6 +601,9 @@ async def _collect_image(
             network_session_identifier=dependencies.new_identifier(),
             network_path=image_network_path,
             attempt=context.attempt,
+        )
+        activity = activity.model_copy(
+            update={"scopes": (*activity.scopes, MARKETPLACE_IMAGE_SCOPE)}
         )
         async with network_activity_scheduler(
             dependencies.database, dependencies.new_identifier

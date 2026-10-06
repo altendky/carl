@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import perf_counter_ns, time_ns
@@ -17,12 +18,20 @@ from carl.analysis_batch_workers import (
     build_analysis_batch_worker_registry,
 )
 from carl.core.analysis_batch import request_missing_analyses_work_constraints
+from carl.core.components import Component, ComponentId
 from carl.core.ebay import ebay_search_work_constraint
-from carl.core.ebay_items import ebay_item_work_constraints
+from carl.core.ebay_items import (
+    ebay_item_work_constraints,
+    legacy_ebay_item_work_constraint_identifiers,
+)
 from carl.core.ebay_refresh import refresh_ebay_search_work_constraints
-from carl.core.facebook_images import image_session_work_constraint
+from carl.core.facebook_images import (
+    image_session_work_constraint,
+    legacy_image_session_work_constraint_identifiers,
+)
 from carl.core.facebook_refresh import refresh_search_work_constraints
 from carl.core.item_analysis import analysis_work_constraints
+from carl.core.marketplace_images import marketplace_image_network_constraint
 from carl.core.worker import WorkerSettings
 from carl.ebay_analysis_workers import build_ebay_analysis_worker_registry
 from carl.ebay_item_workers import EbayItemWorkerDependencies, build_ebay_item_worker_registry
@@ -66,6 +75,72 @@ class WorkRuntime:
     registry: WorkHandlerRegistry
 
 
+async def prepare_worker_constraints(database: Database, repository_root: Path) -> None:
+    """Upgrade immutable limits before workers can claim previously queued work."""
+
+    constraints = (
+        *analysis_work_constraints(),
+        *refresh_search_work_constraints(),
+        *request_missing_analyses_work_constraints(),
+        image_session_work_constraint(),
+        marketplace_image_network_constraint(),
+        ebay_search_work_constraint(),
+        *ebay_item_work_constraints(),
+        *refresh_ebay_search_work_constraints(),
+    )
+    retired_identifiers = (
+        *legacy_image_session_work_constraint_identifiers(),
+        ("carl", "facebook", "image", "network_activity_concurrency", "all_cdns", "v3"),
+        *legacy_ebay_item_work_constraint_identifiers(),
+    )
+    operation_identifier = _identifier()
+    started = perf_counter_ns()
+    provenance = await collect_code_provenance_async(repository_root)
+    # Complete the policy's audit even when shutdown arrives during its upgrade.
+    with anyio.CancelScope(shield=True):
+        await database.begin_operation(
+            operation_id=operation_identifier,
+            component=Component(
+                identifier=ComponentId(("carl", "work", "prepare_constraints")),
+                output_schema_version=1,
+                implementation=prepare_worker_constraints,
+            ),
+            provenance=provenance,
+            invocation=process_invocation(),
+            configuration={
+                "retired_identifiers": [list(identifier) for identifier in retired_identifiers],
+                "constraints": [constraint.model_dump(mode="json") for constraint in constraints],
+            },
+            started_at_utc=datetime.now(UTC).isoformat(),
+        )
+        try:
+            await database.supersede_constraints(
+                retired_identifiers=retired_identifiers,
+                replacements=constraints,
+                operation_identifier=operation_identifier,
+                at_utc_ns=time_ns(),
+                reason="Apply shared image concurrency 25 and eBay description concurrency 10",
+            )
+            await database.complete_operation(
+                operation_id=operation_identifier,
+                records=(),
+                artifacts=(),
+                outputs=(),
+                result={"state": "prepared"},
+                ended_at_utc=datetime.now(UTC).isoformat(),
+                duration_ns=perf_counter_ns() - started,
+            )
+        except BaseException as error:
+            await database.fail_operation(
+                operation_id=operation_identifier,
+                error={"kind": "constraint_policy_failure", "type": type(error).__name__},
+                result={"state": "failed"},
+                ended_at_utc=datetime.now(UTC).isoformat(),
+                duration_ns=perf_counter_ns() - started,
+            )
+            raise
+
+
 @asynccontextmanager
 async def managed_worker_pool(
     database: Database,
@@ -79,17 +154,9 @@ async def managed_worker_pool(
         renewal_interval_ns=30_000_000_000,
         idle_poll_interval_ns=1_000_000_000,
     )
+    await prepare_worker_constraints(database, repository_root)
+    await database.reconcile_terminal_network_activities(recorded_at_utc_ns=time_ns())
     claude = ClaudeCli()
-    for constraint in (
-        *analysis_work_constraints(),
-        *refresh_search_work_constraints(),
-        *request_missing_analyses_work_constraints(),
-        image_session_work_constraint(),
-        ebay_search_work_constraint(),
-        *ebay_item_work_constraints(),
-        *refresh_ebay_search_work_constraints(),
-    ):
-        await database.register_constraint(constraint, registered_at_utc_ns=time_ns())
     analysis_registry = build_analysis_worker_registry(
         AnalysisWorkerDependencies(
             database=database,
@@ -169,24 +236,23 @@ async def managed_worker_pool(
         ),
     )
     stop = anyio.Event()
-    async with anyio.create_task_group() as task_group:
+    async with proton_manager, anyio.create_task_group() as task_group:
         proton_manager.watcher_task_group = task_group
-        async with proton_manager:
-            task_group.start_soon(
-                partial(
-                    run_worker_pool,
-                    database=database,
-                    registry=registry,
-                    settings=settings,
-                    services=services,
-                    stop=stop,
-                )
+        task_group.start_soon(
+            partial(
+                run_worker_pool,
+                database=database,
+                registry=registry,
+                settings=settings,
+                services=services,
+                stop=stop,
             )
-            try:
-                yield WorkRuntime(database=database, registry=registry)
-            finally:
-                stop.set()
-                task_group.cancel_scope.cancel()
+        )
+        try:
+            yield WorkRuntime(database=database, registry=registry)
+        finally:
+            stop.set()
+            task_group.cancel_scope.cancel()
 
 
 @asynccontextmanager

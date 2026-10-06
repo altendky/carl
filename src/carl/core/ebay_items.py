@@ -15,6 +15,7 @@ from pydantic import Field, field_validator
 
 from carl.core.ebay import ebay_item_identifier
 from carl.core.http import RequestPlan
+from carl.core.marketplace_images import MARKETPLACE_IMAGE_MAXIMUM_ACTIVE
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
 from carl.core.work import (
     ConcurrencyConstraint,
@@ -249,17 +250,30 @@ def collect_ebay_description_work(
 def ebay_item_work_constraints() -> tuple[ConcurrencyConstraint, ...]:
     return tuple(
         ConcurrencyConstraint(
-            identifier=(*kind, "concurrency"),
+            identifier=(
+                (*kind, "concurrency", "v2")
+                if kind in (COLLECT_EBAY_DESCRIPTION_WORK_KIND, COLLECT_EBAY_IMAGE_WORK_KIND)
+                else (*kind, "concurrency")
+            ),
             subject_kind=SchedulingSubjectKind.WORK_ITEM,
             scope=SchedulingScope(kind=SchedulingScopeKind.WORK_KIND, identity=kind),
             maximum_active=maximum,
         )
         for kind, maximum in (
             (COLLECT_EBAY_ITEM_WORK_KIND, 1),
-            (COLLECT_EBAY_DESCRIPTION_WORK_KIND, 1),
-            (COLLECT_EBAY_IMAGE_WORK_KIND, 5),
+            (COLLECT_EBAY_DESCRIPTION_WORK_KIND, 10),
+            (COLLECT_EBAY_IMAGE_WORK_KIND, MARKETPLACE_IMAGE_MAXIMUM_ACTIVE),
             (EXTRACT_EBAY_ITEM_WORK_KIND, 5),
         )
+    )
+
+
+def legacy_ebay_item_work_constraint_identifiers() -> tuple[tuple[str, ...], ...]:
+    """Retire image and description limits that prevent the current concurrency."""
+
+    return (
+        (*COLLECT_EBAY_DESCRIPTION_WORK_KIND, "concurrency"),
+        (*COLLECT_EBAY_IMAGE_WORK_KIND, "concurrency"),
     )
 
 

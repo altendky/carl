@@ -330,7 +330,7 @@ class AnalyzeItemPayload(StrictModel):
     product_guide_record_identifier: str = Field(min_length=1)
     recipe_version: int = Field(default=ANALYSIS_RECIPE_VERSION, ge=1)
     claude_version: str | None = Field(default=None, min_length=1)
-    model: str = Field(default="claude-sonnet-5", min_length=1)
+    model: str = Field(default="claude-sonnet-5-5", min_length=1)
     effort: ClaudeEffort = ClaudeEffort.MEDIUM
     timeout_seconds: int = Field(default=210, gt=0)
     maximum_turns: int = Field(default=8, gt=0)

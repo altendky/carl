@@ -2,6 +2,7 @@
 
 import secrets
 import string
+import sys
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -16,12 +17,14 @@ from pydantic import Field, SecretStr
 from carl.core.http import RequestPlan
 from carl.core.models import ConfigurationDocumentIdentity, JsonValue, StrictModel
 from carl.core.routing import BrightDataRouteIdentity, BrightDataSessionObservation
+from carl.io.cleanup import shielded_cleanup
 from carl.io.httpx import (
     Acquisition,
     AcquisitionFailure,
     ClientHttpxAcquirer,
     IdentifierFactory,
     RouteConfigurationFailure,
+    close_httpx_client,
 )
 
 _PROVIDER_SESSION_ALPHABET = string.ascii_letters + string.digits
@@ -312,14 +315,16 @@ class BrightDataSessionManager:
             )
             yield session
         finally:
-            with anyio.CancelScope(shield=True):
-                try:
-                    if client is not None:
-                        client.cookies.clear()
-                        await client.aclose()
-                finally:
-                    if session is not None:
-                        session.ended_at_utc = datetime.now(UTC).isoformat()
+            primary_error = sys.exception()
+            try:
+                if client is not None:
+                    await close_httpx_client(client, primary_error=primary_error)
+            finally:
+                if session is not None:
+                    session.ended_at_utc = datetime.now(UTC).isoformat()
+                async with shielded_cleanup(
+                    "bright_data_credentials", primary_error=primary_error or sys.exception()
+                ):
                     await stack.aclose()
 
 

@@ -1750,7 +1750,7 @@ def analyze_items(
     product_guide: ProductGuideKind,
     maximum_items: int = 1,
     worker_count: int = 1,
-    model: str = "claude-sonnet-5",
+    model: str = "claude-sonnet-5-5",
     effort: ClaudeEffort = ClaudeEffort.MEDIUM,
     timeout_seconds: int = 150,
     claude_executable: str = "claude",

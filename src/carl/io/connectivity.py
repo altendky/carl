@@ -7,6 +7,7 @@ import anyio
 
 from carl.core.json import encode_json
 from carl.core.models import JsonValue
+from carl.io.cleanup import shielded_cleanup
 from carl.io.sqlite import Database
 
 PROBE_INTERVAL_NS = 30_000_000_000
@@ -79,6 +80,25 @@ class ConnectivityMonitor:
         """
 
         token = self.new_identifier()
+        try:
+            return await self._available(token, after_failure=after_failure)
+        except BaseException as error:
+            async with (
+                shielded_cleanup("connectivity probe release", primary_error=error),
+                self.database._connections.writer() as connection,  # pyright: ignore[reportPrivateUsage]
+            ):
+                await connection.execute(
+                    """
+                    UPDATE network_connectivity
+                    SET probe_token = NULL, probe_expires_utc_ns = NULL,
+                        next_probe_utc_ns = ?
+                    WHERE singleton = 1 AND probe_token = ?
+                    """,
+                    (self.utc_now_ns(), token),
+                )
+            raise
+
+    async def _available(self, token: str, *, after_failure: bool) -> bool:
         while True:
             now = self.utc_now_ns()
             async with self.database._connections.writer() as connection:  # pyright: ignore[reportPrivateUsage]

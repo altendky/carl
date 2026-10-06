@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import closing
+from inspect import signature
 from itertools import count
 from pathlib import Path
 from time import perf_counter_ns, time_ns
@@ -100,7 +101,12 @@ def _payload() -> AnalyzeItemPayload:
 
 
 def test_analysis_payload_defaults_to_explicit_sonnet_model() -> None:
-    assert _payload().model == "claude-sonnet-5"
+    payload = _payload()
+    assert payload.model == "claude-sonnet-5-5"
+    assert payload.effort is ClaudeEffort.MEDIUM
+    assert signature(analyze_items).parameters["model"].default == payload.model
+    argv = ClaudeCli().argv("fixture prompt", model=payload.model, effort=payload.effort)
+    assert argv[argv.index("--model") + 1] == payload.model
     assert _payload().timeout_seconds == 210
 
 

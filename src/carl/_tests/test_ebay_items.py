@@ -307,8 +307,8 @@ def test_work_definitions_and_restricted_plans() -> None:
     assert all(definition.payload_schema_version == 1 for definition in definitions)
     assert tuple(constraint.maximum_active for constraint in ebay_item_work_constraints()) == (
         1,
-        1,
-        5,
+        10,
+        25,
         5,
     )
     assert ebay_item_plan(request, network_path=("decodo",)).url == URL

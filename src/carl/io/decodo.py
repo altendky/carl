@@ -2,6 +2,7 @@
 
 import secrets
 import string
+import sys
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -17,12 +18,14 @@ from pydantic import Field, SecretStr
 from carl.core.http import FormField, RequestPlan
 from carl.core.models import ConfigurationDocumentIdentity, JsonValue, StrictModel
 from carl.core.routing import DecodoProduct, DecodoRouteIdentity, DecodoSessionObservation
+from carl.io.cleanup import shielded_cleanup
 from carl.io.httpx import (
     Acquisition,
     AcquisitionFailure,
     ClientHttpxAcquirer,
     IdentifierFactory,
     RouteConfigurationFailure,
+    close_httpx_client,
 )
 from carl.io.wreq import (
     ProxyWreqAcquirer,
@@ -356,12 +359,11 @@ class DecodoSessionManager:
             raise
         finally:
             close_failure: AcquisitionFailure | None = None
-            with anyio.CancelScope(shield=True):
+            async with shielded_cleanup("decodo_cleanup", primary_error=body_error):
                 try:
                     if client is not None:
                         try:
-                            client.cookies.clear()
-                            await client.aclose()
+                            await close_httpx_client(client)
                         except Exception as error:
                             if session is not None:
                                 session.failed = True
@@ -377,7 +379,10 @@ class DecodoSessionManager:
                 finally:
                     if session is not None:
                         session.ended_at_utc = datetime.now(UTC).isoformat()
-                    await stack.aclose()
+                    async with shielded_cleanup(
+                        "decodo_credentials", primary_error=body_error or close_failure
+                    ):
+                        await stack.aclose()
             if close_failure is not None:
                 if body_error is None:
                     raise close_failure from None
@@ -614,7 +619,7 @@ class ManagedDecodoWreqAcquirer:
                 session.failed = True
             raise
         finally:
-            with anyio.CancelScope(shield=True):
+            async with shielded_cleanup("decodo_wreq_credentials", primary_error=sys.exception()):
                 try:
                     await credential_stack.aclose()
                 finally:

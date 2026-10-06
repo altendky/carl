@@ -191,6 +191,26 @@ async def test_facebook_runtime_resolves_legacy_routes_but_preserves_mobile_item
             database=database, directories=_directories(tmp_path), new_identifier=identifiers
         )
         handler = next(handler for handler in registry.handlers if handler.capability.kind == kind)
+        if purpose == "search":
+            assert isinstance(payload, CollectSearchPayload)
+            _ = await ebay_fixtures._enqueue(
+                database,
+                collect_search_work(
+                    identifier="route-test-work", payload=payload, not_before_utc_ns=0
+                ),
+                identifiers,
+            )
+            claimed = await database.claim_work(
+                supported_capabilities=tuple(
+                    capability for capability in registry.capabilities if capability.kind == kind
+                ),
+                worker_identifier="route-test-worker",
+                lease_token="route-test-lease",
+                lease_duration_ns=600_000_000_000,
+                utc_now_ns=time_ns,
+                event_identifier=identifiers(),
+            )
+            assert claimed.lease is not None
         await database.begin_operation(
             operation_id="route-test-operation",
             component=handler.component,

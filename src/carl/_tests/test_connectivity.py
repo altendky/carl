@@ -256,3 +256,47 @@ async def test_crashed_probe_is_replaced_after_fenced_lease_expires(tmp_path: Pa
                 "SELECT paused, probe_token FROM network_connectivity"
             )
             assert await cursor.fetchone() == (0, None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_cancelled_probe_releases_only_its_token_and_retains_pause(
+    tmp_path: Path,
+    replacement: bool,
+) -> None:
+    now = 1_000_000_000
+    async with Database.managed(tmp_path / "database.sqlite3", initialize=True) as database:
+        with anyio.CancelScope() as scope:
+
+            async def probe() -> dict[str, JsonValue]:
+                if replacement:
+                    async with database._connections.writer() as connection:
+                        await connection.execute(
+                            "UPDATE network_connectivity SET probe_token = ?, probe_expires_utc_ns = ?",
+                            ("replacement", now + 15_000_000_000),
+                        )
+                scope.cancel()
+                await anyio.lowlevel.checkpoint()
+                raise AssertionError("Cancelled probe returned")
+
+            monitor = ConnectivityMonitor(database, lambda: "cancelled", lambda: now, probe)
+            await monitor.available(after_failure=True)
+
+        async with database._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT paused, probe_token, probe_expires_utc_ns FROM network_connectivity"
+            )
+            assert await cursor.fetchone() == (
+                (1, "replacement", now + 15_000_000_000) if replacement else (1, None, None)
+            )
+
+        calls: list[str] = []
+
+        async def healthy_probe() -> dict[str, JsonValue]:
+            calls.append("probed")
+            return {"reachable": True}
+
+        if not replacement:
+            monitor = ConnectivityMonitor(database, lambda: "new", lambda: now, healthy_probe)
+            assert await monitor.available()
+            assert calls == ["probed"]

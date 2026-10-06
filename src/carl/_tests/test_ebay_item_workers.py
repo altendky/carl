@@ -1,5 +1,6 @@
 """Offline durable eBay item, description, and gallery-image worker tests."""
 
+import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from time import perf_counter_ns, time_ns
 from types import SimpleNamespace
 from typing import cast
 
+import apsw
 import pytest
 from PIL import Image
 
@@ -30,6 +32,7 @@ from carl.core.ebay_items import (
     collect_ebay_item_work,
 )
 from carl.core.http import RequestPlan
+from carl.core.marketplace_images import MARKETPLACE_IMAGE_SCOPE
 from carl.core.models import CodeProvenance, JsonValue, NamedOutput, RecordDraft
 from carl.core.work import WorkDefinition, WorkRequester, WorkState
 from carl.core.worker import AttemptContext, RetryWork, TerminalFailureWork, WorkerSettings
@@ -376,6 +379,21 @@ async def test_durable_item_pipeline_retains_html_and_schedules_description_and_
 
         imaged = await _run_next(database, registry, identifiers, COLLECT_EBAY_IMAGE_WORK_KIND)
         assert imaged["state"] == WorkState.COMPLETED.value
+        tagged_kinds: list[tuple[str, ...]] = []
+        with apsw.Connection(str(database.path), flags=apsw.SQLITE_OPEN_READONLY) as connection:
+            tagged_kinds = [
+                tuple(json.loads(kind))
+                for kind, scope in connection.execute(
+                    """
+                    SELECT a.kind_parts_json,s.scope_identity_json
+                    FROM network_activities AS a
+                    JOIN network_activity_scopes AS s ON s.network_activity_id=a.id
+                    WHERE s.scope_kind='network_activity_kind'
+                    """
+                )
+                if tuple(json.loads(scope)) == MARKETPLACE_IMAGE_SCOPE.identity
+            ]
+        assert tagged_kinds == [("carl", "ebay", "network_activity", "gallery_image")]
         image_result = _mapping(imaged["result"])
         artifact_identifier = _string(image_result["image_artifact_identifier"])
         image_metadata, content = await database.get_artifact(artifact_identifier)

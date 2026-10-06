@@ -48,6 +48,15 @@ URL = "https://i.ebayimg.com/images/g/example/s-l1600.jpg"
 DESCRIPTION_URL = "https://vi.vipr.ebaydesc.com/itmdesc/123456789012"
 
 
+def test_ebay_analysis_defaults_to_sonnet_5_5_at_medium_effort() -> None:
+    payload = EbayAnalyzeItemPayload(
+        evidence_set_record_identifier="evidence-set",
+        product_guide_record_identifier="product-guide",
+    )
+    assert payload.model == "claude-sonnet-5-5"
+    assert payload.effort is ClaudeEffort.MEDIUM
+
+
 def _identifiers() -> Callable[[], str]:
     numbers = count()
     return lambda: f"ebay-analysis-{next(numbers)}"

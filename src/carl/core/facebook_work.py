@@ -97,6 +97,7 @@ FACEBOOK_NETWORK_SHORT_RATE_MAXIMUM_STARTS = 3
 FACEBOOK_NETWORK_PATH_RATE_PERIOD_NS = 60_000_000_000
 FACEBOOK_NETWORK_PATH_RATE_MAXIMUM_STARTS = 180
 FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE = 1
+FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY = "effective_search_acquisition"
 
 
 def _search_route_scope(routing: tuple[str, ...]) -> SchedulingScope:
@@ -115,6 +116,20 @@ def facebook_search_work_constraint(routing: tuple[str, ...]) -> ConcurrencyCons
         identifier=("carl", "facebook", "search", "route_concurrency", "v1", *routing),
         subject_kind=SchedulingSubjectKind.WORK_ITEM,
         scope=_search_route_scope(routing),
+        maximum_active=FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE,
+    )
+
+
+def facebook_effective_search_work_constraint(routing: tuple[str, ...]) -> ConcurrencyConstraint:
+    """Serialize resolved routes using a scope acquired after the work claim."""
+
+    return ConcurrencyConstraint(
+        identifier=("carl", "facebook", "search", "effective_route_concurrency", "v1", *routing),
+        subject_kind=SchedulingSubjectKind.WORK_ITEM,
+        scope=SchedulingScope(
+            kind=SchedulingScopeKind.NETWORK_PATH,
+            identity=(FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *routing),
+        ),
         maximum_active=FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE,
     )
 
