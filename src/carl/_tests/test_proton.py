@@ -451,7 +451,7 @@ async def test_shared_proton_watcher_contains_cleanup_failure_and_unblocks_repla
                 assert replacement.endpoint.port == 31082
 
             assert provider.opens == 2
-            assert "Failed to close shared Proton transport" in caplog.text
+            assert "shared_proton_close: RuntimeError" in caplog.text
         task_group.cancel_scope.cancel()
 
 
@@ -462,6 +462,158 @@ class _FakeSocksAcquirer:
     async def acquire(self, plan: RequestPlan, new_identifier: object) -> Acquisition:
         del plan, new_identifier
         return Acquisition(record={"hops": []}, bodies=())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ending", ("usage", "runtime"))
+async def test_shared_proton_cancelled_cleanup_waits_for_bookkeeping_lock(
+    tmp_path: Path, ending: str
+) -> None:
+    settings = _settings(tmp_path)
+    provider = _FakeProtonManager()
+    shared = SharedProtonWireproxyManager(cast(ProtonWireproxyManager, cast(object, provider)))
+    lock_held = anyio.Event()
+
+    async def hold_lock() -> None:
+        async with shared._lock:
+            lock_held.set()
+            await anyio.sleep(0.01)
+
+    async with anyio.create_task_group() as task_group:
+        if ending == "usage":
+            async with shared:
+                with anyio.CancelScope() as scope:
+                    async with shared.open(settings):
+                        shared._entries[settings.device_lock_identity].invalidated = True
+                        task_group.start_soon(hold_lock)
+                        await lock_held.wait()
+                        scope.cancel()
+                        await anyio.sleep_forever()
+                assert scope.cancelled_caught
+                assert not shared._entries
+                assert provider.closes == 1
+                async with shared.open(settings):
+                    pass
+                assert provider.opens == 2
+            assert provider.closes == 2
+        else:
+            with anyio.CancelScope() as scope:
+                async with shared:
+                    async with shared.open(settings):
+                        pass
+                    task_group.start_soon(hold_lock)
+                    await lock_held.wait()
+                    scope.cancel()
+                    await anyio.sleep_forever()
+            assert scope.cancelled_caught
+            assert not shared._entries
+            assert provider.closes == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ending", ("normal", "body_error", "cancel"))
+async def test_shared_proton_closes_all_entries_and_preserves_primary_error(
+    tmp_path: Path, ending: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    class FailingCloseManager(_FakeProtonManager):
+        @asynccontextmanager
+        async def open(
+            self, settings: ProtonWireproxySettings
+        ) -> AsyncGenerator[ManagedProtonSession]:
+            async with super().open(settings) as session:
+                try:
+                    yield session
+                finally:
+                    raise OSError("secret provider cleanup diagnostic")
+
+    settings = _settings(tmp_path)
+    second_settings = settings.model_copy(
+        update={
+            "configuration_content": settings.configuration_content.replace(
+                base64.b64encode(b"p" * 32), base64.b64encode(b"q" * 32)
+            )
+        }
+    )
+    provider = FailingCloseManager()
+    shared = SharedProtonWireproxyManager(cast(ProtonWireproxyManager, cast(object, provider)))
+    original = RuntimeError("original body error")
+
+    async def run(scope: anyio.CancelScope) -> None:
+        async with shared:
+            async with shared.open(settings):
+                pass
+            async with shared.open(second_settings):
+                pass
+            if ending == "cancel":
+                scope.cancel()
+                await anyio.sleep_forever()
+            if ending == "body_error":
+                raise original
+
+    with anyio.CancelScope() as scope:
+        if ending == "normal":
+            with pytest.raises(ExceptionGroup) as raised_group:
+                await run(scope)
+            assert len(raised_group.value.exceptions) == 2
+        elif ending == "body_error":
+            with pytest.raises(RuntimeError) as raised:
+                await run(scope)
+            assert raised.value is original
+            assert len(original.__notes__) == 2
+        else:
+            await run(scope)
+    assert scope.cancelled_caught is (ending == "cancel")
+    assert provider.closes == 2
+    assert not shared._entries
+    assert "secret provider cleanup diagnostic" not in caplog.text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ("search", "images"))
+@pytest.mark.parametrize("ending", ("cancel", "body_error"))
+async def test_facebook_proton_client_close_failure_preserves_primary_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, ending: str
+) -> None:
+    from carl.io.facebook_images import ProtonFacebookImageSessionFactory
+    from carl.io.facebook_search import ProtonFacebookSearchSessionFactory
+
+    settings = _settings(tmp_path)
+    provider = _FakeProtonManager()
+    closed = False
+
+    class FailingClient(httpx.AsyncClient):
+        async def aclose(self) -> None:
+            nonlocal closed
+            await anyio.lowlevel.checkpoint()
+            await super().aclose()
+            closed = True
+            raise OSError("secret provider diagnostic")
+
+    client = FailingClient(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+    monkeypatch.setattr("carl.io.facebook_search.httpx.AsyncClient", lambda **_: client)
+    factory_class = (
+        ProtonFacebookSearchSessionFactory
+        if kind == "search"
+        else ProtonFacebookImageSessionFactory
+    )
+    factory = factory_class(
+        manager=cast(ProtonWireproxyManager, cast(object, provider)), settings=settings
+    )
+    original = RuntimeError("original body error")
+    with anyio.CancelScope() as scope:
+        if ending == "cancel":
+            async with factory("session"):
+                scope.cancel()
+                await anyio.sleep_forever()
+        else:
+            with pytest.raises(RuntimeError) as raised:
+                async with factory("session"):
+                    raise original
+            assert raised.value is original
+            assert "secret provider diagnostic" not in repr(original.__notes__)
+    assert scope.cancelled_caught is (ending == "cancel")
+    assert closed
+    assert provider.closes == 1
 
 
 @pytest.mark.anyio

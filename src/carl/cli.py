@@ -27,6 +27,7 @@ from carl.core.composed_projection import (
     ListComposedSearchRequest,
     ListingStatus,
 )
+from carl.core.ebay import EbaySearchRequest
 from carl.core.facebook import listing_id_from_url
 from carl.core.facebook_images import (
     COLLECT_IMAGE_WORK_KIND,
@@ -87,9 +88,11 @@ from carl.core.item_analysis import (
 )
 from carl.core.json import encode_json
 from carl.core.models import Header, JsonValue, NamedOutput, RecordDraft
+from carl.core.refresh_recovery import RetryItemFailuresRequest
 from carl.core.routing import BatchItemNetworkProvider, ItemNetworkProvider, NetworkProvider
 from carl.core.work import WorkCapability, WorkRequester, WorkState
 from carl.core.worker import WorkerSettings
+from carl.ebay import collect_configured_ebay_search
 from carl.facebook_analysis_workers import (
     PLAN_FACEBOOK_LISTING_ANALYSIS_EVIDENCE,
     REGISTER_PRODUCT_GUIDE,
@@ -304,6 +307,27 @@ def retry_image_failures(
     _print_json(anyio.run(perform, backend="trio"))
 
 
+@app.command
+def retry_item_failures(
+    refresh_work_identifier: str,
+    maximum_items: int = 1000,
+    database: Path = _DEFAULT_DATABASE,
+) -> None:
+    """Retry transient item failures from one settled refresh without repeating its search."""
+
+    async def perform() -> dict[str, JsonValue]:
+        async with Database.managed(database) as evidence_database:
+            application = ReviewApplication(evidence_database, _repository_root())
+            result = await application.retry_item_failures(
+                RetryItemFailuresRequest(
+                    refresh_work_identifier=refresh_work_identifier, maximum_items=maximum_items
+                )
+            )
+            return result.model_dump(mode="json")
+
+    _print_json(anyio.run(perform, backend="trio"))
+
+
 async def _ensure_product_guide(
     evidence_database: Database, definition: ProductGuideDefinition
 ) -> str:
@@ -434,6 +458,7 @@ def locations() -> None:
             "configuration_file": str(directories.configuration_file),
             "database_file": str(directories.database_file),
             "image_directory": str(directories.image_directory),
+            "mcp_error_log_file": str(directories.mcp_error_log_file),
             "data_directory": str(directories.data),
             "cache_directory": str(directories.cache),
             "state_directory": str(directories.state),
@@ -1725,7 +1750,7 @@ def analyze_items(
     product_guide: ProductGuideKind,
     maximum_items: int = 1,
     worker_count: int = 1,
-    model: str = "claude-sonnet-5",
+    model: str = "claude-sonnet-5-5",
     effort: ClaudeEffort = ClaudeEffort.MEDIUM,
     timeout_seconds: int = 150,
     claude_executable: str = "claude",
@@ -2038,6 +2063,32 @@ def analyze_items(
             }
 
     _print_work_result(anyio.run(perform, backend="trio"))
+
+
+@app.command
+def ebay_search(
+    query: str,
+    *,
+    stack: str = "ebay_anonymous",
+    maximum_pages: int = 5,
+    database: Path = _DEFAULT_DATABASE,
+) -> None:
+    """Collect and extract a bounded eBay search traversal through a configured stack."""
+
+    async def perform() -> dict[str, JsonValue]:
+        directories = user_directories()
+        async with Database.managed(database, initialize=True) as evidence_database:
+            return await collect_configured_ebay_search(
+                evidence_database,
+                directories=directories,
+                request=EbaySearchRequest(
+                    query=query,
+                    stack_identifier=stack,
+                    maximum_pages=maximum_pages,
+                ),
+            )
+
+    _print_json(anyio.run(perform, backend="trio"))
 
 
 @app.command

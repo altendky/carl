@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from functools import partial
 from pathlib import Path
 from time import perf_counter_ns
 from types import TracebackType
-from typing import Protocol
+from typing import Protocol, final
 
 import anyio
 import httpx
@@ -30,6 +31,7 @@ from carl.core.routing import (
     ProtonSessionObservation,
     WireproxyIdentity,
 )
+from carl.io.cleanup import shielded_cleanup
 from carl.io.httpx import (
     Acquisition,
     AcquisitionFailure,
@@ -37,6 +39,7 @@ from carl.io.httpx import (
     IdentifierFactory,
     LocalSocks5HttpxAcquirer,
     RouteConfigurationFailure,
+    close_httpx_client,
 )
 from carl.io.wireproxy import (
     ManagedWireproxyFailure,
@@ -44,6 +47,11 @@ from carl.io.wireproxy import (
     WireproxyProcessManager,
     render_wireguard_configuration,
     wireguard_device_lock_identity,
+)
+from carl.io.wreq import (
+    LocalSocks5WreqAcquirer,
+    WreqClientFactory,
+    WreqTransportSettings,
 )
 
 _PROTON_EXIT_PROBE = "https://ip.me/"
@@ -222,22 +230,36 @@ class SharedProtonWireproxyManager:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        del exc_type, exc_value, traceback
+        del exc_type, traceback
         if not self._running:
             raise RuntimeError("Shared Proton manager is not running")
         self._running = False
-        async with self._lock:
+        entries: tuple[_SharedProtonEntry, ...] = ()
+        async with (
+            shielded_cleanup("shared_proton_detach", primary_error=exc_value),
+            self._lock,
+        ):
             entries = tuple(self._entries.values())
             self._entries.clear()
-        with anyio.CancelScope(shield=True):
-            for entry in reversed(entries):
-                await self._close_entry(entry)
+        failures: list[Exception] = []
+        for entry in reversed(entries):
+            try:
+                await self._close_entry(entry, primary_error=exc_value)
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            raise ExceptionGroup("Shared Proton transport cleanup failed", failures)
 
-    async def _close_entry(self, entry: _SharedProtonEntry) -> None:
+    async def _close_entry(
+        self, entry: _SharedProtonEntry, *, primary_error: BaseException | None = None
+    ) -> None:
         try:
-            await entry.stack.aclose()
-        except Exception:
-            _LOGGER.exception("Failed to close shared Proton transport")
+            async with shielded_cleanup(
+                "shared_proton_close",
+                primary_error=primary_error,
+                timeout_seconds=entry.settings.shutdown_timeout_seconds + 10,
+            ):
+                await entry.stack.aclose()
         finally:
             entry.closed.set()
 
@@ -245,13 +267,13 @@ class SharedProtonWireproxyManager:
         self, device_identity: bytes, entry: _SharedProtonEntry
     ) -> None:
         close = False
-        async with self._lock:
-            entry.invalidated = True
-            if entry.users == 0 and self._entries.get(device_identity) is entry:
-                del self._entries[device_identity]
-                close = True
-        if close:
-            with anyio.CancelScope(shield=True):
+        async with shielded_cleanup("shared_proton_invalidate", primary_error=sys.exception()):
+            async with self._lock:
+                entry.invalidated = True
+                if entry.users == 0 and self._entries.get(device_identity) is entry:
+                    del self._entries[device_identity]
+                    close = True
+            if close:
                 await self._close_entry(entry)
 
     async def _watch_entry(self, device_identity: bytes, entry: _SharedProtonEntry) -> None:
@@ -265,8 +287,8 @@ class SharedProtonWireproxyManager:
             await self._close_invalidated_entry(device_identity, entry)
         except anyio.get_cancelled_exc_class():
             raise
-        except Exception:
-            _LOGGER.exception("Shared Proton transport watcher failed")
+        except Exception as error:
+            _LOGGER.error("Shared Proton transport watcher failed: %s", type(error).__name__)
             await self._close_invalidated_entry(device_identity, entry)
 
     @asynccontextmanager
@@ -309,7 +331,10 @@ class SharedProtonWireproxyManager:
                             self.manager.open(settings)
                         )
                     except BaseException:
-                        await stack.aclose()
+                        async with shielded_cleanup(
+                            "shared_proton_startup", primary_error=sys.exception()
+                        ):
+                            await stack.aclose()
                         raise
                     entry = _SharedProtonEntry(
                         settings=settings,
@@ -353,20 +378,20 @@ class SharedProtonWireproxyManager:
         finally:
             usage.usage_ended_at_utc = _utc_now()
             close = False
-            async with self._lock:
-                entry.users -= 1
-                if transport_failed:
-                    entry.invalidated = True
-                if (
-                    entry.invalidated
-                    and entry.users == 0
-                    and self._entries.get(device_identity) is entry
-                ):
-                    del self._entries[device_identity]
-                    close = True
-            if close:
-                with anyio.CancelScope(shield=True):
-                    await self._close_entry(entry)
+            async with shielded_cleanup("shared_proton_release", primary_error=sys.exception()):
+                async with self._lock:
+                    entry.users -= 1
+                    if transport_failed:
+                        entry.invalidated = True
+                    if (
+                        entry.invalidated
+                        and entry.users == 0
+                        and self._entries.get(device_identity) is entry
+                    ):
+                        del self._entries[device_identity]
+                        close = True
+                if close:
+                    await self._close_entry(entry, primary_error=sys.exception())
 
 
 def _utc_now() -> str:
@@ -450,10 +475,13 @@ async def _probe_exit_ip(
             "proton_egress_probe_failed", diagnostic=diagnostic
         ) from None
     finally:
-        with anyio.CancelScope(shield=True):
+        primary_error = sys.exception()
+        try:
             if response is not None:
-                await response.aclose()
-            await client.aclose()
+                async with shielded_cleanup("proton_probe_response", primary_error=primary_error):
+                    await response.aclose()
+        finally:
+            await close_httpx_client(client, primary_error=primary_error or sys.exception())
 
 
 class ProtonWireproxyManager:
@@ -583,5 +611,76 @@ class ManagedProtonHttpAcquirer:
         acquisition.record["routing"] = {
             "configured": list(plan.routing),
             "observed": observation,
+        }
+        return acquisition
+
+
+@final
+class ManagedProtonWreqAcquirer:
+    """Acquire one browser-profiled document through the configured Proton route."""
+
+    def __init__(
+        self,
+        *,
+        manager: ProtonSessionManager,
+        settings: ProtonWireproxySettings,
+        transport_settings: WreqTransportSettings | None = None,
+        client_factory: WreqClientFactory | None = None,
+    ):
+        self.manager = manager
+        self.settings = settings
+        self.transport_settings = transport_settings or WreqTransportSettings()
+        self.client_factory = client_factory
+
+    async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        if plan.routing != self.settings.route.network_path:
+            raise RouteConfigurationFailure("request_route_does_not_match_proton_route")
+        session: ProtonSession | None = None
+        try:
+            async with self.manager.open(self.settings) as session:
+                if self.client_factory is None:
+                    acquirer = LocalSocks5WreqAcquirer(
+                        endpoint=session.endpoint,
+                        expected_routing=self.settings.route.network_path,
+                        routing_observation=session.active_observation(),
+                        settings=self.transport_settings,
+                    )
+                else:
+                    acquirer = LocalSocks5WreqAcquirer(
+                        endpoint=session.endpoint,
+                        expected_routing=self.settings.route.network_path,
+                        routing_observation=session.active_observation(),
+                        settings=self.transport_settings,
+                        client_factory=self.client_factory,
+                    )
+                acquisition = await acquirer.acquire(plan, new_identifier)
+        except AcquisitionFailure as error:
+            if session is not None:
+                error.result["routing"] = {
+                    "configured": list(plan.routing),
+                    "observed": session.completed_observation(),
+                }
+            raise
+        except ManagedProtonTransportFailure as error:
+            raise AcquisitionFailure(
+                "Managed Proton transport failed",
+                result={
+                    "hops": [],
+                    "stopping_condition": "transport_failure",
+                    "route_failure": {
+                        "code": error.code,
+                        "exit_code": error.exit_code,
+                        "diagnostic": error.diagnostic,
+                    },
+                    "transport": self.transport_settings.safe_configuration(plan),
+                    "routing": {
+                        "configured": list(plan.routing),
+                        "observed": None,
+                    },
+                },
+            ) from None
+        acquisition.record["routing"] = {
+            "configured": list(plan.routing),
+            "observed": session.completed_observation(),
         }
         return acquisition

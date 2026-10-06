@@ -16,9 +16,15 @@ from carl.core.composed_projection import (
     ComposedListingProjection,
     ListingStatus,
     ProjectionRevision,
+    ScalarFieldChange,
+    ScalarFieldValues,
+    scalar_fields_sha256,
 )
+from carl.core.ebay import EbayListingState
 from carl.core.facebook_search import SearchTraversalPolicy, SearchTraversalStrategy
 from carl.core.facebook_work import CreateSearchRequest
+from carl.core.listing_identity import LISTING_IDENTIFIER_PATTERN, is_listing_identifier
+from carl.core.marketplace_search import Marketplace, SearchTargetSpecification
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
 from carl.core.work import WorkState
 
@@ -304,6 +310,8 @@ class SetWorkspaceDefaultProductGuideRequest(StrictModel):
 class WorkspaceSearchTrack(StrictModel):
     track_identifier: str = Field(min_length=1)
     query: str = Field(min_length=1)
+    marketplace: Marketplace | None = None
+    listing_state: EbayListingState | None = None
     creation_work_identifier: str | None = Field(default=None, min_length=1)
     creation_work_state: WorkState | None = None
     origin_search_run_record_identifier: str | None = Field(default=None, min_length=1)
@@ -329,7 +337,7 @@ class WorkspaceSearchTrackStateRecord(StrictModel):
 
 class CreateWorkspaceSearchRequest(StrictModel):
     workspace_record_identifier: str = Field(min_length=1)
-    search: CreateSearchRequest
+    search: CreateSearchRequest | SearchTargetSpecification
 
 
 class CreateWorkspaceSearchResult(StrictModel):
@@ -343,6 +351,7 @@ class CreateWorkspaceSearchResult(StrictModel):
 class RetryWorkspaceSearchTrackRequest(StrictModel):
     workspace_record_identifier: str = Field(min_length=1)
     track_identifier: str = Field(min_length=1)
+    acquisition_stack: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 class RetryWorkspaceSearchTrackResult(StrictModel):
@@ -362,6 +371,8 @@ class RequestWorkspaceRefreshRequest(StrictModel):
     maximum_images: int | None = Field(default=None, ge=1)
     proton_route: str = Field(default="carl", min_length=1)
     decodo_route: str = Field(default="carl", min_length=1)
+    acquisition_stack: str | None = Field(default=None, min_length=1)
+    maximum_pages: int | None = Field(default=None, ge=1, le=20)
 
 
 class RequestWorkspaceRefreshResult(StrictModel):
@@ -400,12 +411,15 @@ class ListWorkspaceListingsRequest(StrictModel):
 class WorkspaceListingSummary(StrictModel):
     """Compact workspace index entry; use get_workspace_listing for evidence."""
 
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     canonical_source_url: str = Field(min_length=1)
     status: ListingStatus
     title: JsonValue
     price: JsonValue
     location: JsonValue
+    condition: JsonValue = None
+    shipping: JsonValue = None
+    last_sale: JsonValue = None
     preview_image_url: str | None
     description_available: bool
     seller_available: bool
@@ -429,7 +443,7 @@ class WorkspaceListingPage(StrictModel):
 
 class GetWorkspaceListingRequest(StrictModel):
     workspace_record_identifier: str = Field(min_length=1)
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     maximum_search_runs: int = Field(default=100, ge=1, le=100)
     maximum_gallery_images: int = Field(default=20, ge=0, le=100)
     maximum_analyses: int = Field(default=10, ge=0, le=20)
@@ -440,12 +454,13 @@ class ListingReviewRecord(StrictModel):
     record_identifier: str = Field(min_length=1)
     workspace_record_identifier: str = Field(min_length=1)
     batch_record_identifier: str | None = Field(default=None, min_length=1)
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     projection_revision: ProjectionRevision
     inspected: bool
     disposition: ReviewDisposition | None
     note: str | None = Field(default=None, max_length=4_000)
     recorded_at_utc: str
+    scalar_fields_snapshot: ScalarFieldValues | None = None
 
     @field_validator("note")
     @classmethod
@@ -456,7 +471,7 @@ class ListingReviewRecord(StrictModel):
 
 
 class ListingReviewInput(StrictModel):
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     projection_revision: ProjectionRevision
     inspected: bool = True
     disposition: ReviewDisposition | None = None
@@ -554,9 +569,9 @@ class RecordWorkspaceBulkReviewRequest(StrictModel):
     )
     disposition: ReviewDisposition
     note: str | None = Field(default=None, max_length=4_000)
-    exclude_listing_identifiers: Sequence[Annotated[str, Field(pattern=r"^[0-9]+$")]] = Field(
-        default=(), max_length=10_000, json_schema_extra={"uniqueItems": True}
-    )
+    exclude_listing_identifiers: Sequence[
+        Annotated[str, Field(pattern=LISTING_IDENTIFIER_PATTERN)]
+    ] = Field(default=(), max_length=10_000, json_schema_extra={"uniqueItems": True})
     maximum_candidate_listings_examined: int = Field(default=10_000, ge=1, le=10_000)
 
     @field_validator("request_identifier")
@@ -583,8 +598,10 @@ class RecordWorkspaceBulkReviewRequest(StrictModel):
     @field_validator("exclude_listing_identifiers")
     @classmethod
     def validate_excluded_listing_identifiers(cls, value: Sequence[str]) -> Sequence[str]:
-        if any(not identifier.isascii() or not identifier.isdecimal() for identifier in value):
-            raise ValueError("Excluded listing identifiers must be decimal strings")
+        if any(not is_listing_identifier(identifier) for identifier in value):
+            raise ValueError(
+                "Excluded listing identifiers must be Facebook decimal IDs or ebay:<item ID>"
+            )
         if len(set(value)) != len(value):
             raise ValueError("Excluded listing identifiers must be unique")
         return value
@@ -609,6 +626,18 @@ class ReviewBatchItem(StrictModel):
     review_state: ReviewState
     prior_review: ListingReviewRecord | None
     changed_components: tuple[ProjectionRevisionComponent, ...]
+    scalar_field_changes: tuple[ScalarFieldChange, ...] = ()
+    scalar_comparison_available: bool = False
+
+
+class WorkspaceListingReview(ComposedListingProjection):
+    """A listing projection with its workspace-specific review comparison."""
+
+    review_state: ReviewState = ReviewState.UNREVIEWED
+    prior_review: ListingReviewRecord | None = None
+    changed_components: tuple[ProjectionRevisionComponent, ...] = ()
+    scalar_field_changes: tuple[ScalarFieldChange, ...] = ()
+    scalar_comparison_available: bool = False
 
 
 class CreateReviewBatchRequest(StrictModel):
@@ -666,11 +695,10 @@ class ReviewClaimLease(StrictModel):
     def validate_lease(self) -> ReviewClaimLease:
         if self.lease_expires_at_utc_ns <= self.acquired_at_utc_ns:
             raise ValueError("A review claim must expire after it is acquired")
-        if any(
-            not identifier.isascii() or not identifier.isdecimal()
-            for identifier in self.listing_identifiers
-        ):
-            raise ValueError("Claimed listing identifiers must be decimal strings")
+        if any(not is_listing_identifier(identifier) for identifier in self.listing_identifiers):
+            raise ValueError(
+                "Claimed listing identifiers must be Facebook decimal IDs or ebay:<item ID>"
+            )
         if len(set(self.listing_identifiers)) != len(self.listing_identifiers):
             raise ValueError("Claimed listing identifiers must be unique")
         return self
@@ -729,8 +757,10 @@ class CreateReviewWorksetRequest(StrictModel):
     @field_validator("listing_identifiers")
     @classmethod
     def validate_listing_identifiers(cls, value: Sequence[str]) -> Sequence[str]:
-        if any(not identifier.isascii() or not identifier.isdecimal() for identifier in value):
-            raise ValueError("Workset listing identifiers must be decimal strings")
+        if any(not is_listing_identifier(identifier) for identifier in value):
+            raise ValueError(
+                "Workset listing identifiers must be Facebook decimal IDs or ebay:<item ID>"
+            )
         if len(set(value)) != len(value):
             raise ValueError("Workset listing identifiers must be unique")
         return value
@@ -751,8 +781,10 @@ class UpdateReviewWorksetRequest(StrictModel):
         if not additions and not removals:
             raise ValueError("A workset update must add or remove at least one listing")
         for values in (additions, removals):
-            if any(not value.isascii() or not value.isdecimal() for value in values):
-                raise ValueError("Workset listing identifiers must be decimal strings")
+            if any(not is_listing_identifier(value) for value in values):
+                raise ValueError(
+                    "Workset listing identifiers must be Facebook decimal IDs or ebay:<item ID>"
+                )
             if len(set(values)) != len(values):
                 raise ValueError("Workset changes must not contain duplicates")
         if set(additions) & set(removals):
@@ -784,8 +816,10 @@ class ListingIdsSelection(StrictModel):
     @field_validator("listing_identifiers")
     @classmethod
     def validate_listing_identifiers(cls, value: Sequence[str]) -> Sequence[str]:
-        if any(not identifier.isascii() or not identifier.isdecimal() for identifier in value):
-            raise ValueError("Selection listing identifiers must be decimal strings")
+        if any(not is_listing_identifier(identifier) for identifier in value):
+            raise ValueError(
+                "Selection listing identifiers must be Facebook decimal IDs or ebay:<item ID>"
+            )
         if len(set(value)) != len(value):
             raise ValueError("Selection listing identifiers must be unique")
         return value
@@ -813,7 +847,7 @@ class CreateSelectionSnapshotRequest(StrictModel):
 
 
 class SelectionSnapshotItem(StrictModel):
-    listing_identifier: str = Field(pattern=r"^[0-9]+$")
+    listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
     projection_revision: ProjectionRevision
 
 
@@ -869,6 +903,7 @@ class WorkspaceWorkStatus(StrictModel):
     queued_count: int = Field(ge=0)
     in_progress_count: int = Field(ge=0)
     terminal_failure_count: int = Field(ge=0)
+    completed_with_failures_count: int = Field(default=0, ge=0)
     active_work: tuple[WorkActivity, ...] = Field(max_length=100)
     active_work_truncated: bool
     failed_work: tuple[WorkActivity, ...] = Field(max_length=100)
@@ -923,13 +958,35 @@ def classify_review_state(
     current_revision: ProjectionRevision,
     previous_review: ListingReviewRecord | None,
     policy: ReviewStalenessPolicy,
+    previous_scalar_fields: ScalarFieldValues | None = None,
 ) -> tuple[ReviewState, tuple[ProjectionRevisionComponent, ...]]:
     if previous_review is None:
         return ReviewState.UNREVIEWED, ()
     if not previous_review.inspected:
         return ReviewState.UNREVIEWED, ()
-    if previous_review.projection_revision.recipe_version != current_revision.recipe_version:
+    previous_revision = previous_review.projection_revision
+    if previous_revision.recipe_version == 1 and current_revision.recipe_version == 2:
+        # Recipe 2 changes only scalar normalization. Preserve all other historical hashes.
+        baseline = previous_scalar_fields or previous_review.scalar_fields_snapshot
+        previous_revision = previous_revision.model_copy(
+            update={
+                "recipe_version": 2,
+                "scalar_fields_sha256": (
+                    previous_revision.scalar_fields_sha256
+                    if baseline is None
+                    else scalar_fields_sha256(baseline)
+                ),
+            }
+        )
+    if previous_revision.recipe_version != current_revision.recipe_version:
         return ReviewState.STALE, tuple(policy.components)
-    changed = changed_projection_components(previous_review.projection_revision, current_revision)
+    # A verified snapshot can normalize legacy representation changes within
+    # the same recipe too (notably eBay display strings becoming structured money).
+    baseline = previous_scalar_fields or previous_review.scalar_fields_snapshot
+    if baseline is not None and current_revision.recipe_version == 2:
+        previous_revision = previous_revision.model_copy(
+            update={"scalar_fields_sha256": scalar_fields_sha256(baseline)}
+        )
+    changed = changed_projection_components(previous_revision, current_revision)
     relevant = tuple(component for component in changed if component in policy.components)
     return (ReviewState.STALE if relevant else ReviewState.CURRENT), relevant

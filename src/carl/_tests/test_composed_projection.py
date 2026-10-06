@@ -1,5 +1,7 @@
 """Pure composed-projection selection and contract tests."""
 
+import hashlib
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -25,6 +27,8 @@ from carl.core.composed_projection import (
     ProjectionEvidence,
     ProjectionGalleryImageDescriptor,
     ProjectionSourceKind,
+    ScalarFieldName,
+    ScalarFieldValues,
     SearchAncestrySelection,
     SearchCardCandidate,
     SearchComparisonCoverage,
@@ -40,7 +44,11 @@ from carl.core.composed_projection import (
     decode_composed_listing_cursor,
     encode_composed_listing_cursor,
     normalize_listing_status,
+    normalize_scalar_fields,
     projection_revision,
+    projection_scalar_fields,
+    scalar_field_changes,
+    scalar_fields_sha256,
     select_analyses,
     select_composed_field,
     select_field,
@@ -266,6 +274,7 @@ def test_newer_search_card_price_supersedes_older_item_price() -> None:
     assert price is not None and price.value == {
         "amount_decimal": "125.00",
         "formatted_amount": "$125",
+        "currency": "USD",
     }
     assert price.evidence.source_kind is ProjectionSourceKind.SEARCH_CARD
     assert location is not None and location.value == "Example City, Pennsylvania"
@@ -659,6 +668,208 @@ def test_projection_revision_ignores_evidence_record_churn_but_detects_value_cha
         )
 
 
+def _scalar_projection(price: JsonValue) -> ComposedListingProjection:
+    status = ComposedStatus(value=ListingStatus.UNKNOWN, raw_flags=None, evidence=None)
+    field = ComposedField(value=price, evidence=_evidence("price", 1))
+    return ComposedListingProjection(
+        listing_identifier="123",
+        canonical_source_url=canonical_facebook_listing_url("123"),
+        as_of_completion_sequence=1,
+        projection_revision=projection_revision(
+            listing_identifier="123",
+            status=status,
+            title=None,
+            price=field,
+            location=None,
+            description=None,
+            seller=None,
+            preview_image=None,
+            gallery=None,
+            analyses=(),
+            analyses_truncated=False,
+            search_membership=None,
+        ),
+        status=status,
+        title=None,
+        price=field,
+        location=None,
+        description=None,
+        seller=None,
+        preview_image=None,
+        gallery=None,
+        analyses=(),
+        analyses_truncated=False,
+        search_membership=None,
+    )
+
+
+@pytest.mark.parametrize("amount", ["20.00", "20", "2E1", 20, 20.0])
+def test_scalar_prices_ignore_decimal_spelling_and_redundant_display(amount: JsonValue) -> None:
+    first = _scalar_projection({"amount_decimal": "20.00", "currency": "USD"})
+    refreshed = _scalar_projection(
+        {"amount_decimal": amount, "currency": "usd", "formatted_amount": "$20"}
+    )
+    assert refreshed.projection_revision == first.projection_revision
+    assert refreshed.projection_revision.recipe_version == 2
+    assert projection_scalar_fields(refreshed).price == {"amount_decimal": "20", "currency": "USD"}
+    assert (
+        scalar_field_changes(projection_scalar_fields(first), projection_scalar_fields(refreshed))
+        == ()
+    )
+
+
+def test_source_price_refresh_inherits_known_currency_and_retains_legacy_selection() -> None:
+    item = _observation(
+        "item", 1, {"price": _field({"amount_decimal": "20.00", "currency": "USD"})}
+    )
+    card = _search_card("card", 2, {"listing_price": {"amount": "20", "formatted_amount": "$20"}})
+    current = select_composed_field("price", (item,), (card,), as_of_completion_sequence=2)
+    legacy = select_composed_field(
+        "price", (item,), (card,), as_of_completion_sequence=2, inherit_price_currency=False
+    )
+    assert current is not None and legacy is not None
+    assert current.evidence == card.evidence
+    assert current.value == {"amount_decimal": "20", "formatted_amount": "$20", "currency": "USD"}
+    assert legacy.value == {"amount_decimal": "20", "formatted_amount": "$20"}
+    assert (
+        _scalar_projection(current.value).projection_revision
+        == _scalar_projection({"amount_decimal": "20.00", "currency": "USD"}).projection_revision
+    )
+
+
+def test_currency_inheritance_uses_latest_eligible_reliable_currency_without_assumption() -> None:
+    item = _observation("item", 1, {"price": _field({"amount_decimal": "20", "currency": "USD"})})
+    euro = _search_card("euro", 2, {"listing_price": {"amount": "20", "currency": "EUR"}})
+    missing = _search_card("missing", 3, {"listing_price": {"amount": "25"}})
+    future = _search_card("future", 4, {"listing_price": {"amount": "25", "currency": "GBP"}})
+    price = select_composed_field(
+        "price", (item,), (euro, missing, future), as_of_completion_sequence=3
+    )
+    assert price is not None and price.value == {"amount_decimal": "25", "currency": "EUR"}
+    without_currency = select_composed_field("price", (), (missing,), as_of_completion_sequence=3)
+    assert without_currency is not None and without_currency.value == {"amount_decimal": "25"}
+    explicit = select_composed_field("price", (item,), (euro,), as_of_completion_sequence=2)
+    assert explicit is not None and explicit.value == {"amount_decimal": "20", "currency": "EUR"}
+
+
+def test_currency_inheritance_retains_older_item_currency_when_latest_item_omits_it() -> None:
+    older = _observation("old", 1, {"price": _field({"amount_decimal": "20", "currency": "USD"})})
+    newer = _observation("new", 2, {"price": _field({"amount_decimal": "25"})})
+    selected = select_composed_field("price", (older, newer), (), as_of_completion_sequence=2)
+    assert selected is not None and selected.value == {"amount_decimal": "25", "currency": "USD"}
+    assert selected.evidence == newer.evidence
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"amount_decimal": "21", "currency": "USD"}, {"amount_decimal": "20", "currency": "EUR"}],
+)
+def test_real_price_changes_have_semantic_hash_and_old_new_diff(changed: JsonValue) -> None:
+    previous = ScalarFieldValues(price={"amount_decimal": "20.00", "currency": "USD"})
+    current = ScalarFieldValues(price=changed)
+    assert scalar_fields_sha256(previous) != scalar_fields_sha256(current)
+    changes = scalar_field_changes(previous, current)
+    assert len(changes) == 1
+    assert changes[0].field is ScalarFieldName.PRICE
+    assert changes[0].previous_value == {"amount_decimal": "20", "currency": "USD"}
+    assert changes[0].current_value == changed
+
+
+def test_price_normalization_is_exact_and_zero_is_not_missing() -> None:
+    precise = "123456789012345678901234567890.123456789012345678901234567890"
+    normalized = normalize_scalar_fields(ScalarFieldValues(price={"amount_decimal": precise}))
+    assert normalized.price == {"amount_decimal": precise[:-1]}
+    for amount in ("0.00", "-0", 0):
+        assert normalize_scalar_fields(
+            ScalarFieldValues(price={"amount_decimal": amount})
+        ).price == {"amount_decimal": "0"}
+    assert scalar_field_changes(
+        ScalarFieldValues(), ScalarFieldValues(price={"amount_decimal": "0"})
+    )[0].current_value == {"amount_decimal": "0"}
+
+
+@pytest.mark.parametrize(
+    "price",
+    [
+        {"formatted_amount": "Ask seller"},
+        {"amount_decimal": "NaN", "formatted_amount": "$20"},
+        {"amount_decimal": True},
+        "20 dollars",
+        None,
+    ],
+)
+def test_unusable_numeric_price_is_preserved_conservatively(price: JsonValue) -> None:
+    values = ScalarFieldValues(price=price)
+    assert normalize_scalar_fields(values) == values
+
+
+def test_scalar_normalization_preserves_other_fields_and_legacy_raw_hash() -> None:
+    previous = ScalarFieldValues(
+        title="Textbook",
+        price={"amount_decimal": "20.00", "currency": "USD", "formatted_amount": "$20"},
+        location="Town",
+        description="First\nSecond",
+        seller={"id": "seller", "name": "Seller"},
+    )
+    raw = previous.model_dump(mode="json", exclude={"last_sale", "condition", "shipping"})
+    expected = hashlib.sha256(
+        json.dumps(raw, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    assert scalar_fields_sha256(previous, normalize=False) == expected
+    assert scalar_fields_sha256(previous) != expected
+    current = previous.model_copy(
+        update={"title": "Textbook updated", "seller": {"id": "new", "name": "Seller"}}
+    )
+    changes = scalar_field_changes(previous, current)
+    assert [change.field for change in changes] == [ScalarFieldName.TITLE, ScalarFieldName.SELLER]
+    assert changes[0].previous_value == "Textbook"
+    assert changes[0].current_value == "Textbook updated"
+    assert normalize_scalar_fields(previous).description == "First\nSecond"
+    assert scalar_fields_sha256(
+        previous.model_copy(update={"last_sale": {"sold_date": "2026-09-30"}})
+    ) != scalar_fields_sha256(previous)
+
+
+def test_condition_and_shipping_are_review_scalar_changes() -> None:
+    previous = ScalarFieldValues(condition="Pre-Owned", shipping="Free shipping")
+    current = previous.model_copy(update={"condition": "New", "shipping": "+$8 shipping"})
+    changes = scalar_field_changes(previous, current)
+    assert [change.field for change in changes] == [
+        ScalarFieldName.CONDITION,
+        ScalarFieldName.SHIPPING,
+    ]
+    assert changes[0].previous_value == "Pre-Owned"
+    assert changes[0].current_value == "New"
+    assert scalar_fields_sha256(previous) != scalar_fields_sha256(current)
+
+
+def test_sale_price_display_does_not_change_structured_sale_revision() -> None:
+    first = ScalarFieldValues(
+        last_sale={
+            "sold_price": "$180.00",
+            "sold_price_value": {
+                "amount_decimal": "180.00",
+                "currency": "USD",
+                "formatted_amount": "$180.00",
+            },
+            "sold_date": "2026-09-29",
+        }
+    )
+    refreshed = ScalarFieldValues(
+        last_sale={
+            "sold_price": "US $180",
+            "sold_price_value": {
+                "amount_decimal": "180",
+                "currency": "USD",
+                "formatted_amount": "US $180",
+            },
+            "sold_date": "2026-09-29",
+        }
+    )
+    assert scalar_fields_sha256(first) == scalar_fields_sha256(refreshed)
+    assert scalar_field_changes(first, refreshed) == ()
+
+
 def test_projection_revision_ignores_url_churn_for_a_stable_photo_identifier() -> None:
     status = ComposedStatus(
         value=ListingStatus.AVAILABLE,
@@ -733,6 +944,10 @@ async def test_composed_search_queries_the_union_of_independent_lineages(
     observed_runs: list[Sequence[tuple[str, str]]] = []
 
     class ScopeDatabase:
+        async def get_record(self, identifier: str) -> tuple[tuple[str, ...], int, JsonValue]:
+            assert identifier in {"first-current", "second-current"}
+            return ("carl", "facebook", "search_run"), 1, {}
+
         async def current_completion_boundary(self) -> int:
             return 10
 

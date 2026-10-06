@@ -75,6 +75,7 @@ class BrightDataProduct(JsonStringEnumeration):
 
 
 class DecodoProduct(JsonStringEnumeration):
+    DATACENTER_PROXY = "datacenter_proxy"
     RESIDENTIAL_PROXY = "residential_proxy"
     MOBILE_PROXY = "mobile_proxy"
 
@@ -149,9 +150,11 @@ class DecodoSessionObservation(StrictModel):
     route: DecodoRouteIdentity
     configuration: ConfigurationDocumentIdentity
     session_record_identifier: str = Field(min_length=1)
-    proxy_username_shape: Literal["base_username_with_country_sticky_session_and_duration"]
-    sticky_peer_requested: Literal[True] = True
-    configured_session_duration_minutes: int = Field(ge=1, le=1440)
+    proxy_username_shape: Literal[
+        "base_username_with_country_sticky_session_and_duration", "base_username_with_country"
+    ]
+    sticky_peer_requested: bool = True
+    configured_session_duration_minutes: int | None = Field(ge=1, le=1440)
     tls_verification: Literal["system_roots"]
     started_at_utc: str
     ended_at_utc: str

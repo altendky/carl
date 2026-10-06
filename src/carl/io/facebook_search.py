@@ -1,15 +1,28 @@
 """Coherent HTTP sessions for Facebook Marketplace search collection."""
 
-from collections.abc import AsyncIterator
+import sys
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, final
 
-import anyio
 import httpx
 
 from carl.core.models import JsonValue
-from carl.io.httpx import AcquisitionFailure, ClientHttpxAcquirer, HttpFormAcquirer
+from carl.core.routing import DecodoProduct
+from carl.io.decodo import (
+    DecodoCredentialSource,
+    DecodoProxySettings,
+    DecodoSessionManager,
+    ManagedDecodoSession,
+)
+from carl.io.httpx import (
+    AcquisitionFailure,
+    ClientHttpxAcquirer,
+    HttpFormAcquirer,
+    RouteConfigurationFailure,
+    close_httpx_client,
+)
 from carl.io.proton import (
     ManagedProtonTransportFailure,
     ProtonSession,
@@ -31,7 +44,7 @@ class FacebookSearchHttpSession(Protocol):
 class ManagedFacebookSearchHttpSession:
     identifier: str
     acquirer: HttpFormAcquirer
-    provider_session: ProtonSession
+    provider_session: ProtonSession | ManagedDecodoSession
 
     def active_observation(self) -> dict[str, JsonValue]:
         return {
@@ -42,7 +55,11 @@ class ManagedFacebookSearchHttpSession:
     def completed_observation(self) -> dict[str, JsonValue]:
         return {
             "network_session_identifier": self.identifier,
-            "provider_session": self.provider_session.completed_observation(),
+            "provider_session": (
+                self.provider_session.completed_observation().as_json()
+                if isinstance(self.provider_session, ManagedDecodoSession)
+                else self.provider_session.completed_observation()
+            ),
         }
 
 
@@ -109,9 +126,7 @@ class ProtonFacebookSearchSessionFactory:
                     )
                 finally:
                     try:
-                        with anyio.CancelScope(shield=True):
-                            client.cookies.clear()
-                            await client.aclose()
+                        await close_httpx_client(client, primary_error=sys.exception())
                     except Exception as error:
                         raise AcquisitionFailure(
                             "HTTP transport failed while closing a search client",
@@ -139,3 +154,52 @@ class ProtonFacebookSearchSessionFactory:
                 exit_code=error.exit_code,
                 diagnostic=error.diagnostic,
             ) from None
+
+
+@final
+class DecodoFacebookSearchSessionFactory:
+    """Keep bootstrap and GraphQL pagination on one managed proxy client."""
+
+    def __init__(
+        self,
+        *,
+        manager: DecodoSessionManager,
+        settings: DecodoProxySettings,
+        credential_source: DecodoCredentialSource,
+    ):
+        self.manager = manager
+        self.settings = settings
+        self.credential_source = credential_source
+
+    @asynccontextmanager
+    async def __call__(self, identifier: str) -> AsyncGenerator[FacebookSearchHttpSession]:
+        if (
+            self.settings.route.product is DecodoProduct.DATACENTER_PROXY
+            and self.settings.route.endpoint.port == 10000
+        ):
+            raise RouteConfigurationFailure(
+                "facebook_search_requires_static_decodo_datacenter_port"
+            )
+        provider_session: ManagedDecodoSession | None = None
+        try:
+            async with self.manager.open(
+                settings=self.settings,
+                credential_source=self.credential_source,
+                new_identifier=lambda: identifier,
+                target_authentication="anonymous_guest_session",
+            ) as provider_session:
+                yield ManagedFacebookSearchHttpSession(
+                    identifier=identifier,
+                    acquirer=provider_session,
+                    provider_session=provider_session,
+                )
+        except AcquisitionFailure as error:
+            if provider_session is not None:
+                error.result["routing"] = {
+                    "configured": list(self.settings.route.network_path),
+                    "observed": {
+                        "network_session_identifier": identifier,
+                        "provider_session": provider_session.completed_observation().as_json(),
+                    },
+                }
+            raise

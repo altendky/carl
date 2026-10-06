@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from time import time_ns
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ from carl.core.activity import (
     ActiveNetworkActivity,
     ActivitySnapshot,
     NetworkActivityCounts,
+    NetworkConnectivityActivity,
     NetworkPathActivity,
     WorkActivity,
     WorkKindActivity,
@@ -39,6 +41,13 @@ from carl.core.composed_projection import (
     StatusObservationCandidate,
     status_candidate_from_search_occurrence,
 )
+from carl.core.connectivity import network_work_kind
+from carl.core.ebay import (
+    COLLECT_EBAY_SEARCH_WORK_KIND,
+    CollectEbaySearchPayload,
+    collect_ebay_search_work,
+)
+from carl.core.ebay_analysis import EbayAnalyzeItemPayload
 from carl.core.facebook import FacebookItemResponseKind
 from carl.core.facebook_images import (
     COLLECT_IMAGE_WORK_KIND,
@@ -49,7 +58,12 @@ from carl.core.facebook_images import (
 )
 from carl.core.facebook_refresh import SearchRunOrigin
 from carl.core.facebook_search import SearchStoppingReason
-from carl.core.facebook_work import COLLECT_SEARCH_WORK_KIND, SuccessfulItemPageResult
+from carl.core.facebook_work import (
+    COLLECT_SEARCH_WORK_KIND,
+    FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY,
+    SuccessfulItemPageResult,
+    facebook_effective_search_work_constraint,
+)
 from carl.core.item_analysis import (
     ANALYZE_ITEM_WORK_SCHEMA_VERSION,
     LEGACY_ANALYZE_ITEM_WORK_SCHEMA_VERSION,
@@ -61,6 +75,11 @@ from carl.core.item_analysis import (
     UnavailableAnalysisImageSelection,
 )
 from carl.core.json import decode_json, encode_json
+from carl.core.listing_identity import is_listing_identifier
+from carl.core.marketplace_search import (
+    MARKETPLACE_SEARCH_TARGET_KIND,
+    MarketplaceSearchTargetRecord,
+)
 from carl.core.models import (
     ArtifactDraft,
     BytesDraft,
@@ -148,9 +167,15 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=8,
+    version=11,
 )
 
+_V10_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 10})
+_V10_SCHEMA_DEFINITION_SHA256 = "b2a07eec693b04bc149448ee2ed9c11083f790d235e2a9a9c7e75818a6c9ceda"
+_V9_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 9})
+_V9_SCHEMA_DEFINITION_SHA256 = "cb2a83d9b6cb83b52aa3c4741bbfdf77168d26be7fd8508cb3626d256e4709db"
+_V8_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 8})
+_V8_SCHEMA_DEFINITION_SHA256 = "be508e7e461bfd1ad9df975ec37e03a9822b5fc41f6d9db517e7ed46e4b0faaf"
 _V7_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 7})
 _V7_SCHEMA_DEFINITION_SHA256 = "98ee0b3ee6f75ad08cc657e740762e0f752165cba67f12dd832c548df33e8dbc"
 _V6_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 6})
@@ -167,10 +192,29 @@ _V1_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 1})
 _V1_SCHEMA_DEFINITION_SHA256 = "b3fa83413034992e01f84abf8ffe4993864cfad23b4792442b38b60a47b8dca6"
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS network_connectivity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    next_probe_utc_ns INTEGER NOT NULL CHECK (next_probe_utc_ns >= 0),
+    probe_token TEXT,
+    probe_expires_utc_ns INTEGER,
+    checked_at_utc_ns INTEGER,
+    result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json))
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS schema_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS code_states (
+    id INTEGER PRIMARY KEY,
+    commit_hash BLOB CHECK (commit_hash IS NULL OR length(commit_hash) IN (20, 32)),
+    worktree_state TEXT NOT NULL CHECK (worktree_state IN ('clean', 'dirty', 'unknown'))
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS code_states_identity
+ON code_states(coalesce(commit_hash, X''), worktree_state);
 
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
@@ -184,8 +228,11 @@ CREATE TABLE IF NOT EXISTS operations (
     ended_at_utc TEXT,
     duration_ns INTEGER CHECK (duration_ns IS NULL OR duration_ns >= 0),
     result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
-    error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json))
+    error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json)),
+    code_state_id INTEGER REFERENCES code_states(id)
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS operations_code_state ON operations(code_state_id);
 
 CREATE TABLE IF NOT EXISTS objects (
     id TEXT PRIMARY KEY,
@@ -525,7 +572,14 @@ CREATE TABLE IF NOT EXISTS review_listing_claims (
     workspace_record_id TEXT NOT NULL,
     listing_identifier TEXT NOT NULL CHECK (
         length(listing_identifier) > 0
-        AND listing_identifier NOT GLOB '*[^0-9]*'
+        AND (
+            listing_identifier NOT GLOB '*[^0-9]*'
+            OR (
+                listing_identifier GLOB 'ebay:[0-9]*'
+                AND length(substr(listing_identifier, 6)) BETWEEN 9 AND 15
+                AND substr(listing_identifier, 6) NOT GLOB '*[^0-9]*'
+            )
+        )
     ),
     batch_record_id TEXT NOT NULL,
     claim_token TEXT NOT NULL CHECK (length(claim_token) > 0),
@@ -574,6 +628,13 @@ ON records(
 )
 WHERE json_extract(value_json, '$.workspace_record_identifier') IS NOT NULL
   AND json_extract(value_json, '$.listing_identifier') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_marketplace_item_observation
+ON records(json_extract(value_json, '$.item_identifier'),
+           json_extract(value_json, '$.observation_record_identifier'), object_id);
+
+CREATE INDEX IF NOT EXISTS records_marketplace_source_run
+ON records(json_extract(value_json, '$.search_run_record_identifier'), object_id);
 """
 
 _SCHEMA_DEFINITION_SHA256 = hashlib.sha256(_SCHEMA.encode()).hexdigest()
@@ -581,6 +642,14 @@ _SCHEMA_DEFINITION_SHA256 = hashlib.sha256(_SCHEMA.encode()).hexdigest()
 
 def _json(value: JsonValue) -> str:
     return encode_json(value)
+
+
+def _ebay_search_stack_identifier(payload: JsonValue) -> str | None:
+    """Read scheduling metadata without taking payload validation from the handler."""
+    if not isinstance(payload, dict) or not isinstance((request := payload.get("request")), dict):
+        return None
+    stack = request.get("stack_identifier", "ebay_anonymous")
+    return stack if isinstance(stack, str) else None
 
 
 def _text(value: apsw.SQLiteValue) -> str:
@@ -757,6 +826,30 @@ class Database:
         }
 
     @staticmethod
+    def _v8_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V8_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": str(_V8_DATABASE_SCHEMA.version),
+            "schema_definition_sha256": _V8_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
+    def _v9_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V9_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": str(_V9_DATABASE_SCHEMA.version),
+            "schema_definition_sha256": _V9_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
+    def _v10_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V10_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": str(_V10_DATABASE_SCHEMA.version),
+            "schema_definition_sha256": _V10_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v7_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V7_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -807,6 +900,9 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v10_metadata())
+                and not await cls._metadata_matches(connection, cls._v9_metadata())
+                and not await cls._metadata_matches(connection, cls._v8_metadata())
                 and not await cls._metadata_matches(connection, cls._v7_metadata())
                 and not await cls._metadata_matches(connection, cls._v6_metadata())
                 and not await cls._metadata_matches(connection, cls._v5_metadata())
@@ -1115,6 +1211,96 @@ class Database:
                       AND json_extract(value_json, '$.listing_identifier') IS NOT NULL
                     """
                 )
+                for key, value in self._v8_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v8_metadata()):
+                await connection.execute(
+                    "ALTER TABLE review_listing_claims RENAME TO review_listing_claims_v8"
+                )
+                await connection.execute(
+                    """
+                    CREATE TABLE review_listing_claims (
+                        workspace_record_id TEXT NOT NULL,
+                        listing_identifier TEXT NOT NULL CHECK (
+                            length(listing_identifier) > 0 AND (
+                                listing_identifier NOT GLOB '*[^0-9]*'
+                                OR (
+                                    listing_identifier GLOB 'ebay:[0-9]*'
+                                    AND length(substr(listing_identifier, 6)) BETWEEN 9 AND 15
+                                    AND substr(listing_identifier, 6) NOT GLOB '*[^0-9]*'
+                                )
+                            )
+                        ),
+                        batch_record_id TEXT NOT NULL,
+                        claim_token TEXT NOT NULL CHECK (length(claim_token) > 0),
+                        owner_identifier TEXT NOT NULL CHECK (length(owner_identifier) > 0),
+                        acquired_at_utc_ns INTEGER NOT NULL CHECK (acquired_at_utc_ns >= 0),
+                        lease_expires_at_utc_ns INTEGER NOT NULL CHECK (
+                            lease_expires_at_utc_ns > acquired_at_utc_ns
+                        ),
+                        PRIMARY KEY (workspace_record_id, listing_identifier),
+                        FOREIGN KEY (workspace_record_id) REFERENCES objects(id),
+                        FOREIGN KEY (batch_record_id) REFERENCES objects(id)
+                    ) STRICT
+                    """
+                )
+                await connection.execute(
+                    "INSERT INTO review_listing_claims SELECT * FROM review_listing_claims_v8"
+                )
+                await connection.execute("DROP TABLE review_listing_claims_v8")
+                await connection.execute(
+                    """
+                    CREATE INDEX review_listing_claims_token ON review_listing_claims(
+                        claim_token, owner_identifier, lease_expires_at_utc_ns
+                    )
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE INDEX review_listing_claims_batch ON review_listing_claims(
+                        batch_record_id, claim_token, lease_expires_at_utc_ns
+                    )
+                    """
+                )
+                for key, value in self._v9_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+                await connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS records_marketplace_item_observation
+                    ON records(json_extract(value_json, '$.item_identifier'),
+                               json_extract(value_json, '$.observation_record_identifier'), object_id)
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS records_marketplace_source_run
+                    ON records(json_extract(value_json, '$.search_run_record_identifier'), object_id)
+                    """
+                )
+            if await self._metadata_matches(connection, self._v9_metadata()):
+                await connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS network_connectivity (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+                        next_probe_utc_ns INTEGER NOT NULL CHECK (next_probe_utc_ns >= 0),
+                        probe_token TEXT,
+                        probe_expires_utc_ns INTEGER,
+                        checked_at_utc_ns INTEGER,
+                        result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json))
+                    ) STRICT
+                    """
+                )
+                for key, value in self._v10_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v10_metadata()):
+                await self._migrate_code_states(connection)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
@@ -1122,6 +1308,83 @@ class Database:
             if not await self._metadata_matches(connection, self._expected_metadata()):
                 raise RuntimeError("Unsupported database schema metadata")
             await self._validate_schema(connection)
+
+    async def _migrate_code_states(self, connection: AsyncConnection) -> None:
+        """Normalize retained operation provenance without changing output identities."""
+
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS code_states (
+                id INTEGER PRIMARY KEY,
+                commit_hash BLOB CHECK (commit_hash IS NULL OR length(commit_hash) IN (20, 32)),
+                worktree_state TEXT NOT NULL CHECK (worktree_state IN ('clean', 'dirty', 'unknown'))
+            ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS code_states_identity
+            ON code_states(coalesce(commit_hash, X''), worktree_state);
+            """
+        )
+        cursor = await connection.execute("PRAGMA table_info(operations)")
+        if not any(row[1] == "code_state_id" for row in await cursor.fetchall()):
+            await connection.execute(
+                "ALTER TABLE operations ADD COLUMN code_state_id INTEGER REFERENCES code_states(id)"
+            )
+        await connection.execute(
+            "CREATE INDEX IF NOT EXISTS operations_code_state ON operations(code_state_id)"
+        )
+        cursor = await connection.execute(
+            """
+            SELECT DISTINCT json_extract(code_provenance_json, '$.commit_hash'),
+                   coalesce(json_extract(code_provenance_json, '$.worktree_state'), 'unknown')
+            FROM operations WHERE code_state_id IS NULL
+            """
+        )
+        for commit_hash, worktree_state in await cursor.fetchall():
+            code_state_id = await self._intern_code_state(connection, commit_hash, worktree_state)
+            await connection.execute(
+                """
+                UPDATE operations SET code_state_id = ?,
+                    code_provenance_json = json_remove(
+                        code_provenance_json, '$.commit_hash', '$.worktree_state'
+                    )
+                WHERE code_state_id IS NULL
+                  AND json_extract(code_provenance_json, '$.commit_hash') IS ?
+                  AND coalesce(json_extract(code_provenance_json, '$.worktree_state'), 'unknown') = ?
+                """,
+                (code_state_id, commit_hash, worktree_state),
+            )
+
+    @staticmethod
+    async def _intern_code_state(
+        connection: AsyncConnection,
+        commit_hash: apsw.SQLiteValue,
+        worktree_state: apsw.SQLiteValue,
+    ) -> int:
+        if worktree_state not in {"clean", "dirty", "unknown"}:
+            raise ValueError("Invalid code provenance worktree state")
+        binary_hash: bytes | None = None
+        if commit_hash is not None:
+            if (
+                not isinstance(commit_hash, str)
+                or len(commit_hash) not in (40, 64)
+                or any(character not in "0123456789abcdefABCDEF" for character in commit_hash)
+            ):
+                raise ValueError("Code provenance commit hash must be a full Git hexadecimal hash")
+            binary_hash = bytes.fromhex(commit_hash)
+        await connection.execute(
+            "INSERT INTO code_states(commit_hash, worktree_state) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            (binary_hash, worktree_state),
+        )
+        cursor = await connection.execute(
+            """
+            SELECT id FROM code_states
+            WHERE coalesce(commit_hash, X'') = coalesce(?, X'') AND worktree_state = ?
+            """,
+            (binary_hash, worktree_state),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise AssertionError("Code state was not retained")
+        return _integer(row[0])
 
     async def initialize(self) -> None:
         async with self._connections.writer() as connection:
@@ -1355,6 +1618,13 @@ class Database:
         """Persist an activity and sample each applicable holdoff exactly once."""
 
         async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                "SELECT state FROM operations WHERE id = ?",
+                (definition.operation_identifier,),
+            )
+            operation = await cursor.fetchone()
+            if operation is None or operation[0] != "started":
+                raise RuntimeError("Only a started operation can own network activity")
             await connection.execute(
                 """
                 INSERT INTO network_activities(
@@ -1504,15 +1774,18 @@ class Database:
         async with self._connections.writer() as connection:
             cursor = await connection.execute(
                 """
-                SELECT state, eligible_at_utc_ns
-                FROM network_activities
-                WHERE id = ?
+                SELECT activity.state, activity.eligible_at_utc_ns, operation.state
+                FROM network_activities AS activity
+                JOIN operations AS operation ON operation.id = activity.operation_id
+                WHERE activity.id = ?
                 """,
                 (network_activity_identifier,),
             )
             row = await cursor.fetchone()
             if row is None:
                 raise KeyError(network_activity_identifier)
+            if row[2] != "started":
+                raise RuntimeError("Only a started operation can own network activity")
             if _text(row[0]) != NetworkActivityState.PENDING.value:
                 raise RuntimeError("Only a pending network activity can be admitted")
             eligible_at = _integer(row[1])
@@ -1665,6 +1938,94 @@ class Database:
                 data=result,
             )
 
+    async def _reconcile_terminal_network_activities(
+        self,
+        connection: AsyncConnection,
+        *,
+        recorded_at_utc_ns: int,
+        operation_id: str | None = None,
+        activity_identifiers: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Close unknown outcomes, not fabricate request successes or failures."""
+
+        if recorded_at_utc_ns < 0:
+            raise ValueError("Reconciliation time cannot be negative")
+        if activity_identifiers is not None and not activity_identifiers:
+            return ()
+        operation_predicate = "AND activity.operation_id = ?" if operation_id is not None else ""
+        identifier_predicate = (
+            "AND activity.id IN (SELECT value FROM json_each(?))"
+            if activity_identifiers is not None
+            else ""
+        )
+        bindings: list[apsw.SQLiteValue] = []
+        if operation_id is not None:
+            bindings.append(operation_id)
+        if activity_identifiers is not None:
+            bindings.append(_json(list(activity_identifiers)))
+        # The state index restricts this to unfinished activities, rather than
+        # scanning the complete network history on every operation completion.
+        cursor = await connection.execute(
+            f"""
+            SELECT activity.id, activity.state, operation.state
+            FROM network_activities AS activity
+            JOIN operations AS operation ON operation.id = activity.operation_id
+            WHERE activity.state IN ('pending', 'admitted')
+              AND operation.state IN ('completed', 'failed')
+              {operation_predicate} {identifier_predicate}
+            ORDER BY activity.created_at_utc_ns, activity.id
+            """,
+            bindings,
+        )
+        rows = await cursor.fetchall()
+        reconciled: list[str] = []
+        for row in rows:
+            identifier = _text(row[0])
+            previous_state = _text(row[1])
+            result: dict[str, JsonValue] = {
+                "kind": "owning_operation_finished",
+                "operation_state": _text(row[2]),
+                "previous_state": previous_state,
+                "possibly_dispatched": previous_state == "admitted",
+                "outcome": "unknown",
+            }
+            await connection.execute(
+                """
+                UPDATE network_activities
+                SET state = 'cancelled', admission_token = NULL,
+                    permit_expires_at_utc_ns = NULL, ended_at_utc_ns = ?, result_json = ?
+                WHERE id = ? AND state = ?
+                """,
+                (recorded_at_utc_ns, _json(result), identifier, previous_state),
+            )
+            if await connection.changes() != 1:
+                raise RuntimeError("Network activity changed during reconciliation")
+            await self._append_network_activity_event(
+                connection,
+                event_identifier=str(uuid4()),
+                network_activity_identifier=identifier,
+                event_kind=NetworkActivityEventKind.CANCELLED,
+                recorded_at_utc_ns=recorded_at_utc_ns,
+                data=result,
+            )
+            reconciled.append(identifier)
+        return tuple(reconciled)
+
+    async def reconcile_terminal_network_activities(
+        self,
+        *,
+        recorded_at_utc_ns: int,
+        activity_identifiers: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        """Repair legacy orphans; active owners and finished activities stay untouched."""
+
+        async with self._connections.writer() as connection:
+            return await self._reconcile_terminal_network_activities(
+                connection,
+                recorded_at_utc_ns=recorded_at_utc_ns,
+                activity_identifiers=activity_identifiers,
+            )
+
     async def network_activity(self, identifier: str) -> dict[str, JsonValue]:
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
@@ -1708,6 +2069,11 @@ class Database:
         kind_json = _json(list(definition.kind))
         deduplication_json = _json(list(definition.deduplication_identity))
         async with self._connections.writer() as connection:
+            eligible_at = max(definition.not_before_utc_ns, enqueued_at_utc_ns)
+            if definition.kind == COLLECT_EBAY_SEARCH_WORK_KIND:
+                stack = _ebay_search_stack_identifier(definition.payload)
+                cooldowns = await self._ebay_search_stack_cooldowns(connection, enqueued_at_utc_ns)
+                eligible_at = max(eligible_at, cooldowns.get(stack, 0) if stack is not None else 0)
             cursor = await connection.execute(
                 """
                 SELECT id, eligible_at_utc_ns
@@ -1736,7 +2102,7 @@ class Database:
                         _json(definition.payload),
                         deduplication_json,
                         definition.priority,
-                        max(definition.not_before_utc_ns, enqueued_at_utc_ns),
+                        eligible_at,
                         enqueued_at_utc_ns,
                     ),
                 )
@@ -1765,7 +2131,6 @@ class Database:
                     raise ValueError(
                         "Holdoff decisions must exactly match applicable holdoff constraints"
                     )
-                eligible_at = max(definition.not_before_utc_ns, enqueued_at_utc_ns)
                 for identity, constraint in holdoffs.items():
                     sampled_delay = decisions[identity].sampled_delay_ns
                     if not constraint.minimum_ns <= sampled_delay <= constraint.maximum_ns:
@@ -2097,6 +2462,14 @@ class Database:
         )
         async with self._connections.writer() as connection:
             now_utc_ns = utc_now_ns()
+            ebay_cooldowns = (
+                await self._ebay_search_stack_cooldowns(connection, now_utc_ns)
+                if any(
+                    capability.kind == COLLECT_EBAY_SEARCH_WORK_KIND
+                    for capability in supported_capabilities
+                )
+                else {}
+            )
             cursor = await connection.execute(
                 f"""
                 WITH eligible AS (
@@ -2128,7 +2501,10 @@ class Database:
                 ),
                 representatives AS (
                     SELECT *, row_number() OVER (
-                        PARTITION BY scope_profile
+                        PARTITION BY scope_profile,
+                            CASE WHEN kind_parts_json='["carl","ebay","collect","search"]'
+                                 THEN COALESCE(json_extract(payload_json,'$.request.stack_identifier'),
+                                               'ebay_anonymous') END
                         ORDER BY priority DESC, eligible_at_utc_ns, created_at_utc_ns, id
                     ) AS profile_rank
                     FROM eligible
@@ -2144,8 +2520,25 @@ class Database:
             )
             rows = await cursor.fetchall()
             next_checks: list[int] = []
+            connectivity_cursor = await connection.execute(
+                "SELECT paused, next_probe_utc_ns, probe_expires_utc_ns FROM network_connectivity WHERE singleton = 1"
+            )
+            connectivity = await connectivity_cursor.fetchone()
             for row in rows:
                 work_item_identifier = _text(row[0])
+                if (
+                    connectivity is not None
+                    and connectivity[0] == 1
+                    and network_work_kind(tuple(decode_json(_text(row[1]))))
+                ):
+                    next_checks.append(max(now_utc_ns + 1_000_000_000, _integer(connectivity[1])))
+                    continue
+                if _text(row[1]) == _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)):
+                    stack = _ebay_search_stack_identifier(decode_json(_text(row[3])))
+                    cooldown_until = ebay_cooldowns.get(stack, 0) if stack is not None else 0
+                    if cooldown_until > now_utc_ns:
+                        next_checks.append(cooldown_until)
+                        continue
                 available, next_eligible, constraints = await self._constraint_availability(
                     connection,
                     work_item_identifier=work_item_identifier,
@@ -2545,6 +2938,14 @@ class Database:
                 (maximum_rows,),
             )
             active_network_rows = await active_network_cursor.fetchall()
+            connectivity_cursor = await connection.execute(
+                """
+                SELECT paused, next_probe_utc_ns, probe_token, probe_expires_utc_ns,
+                       checked_at_utc_ns, result_json
+                FROM network_connectivity WHERE singleton = 1
+                """
+            )
+            connectivity_row = await connectivity_cursor.fetchone()
 
         work_counts: dict[tuple[str, ...], dict[WorkState, int]] = {}
         for row in work_count_rows:
@@ -2613,6 +3014,12 @@ class Database:
             all_counts[state] = _integer(row[2])
             recent_counts[state] = _integer(row[3])
 
+        probe_in_progress = (
+            connectivity_row is not None
+            and connectivity_row[2] is not None
+            and connectivity_row[3] is not None
+            and _integer(connectivity_row[3]) > captured_at_utc_ns
+        )
         return ActivitySnapshot(
             captured_at_utc_ns=captured_at_utc_ns,
             recent_window_ns=recent_window_ns,
@@ -2665,6 +3072,32 @@ class Database:
                 )
                 for row in active_network_rows
             ),
+            connectivity=(
+                NetworkConnectivityActivity()
+                if connectivity_row is None
+                else NetworkConnectivityActivity(
+                    paused=bool(connectivity_row[0]),
+                    reason=(
+                        "checking_connectivity"
+                        if probe_in_progress
+                        else "connectivity_outage"
+                        if connectivity_row[0]
+                        else None
+                    ),
+                    probe_in_progress=probe_in_progress,
+                    next_probe_at_utc_ns=(
+                        _integer(connectivity_row[1]) if connectivity_row[0] else None
+                    ),
+                    last_probe_at_utc_ns=(
+                        None if connectivity_row[4] is None else _integer(connectivity_row[4])
+                    ),
+                    last_probe_result=(
+                        None
+                        if connectivity_row[5] is None
+                        else decode_json(_text(connectivity_row[5]))
+                    ),
+                )
+            ),
         )
 
     async def requested_work_identifiers(
@@ -2703,6 +3136,14 @@ class Database:
                     SELECT DISTINCT work_item_id
                     FROM work_requests
                     WHERE requester_identifier = ?
+                    UNION
+                    SELECT json_extract(execution.value_json, '$.work_identifier')
+                    FROM records AS execution JOIN objects AS object ON object.id=execution.object_id
+                    WHERE object.kind_parts_json='["carl","marketplace","search_execution"]'
+                      AND json_extract(execution.value_json, '$.search_record_identifier') = (
+                          SELECT json_extract(workspace.value_json, '$.search_run_record_identifier')
+                          FROM records AS workspace WHERE workspace.object_id=?
+                      )
                 )
                 SELECT
                     count(*) FILTER (WHERE work.state = 'pending'),
@@ -2712,7 +3153,7 @@ class Database:
                 JOIN work_items AS work ON work.id = requested.work_item_id
                 WHERE work.state IN ('pending', 'leased', 'terminal_failure')
                 """,
-                (workspace_record_identifier,),
+                (workspace_record_identifier, workspace_record_identifier),
             )
             count_row = await count_cursor.fetchone()
             active_cursor = await connection.execute(
@@ -2721,6 +3162,14 @@ class Database:
                     SELECT DISTINCT work_item_id
                     FROM work_requests
                     WHERE requester_identifier = ?
+                    UNION
+                    SELECT json_extract(execution.value_json, '$.work_identifier')
+                    FROM records AS execution JOIN objects AS object ON object.id=execution.object_id
+                    WHERE object.kind_parts_json='["carl","marketplace","search_execution"]'
+                      AND json_extract(execution.value_json, '$.search_record_identifier') = (
+                          SELECT json_extract(workspace.value_json, '$.search_run_record_identifier')
+                          FROM records AS workspace WHERE workspace.object_id=?
+                      )
                 )
                 SELECT work.id, work.kind_parts_json, work.state, work.attempt,
                        work.created_at_utc_ns, work.eligible_at_utc_ns,
@@ -2733,7 +3182,7 @@ class Database:
                          work.created_at_utc_ns, work.id
                 LIMIT ?
                 """,
-                (workspace_record_identifier, maximum_rows),
+                (workspace_record_identifier, workspace_record_identifier, maximum_rows),
             )
             rows = await active_cursor.fetchall()
             failure_cursor = await connection.execute(
@@ -2742,6 +3191,14 @@ class Database:
                     SELECT DISTINCT work_item_id
                     FROM work_requests
                     WHERE requester_identifier = ?
+                    UNION
+                    SELECT json_extract(execution.value_json, '$.work_identifier')
+                    FROM records AS execution JOIN objects AS object ON object.id=execution.object_id
+                    WHERE object.kind_parts_json='["carl","marketplace","search_execution"]'
+                      AND json_extract(execution.value_json, '$.search_record_identifier') = (
+                          SELECT json_extract(workspace.value_json, '$.search_run_record_identifier')
+                          FROM records AS workspace WHERE workspace.object_id=?
+                      )
                 )
                 SELECT work.id, work.kind_parts_json, work.state, work.attempt,
                        work.created_at_utc_ns, work.eligible_at_utc_ns,
@@ -2754,11 +3211,14 @@ class Database:
                        )
                 FROM requested
                 JOIN work_items AS work ON work.id = requested.work_item_id
-                WHERE work.state = 'terminal_failure'
+                WHERE work.state = 'terminal_failure' OR (
+                    work.state = 'completed'
+                    AND json_extract(work.result_json, '$.state') = 'completed_with_failures'
+                )
                 ORDER BY 12 DESC, work.created_at_utc_ns DESC, work.id
                 LIMIT ?
                 """,
-                (workspace_record_identifier, maximum_failure_rows),
+                (workspace_record_identifier, workspace_record_identifier, maximum_failure_rows),
             )
             failure_rows = await failure_cursor.fetchall()
 
@@ -2784,7 +3244,11 @@ class Database:
                 worker_identifier=None if row[7] is None else _text(row[7]),
                 subject=work_subject(kind, payload),
                 stage=work_stage(result),
-                error_kind=work_error_kind(error),
+                error_kind=(
+                    "completed_with_failures"
+                    if isinstance(result, dict) and result.get("state") == "completed_with_failures"
+                    else work_error_kind(error)
+                ),
                 terminal_at_utc_ns=None if len(row) < 12 or row[11] is None else _integer(row[11]),
             )
 
@@ -2795,6 +3259,23 @@ class Database:
             tuple(activity_from_row(row) for row in rows),
             tuple(activity_from_row(row) for row in failure_rows),
         )
+
+    async def workspace_partial_failure_count(self, workspace_record_identifier: str) -> int:
+        """Count settled coordinators that explicitly retained child failures."""
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT count(*) FROM work_items AS work
+                WHERE work.state='completed'
+                  AND json_extract(work.result_json,'$.state')='completed_with_failures'
+                  AND EXISTS (SELECT 1 FROM work_requests AS request
+                    WHERE request.work_item_id=work.id AND request.requester_identifier=?)
+                """,
+                (workspace_record_identifier,),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        return _integer(row[0])
 
     async def retry_terminal_collect_search_work(
         self,
@@ -2868,6 +3349,176 @@ class Database:
                 },
             )
         return previous_attempt
+
+    async def retry_terminal_ebay_search_work(
+        self,
+        *,
+        work_item_identifier: str,
+        retried_at_utc_ns: int,
+        event_identifier: str,
+        reason: JsonValue,
+        payload_schema_version: int,
+        acquisition_stack: str | None = None,
+    ) -> int:
+        """Give an exact eBay search a new retry budget without erasing history."""
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                "SELECT attempt,payload_json FROM work_items WHERE id=? AND kind_parts_json=? AND state='terminal_failure'",
+                (work_item_identifier, _json(["carl", "ebay", "collect", "search"])),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise ValueError("eBay search work is not in terminal failure")
+            previous_attempt = _integer(row[0])
+            payload = CollectEbaySearchPayload.model_validate_json(_text(row[1]))
+            previous_stack = payload.request.stack_identifier
+            request = payload.request
+            if acquisition_stack is not None:
+                request = type(payload.request).model_validate(
+                    {**payload.request.model_dump(), "stack_identifier": acquisition_stack}
+                )
+            payload = CollectEbaySearchPayload(
+                request=request, retry_attempt_offset=previous_attempt
+            )
+            definition = collect_ebay_search_work(
+                identifier=work_item_identifier,
+                payload=payload,
+                not_before_utc_ns=retried_at_utc_ns,
+            )
+            cursor = await connection.execute(
+                "SELECT id FROM work_items WHERE kind_parts_json=? AND deduplication_identity_json=? AND state IN ('pending','leased') AND id<>?",
+                (
+                    _json(list(definition.kind)),
+                    _json(list(definition.deduplication_identity)),
+                    work_item_identifier,
+                ),
+            )
+            if await cursor.fetchone() is not None:
+                raise ValueError("An equivalent eBay search is already active; no retry performed")
+            cooldowns = await self._ebay_search_stack_cooldowns(connection, retried_at_utc_ns)
+            eligible_at = max(retried_at_utc_ns, cooldowns.get(payload.request.stack_identifier, 0))
+            await connection.execute(
+                """
+                UPDATE work_items SET state='pending', eligible_at_utc_ns=?,
+                    payload_schema_version=?,
+                    payload_json=?,deduplication_identity_json=?,
+                    result_json=NULL,error_json=NULL,lease_token=NULL,lease_owner=NULL,
+                    lease_expires_at_utc_ns=NULL
+                WHERE id=? AND state='terminal_failure'
+                """,
+                (
+                    eligible_at,
+                    payload_schema_version,
+                    _json(payload.as_json()),
+                    _json(list(definition.deduplication_identity)),
+                    work_item_identifier,
+                ),
+            )
+            for scope in definition.scopes:
+                await connection.execute(
+                    "INSERT OR IGNORE INTO work_scopes VALUES (?,?,?)",
+                    (work_item_identifier, scope.kind.value, _json(list(scope.identity))),
+                )
+            if previous_stack != payload.request.stack_identifier:
+                await connection.execute(
+                    "DELETE FROM work_scopes WHERE work_item_id=? AND scope_kind='network_path' AND scope_identity_json=?",
+                    (work_item_identifier, _json(["ebay", "search", previous_stack])),
+                )
+            await self._append_work_event(
+                connection,
+                event_identifier=event_identifier,
+                work_item_identifier=work_item_identifier,
+                event_kind=WorkEventKind.ENQUEUED,
+                recorded_at_utc_ns=retried_at_utc_ns,
+                data={
+                    "reason": reason,
+                    "previous_attempt": previous_attempt,
+                    "retry_attempt_offset": previous_attempt,
+                    "payload_schema_version": payload_schema_version,
+                    "previous_acquisition_stack": previous_stack,
+                    "acquisition_stack": payload.request.stack_identifier,
+                    "eligible_at_utc_ns": eligible_at,
+                },
+            )
+        return previous_attempt
+
+    async def _ebay_search_stack_cooldowns(
+        self, connection: AsyncConnection, now_utc_ns: int
+    ) -> dict[str, int]:
+        """Read cooldowns from fenced attempt events, including terminal attempts."""
+        cursor = await connection.execute(
+            """
+            WITH cooldowns AS (
+                SELECT COALESCE(json_extract(event.data_json,'$.reason.cooldown.stack_identifier'),
+                                json_extract(event.data_json,'$.error.cooldown.stack_identifier')) stack,
+                       COALESCE(json_extract(event.data_json,'$.reason.cooldown.until_utc_ns'),
+                                json_extract(event.data_json,'$.error.cooldown.until_utc_ns')) until_ns
+                FROM work_items AS work JOIN work_events AS event ON event.work_item_id=work.id
+                WHERE work.kind_parts_json=? AND event.event_kind IN ('released','terminal_failure')
+            ) SELECT stack,MAX(until_ns) FROM cooldowns
+              WHERE typeof(stack)='text' AND typeof(until_ns)='integer' AND until_ns>?
+              GROUP BY stack
+            """,
+            (_json(list(COLLECT_EBAY_SEARCH_WORK_KIND)), now_utc_ns),
+        )
+        return {_text(row[0]): _integer(row[1]) for row in await cursor.fetchall()}
+
+    async def _defer_ebay_search_siblings(
+        self,
+        connection: AsyncConnection,
+        work_item_identifier: str,
+        failure: JsonValue,
+        now_utc_ns: int,
+        event_identifier: str,
+    ) -> None:
+        if not isinstance(failure, dict) or not isinstance(
+            (cooldown := failure.get("cooldown")), dict
+        ):
+            return
+        stack, until_ns = cooldown.get("stack_identifier"), cooldown.get("until_utc_ns")
+        if (
+            not isinstance(stack, str)
+            or not isinstance(until_ns, int)
+            or isinstance(until_ns, bool)
+        ):
+            raise ValueError("Invalid eBay search cooldown marker")
+        if until_ns <= now_utc_ns:
+            return
+        cursor = await connection.execute(
+            "SELECT kind_parts_json,payload_json FROM work_items WHERE id=?",
+            (work_item_identifier,),
+        )
+        row = await cursor.fetchone()
+        if row is None or _text(row[0]) != _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)):
+            raise ValueError("eBay search cooldown belongs to another work kind")
+        payload = CollectEbaySearchPayload.model_validate_json(_text(row[1]))
+        if payload.request.stack_identifier != stack:
+            raise ValueError("eBay search cooldown stack disagrees with its attempt")
+        cursor = await connection.execute(
+            "SELECT id FROM work_items WHERE kind_parts_json=? AND state='pending' AND COALESCE(json_extract(payload_json,'$.request.stack_identifier'),'ebay_anonymous')=? AND eligible_at_utc_ns<? ORDER BY id",
+            (_json(list(COLLECT_EBAY_SEARCH_WORK_KIND)), stack, until_ns),
+        )
+        for index, row in enumerate(await cursor.fetchall()):
+            identifier = _text(row[0])
+            await connection.execute(
+                "UPDATE work_items SET eligible_at_utc_ns=MAX(eligible_at_utc_ns,?) WHERE id=?",
+                (until_ns, identifier),
+            )
+            await self._append_work_event(
+                connection,
+                event_identifier=f"{event_identifier}-cooldown-{index}",
+                work_item_identifier=identifier,
+                event_kind=WorkEventKind.ENQUEUED,
+                recorded_at_utc_ns=now_utc_ns,
+                data={
+                    "reason": {
+                        "kind": "ebay_search_shared_cooldown",
+                        "source_work_identifier": work_item_identifier,
+                        "cooldown": cooldown,
+                    },
+                    "eligible_at_utc_ns": until_ns,
+                },
+            )
 
     async def defer_pending_collect_search_work_for_route(
         self,
@@ -3257,6 +3908,66 @@ class Database:
             raise LeaseLostError("The work lease is missing, expired, or owned by another worker")
         return _integer(row[0]), _integer(row[1])
 
+    async def try_admit_facebook_search_route(
+        self,
+        *,
+        work_item_identifier: str,
+        lease_token: str,
+        worker_identifier: str,
+        routing: tuple[str, ...],
+        utc_now_ns: Callable[[], int],
+    ) -> bool:
+        """Atomically bind an effective search route to an active, renewable lease.
+
+        Requested scopes and payloads remain intact. Only previous effective-route
+        scopes are removed, including when waiting for the new route's capacity.
+        """
+
+        constraint = facebook_effective_search_work_constraint(routing)
+        async with self._connections.writer() as connection:
+            scope_json = _json(list(constraint.scope.identity))
+            # Acquire SQLite's writer reservation before reading admission state.
+            # A stale/invalid lease rolls this deletion back with the transaction.
+            await connection.execute(
+                """
+                DELETE FROM work_scopes
+                WHERE work_item_id = ? AND scope_kind = 'network_path'
+                  AND json_extract(scope_identity_json, '$[0]') = ?
+                  AND scope_identity_json != ?
+                """,
+                (work_item_identifier, FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, scope_json),
+            )
+            now_utc_ns = utc_now_ns()
+            await self._require_active_lease(
+                connection,
+                work_item_identifier=work_item_identifier,
+                lease_token=lease_token,
+                worker_identifier=worker_identifier,
+                now_utc_ns=now_utc_ns,
+            )
+            await self._register_constraint(
+                connection, constraint=constraint, registered_at_utc_ns=now_utc_ns
+            )
+            cursor = await connection.execute(
+                """
+                SELECT count(*) FROM work_items
+                JOIN work_scopes ON work_scopes.work_item_id = work_items.id
+                WHERE work_scopes.scope_kind = 'network_path'
+                  AND work_scopes.scope_identity_json = ?
+                  AND work_items.id != ? AND work_items.state = 'leased'
+                  AND work_items.lease_expires_at_utc_ns > ?
+                """,
+                (scope_json, work_item_identifier, now_utc_ns),
+            )
+            rows = await cursor.fetchall()
+            if _integer(rows[0][0]) >= constraint.maximum_active:
+                return False
+            await connection.execute(
+                "INSERT OR IGNORE INTO work_scopes VALUES (?, 'network_path', ?)",
+                (work_item_identifier, scope_json),
+            )
+            return True
+
     async def renew_lease(
         self,
         *,
@@ -3360,6 +4071,93 @@ class Database:
                 },
             )
 
+    async def finalize_interrupted_work(
+        self,
+        *,
+        work_item_identifier: str,
+        lease_token: str,
+        worker_identifier: str,
+        operation_id: str,
+        utc_now_ns: Callable[[], int],
+        event_identifier: str,
+        reason: str,
+        ended_at_utc: str,
+        duration_ns: int,
+        possibly_dispatched: bool,
+    ) -> bool:
+        """Reconcile interruption atomically; committed outcomes and replacement leases win.
+
+        Setup may not have created an operation yet. Conversely, cancellation
+        may hide a successful commit. Neither case is inferred from local flags.
+        """
+
+        async with self._connections.writer() as connection:
+            now_utc_ns = utc_now_ns()
+            cursor = await connection.execute(
+                """
+                SELECT operations.state, work_operations.work_item_id,
+                       work_operations.lease_token, work_operations.worker_identifier
+                FROM operations
+                LEFT JOIN work_operations ON work_operations.operation_id = operations.id
+                WHERE operations.id = ?
+                """,
+                (operation_id,),
+            )
+            operation = await cursor.fetchone()
+            if operation is not None:
+                if tuple(operation[1:]) != (work_item_identifier, lease_token, worker_identifier):
+                    raise LeaseLostError("The interrupted operation belongs to another attempt")
+                if operation[0] != "started":
+                    return False
+                await self._fail_operation(
+                    connection,
+                    operation_id=operation_id,
+                    error={"kind": reason, "possibly_dispatched": possibly_dispatched},
+                    result={"state": reason},
+                    ended_at_utc=ended_at_utc,
+                    duration_ns=duration_ns,
+                )
+            try:
+                attempt, _ = await self._require_active_lease(
+                    connection,
+                    work_item_identifier=work_item_identifier,
+                    lease_token=lease_token,
+                    worker_identifier=worker_identifier,
+                    now_utc_ns=now_utc_ns,
+                )
+            except LeaseLostError:
+                # A bound old operation can be failed, but never release its successor.
+                return False
+            await connection.execute(
+                """
+                UPDATE work_items
+                SET state = 'pending', eligible_at_utc_ns = ?, lease_token = NULL,
+                    lease_owner = NULL, lease_expires_at_utc_ns = NULL
+                WHERE id = ? AND lease_token = ? AND lease_owner = ?
+                """,
+                (now_utc_ns, work_item_identifier, lease_token, worker_identifier),
+            )
+            await self._append_work_event(
+                connection,
+                event_identifier=event_identifier,
+                work_item_identifier=work_item_identifier,
+                event_kind=WorkEventKind.RELEASED,
+                recorded_at_utc_ns=now_utc_ns,
+                data={
+                    "worker_identifier": worker_identifier,
+                    "lease_token": lease_token,
+                    "attempt": attempt,
+                    "eligible_at_utc_ns": now_utc_ns,
+                    "reason": {
+                        "kind": "worker_cancelled" if reason == "cancelled" else reason,
+                        "operation_identifier": operation_id,
+                        "possibly_dispatched": possibly_dispatched,
+                        "decision": "retry",
+                    },
+                },
+            )
+            return True
+
     async def _begin_operation(
         self,
         connection: AsyncConnection,
@@ -3372,22 +4170,29 @@ class Database:
         started_at_utc: str,
         inputs: Sequence[tuple[tuple[str, ...], str]] = (),
     ) -> None:
+        code_state_id = await self._intern_code_state(
+            connection, provenance.commit_hash, provenance.worktree_state
+        )
+        stored_provenance = provenance.as_json()
+        del stored_provenance["commit_hash"]
+        del stored_provenance["worktree_state"]
         await connection.execute(
             """
             INSERT INTO operations(
                 id, component_parts_json, output_schema_version,
                 code_provenance_json, invocation_json, configuration_json,
-                state, started_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, 'started', ?)
+                state, started_at_utc, code_state_id
+            ) VALUES (?, ?, ?, ?, ?, ?, 'started', ?, ?)
             """,
             (
                 operation_id,
                 _json(list(component.identifier.parts)),
                 component.output_schema_version,
-                _json(provenance.as_json()),
+                _json(stored_provenance),
                 _json(invocation),
                 _json(configuration),
                 started_at_utc,
+                code_state_id,
             ),
         )
         for name, object_identifier in inputs:
@@ -3631,6 +4436,10 @@ class Database:
         if await connection.changes() != 1:
             raise RuntimeError("Operation was not in started state")
 
+        await self._reconcile_terminal_network_activities(
+            connection, operation_id=operation_id, recorded_at_utc_ns=time_ns()
+        )
+
     async def publish_leased_operation_checkpoint(
         self,
         *,
@@ -3860,6 +4669,10 @@ class Database:
         if await connection.changes() != 1:
             raise RuntimeError("Operation was not in started state")
 
+        await self._reconcile_terminal_network_activities(
+            connection, operation_id=operation_id, recorded_at_utc_ns=time_ns()
+        )
+
     async def retry_leased_operation(
         self,
         *,
@@ -3944,6 +4757,9 @@ class Database:
                     "reason": reason,
                 },
             )
+            await self._defer_ebay_search_siblings(
+                connection, work_item_identifier, reason, now_utc_ns, event_identifier
+            )
 
     async def terminally_fail_leased_operation(
         self,
@@ -4025,6 +4841,9 @@ class Database:
                     "result": result,
                 },
             )
+            await self._defer_ebay_search_siblings(
+                connection, work_item_identifier, error, now_utc_ns, event_identifier
+            )
 
     async def fail_operation(
         self,
@@ -4034,6 +4853,8 @@ class Database:
         result: JsonValue,
         ended_at_utc: str,
         duration_ns: int,
+        artifacts: Sequence[ArtifactDraft] = (),
+        outputs: Sequence[NamedOutput] = (),
     ) -> None:
         async with self._connections.writer() as connection:
             await self._fail_operation(
@@ -4043,6 +4864,8 @@ class Database:
                 result=result,
                 ended_at_utc=ended_at_utc,
                 duration_ns=duration_ns,
+                artifacts=artifacts,
+                outputs=outputs,
             )
 
     async def get_record(self, identifier: str) -> tuple[tuple[str, ...], int, JsonValue]:
@@ -4063,6 +4886,26 @@ class Database:
             raise ValueError("Invalid stored object kind")
         return tuple(kind), _integer(row[1]), decode_json(_text(row[2]))
 
+    async def ebay_item_observations(
+        self, item_identifier: str
+    ) -> tuple[tuple[str, JsonValue], ...]:
+        """Order observations by acquisition recency, then offline derivation recency."""
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT observation.id, records.value_json
+                FROM objects AS observation JOIN records ON records.object_id = observation.id
+                LEFT JOIN objects AS acquisition
+                  ON acquisition.id = json_extract(records.value_json, '$.acquisition_record_identifier')
+                WHERE observation.kind_parts_json = ?
+                  AND json_extract(records.value_json, '$.item_identifier') = ?
+                ORDER BY COALESCE(acquisition.rowid, observation.rowid), observation.rowid
+                """,
+                (_json(["carl", "ebay", "listing_observation"]), item_identifier),
+            )
+            rows = await cursor.fetchall()
+        return tuple((_text(row[0]), decode_json(_text(row[1]))) for row in rows)
+
     async def records_by_kind(self, kind: tuple[str, ...]) -> tuple[tuple[str, JsonValue], ...]:
         """Return immutable records of one kind in publication order."""
 
@@ -4078,6 +4921,96 @@ class Database:
                 (_json(list(kind)),),
             )
             rows = await cursor.fetchall()
+        return tuple((_text(row[0]), decode_json(_text(row[1]))) for row in rows)
+
+    async def search_listing_occurrences_for_runs(
+        self,
+        marketplace: str,
+        run_identifiers: Sequence[str],
+        *,
+        as_of_completion_sequence: int,
+        maximum_object_rowid: int | None = None,
+    ) -> tuple[tuple[str, JsonValue], ...]:
+        """Read completed cards for exact source runs, without other-source scans."""
+        if marketplace not in ("facebook", "ebay"):
+            raise ValueError("Search occurrence marketplace is invalid")
+        if len(run_identifiers) > 100 or any(not identifier for identifier in run_identifiers):
+            raise ValueError("Search occurrence run scope exceeds its supported bounds")
+        if as_of_completion_sequence < 0 or (
+            maximum_object_rowid is not None and maximum_object_rowid < 0
+        ):
+            raise ValueError("Search occurrence snapshot boundary is invalid")
+        if not run_identifiers:
+            return ()
+        source_identifiers: list[str] = []
+        for identifier in dict.fromkeys(run_identifiers):
+            kind, _, value = await self.get_record(identifier)
+            if kind != ("carl", marketplace, "search_run") or not isinstance(value, dict):
+                raise ValueError("Search occurrence scope contains a different source kind")
+            if marketplace == "facebook":
+                internal = value.get("search_run_identifier")
+                if not isinstance(internal, str) or not internal:
+                    raise ValueError("Stored Facebook search run has no internal identifier")
+                source_identifiers.append(internal)
+            else:
+                source_identifiers.append(identifier)
+        # Paths and index names are internal constants, never user-provided SQL.
+        source_path = (
+            "$.search_run_identifier"
+            if marketplace == "facebook"
+            else "$.search_run_record_identifier"
+        )
+        index = (
+            "records_search_occurrence_run_position"
+            if marketplace == "facebook"
+            else "records_marketplace_source_run"
+        )
+        partial_predicate = (
+            "AND json_extract(record.value_json, '$.listing_identifier') IS NOT NULL "
+            "AND json_extract(record.value_json, '$.search_run_identifier') IS NOT NULL"
+            if marketplace == "facebook"
+            else ""
+        )
+        async with self._connections.reader() as connection:
+            if maximum_object_rowid is None:
+                cursor = await connection.execute("SELECT COALESCE(MAX(rowid), 0) FROM objects")
+                row = await cursor.fetchone()
+                assert row is not None
+                maximum_object_rowid = _integer(row[0])
+            cursor = await connection.execute(
+                f"""
+                SELECT object.id, record.value_json
+                FROM json_each(?) AS requested
+                CROSS JOIN records AS record INDEXED BY {index}
+                  ON json_extract(record.value_json, '{source_path}') = requested.value
+                CROSS JOIN objects AS object
+                  ON object.id = record.object_id
+                CROSS JOIN operations AS operation
+                  ON operation.id = object.created_by_operation_id
+                WHERE object.kind_parts_json = ?
+                  AND object.rowid <= ?
+                  AND operation.state = 'completed'
+                  {partial_predicate}
+                  AND COALESCE((SELECT MAX(event.sequence)
+                    FROM work_operations AS work
+                    JOIN work_events AS event ON event.work_item_id = work.work_item_id
+                    WHERE work.operation_id = object.created_by_operation_id
+                      AND event.event_kind = 'completed'
+                      AND json_extract(event.data_json, '$.operation_identifier') =
+                          object.created_by_operation_id), 0) <= ?
+                ORDER BY object.rowid, object.id
+                LIMIT 100001
+                """,
+                (
+                    _json(list(dict.fromkeys(source_identifiers))),
+                    _json(["carl", marketplace, "search_listing_occurrence"]),
+                    maximum_object_rowid,
+                    as_of_completion_sequence,
+                ),
+            )
+            rows = await cursor.fetchall()
+        if len(rows) > 100_000:
+            raise ValueError("Retained search cards exceed the supported safety bound")
         return tuple((_text(row[0]), decode_json(_text(row[1]))) for row in rows)
 
     @staticmethod
@@ -4132,8 +5065,7 @@ class Database:
         """Return current review heads for one workspace and exact listing subset."""
 
         if len(listing_identifiers) > 10_000 or any(
-            not identifier.isascii() or not identifier.isdecimal()
-            for identifier in listing_identifiers
+            not is_listing_identifier(identifier) for identifier in listing_identifiers
         ):
             raise ValueError("Listing-review lookup identifiers are invalid")
         if not listing_identifiers:
@@ -4187,6 +5119,31 @@ class Database:
                 workspace_record_identifier=workspace_record_identifier,
                 listing_identifiers=listing_identifiers,
             )
+
+    async def listing_review_scalar_boundaries(
+        self, review_record_identifiers: Sequence[str]
+    ) -> dict[str, int]:
+        """Recover immutable bulk-review evidence boundaries without modifying old reviews."""
+
+        if not review_record_identifiers:
+            return {}
+        if len(review_record_identifiers) > 10_000:
+            raise ValueError("Review scalar history lookup is too large")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT object.id,
+                       json_extract(mutation.response_json, '$.as_of_completion_sequence')
+                FROM objects AS object
+                JOIN review_mutation_requests AS mutation
+                  ON mutation.operation_id = object.created_by_operation_id
+                 AND mutation.action = 'record_workspace_bulk_review'
+                WHERE object.id IN (SELECT value FROM json_each(?))
+                """,
+                (_json(list(review_record_identifiers)),),
+            )
+            rows = await cursor.fetchall()
+        return {_text(row[0]): row[1] for row in rows if isinstance(row[1], int) and row[1] >= 0}
 
     @staticmethod
     async def _record_review_mutation_response(
@@ -4907,10 +5864,35 @@ class Database:
         ended_at_utc: str,
         duration_ns: int,
         result: JsonValue,
+        marketplace_target_guard: MarketplaceSearchTargetRecord | None = None,
     ) -> None:
         """Atomically publish a small local mutation as a provenance-linked operation."""
 
         async with self._connections.writer() as connection:
+            if marketplace_target_guard is not None:
+                cursor = await connection.execute(
+                    """
+                    SELECT records.value_json
+                    FROM records JOIN objects ON objects.id = records.object_id
+                    WHERE objects.kind_parts_json = ?
+                      AND json_extract(records.value_json, '$.search_record_identifier') = ?
+                    """,
+                    (
+                        _json(list(MARKETPLACE_SEARCH_TARGET_KIND)),
+                        marketplace_target_guard.search_record_identifier,
+                    ),
+                )
+                existing = tuple(
+                    MarketplaceSearchTargetRecord.model_validate(decode_json(_text(row[0])))
+                    for row in await cursor.fetchall()
+                )
+                if len(existing) >= 20:
+                    raise ValueError("A marketplace search supports at most 20 targets")
+                if any(
+                    target.specification == marketplace_target_guard.specification
+                    for target in existing
+                ):
+                    raise ValueError("The marketplace search already contains this target")
             await self._begin_operation(
                 connection,
                 operation_id=operation_identifier,
@@ -5259,6 +6241,10 @@ class Database:
             parameters.append(product_guide_record_identifier)
         parameters.append(maximum_per_listing)
         async with self._connections.reader() as connection:
+            # Start from completed analysis work once. Starting from requested listings
+            # lets SQLite reorder this chain into a full analysis scan per listing;
+            # indexed CROSS JOINs preserve the single-pass direction without restricting
+            # historical payload schema versions to fit the analysis lookup index.
             cursor = await connection.execute(
                 f"""
                 WITH requested(listing_identifier) AS MATERIALIZED (
@@ -5266,7 +6252,9 @@ class Database:
                 ),
                 candidates AS MATERIALIZED (
                     SELECT
-                        requested.listing_identifier,
+                        json_extract(
+                            observation_record.value_json, '$.listing_id'
+                        ) AS listing_identifier,
                         analysis.id,
                         analysis_record.value_json,
                         work.payload_json,
@@ -5274,49 +6262,59 @@ class Database:
                         completed.sequence,
                         operation.ended_at_utc,
                         row_number() OVER (
-                            PARTITION BY requested.listing_identifier,
+                            PARTITION BY json_extract(
+                                             observation_record.value_json, '$.listing_id'
+                                         ),
                                          json_extract(
                                              work.payload_json,
                                              '$.product_guide_record_identifier'
                                          )
                             ORDER BY completed.sequence DESC, analysis.id DESC
                         ) AS guide_rank
-                    FROM requested
-                    CROSS JOIN records AS observation_record
-                        INDEXED BY records_listing_observation_listing
-                      ON json_extract(observation_record.value_json, '$.listing_id') =
-                         requested.listing_identifier
-                    JOIN objects AS observation
-                      ON observation.id = observation_record.object_id
-                     AND observation.kind_parts_json = ?
-                    JOIN operation_inputs AS evidence_input
-                      ON evidence_input.object_id = observation.id
-                     AND evidence_input.name_parts_json = ?
-                    JOIN objects AS evidence
-                      ON evidence.created_by_operation_id = evidence_input.operation_id
-                    JOIN work_items AS work
-                      ON json_extract(
-                             work.payload_json, '$.evidence_set_record_identifier'
-                         ) = evidence.id
-                     AND work.kind_parts_json = ?
-                     AND work.state = 'completed'
-                    JOIN work_operations AS work_operation
+                    FROM work_items AS work
+                        INDEXED BY work_items_analysis_lookup
+                    CROSS JOIN work_operations AS work_operation
+                        INDEXED BY sqlite_autoindex_work_operations_2
                       ON work_operation.work_item_id = work.id
-                    JOIN objects AS analysis
+                    CROSS JOIN objects AS analysis
+                        INDEXED BY objects_operation_kind
                       ON analysis.created_by_operation_id = work_operation.operation_id
                      AND analysis.kind_parts_json = ?
-                    JOIN records AS analysis_record
+                    CROSS JOIN records AS analysis_record
+                        INDEXED BY sqlite_autoindex_records_1
                       ON analysis_record.object_id = analysis.id
-                    JOIN operations AS operation
+                    CROSS JOIN operations AS operation
+                        INDEXED BY sqlite_autoindex_operations_1
                       ON operation.id = analysis.created_by_operation_id
                      AND operation.state = 'completed'
-                    JOIN work_events AS completed
+                    CROSS JOIN work_events AS completed
+                        INDEXED BY work_events_work_item
                       ON completed.work_item_id = work.id
                      AND completed.event_kind = 'completed'
                      AND completed.sequence <= ?
-                    WHERE json_extract(
+                    CROSS JOIN objects AS evidence
+                        INDEXED BY sqlite_autoindex_objects_1
+                      ON evidence.id = json_extract(
+                             work.payload_json, '$.evidence_set_record_identifier'
+                         )
+                    CROSS JOIN operation_inputs AS evidence_input
+                        INDEXED BY sqlite_autoindex_operation_inputs_1
+                      ON evidence_input.operation_id = evidence.created_by_operation_id
+                     AND evidence_input.name_parts_json = ?
+                    CROSS JOIN objects AS observation
+                        INDEXED BY sqlite_autoindex_objects_1
+                      ON observation.id = evidence_input.object_id
+                     AND observation.kind_parts_json = ?
+                    CROSS JOIN records AS observation_record
+                        INDEXED BY sqlite_autoindex_records_1
+                      ON observation_record.object_id = observation.id
+                    WHERE work.kind_parts_json = ? AND work.state = 'completed'
+                      AND json_extract(
                               observation_record.value_json, '$.listing_id'
                           ) IS NOT NULL
+                      AND json_extract(
+                              observation_record.value_json, '$.listing_id'
+                          ) IN (SELECT listing_identifier FROM requested)
                       {guide_filter}
                 ),
                 latest_per_guide AS MATERIALIZED (
@@ -5335,11 +6333,12 @@ class Database:
                 """,
                 (
                     parameters[0],
-                    parameters[3],
-                    parameters[2],
-                    parameters[1],
                     parameters[4],
-                    *parameters[5:],
+                    parameters[5],
+                    parameters[2],
+                    parameters[3],
+                    parameters[1],
+                    *parameters[6:],
                 ),
             )
             rows = await cursor.fetchall()
@@ -5355,6 +6354,15 @@ class Database:
             row = await cursor.fetchone()
         if row is None:
             raise AssertionError("Completion-boundary query returned no row")
+        return _integer(row[0])
+
+    async def current_object_boundary(self) -> int:
+        """Freeze immutable publications, including records without work events."""
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute("SELECT COALESCE(MAX(rowid), 0) FROM objects")
+            row = await cursor.fetchone()
+        if row is None:
+            raise AssertionError("Object-boundary query returned no row")
         return _integer(row[0])
 
     async def facebook_projection_search_run(
@@ -5711,6 +6719,7 @@ class Database:
         *,
         as_of_completion_sequence: int,
         maximum_per_listing: int,
+        status_only: bool = False,
     ) -> tuple[ListingObservationCandidate, ...]:
         """Return item observations only for a bounded exact listing-ID set."""
 
@@ -5722,9 +6731,22 @@ class Database:
             raise ValueError("Projection listing identifiers are invalid")
         if as_of_completion_sequence < 0 or not 1 <= maximum_per_listing <= 101:
             raise ValueError("Projection observation bounds are invalid")
+        observation_json = (
+            """json_object(
+                'acquisition_record_id', json_extract(observation_record.value_json, '$.acquisition_record_id'),
+                'response_classification', json_extract(observation_record.value_json, '$.response_classification'),
+                'fields', json_object(
+                    'availability_sold', json_extract(observation_record.value_json, '$.fields.availability_sold'),
+                    'availability_pending', json_extract(observation_record.value_json, '$.fields.availability_pending'),
+                    'availability_live', json_extract(observation_record.value_json, '$.fields.availability_live')
+                )
+            )"""
+            if status_only
+            else "observation_record.value_json"
+        )
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 WITH requested(listing_identifier) AS MATERIALIZED (
                     SELECT value FROM json_each(?)
                 ),
@@ -5732,7 +6754,7 @@ class Database:
                     SELECT
                         requested.listing_identifier,
                         observation_record.object_id AS observation_identifier,
-                        observation_record.value_json
+                        {observation_json} AS value_json
                     FROM requested
                     CROSS JOIN records AS observation_record
                         INDEXED BY records_listing_observation_listing
@@ -6342,6 +7364,53 @@ class Database:
             )
         return tuple(records)
 
+    async def ebay_search_run_records(
+        self, *, query: str | None = None, limit: int = 50
+    ) -> tuple[FacebookSearchRunRecord, ...]:
+        """Retained eBay run summaries, including partial or failed attempts."""
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT object.id, record.value_json, operation.started_at_utc,
+                       operation.ended_at_utc,
+                       COALESCE((SELECT MAX(event.sequence)
+                           FROM work_items AS work JOIN work_events AS event
+                             ON event.work_item_id=work.id AND event.event_kind='completed'
+                           WHERE json_extract(work.result_json,'$.search_run_record_identifier')=object.id
+                       ),0),
+                       (SELECT json_extract(refresh.payload_json,'$.base_search_run_record_identifier')
+                        FROM work_items AS refresh
+                        WHERE refresh.kind_parts_json=?
+                          AND json_extract(refresh.result_json,'$.refreshed_search_run_record_identifier')=object.id
+                        ORDER BY refresh.created_at_utc_ns DESC LIMIT 1)
+                FROM objects AS object JOIN records AS record ON record.object_id=object.id
+                JOIN operations AS operation ON operation.id=object.created_by_operation_id
+                WHERE object.kind_parts_json=? AND operation.state='completed'
+                  AND (? IS NULL OR json_extract(record.value_json,'$.request.query')=?)
+                ORDER BY object.rowid DESC LIMIT ?
+                """,
+                (
+                    _json(["carl", "ebay", "work", "refresh_search"]),
+                    _json(["carl", "ebay", "search_run"]),
+                    query,
+                    query,
+                    limit,
+                ),
+            )
+            rows = await cursor.fetchall()
+        return tuple(
+            FacebookSearchRunRecord(
+                record_identifier=_text(row[0]),
+                value=decode_json(_text(row[1])),
+                started_at_utc=_text(row[2]),
+                ended_at_utc=None if row[3] is None else _text(row[3]),
+                completion_sequence=_integer(row[4]),
+                origin=SearchRunOrigin.FRESH if row[5] is None else SearchRunOrigin.REFRESH,
+                refresh_source_run_record_identifier=None if row[5] is None else _text(row[5]),
+            )
+            for row in rows
+        )
+
     async def facebook_search_run_refresh_work_identifier(
         self, search_run_record_identifier: str
     ) -> str | None:
@@ -6355,7 +7424,7 @@ class Database:
                 JOIN work_events AS completed
                   ON completed.work_item_id = refresh.id
                  AND completed.event_kind = 'completed'
-                WHERE refresh.kind_parts_json = ?
+                WHERE refresh.kind_parts_json IN (?, ?)
                   AND json_extract(
                           refresh.result_json,
                           '$.refreshed_search_run_record_identifier'
@@ -6365,6 +7434,7 @@ class Database:
                 """,
                 (
                     _json(["carl", "facebook", "work", "refresh_search"]),
+                    _json(["carl", "ebay", "work", "refresh_search"]),
                     search_run_record_identifier,
                 ),
             )
@@ -7133,6 +8203,33 @@ class Database:
         expected = payload.model_dump(mode="json", exclude={"claude_version"})
         for row in rows:
             stored = AnalyzeItemPayload.model_validate_json(_text(row[1]))
+            if stored.model_dump(mode="json", exclude={"claude_version"}) == expected:
+                return _text(row[0])
+        return None
+
+    async def ebay_item_analysis_work_identifier(self, payload: AnalyzeItemPayload) -> str | None:
+        """Reuse only exact active or successful eBay analysis configurations."""
+
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT id, payload_json FROM work_items
+                WHERE kind_parts_json = ? AND payload_schema_version = 1
+                  AND state IN ('pending', 'leased', 'completed')
+                  AND json_extract(payload_json, '$.evidence_set_record_identifier') = ?
+                  AND json_extract(payload_json, '$.product_guide_record_identifier') = ?
+                ORDER BY created_at_utc_ns DESC, id
+                """,
+                (
+                    _json(["carl", "ebay", "work", "analyze_item"]),
+                    payload.evidence_set_record_identifier,
+                    payload.product_guide_record_identifier,
+                ),
+            )
+            rows = await cursor.fetchall()
+        expected = payload.model_dump(mode="json", exclude={"claude_version"})
+        for row in rows:
+            stored = EbayAnalyzeItemPayload.model_validate_json(_text(row[1]))
             if stored.model_dump(mode="json", exclude={"claude_version"}) == expected:
                 return _text(row[0])
         return None
@@ -7926,16 +9023,23 @@ class Database:
             "duration_ns",
             "result_json",
             "error_json",
+            "code_state_id",
         )
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                f"SELECT {', '.join(columns)} FROM operations WHERE id = ?",
+                f"""
+                SELECT {", ".join("operation." + column for column in columns)},
+                       code_state.commit_hash, code_state.worktree_state
+                FROM operations AS operation
+                LEFT JOIN code_states AS code_state ON code_state.id = operation.code_state_id
+                WHERE operation.id = ?
+                """,
                 (identifier,),
             )
             row = await cursor.fetchone()
         if row is None:
             raise KeyError(identifier)
-        result: dict[str, JsonValue] = dict(zip(columns, row, strict=True))
+        result: dict[str, JsonValue] = dict(zip(columns, row[: len(columns)], strict=True))
         for key in (
             "component_parts_json",
             "code_provenance_json",
@@ -7947,4 +9051,13 @@ class Database:
             output_key = key.removesuffix("_json")
             raw = result.pop(key)
             result[output_key] = decode_json(raw) if isinstance(raw, str) else None
+        provenance = result["code_provenance"]
+        if result["code_state_id"] is not None:
+            if not isinstance(provenance, dict):
+                raise ValueError("Operation code provenance is not an object")
+            commit_hash, worktree_state = row[-2:]
+            if commit_hash is not None and not isinstance(commit_hash, bytes):
+                raise ValueError("Stored code state commit hash is not binary")
+            provenance["commit_hash"] = None if commit_hash is None else commit_hash.hex()
+            provenance["worktree_state"] = _text(worktree_state)
         return result

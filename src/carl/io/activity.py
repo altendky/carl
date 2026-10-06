@@ -267,6 +267,17 @@ def activity_dashboard(snapshot: ActivitySnapshot, database: Path) -> Renderable
     heading.append("Carl activity", style="bold")
     heading.append(f"  {observed}  •  recent window {recent}\n")
     heading.append(str(database))
+    if snapshot.connectivity.paused:
+        _ = heading.append("\nNetwork work paused", style="bold red")
+        if snapshot.connectivity.probe_in_progress:
+            _ = heading.append(" — checking connectivity", style="yellow")
+        else:
+            _ = heading.append(" — internet connectivity probe failed", style="red")
+            next_probe = snapshot.connectivity.next_probe_at_utc_ns
+            if next_probe is not None:
+                _ = heading.append(
+                    f"; next probe in {_duration(next_probe - snapshot.captured_at_utc_ns)}"
+                )
     return Group(
         Panel(heading),
         Panel(_work_summary(snapshot)),

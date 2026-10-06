@@ -61,6 +61,15 @@ uv run carl monitor --work
 This runs background work and displays its progress. Use `uv run carl work` to run it without the
 dashboard. MCP servers intentionally do not start background work themselves.
 
+During an Internet outage, marketplace acquisition pauses automatically and
+checks direct DNS/TCP connectivity every 30 seconds without spending proxy
+requests or job retry budgets. The activity snapshot and dashboard show the pause.
+A mostly-failed refresh is reported as a failure, not successful completion.
+Recover its transient item-page failures without repeating the search using MCP
+`retry_item_failures` or `uv run carl retry-item-failures REFRESH_WORK_ID`.
+After upgrading, stop old workers/MCP processes, run `uv run carl init` to prepare
+the current database schema, and restart them before resuming work.
+
 Configure an MCP client to launch:
 
 ```console
@@ -69,6 +78,16 @@ uv run carl mcp
 
 The MCP interface guides agents through the workflow above and allows them to inspect the underlying
 evidence when necessary.
+
+Unexpected MCP failures return an error identifier and a diagnostic traceback directly to the
+caller. The same diagnostics are written to a private, rotating `mcp-errors.jsonl` log in Carl's
+state directory (`~/.local/state/carl` on Linux). `uv run carl locations` reports the effective
+`mcp_error_log_file` path. Each entry includes the tool or startup stage, timestamp, process,
+server/source version, and tool duration. The log rotates at 5 MiB with three backups; multiple
+MCP processes safely share it. A log-write failure is reported without hiding the original error.
+Tracebacks omit locals, source snippets, and Pydantic input values, and redact common labeled
+credentials, URL credentials, authorization headers, and cookies. Unlabeled secrets in exception
+messages cannot be reliably recognized; treat these local diagnostics as private.
 
 ## Development
 

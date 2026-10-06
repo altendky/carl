@@ -50,6 +50,7 @@ from carl.core.models import (
     NamedOutput,
     RecordDraft,
 )
+from carl.core.refresh_recovery import classify_refresh_completion, refresh_failure_summary
 from carl.core.work import WorkCapability, WorkRequester, WorkState
 from carl.core.worker import (
     AttemptContext,
@@ -77,7 +78,7 @@ def _component_anchor() -> None:
 
 
 def build_refresh_component_registry() -> Registry:
-    return Registry((Component(REFRESH_FACEBOOK_SEARCH, 1, _component_anchor),))
+    return Registry((Component(REFRESH_FACEBOOK_SEARCH, 2, _component_anchor),))
 
 
 def _stable_identifier(*parts: str) -> str:
@@ -301,7 +302,10 @@ async def _item_phase(
     refreshed_identifier: str,
     context: AttemptContext,
     dependencies: RefreshWorkerDependencies,
+    *,
+    checkpoint: dict[str, JsonValue] | None = None,
 ) -> WorkOutcome:
+    checkpoint = checkpoint or {}
     database = dependencies.database
     _, _, base = await database.get_record(payload.base_search_run_record_identifier)
     _, _, refreshed = await database.get_record(refreshed_identifier)
@@ -408,6 +412,18 @@ async def _item_phase(
             reason={"kind": "waiting_for_item_collections"},
             result={
                 "stage": "collecting_items",
+                **(
+                    {
+                        "item_retry_generation_identifier": checkpoint[
+                            "item_retry_generation_identifier"
+                        ],
+                        "prior_image_collection_count": checkpoint.get(
+                            "prior_image_collection_count", 0
+                        ),
+                    }
+                    if isinstance(checkpoint.get("item_retry_generation_identifier"), str)
+                    else {}
+                ),
                 "refreshed_search_run_record_identifier": refreshed_identifier,
                 "reused_successful_item_pages": len(reused_results),
                 "item_collection_work_identifiers": collection_identifiers,
@@ -429,6 +445,18 @@ async def _item_phase(
             reason={"kind": "waiting_for_item_extractions"},
             result={
                 "stage": "extracting_items",
+                **(
+                    {
+                        "item_retry_generation_identifier": checkpoint[
+                            "item_retry_generation_identifier"
+                        ],
+                        "prior_image_collection_count": checkpoint.get(
+                            "prior_image_collection_count", 0
+                        ),
+                    }
+                    if isinstance(checkpoint.get("item_retry_generation_identifier"), str)
+                    else {}
+                ),
                 "refreshed_search_run_record_identifier": refreshed_identifier,
                 "reused_successful_item_pages": len(reused_results),
                 "item_collection_work_identifiers": collection_identifiers,
@@ -456,6 +484,18 @@ async def _item_phase(
         reason={"kind": "continue_refresh", "next_stage": "images"},
         result={
             "stage": "items_complete",
+            **(
+                {
+                    "item_retry_generation_identifier": checkpoint[
+                        "item_retry_generation_identifier"
+                    ],
+                    "prior_image_collection_count": checkpoint.get(
+                        "prior_image_collection_count", 0
+                    ),
+                }
+                if isinstance(checkpoint.get("item_retry_generation_identifier"), str)
+                else {}
+            ),
             "refreshed_search_run_record_identifier": refreshed_identifier,
             "base_unique_listings": len(base_ids),
             "refreshed_unique_listings": len(refreshed_ids),
@@ -504,7 +544,12 @@ async def _image_phase(
         )
     existing_references = await database.facebook_gallery_reference_identifiers()
     reference_identifiers = dict(existing_references)
-    plan_identifier = _stable_identifier(context.work_item_identifier, "image_plan")
+    generation = checkpoint.get("item_retry_generation_identifier")
+    plan_identifier = (
+        _stable_identifier(context.work_item_identifier, "image_plan", generation)
+        if isinstance(generation, str)
+        else _stable_identifier(context.work_item_identifier, "image_plan")
+    )
     plan_exists = True
     stored_selected_reference_identifiers: frozenset[str] = frozenset()
     try:
@@ -561,6 +606,10 @@ async def _image_phase(
                 )
             )
     configured_maximum_images = payload.maximum_images
+    if configured_maximum_images is not None:
+        configured_maximum_images = max(
+            0, configured_maximum_images - int(checkpoint.get("prior_image_collection_count", 0))
+        )
     if configured_maximum_images is None:
         configured_maximum_images = len({reference.rendition_identity for reference in references})
     saved_before_resumption = await database.saved_facebook_image_renditions()
@@ -903,7 +952,11 @@ async def _image_phase(
         if isinstance(item_failures_value, int) and not isinstance(item_failures_value, bool)
         else 0
     )
-    result_identifier = _stable_identifier(context.work_item_identifier, "result")
+    result_identifier = (
+        _stable_identifier(context.work_item_identifier, "result", generation)
+        if isinstance(generation, str)
+        else _stable_identifier(context.work_item_identifier, "result")
+    )
     result_value: dict[str, JsonValue] = {
         **checkpoint,
         "state": (
@@ -923,27 +976,33 @@ async def _image_phase(
         "resumed_images_saved": resumed_saved,
         "resumed_images_failed": resumed_failed,
     }
-    return CompletedWork(
-        inputs=(
-            ()
-            if not plan_exists
-            else (
-                NamedInput(
-                    name=("image_followup_plan",),
-                    object_identifier=plan_identifier,
-                ),
-            )
-        ),
-        records=(
-            RecordDraft(
-                identifier=result_identifier,
-                kind=("carl", "facebook", "search_refresh"),
-                schema_version=1,
-                value=result_value,
+    summary = refresh_failure_summary(result_value)
+    result_value["failure_summary"] = summary.model_dump(mode="json")
+    if summary.severity == "failed":
+        result_value["state"] = "failed"
+    return classify_refresh_completion(
+        CompletedWork(
+            inputs=(
+                ()
+                if not plan_exists
+                else (
+                    NamedInput(
+                        name=("image_followup_plan",),
+                        object_identifier=plan_identifier,
+                    ),
+                )
             ),
-        ),
-        outputs=(NamedOutput(name=("search_refresh",), object_identifier=result_identifier),),
-        result={**result_value, "search_refresh_record_identifier": result_identifier},
+            records=(
+                RecordDraft(
+                    identifier=result_identifier,
+                    kind=("carl", "facebook", "search_refresh"),
+                    schema_version=1,
+                    value=result_value,
+                ),
+            ),
+            outputs=(NamedOutput(name=("search_refresh",), object_identifier=result_identifier),),
+            result={**result_value, "search_refresh_record_identifier": result_identifier},
+        )
     )
 
 
@@ -969,6 +1028,7 @@ def build_refresh_worker_registry(
                 refreshed_identifier,
                 context,
                 dependencies,
+                checkpoint=checkpoint,
             )
         if stage in {
             "items_complete",

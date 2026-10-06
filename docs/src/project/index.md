@@ -55,6 +55,16 @@ registered component + code provenance + configuration + input records
 Input links mean actual derivation. A later acquisition of the same URL is an
 independent record and has no automatic relationship to an earlier acquisition.
 
+Each operation references a shared `code_states` row identifying its Git commit
+and `clean`, `dirty`, or `unknown` worktree state. Records and artifacts inherit
+this reference through `objects.created_by_operation_id`; network activities
+use their operation reference. Commit hashes are SQLite `BLOB` values containing
+the raw 20-byte SHA-1 or 32-byte SHA-256 hash, not repeated hexadecimal strings.
+Other execution-environment provenance remains on the operation. Provenance
+reads return the familiar hexadecimal commit hash and include `code_state_id`.
+Different local edits at the same commit share the same dirty state: this pair
+does not identify the exact uncommitted source tree.
+
 ## Registered code
 
 Every component that creates retained outputs has a structured identifier such
@@ -101,6 +111,8 @@ typed namespace, domain, and backend segments corresponding to
 `("carl", "storage", "sqlite")`. Version 3 adds external artifact locations;
 opening a recognized earlier schema upgrades it in a transaction without
 rewriting retained evidence.
+Version 11 normalizes commit/worktree states and backfills operations from their
+retained provenance; unavailable historical state remains unknown.
 
 Real databases live outside the source repository. The CLI uses `platformdirs`
 to choose the operating system's per-user application data directory. A small
@@ -133,6 +145,16 @@ version = 1
 executable_path = "/opt/carl/bin/wireproxy"
 version = "1.1.3"
 binary_sha256 = "<verified 64-character lowercase SHA-256>"
+
+[[http_transports]]
+identifier = "browser_chrome_153"
+implementation = "wreq"
+emulation_profile = "chrome_153"
+
+[[acquisition_stacks]]
+identifier = "ebay_anonymous"
+http_transport = "browser_chrome_153"
+network_path = ["decodo", "personal", "carl"]
 
 [[routes]]
 provider = "bright_data"
@@ -178,7 +200,73 @@ configuration_id = "carl"
 relay_hostname = "us-was-wg-001"
 ```
 
+To replace the default Proton path for Facebook searches and Facebook/eBay
+gallery images, add a separately credentialed datacenter route and an explicit
+cutover. The mobile/residential item-page and eBay search stack above is unchanged:
+
+```toml
+[[routes]]
+provider = "decodo"
+network_path = ["decodo", "personal", "datacenter"]
+account_identifier = "personal"
+proxy_username = "<base datacenter proxy username>"
+credential_id = "datacenter"
+product = "datacenter_proxy"
+country_code = "us"
+
+[routes.endpoint]
+host = "dc.decodo.com"
+port = 10001
+
+[[route_overrides]]
+requested_network_path = ["proton", "personal", "carl"]
+network_path = ["decodo", "personal", "datacenter"]
+```
+
+The cutover is resolved before a queued Facebook search or image acquisition,
+including retries of work created before the configuration change. New request
+plans, network activities, scheduling policies, and provider observations use
+the effective Decodo path. Historical work payloads and past attempts are not
+rewritten. Legacy `proton_route` request options still name the requested route;
+the explicit configuration override determines its effective provider. Other
+Proton aliases are unaffected. There is no automatic provider fallback.
+Overrides must name configured routes and cannot chain or cycle.
+Repeat the override for any older Proton aliases that should also use Decodo.
+Facebook search admission uses the effective route, so aliases converging on
+one route still permit only one active search. Admission waits under the work
+lease without spending another retry attempt; retained request payloads keep
+their original route identity.
+
+Datacenter authentication uses `user-<base>-country-<country>` without mobile
+session or duration controls. [Decodo documents port 10000 as rotating on each
+request and ports 10001-63000 as static ports](https://help.decodo.com/docs/datacenter-pay-per-gb-proxy-session-types).
+Use a static port for Facebook bootstrap and pagination: they share one
+cookie-preserving client and endpoint throughout the search. Datacenter
+observations record the port and whether a static peer was requested; they do
+not invent a mobile sticky-session lifetime. Import its separate password with
+`carl configure-decodo-credential datacenter` before enabling the override.
+
+Facebook and eBay image downloads share a database-enforced limit of 25
+simultaneous image requests, across network paths and worker processes. Each
+source's image work limit is also 25; these are not two additive pools of 25.
+eBay seller descriptions permit ten concurrent jobs. The worker pool remains
+30 per process, and the existing request-rate and holdoff limits are unchanged.
+Worker startup retires the older immutable image/description constraints and
+records the replacement policy with code provenance, including for work queued
+before the upgrade.
+
+Facebook's `overlapping_price_partitions` strategy requests the first result
+page of each price bucket without cursor pagination. Cursor pagination is
+still available and remains the default when no traversal strategy is supplied;
+a cursor-pagination failure does not establish that bucketed searches fail.
+
 The ordinary document contains credential identities, never proxy passwords.
+HTTP transports and network routes are independently named configuration
+components. An acquisition stack composes one of each without adding the HTTP
+implementation to `network_path`. The `ebay_anonymous` example therefore means
+wreq with its Chrome 153 profile over the configured Decodo route. The stack
+model can represent other route providers, but the initial eBay command
+deliberately resolves Decodo only and has no implicit fallback.
 Carl currently requires `config.toml` to be owned by the current user with mode
 0600. `carl configure-decodo-credential IDENTIFIER` reads the password from a
 non-echoing prompt and creates a mode-0600 file in Carl's fixed private Decodo
@@ -200,6 +288,60 @@ stored in ordinary provenance. This makes aliases for the same device contend
 on the same cross-process lock. Safe provenance retains the route, account and
 configuration references, provider/product settings, verified wireproxy
 identity, and configuration-document identity.
+
+## eBay item and image follow-up
+
+`request_listing_details` accepts an explicit eBay item ID and queues bounded durable follow-up.
+It defaults to reprocessing an already retained usable item acquisition, with `refresh=true` for a
+new page. Collection and offline extraction are separate work items. Extraction binds structured
+data and targeted DOM fields to the requested item identity; challenges, unavailable pages,
+mismatched items, and unrecognized responses remain explicit observations. A later failure does
+not discard earlier usable details. Observation ordering follows acquisition publication, then
+derivation publication, so reprocessing old evidence does not give it a new acquisition age.
+
+Item and seller-description iframe pages use the configured Decodo/wreq acquisition stack.
+Descriptions are separate provenance-linked follow-ups and must return complete HTML rather than
+a challenge page. Gallery extraction excludes unrelated recommendation images and accepts only
+credential-free HTTPS eBay image-host URLs. Downloads use the effective configured image route,
+disable redirects, and require the exact requested HTTP 200 resource. The per-item image bound
+defaults to twenty and is capped at fifty; zero retains gallery URLs without downloading images.
+
+Images pass Carl's existing decoding, MIME, image-structure and pixel-limit checks before being
+published as content-addressed external files. Acquisition metadata points at that validated image
+artifact, not a duplicate response BLOB. Exact-URL reuse keeps a new listing/reference relationship
+and links the original saved result as input rather than claiming to create its existing artifact.
+Failed image validation retains diagnostics, not dangling references to discarded body bytes.
+Transport failures retry with a bounded budget; permanent configuration or validation failures
+remain terminal.
+
+`get_listing_details` reads retained Facebook or eBay detail without collecting anything and returns
+per-image outcomes and exact saved artifact IDs. `get_listing_image` authorizes saved image results
+from either source. The same detail, refresh, workspace, and analysis calls dispatch from retained
+source provenance. Workspaces may mix Facebook/eBay tracks, reviews, claims, worksets, and selections;
+eBay review identities use `ebay:<item ID>` while legacy Facebook numeric IDs remain compatible.
+Refresh coordinators wait for item, description, and gallery work; search-only calls do not implicitly
+fetch every item. eBay AI inputs include exact saved description and gallery provenance and share
+the global analysis concurrency limit. SQLite v9 migrates existing numeric claim rows intact and adds
+marketplace evidence indexes. Restart old MCP and worker processes together after upgrading.
+Offline fixtures cover these paths;
+the eBay item parser has not yet been validated against live provider responses.
+
+New eBay searches must use `listing_state="active"`. Sold/completed acquisitions are presently
+unsupported: the anonymous configured acquisition does not support closed-listing sign-in/challenge
+gating. Creation, reruns, retries, and refreshes reject these modes; retained evidence remains readable.
+Historical `"sold"` mode adds `LH_Sold=1` and
+`LH_Complete=1`, while `"completed"` adds only `LH_Complete=1` to search all closed listings,
+including unsold endings. These retained request modes are
+ordinary search modes; results retain the same item identities as active observations. Explicit
+Sold evidence yields sold status; explicit Ended evidence without a sale yields unavailable;
+unmarked cards stay unknown. A closed listing's asking price is not a sale price.
+Each retained sold card records its displayed
+sale price and date, original date text, and price availability; result summaries preserve that
+price/date pair's exact occurrence provenance. Missing years are not guessed. Recognized accepted
+Best Offers and crossed-out prices remain unknown sale amounts rather than false comparables.
+Public card prices are not verified transaction totals. Composed views expose `last_sale`
+separately from ordinary price evidence and classify sold cards as sold; available-only filtering
+remains the default. This is retained evidence, not automatic matching or deal scoring.
 
 ## Storage implementation
 
@@ -401,6 +543,79 @@ header's position and name while replacing protected values with an explicit
 redaction record. The HTTPX request object inspected for evidence is the same
 request object sent by the client.
 
+The browser-profiled wreq adapter is a distinct HTTP evidence producer. It
+records the installed wreq version, named emulation profile, profile platform
+mode, default-header policy, cookie and redirect behavior, TLS verification,
+HTTP-version policy, worker-thread execution mode, effective timeout mapping,
+and compression behavior. Wreq generates part of the outbound header block
+inside its native engine; Carl records caller-supplied headers separately and
+marks the profile-generated portion as unobserved rather than claiming it is a
+complete effective-request capture. Wreq also decodes HTTP content encoding
+before exposing body bytes to Python. Those artifacts are explicitly labeled
+as wreq-decoded, with raw received-content byte counts unavailable, and are
+never described as exact wire bytes. HTTP statuses and semantic challenge pages
+remain complete target responses; only native request, proxy, TLS, timeout,
+stream, and cleanup failures are transport failures.
+
+## eBay search
+
+`carl ebay-search QUERY` performs a bounded anonymous eBay search traversal
+through the configured `ebay_anonymous` stack. The initial stack composes the
+wreq Chrome 153 transport with Decodo. Each page is a separately retained HTTP
+acquisition; the traversal follows only a validated, sequential eBay next-page
+link and defaults to at most five pages, with a hard request-model limit of
+twenty. Follow-up pages send the preceding search page's URL as `Referer`, without
+a deliberate inter-page delay, using the same sticky session and cookie-preserving client.
+A missing next link stops normally. Challenge, empty, and unrecognized
+pages are retained as the terminal page. Item-detail requests, retries, and
+route fallback remain out of scope.
+
+MCP agents use the single `create_search` tool with one or more discriminated
+targets. Each target names `marketplace = "ebay"` or `marketplace = "facebook"`
+and carries that source's request. One group can therefore search either source
+or both. Both branches enqueue durable work for `carl work`; the MCP server
+itself does not perform the network request.
+
+Search groups, target definitions, target-state changes, and executions are
+immutable records. `add_search_target` appends and initially runs a target;
+`set_search_target_enabled` changes only whether later `run_search` calls
+schedule it. Disabling a target never removes its earlier executions or search
+runs. `get_search` returns all targets and executions, including disabled-target
+history, and a deduplicated list of every completed source search-run record.
+
+`list_search_results` is the marketplace-neutral read path after creation. It
+takes the search-group record identifier, discovers each completed target
+execution from retained provenance, and returns common search-card fields. The
+caller does not select Facebook- or eBay-specific processing. Results are
+deduplicated by marketplace plus the source's external item identifier; all
+supporting occurrence, source-run, target, execution, acquisition, and
+completion-sequence references remain attached. Opaque cursors preserve the
+initial completion boundary, so later search completions appear only in a new
+traversal rather than between pages of an existing one. Disabling a target does
+not remove its historical results, and removing a marketplace implementation
+later would not erase already retained records.
+
+Check `get_search` execution `collection_succeeded`, `response_classification`,
+and `stopping_reason`, and `list_search_results.execution_warnings`, before
+interpreting zero cards as a successful empty search. Warnings include failed
+collections (even legacy work marked completed) and pending or failed work.
+Execution warnings are live; only listing-card pagination uses the fixed cursor
+boundary. Older failed runs remain immutable and are flagged on read.
+
+The acquisition uses the generic `carl/http/acquisition` record and
+`carl/http/response_body` artifact kinds. A separate offline extraction
+operation stores a UTF-8 text derivative, one `carl/ebay/search_extraction`
+record per page, and one `carl/ebay/search_listing_occurrence` record per
+page-local distinct item ID. A final `carl/ebay/search_run` manifest ties every
+page, occurrence, classification, requested bound, and stopping reason together
+while reporting both occurrence and cross-page unique-listing counts. The
+extractor classifies usable results, legitimate empty results, eBay challenge
+pages, error pages, non-success HTTP responses, and unrecognized page structures.
+A challenge or error remains retained HTTP evidence but is not a successful
+empty search. Durable work retries these response failures at most three total
+attempts with exponential backoff, preserving each attempt's evidence, then
+reports terminal failure. Explicit empty results remain successful.
+
 ## Network providers
 
 Every production network route describes one concrete, ordered network path and
@@ -413,8 +628,12 @@ Route selection belongs to the flow or activity policy. A future policy may
 require one path, choose randomly from an eligible set, or try candidates in an
 explicit fallback order. Selection may apply to complete paths or to an
 alternative at one layer of a path. For example, Marketplace search and image
-downloads use Proton, while item details currently use Decodo. A later flow may
+downloads request the configured Proton path, which an explicit runtime cutover
+can replace with Decodo datacenter, while item details use their separate Decodo
+route. A later flow may
 choose among Decodo, Mullvad, Bright Data, or other explicitly configured paths.
+Anonymous eBay acquisition currently selects the named wreq/Chrome 153
+transport composed with the Decodo route.
 
 The policy must resolve a concrete path before each request attempt. A fallback
 therefore creates another attempt with its own selected path and complete
@@ -447,20 +666,23 @@ are redacted. Native proxy TLS uses system trust roots. A future product that
 requires Bright Data's inspection certificate will have a separate adapter and
 explicit certificate identity.
 
-Decodo is also a native HTTP proxy adapter, with typed residential and mobile
-products. A route records the safe base proxy username, account identity,
+Decodo is also a native HTTP proxy adapter, with typed residential, mobile, and
+shared datacenter products. A route records the safe base proxy username, account identity,
 gateway, target country, credential reference, and requested sticky duration.
-For each independent item-page acquisition Carl generates a transient provider
-session identifier and appends the country, session, and duration controls to
-the username. The constructed username, provider session identifier, password,
+For each independent residential/mobile acquisition Carl generates a transient provider session
+identifier and appends the country, session, and duration controls to the
+username. The constructed username, provider session identifier, password,
 cookies, and protected proxy headers are not retained. Redirects and cookies
-within that acquisition share one HTTPX client. The next item acquisition opens
-a fresh provider session so a provider-selected bad exit is scoped to that
-item. Provenance says that a sticky peer was requested; it does not claim that
-Decodo guaranteed the peer remained available. HTTPX proxy errors are
-classified as provider failures. HTTP statuses remain target evidence unless a
-later adapter has provider-specific proof. Provider selection,
-fallback, and semantic retry remain flow policy rather than route behavior.
+within an acquisition share one client of the selected HTTP implementation.
+Facebook item collection currently selects HTTPX, while the anonymous eBay
+stack selects wreq with the configured browser profile. The next independent
+acquisition opens a fresh provider session so a provider-selected bad exit is
+scoped to that acquisition. Provenance says that a sticky peer was requested;
+it does not claim that Decodo guaranteed the peer remained available. HTTPX and
+wreq proxy-transport errors are classified as provider failures. HTTP statuses
+remain target evidence unless a later adapter has provider-specific proof.
+Provider selection, fallback, and semantic retry remain flow policy rather than
+route behavior.
 
 Proton is implemented as a provider-specific managed WireGuard transport over a
 provider-neutral `wireproxy` process manager. It requires a dedicated exported
@@ -514,7 +736,9 @@ its activity's selection policy. Path layers are always ordered from the
 application toward the network; this direction is part of the schema rather
 than a per-record option.
 
-Marketplace searches and image downloads are assigned to Proton. Item-page
+Facebook searches and both marketplaces' images resolve explicit route
+overrides; a Decodo datacenter cutover replaces their requested Proton paths.
+eBay searches and item-page
 collection defaults to Decodo, with Mullvad available as an explicit override
 and Bright Data retained as another native proxy implementation. No adapter
 silently changes its assigned path. A future flow policy may explicitly select
@@ -725,10 +949,11 @@ composed prompt remains model-boundary evidence. The evidence-set and guide prov
 rest of the source graph without copying upstream facts into the analysis result. The queue skips a
 completed analysis of the same evidence set, guide, and analysis configuration. The CLI requires
 an explicit product guide so telescope guidance cannot silently apply to tool storage or another
-product family. The initial model choice is
-Claude Sonnet 5 with medium effort; both are explicit invocation settings, while
+product family. The default model choice is
+Claude Sonnet 5.5 with medium effort; both are explicit invocation settings, while
 Claude's exact output metadata retains reported model usage. Carl uses the
-exact `claude-sonnet-5` model ID for repeatability. Exact analysis-record lookup includes retained
+exact `claude-sonnet-5-5` model ID for repeatability. Existing queued work retains its recorded
+model choice. Exact analysis-record lookup includes retained
 failed attempts for diagnosis, but candidate and dossier analysis summaries remain completed-only.
 
 Web claims in this initial implementation have agent-reported provenance: the report retains page
@@ -763,10 +988,10 @@ retained searches, and accepts one durable refresh request. New-search requests 
 immediately and rely on the explicit shared worker pool just like refreshes. The refresh request inherits the exact search intent, bounds, and traversal
 strategy unless the caller supplies complete typed replacements. This makes overlapping price
 partition width, overlap, and order available without reproducing CLI flags as loosely related
-strings. A refresh repeats the search through Proton, selects the union of the baseline and refreshed
+strings. A refresh repeats the search through the effective configured route, selects the union of the baseline and refreshed
 listing IDs, and reuses the latest semantically usable retained item page for each exact ID. Only an
 ID without a usable `full_listing` or `listing_unavailable` observation causes a new Decodo request.
-The refresh then runs the existing image reuse and Proton collection logic against those latest
+The refresh then runs the existing image reuse and routed collection logic against those latest
 usable observations. Including baseline-only IDs preserves their retained detail evidence without
 treating absence from search as evidence of sale. Optional item and image limits bound experiments;
 the first configured search traversal limit remains decisive.
@@ -840,8 +1065,24 @@ pure functions. The application layer coordinates those rules with SQLite and ar
 The MCP module translates between official-SDK values and the application; it does not issue SQL,
 traverse provenance itself, or construct storage paths. `carl.cli` selects Trio. MCP owns only its
 database/application lifetime. `carl work` and `carl monitor --work` compose the isolated worker-pool
-runtime with an independently owned database lifetime. AnyIO and `contextlib.asynccontextmanager`
-own cancellation and cleanup in both cases.
+runtime with an independently owned database lifetime. Resource-owning context managers enclose
+their users: the database outlives shared transports, and transports outlive the worker/watch task
+group. Shutdown stops new work, cancels and joins that group, closes transports, then closes the
+database. Borrowers never close their shared dependencies.
+
+Resource finalizers use bounded shielding before their first cleanup await, including ownership
+locks and successful context exits. Independent cleanup obligations are attempted even after a
+failure; incomplete database closure remains retryable. Secondary cleanup failures are reported
+using safe phase/type metadata without replacing an active error or cancellation. Transaction
+rollback failures remain explicit rather than permitting reuse of uncertain transaction state.
+Durable work interruption is reconciled atomically using the lease token and operation binding:
+setup without an operation can release its lease, but committed outcomes and replacement owners
+are never undone. Lease/permit expiry is crash recovery, not the normal shutdown mechanism.
+Ending an operation also cancels any unfinished network activities in the same transaction.
+These fallback records retain the previous state, whether dispatch was possible, and the owner's
+terminal state; the request outcome remains explicitly unknown. Existing terminal activity results
+and event history are preserved. Worker startup reconciles historical activities whose owners
+already ended; an expired permit alone is not enough to cancel an activity with a live owner.
 
 MCP tools are defined by an explicit immutable registry constructed during startup. Registration
 rejects duplicate tool names and duplicate structured operation identities and retains generated

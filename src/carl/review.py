@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from time import perf_counter_ns, time_ns
+from typing import Literal, cast
 from uuid import uuid4
 
 import anyio
@@ -44,6 +45,7 @@ from carl.core.composed_projection import (
     ProjectionAnalysisDescriptor,
     ProjectionGalleryImageDescriptor,
     SavedImageProjectionCandidate,
+    ScalarFieldValues,
     SearchAncestrySelection,
     SearchCardCandidate,
     SearchMembershipOccurrenceCandidate,
@@ -58,7 +60,12 @@ from carl.core.composed_projection import (
     decode_composed_listing_cursor,
     encode_composed_listing_cursor,
     evidence_recency_key,
+    normalize_scalar_fields,
     projection_revision,
+    projection_scalar_fields,
+    scalar_field_changes,
+    scalar_fields_sha256,
+    search_card_field_value,
     select_analyses,
     select_composed_field,
     select_gallery,
@@ -69,6 +76,33 @@ from carl.core.composed_projection import (
     truncate_composed_gallery,
     validate_composed_listing_cursor_scope,
 )
+from carl.core.ebay import (
+    COLLECT_EBAY_SEARCH_PAYLOAD_SCHEMA_VERSION,
+    COLLECT_EBAY_SEARCH_WORK_KIND,
+    EBAY_SEARCH_FAILURE_KINDS,
+    CollectEbaySearchPayload,
+    EbayListingState,
+    EbaySearchRequest,
+    EbaySearchResponseClassification,
+    collect_ebay_search_work,
+)
+from carl.core.ebay_items import (
+    CollectEbayItemPayload,
+    ExtractEbayItemPayload,
+    collect_ebay_item_work,
+    extract_ebay_item_work,
+)
+from carl.core.ebay_price import ebay_price_value, normalize_ebay_scalar_fields
+from carl.core.ebay_refresh import (
+    REFRESH_EBAY_SEARCH_WORK_KIND,
+    RefreshEbaySearchPayload,
+    refresh_ebay_search_work,
+    refresh_ebay_search_work_constraints,
+)
+from carl.core.ebay_search_support import (
+    UnsupportedEbaySearchMode,
+    require_supported_ebay_search_acquisition,
+)
 from carl.core.facebook_images import (
     GalleryImageReference,
     ImageFailureSourceKind,
@@ -76,6 +110,10 @@ from carl.core.facebook_images import (
     RetryImageFailuresResult,
     gallery_references,
     image_session_work_constraint,
+)
+from carl.core.facebook_listing import (
+    RequestFacebookListingDetailsPayload,
+    request_facebook_listing_details_work,
 )
 from carl.core.facebook_refresh import (
     RefreshSearchPayload,
@@ -103,7 +141,52 @@ from carl.core.item_analysis import (
     listing_analysis_evidence_set,
 )
 from carl.core.json import encode_json
+from carl.core.marketplace_listing import (
+    GetMarketplaceListingRequest,
+    MarketplaceListingDetails,
+    MarketplaceListingImage,
+    RequestEbayListingDetailsRequest,
+    RequestListingDetailsResult,
+)
+from carl.core.marketplace_search import (
+    ADD_MARKETPLACE_SEARCH_TARGET,
+    CREATE_MARKETPLACE_SEARCH,
+    MARKETPLACE_SEARCH_EXECUTION_KIND,
+    MARKETPLACE_SEARCH_KIND,
+    MARKETPLACE_SEARCH_TARGET_KIND,
+    MARKETPLACE_SEARCH_TARGET_STATE_KIND,
+    RUN_MARKETPLACE_SEARCH,
+    SET_MARKETPLACE_SEARCH_TARGET_ENABLED,
+    AddMarketplaceSearchTargetRequest,
+    CreateMarketplaceSearchRequest,
+    EbaySearchTargetSpecification,
+    FacebookSearchTargetSpecification,
+    ListMarketplaceSearchResultsRequest,
+    Marketplace,
+    MarketplaceSearch,
+    MarketplaceSearchExecution,
+    MarketplaceSearchExecutionRecord,
+    MarketplaceSearchExecutionWarning,
+    MarketplaceSearchRecord,
+    MarketplaceSearchResult,
+    MarketplaceSearchResultOccurrence,
+    MarketplaceSearchResultsCursor,
+    MarketplaceSearchResultsPage,
+    MarketplaceSearchTarget,
+    MarketplaceSearchTargetRecord,
+    MarketplaceSearchTargetStateRecord,
+    RunMarketplaceSearchRequest,
+    SetMarketplaceSearchTargetEnabledRequest,
+    build_marketplace_search_component_registry,
+    decode_marketplace_search_results_cursor,
+    encode_marketplace_search_results_cursor,
+)
 from carl.core.models import CodeProvenance, JsonValue, NamedInput, NamedOutput, RecordDraft
+from carl.core.refresh_recovery import (
+    RetryItemFailuresRequest,
+    RetryItemFailuresResult,
+    refresh_failure_summary,
+)
 from carl.core.review import (
     AnalysisBatchProgress,
     AnalysisDescriptor,
@@ -137,6 +220,7 @@ from carl.core.review import (
     search_refresh_phase,
     work_group_progress,
 )
+from carl.core.review_errors import IncompleteGalleryError, ReviewInputError
 from carl.core.review_workspace import (
     ACQUIRE_REVIEW_BATCH,
     ADD_WORKSPACE_PRODUCT_GUIDE,
@@ -216,6 +300,7 @@ from carl.core.review_workspace import (
     WorksetSelection,
     WorkspaceDefaultProductGuideStateRecord,
     WorkspaceListingPage,
+    WorkspaceListingReview,
     WorkspaceListingSummary,
     WorkspaceProductGuideBinding,
     WorkspaceProductGuideBindingRecord,
@@ -229,12 +314,27 @@ from carl.core.review_workspace import (
     review_mutation_request_sha256,
 )
 from carl.core.work import WorkEventKind, WorkRequester, WorkState
+from carl.core.workspace_search_results import (
+    ListWorkspaceSearchResultsRequest,
+    WorkspaceSearchResult,
+    WorkspaceSearchResultOccurrence,
+    WorkspaceSearchResultsCursor,
+    WorkspaceSearchResultsPage,
+    decode_workspace_search_results_cursor,
+    encode_workspace_search_results_cursor,
+    workspace_search_results_scope,
+)
+from carl.ebay_analysis_workers import request_ebay_listing_analysis
+from carl.ebay_refresh_workers import ebay_refresh_child_work_states
+from carl.ebay_retry import retry_ebay_image_failures
 from carl.facebook_analysis_workers import (
     AUTHOR_PRODUCT_GUIDE,
     PLAN_FACEBOOK_LISTING_ANALYSIS_EVIDENCE,
     build_analysis_component_registry,
 )
 from carl.io.claude import ClaudeCli
+from carl.io.configuration import ConfigurationFailure, load_configuration
+from carl.io.paths import user_directories
 from carl.io.processes import database_process_activity
 from carl.io.provenance import (
     collect_code_provenance_async,
@@ -242,28 +342,18 @@ from carl.io.provenance import (
     source_tree_sha256_async,
 )
 from carl.io.sqlite import Database
-
-
-class ReviewInputError(ValueError):
-    """An expected request failure that an interactive agent can correct."""
-
-
-class IncompleteGalleryError(ReviewInputError):
-    def __init__(
-        self,
-        unavailable_gallery_orders: tuple[int, ...],
-        gallery_absence_reason: str | None = None,
-    ):
-        self.unavailable_gallery_orders: tuple[int, ...] = unavailable_gallery_orders
-        self.gallery_absence_reason: str | None = gallery_absence_reason
-        if gallery_absence_reason is not None:
-            message = (
-                f"Selected listing observation has no usable gallery: {gallery_absence_reason}"
-            )
-        else:
-            positions = ", ".join(str(order) for order in unavailable_gallery_orders)
-            message = f"Selected listing observation has unavailable gallery positions: {positions}"
-        super().__init__(message)
+from carl.marketplace_listing import ebay_observations, read_ebay_listing
+from carl.marketplace_projection import (
+    ebay_analysis_descriptor,
+    ebay_candidate_sources,
+    expand_search_runs,
+    get_marketplace_composed_listing,
+    list_marketplace_composed_search,
+    marketplace_bulk_review_projections,
+    run_listing_identifiers,
+    scope_contains_ebay,
+)
+from carl.refresh_recovery import retry_refresh_item_failures
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +401,84 @@ def _optional_positive_integer(source: dict[str, JsonValue], name: str) -> int |
 
 
 @dataclass(frozen=True, slots=True)
+class _MarketplaceSearchResultCandidate:
+    marketplace: Marketplace
+    external_identifier: str
+    canonical_url: str
+    title: str | None
+    displayed_price: str | None
+    location: str | None
+    shipping_text: str | None
+    condition: str | None
+    preview_image_url: str | None
+    promoted: bool | None
+    occurrence: MarketplaceSearchResultOccurrence
+
+
+def _nested_text(value: JsonValue) -> str | None:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return None
+    mapping = cast(dict[str, JsonValue], value)
+    for name in ("text", "display_name", "label"):
+        candidate = mapping.get(name)
+        if isinstance(candidate, str):
+            return candidate
+    return None
+
+
+def _facebook_displayed_price(original: dict[str, JsonValue]) -> str | None:
+    price = search_card_field_value("price", original)
+    if not isinstance(price, dict):
+        return None
+    normalized = cast(dict[str, JsonValue], price)
+    formatted = normalized.get("formatted_amount")
+    if isinstance(formatted, str):
+        return formatted
+    amount = normalized.get("amount_decimal")
+    currency = normalized.get("currency")
+    if not isinstance(amount, str):
+        return None
+    return f"{amount} {currency}" if isinstance(currency, str) else amount
+
+
+def _facebook_preview_image(original: dict[str, JsonValue]) -> str | None:
+    photo = original.get("primary_listing_photo")
+    if not isinstance(photo, dict):
+        return None
+    image = cast(dict[str, JsonValue], photo).get("image")
+    if not isinstance(image, dict):
+        return None
+    uri = cast(dict[str, JsonValue], image).get("uri")
+    return uri if isinstance(uri, str) else None
+
+
+def _ebay_listing_state(value: JsonValue) -> EbayListingState | None:
+    request = value.get("request") if isinstance(value, dict) else None
+    if not isinstance(request, dict):
+        return None
+    state = request.get("listing_state", "active")
+    return state if state in ("active", "sold", "completed") else None
+
+
+def _require_ebay_search_acquisition(request: EbaySearchRequest) -> None:
+    try:
+        require_supported_ebay_search_acquisition(request)
+    except UnsupportedEbaySearchMode as error:
+        raise ReviewInputError(str(error)) from error
+
+
+def _newest_value[T](
+    candidates: tuple[_MarketplaceSearchResultCandidate, ...],
+    getter: Callable[[_MarketplaceSearchResultCandidate], T | None],
+) -> T | None:
+    return next(
+        (value for candidate in candidates if (value := getter(candidate)) is not None), None
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewApplication:
     database: Database
     repository_root: Path
@@ -345,15 +513,29 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=34),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=23),
-                ServerCapability(identity=("carl", "activity", "snapshot"), version=2),
-                ServerCapability(identity=("carl", "facebook", "search_refresh"), version=2),
-                ServerCapability(identity=("carl", "facebook", "create_search"), version=1),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=49),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=36),
+                ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
+                ServerCapability(identity=("carl", "facebook", "search_refresh"), version=3),
+                ServerCapability(identity=("carl", "marketplace", "create_search"), version=1),
+                ServerCapability(identity=("carl", "marketplace", "search_group"), version=2),
+                ServerCapability(
+                    identity=("carl", "marketplace", "search_results_projection"), version=4
+                ),
+                ServerCapability(identity=("carl", "ebay", "collect_search_work"), version=9),
+                ServerCapability(identity=("carl", "marketplace", "listing_details"), version=2),
+                ServerCapability(identity=("carl", "ebay", "item_images"), version=1),
+                ServerCapability(identity=("carl", "marketplace", "search_refresh"), version=2),
+                ServerCapability(identity=("carl", "marketplace", "item_failure_retry"), version=1),
+                ServerCapability(identity=("carl", "work", "connectivity_outage_pause"), version=1),
+                ServerCapability(identity=("carl", "marketplace", "listing_analysis"), version=1),
+                ServerCapability(
+                    identity=("carl", "marketplace", "image_failure_retry"), version=1
+                ),
                 ServerCapability(identity=("carl", "facebook", "search_run_summary"), version=1),
                 ServerCapability(identity=("carl", "facebook", "search_run_membership"), version=1),
                 ServerCapability(
-                    identity=("carl", "facebook", "search_transport_retry"), version=3
+                    identity=("carl", "facebook", "search_transport_retry"), version=4
                 ),
                 ServerCapability(
                     identity=("carl", "facebook", "search_refresh", "child_progress"),
@@ -362,7 +544,7 @@ class ReviewApplication:
                 ServerCapability(identity=("carl", "work", "cross_process_constraints"), version=1),
                 ServerCapability(identity=("carl", "work", "explicit_runtime"), version=1),
                 ServerCapability(identity=("carl", "facebook", "image_failure_retry"), version=2),
-                ServerCapability(identity=("carl", "facebook", "collect_image_work"), version=2),
+                ServerCapability(identity=("carl", "facebook", "collect_image_work"), version=3),
                 ServerCapability(identity=("carl", "facebook", "analysis_batch"), version=6),
                 ServerCapability(
                     identity=("carl", "facebook", "analysis_timeout_retry"), version=1
@@ -372,18 +554,18 @@ class ReviewApplication:
                 ),
                 ServerCapability(identity=("carl", "facebook", "listing_availability"), version=1),
                 ServerCapability(identity=("carl", "review", "provenance_summary"), version=1),
-                ServerCapability(identity=("carl", "review", "composed_projection"), version=4),
-                ServerCapability(identity=("carl", "review", "workspace"), version=7),
-                ServerCapability(identity=("carl", "review", "workspace_bulk_review"), version=1),
+                ServerCapability(identity=("carl", "review", "composed_projection"), version=9),
+                ServerCapability(identity=("carl", "review", "workspace"), version=10),
+                ServerCapability(identity=("carl", "review", "workspace_bulk_review"), version=4),
                 ServerCapability(
                     identity=("carl", "review", "workspace_product_guides"), version=1
                 ),
                 ServerCapability(identity=("carl", "review", "product_guides"), version=1),
-                ServerCapability(identity=("carl", "review", "workspace_search_tracks"), version=3),
-                ServerCapability(identity=("carl", "review", "claims"), version=1),
-                ServerCapability(identity=("carl", "review", "selection_snapshot"), version=1),
-                ServerCapability(identity=("carl", "review", "selection_analysis"), version=4),
-                ServerCapability(identity=("carl", "review", "workspace_work"), version=3),
+                ServerCapability(identity=("carl", "review", "workspace_search_tracks"), version=7),
+                ServerCapability(identity=("carl", "review", "claims"), version=2),
+                ServerCapability(identity=("carl", "review", "selection_snapshot"), version=2),
+                ServerCapability(identity=("carl", "review", "selection_analysis"), version=5),
+                ServerCapability(identity=("carl", "review", "workspace_work"), version=4),
                 ServerCapability(identity=("carl", "work", "runtime_status"), version=2),
             ),
         )
@@ -393,7 +575,7 @@ class ReviewApplication:
         recent_window_minutes: int = 60,
         maximum_rows: int = 20,
     ) -> ActivitySnapshot:
-        """Return a bounded overview of active work, recent outcomes, and network activity."""
+        """Return work, failed connection attempts, and global connectivity pause/probe state."""
 
         if not 1 <= recent_window_minutes <= 7 * 24 * 60:
             raise ReviewInputError("Activity recent-window minutes must be between 1 and 10080")
@@ -822,6 +1004,18 @@ class ReviewApplication:
     async def get_composed_listing(
         self, request: GetComposedListingRequest
     ) -> ComposedListingProjection:
+        roots = tuple(
+            identifier
+            for identifier in (
+                request.search_run_record_identifier,
+                *request.additional_search_run_record_identifiers,
+            )
+            if identifier is not None
+        )
+        if request.listing_identifier.startswith("ebay:") or await scope_contains_ebay(
+            self.database, roots
+        ):
+            return await get_marketplace_composed_listing(self, request)
         if request.product_guide_record_identifier is not None:
             await self._active_product_guide(request.product_guide_record_identifier)
         as_of = await self.database.current_completion_boundary()
@@ -917,6 +1111,14 @@ class ReviewApplication:
         return projection
 
     async def list_composed_search(self, request: ListComposedSearchRequest) -> ComposedListingPage:
+        if await scope_contains_ebay(
+            self.database,
+            (
+                request.search_run_record_identifier,
+                *request.additional_search_run_record_identifiers,
+            ),
+        ):
+            return await list_marketplace_composed_search(self, request)
         try:
             cursor = (
                 None if request.cursor is None else decode_composed_listing_cursor(request.cursor)
@@ -1181,6 +1383,9 @@ class ReviewApplication:
                     title=None if listing.title is None else listing.title.value,
                     price=None if listing.price is None else listing.price.value,
                     location=None if listing.location is None else listing.location.value,
+                    condition=None if listing.condition is None else listing.condition.value,
+                    shipping=None if listing.shipping is None else listing.shipping.value,
+                    last_sale=None if listing.last_sale is None else listing.last_sale.value,
                     preview_image_url=(
                         None
                         if listing.preview_image is None
@@ -1203,16 +1408,271 @@ class ReviewApplication:
             next_cursor=page.next_cursor,
         )
 
+    async def list_workspace_search_results(
+        self, request: ListWorkspaceSearchResultsRequest
+    ) -> WorkspaceSearchResultsPage:
+        """Read one track's latest retained cards, without composing or acquiring listings."""
+
+        workspace = await self.get_review_workspace(request.workspace_record_identifier)
+        track = next(
+            (
+                item
+                for item in workspace.search_tracks
+                if item.track_identifier == request.track_identifier
+            ),
+            None,
+        )
+        if track is None:
+            raise ReviewInputError("The search track does not belong to this workspace")
+        scope = workspace_search_results_scope(request)
+        cursor = None
+        if request.cursor is not None:
+            try:
+                cursor = decode_workspace_search_results_cursor(request.cursor)
+            except ValueError as error:
+                raise ReviewInputError(str(error)) from error
+            if cursor.scope_sha256 != scope:
+                raise ReviewInputError(
+                    "Workspace search-results cursor belongs to another track or filter"
+                )
+        now = await self.database.current_completion_boundary()
+        as_of = now if cursor is None else cursor.as_of_completion_sequence
+        object_boundary = (
+            await self.database.current_object_boundary()
+            if cursor is None
+            else cursor.maximum_object_rowid
+        )
+        if as_of > now or object_boundary > await self.database.current_object_boundary():
+            raise ReviewInputError(
+                "Workspace search-results cursor boundary is beyond retained evidence"
+            )
+        warnings = []
+        if track.creation_work_state in (
+            WorkState.PENDING,
+            WorkState.LEASED,
+            WorkState.TERMINAL_FAILURE,
+        ):
+            warnings.append("track_creation_not_completed")
+        if track.latest_refresh_work_state in (
+            WorkState.PENDING,
+            WorkState.LEASED,
+            WorkState.TERMINAL_FAILURE,
+        ):
+            warnings.append("latest_track_refresh_not_completed")
+        current = track.current_search_run_record_identifier
+        source_run = current if cursor is None else cursor.source_search_run_record_identifier
+        if source_run is None:
+            return WorkspaceSearchResultsPage(
+                workspace_record_identifier=workspace.record_identifier,
+                track_identifier=track.track_identifier,
+                source_search_run_record_identifier=None,
+                as_of_completion_sequence=as_of,
+                total_distinct_results=0,
+                collection_succeeded=False,
+                results=(),
+                next_cursor=None,
+                warnings=tuple(warnings or ["track_has_no_completed_search"]),
+            )
+        if cursor is not None and source_run != current:
+            runs = (
+                ()
+                if current is None
+                else await expand_search_runs(
+                    self.database,
+                    (current,),
+                    as_of_completion_sequence=now,
+                )
+            )
+            if source_run not in runs:
+                raise ReviewInputError(
+                    "Workspace search-results cursor source is outside this track"
+                )
+        kind, _, run_value = await self.database.get_record(source_run)
+        if kind not in (("carl", "facebook", "search_run"), ("carl", "ebay", "search_run")):
+            raise ReviewInputError("The track does not reference a source search run")
+        marketplace = Marketplace(kind[1])
+        classification = None
+        stopping_reason = None
+        succeeded = None
+        if marketplace is Marketplace.EBAY and isinstance(run_value, dict):
+            stopping_reason = _optional_string(run_value, "stopping_reason")
+            pages = run_value.get("pages")
+            if isinstance(pages, list) and pages and isinstance(pages[-1], dict):
+                value = pages[-1].get("response_classification")
+                if isinstance(value, dict):
+                    classification = EbaySearchResponseClassification.model_validate_json(
+                        encode_json(value)
+                    )
+            if classification is not None:
+                succeeded = (
+                    classification.kind not in EBAY_SEARCH_FAILURE_KINDS
+                    and stopping_reason != "invalid_next_page"
+                )
+            elif stopping_reason in {
+                "challenge",
+                "unrecognized_response",
+                "error_page",
+                "http_error",
+                "invalid_next_page",
+            }:
+                succeeded = False
+            if succeeded is False:
+                warnings.append("source_search_collection_failed")
+        records = await self.database.search_listing_occurrences_for_runs(
+            marketplace.value,
+            (source_run,),
+            as_of_completion_sequence=as_of,
+            maximum_object_rowid=object_boundary,
+        )
+        grouped: dict[str, list[tuple[str, dict[str, JsonValue]]]] = {}
+        for identifier, value in records:
+            if not isinstance(value, dict):
+                continue
+            item = value.get(
+                "item_identifier" if marketplace is Marketplace.EBAY else "listing_identifier"
+            )
+            if isinstance(item, str):
+                grouped.setdefault(item, []).append((identifier, value))
+        results: list[WorkspaceSearchResult] = []
+        for external, occurrences in grouped.items():
+            occurrences.sort(
+                key=lambda pair: (
+                    _nonnegative_integer(pair[1].get("page_ordinal")),
+                    _nonnegative_integer(pair[1].get("position", pair[1].get("edge_index"))),
+                    pair[0],
+                ),
+                reverse=True,
+            )
+            newest = occurrences[0][1]
+            if marketplace is Marketplace.EBAY:
+                title = _optional_string(newest, "title")
+                displayed = _optional_string(newest, "displayed_price")
+                state = newest.get("listing_state", "active")
+                location = None
+                price = ebay_price_value(displayed, currency=newest.get("currency"))
+                condition = _optional_string(newest, "condition")
+                shipping = _optional_string(newest, "shipping_text")
+                preview = _optional_string(newest, "image_url")
+                listing_identifier = f"ebay:{external}"
+                canonical = f"https://www.ebay.com/itm/{external}"
+            else:
+                original = newest.get("original")
+                if not isinstance(original, dict):
+                    continue
+                title = _nested_text(search_card_field_value("title", original))
+                displayed = _facebook_displayed_price(original)
+                state = (
+                    "sold"
+                    if original.get("is_sold") is True
+                    else "active"
+                    if original.get("is_live") is True
+                    else None
+                )
+                location = search_card_field_value("location_text", original)
+                price = search_card_field_value("price", original)
+                condition = _nested_text(original.get("condition")) or _nested_text(
+                    original.get("listing_condition")
+                )
+                shipping = None
+                preview = _facebook_preview_image(original)
+                listing_identifier = external
+                canonical = canonical_facebook_listing_url(external)
+            if request.listing_state == "completed":
+                if state not in ("sold", "completed"):
+                    continue
+            elif request.listing_state is not None and request.listing_state != state:
+                continue
+            folded = (title or "").casefold()
+            if any(
+                word.casefold() not in folded for word in request.required_title_keywords
+            ) or any(word.casefold() in folded for word in request.excluded_title_keywords):
+                continue
+            projected_occurrences = tuple(
+                WorkspaceSearchResultOccurrence(
+                    occurrence_record_identifier=identifier,
+                    acquisition_record_identifier=_optional_string(
+                        value, "acquisition_record_identifier"
+                    ),
+                    page_ordinal=_nonnegative_integer(value.get("page_ordinal")),
+                    position=_nonnegative_integer(value.get("position", value.get("edge_index"))),
+                    listing_state=value.get("listing_state")
+                    if marketplace is Marketplace.EBAY
+                    else state,
+                    sold_price=value.get("sold_price"),
+                    sold_price_value=ebay_price_value(value.get("sold_price")),
+                    sold_date=date.fromisoformat(raw)
+                    if isinstance(raw := value.get("sold_date"), str)
+                    else None,
+                    sold_date_text=value.get("sold_date_text"),
+                    sold_price_status=value.get("sold_price_status"),
+                )
+                for identifier, value in occurrences
+            )
+            sale = next(
+                (item for item in projected_occurrences if item.listing_state == "sold"), None
+            )
+            results.append(
+                WorkspaceSearchResult(
+                    marketplace=marketplace,
+                    listing_identifier=listing_identifier,
+                    external_identifier=external,
+                    canonical_url=canonical,
+                    title=title,
+                    price=price if state == "active" else None,
+                    displayed_price=displayed,
+                    location=location,
+                    condition=condition,
+                    shipping_text=shipping,
+                    preview_image_url=preview,
+                    listing_state=state,
+                    last_sale=None if sale is None else sale.model_dump(mode="json"),
+                    occurrences=projected_occurrences,
+                )
+            )
+        results.sort(key=lambda result: result.listing_identifier)
+        total = len(results)
+        if cursor is not None:
+            results = [
+                item
+                for item in results
+                if item.listing_identifier > cursor.after_listing_identifier
+            ]
+        selected = tuple(results[: request.page_size])
+        next_cursor = None
+        if len(results) > len(selected):
+            next_cursor = encode_workspace_search_results_cursor(
+                WorkspaceSearchResultsCursor(
+                    scope_sha256=scope,
+                    source_search_run_record_identifier=source_run,
+                    as_of_completion_sequence=as_of,
+                    maximum_object_rowid=object_boundary,
+                    after_listing_identifier=selected[-1].listing_identifier,
+                )
+            )
+        return WorkspaceSearchResultsPage(
+            workspace_record_identifier=workspace.record_identifier,
+            track_identifier=track.track_identifier,
+            source_search_run_record_identifier=source_run,
+            as_of_completion_sequence=as_of,
+            total_distinct_results=total,
+            collection_succeeded=succeeded,
+            response_classification=classification,
+            stopping_reason=stopping_reason,
+            results=selected,
+            next_cursor=next_cursor,
+            warnings=tuple(warnings),
+        )
+
     async def get_workspace_listing(
         self, request: GetWorkspaceListingRequest
-    ) -> ComposedListingProjection:
+    ) -> WorkspaceListingReview:
         """Compose one exact listing within a workspace's active search-track scope."""
 
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
         current_runs = self._workspace_current_search_runs(workspace)
         if not current_runs:
             raise ReviewInputError("The workspace has no completed active search track")
-        return await self.get_composed_listing(
+        projection = await self.get_composed_listing(
             GetComposedListingRequest(
                 listing_identifier=request.listing_identifier,
                 search_run_record_identifier=current_runs[0],
@@ -1223,6 +1683,32 @@ class ReviewApplication:
                 maximum_analyses=request.maximum_analyses,
                 maximum_observations=request.maximum_observations,
             )
+        )
+        prior_by_listing = await self._latest_listing_reviews(
+            workspace.record_identifier, (projection.listing_identifier,)
+        )
+        prior = prior_by_listing.get(projection.listing_identifier)
+        baselines = await self._review_scalar_baselines(tuple(prior_by_listing.values()))
+        baseline = None if prior is None else baselines.get(prior.record_identifier)
+        state, changed = classify_review_state(
+            current_revision=projection.projection_revision,
+            previous_review=prior,
+            policy=workspace.staleness_policy,
+            previous_scalar_fields=baseline,
+        )
+        return WorkspaceListingReview.model_validate(
+            {
+                **projection.model_dump(mode="python"),
+                "review_state": state,
+                "prior_review": prior,
+                "changed_components": changed,
+                "scalar_field_changes": (
+                    ()
+                    if baseline is None
+                    else scalar_field_changes(baseline, projection_scalar_fields(projection))
+                ),
+                "scalar_comparison_available": baseline is not None,
+            }
         )
 
     async def list_search_runs(self, query: str | None = None, limit: int = 50) -> SearchRunPage:
@@ -1276,7 +1762,45 @@ class ReviewApplication:
                     ),
                 )
             )
-        return SearchRunPage(search_runs=tuple(summaries))
+        for run in await self.database.ebay_search_run_records(query=query, limit=limit):
+            value = run.value
+            if not isinstance(value, dict):
+                raise ValueError("Stored eBay search run is malformed")
+            stored_request = value.get("request")
+            if not isinstance(stored_request, dict):
+                raise ValueError("Stored eBay search request is malformed")
+            summaries.append(
+                SearchRunSummary(
+                    marketplace="ebay",
+                    listing_state=EbaySearchRequest.model_validate(stored_request).listing_state,
+                    record_identifier=run.record_identifier,
+                    completion_sequence=run.completion_sequence,
+                    started_at_utc=run.started_at_utc,
+                    ended_at_utc=run.ended_at_utc,
+                    origin=run.origin,
+                    refresh_source_run_record_identifier=run.refresh_source_run_record_identifier,
+                    query=str(stored_request["query"]),
+                    facebook_location_identifier=None,
+                    radius_value=None,
+                    radius_unit=None,
+                    minimum_price=None,
+                    maximum_price=None,
+                    traversal_strategy=None,
+                    unique_listings=int(value.get("listing_count", 0)),
+                    stopping_reason=str(value["stopping_reason"])
+                    if value.get("stopping_reason") is not None
+                    else None,
+                )
+            )
+        summaries.sort(
+            key=lambda summary: (
+                summary.started_at_utc,
+                summary.completion_sequence,
+                summary.record_identifier,
+            ),
+            reverse=True,
+        )
+        return SearchRunPage(search_runs=tuple(summaries[:limit]))
 
     async def _publish_local_records(
         self,
@@ -1305,11 +1829,49 @@ class ReviewApplication:
             result=result,
         )
 
+    async def _publish_marketplace_search_records(
+        self,
+        *,
+        component_identifier: ComponentId,
+        records: tuple[RecordDraft, ...],
+        inputs: tuple[NamedInput, ...],
+        outputs: tuple[NamedOutput, ...],
+        result: JsonValue,
+        marketplace_target_guard: MarketplaceSearchTargetRecord | None = None,
+    ) -> None:
+        started_utc_ns = self.utc_now_ns()
+        started_monotonic_ns = self.monotonic_ns()
+        provenance = await self._code_provenance()
+        ended_utc_ns = self.utc_now_ns()
+        try:
+            await self.database.publish_records_operation(
+                component=build_marketplace_search_component_registry().require(
+                    component_identifier
+                ),
+                operation_identifier=self.new_identifier(),
+                records=records,
+                inputs=inputs,
+                outputs=outputs,
+                provenance=provenance,
+                invocation=process_invocation(),
+                started_at_utc=_utc_text(started_utc_ns),
+                ended_at_utc=_utc_text(ended_utc_ns),
+                duration_ns=max(0, self.monotonic_ns() - started_monotonic_ns),
+                result=result,
+                marketplace_target_guard=marketplace_target_guard,
+            )
+        except ValueError as error:
+            raise ReviewInputError(str(error)) from error
+
     async def create_review_workspace(
         self, request: CreateReviewWorkspaceRequest
     ) -> ReviewWorkspace:
         kind, _, _ = await self.database.get_record(request.search_run_record_identifier)
-        if kind != ("carl", "facebook", "search_run"):
+        if kind not in (
+            ("carl", "facebook", "search_run"),
+            ("carl", "ebay", "search_run"),
+            MARKETPLACE_SEARCH_KIND,
+        ):
             raise ReviewInputError("The workspace source is not a search run")
         if request.product_guide_record_identifier is not None:
             await self.database.require_product_guide_record(
@@ -1480,7 +2042,9 @@ class ReviewApplication:
     async def _workspace_search_tracks(
         self, workspace: ReviewWorkspace
     ) -> tuple[WorkspaceSearchTrack, ...]:
-        _, _, initial_value = await self.database.get_record(workspace.search_run_record_identifier)
+        initial_kind, _, initial_value = await self.database.get_record(
+            workspace.search_run_record_identifier
+        )
         initial_refresh_identifier = (
             await self.database.facebook_search_run_refresh_work_identifier(
                 workspace.search_run_record_identifier
@@ -1490,6 +2054,15 @@ class ReviewApplication:
             workspace.search_run_record_identifier: WorkspaceSearchTrack(
                 track_identifier=workspace.search_run_record_identifier,
                 query=self._search_query(initial_value),
+                marketplace=(
+                    Marketplace(initial_kind[1])
+                    if initial_kind
+                    in (("carl", "facebook", "search_run"), ("carl", "ebay", "search_run"))
+                    else None
+                ),
+                listing_state=_ebay_listing_state(initial_value)
+                if initial_kind == ("carl", "ebay", "search_run")
+                else None,
                 creation_work_identifier=None,
                 creation_work_state=None,
                 origin_search_run_record_identifier=workspace.search_run_record_identifier,
@@ -1500,6 +2073,50 @@ class ReviewApplication:
                 ),
             )
         }
+        if initial_kind == MARKETPLACE_SEARCH_KIND:
+            search = await self.get_marketplace_search(workspace.search_run_record_identifier)
+            tracks = {}
+            for target in search.targets:
+                successful = tuple(
+                    execution
+                    for execution in target.executions
+                    if execution.state is WorkState.COMPLETED
+                    and execution.collection_succeeded is not False
+                    and execution.search_run_record_identifier is not None
+                )
+                current = successful[-1] if successful else None
+                latest = target.executions[-1] if target.executions else None
+                run_identifier = None if current is None else current.search_run_record_identifier
+                refresh_identifier = (
+                    None
+                    if run_identifier is None
+                    else await self.database.facebook_search_run_refresh_work_identifier(
+                        run_identifier
+                    )
+                )
+                specification = target.specification.search
+                query = (
+                    specification.query
+                    if isinstance(specification, EbaySearchRequest)
+                    else specification.request.query
+                )
+                tracks[target.record_identifier] = WorkspaceSearchTrack(
+                    track_identifier=target.record_identifier,
+                    query=query,
+                    marketplace=target.specification.marketplace,
+                    listing_state=specification.listing_state
+                    if isinstance(specification, EbaySearchRequest)
+                    else None,
+                    creation_work_identifier=None if latest is None else latest.work_identifier,
+                    creation_work_state=None if latest is None else latest.state,
+                    origin_search_run_record_identifier=run_identifier,
+                    current_search_run_record_identifier=run_identifier,
+                    latest_refresh_work_identifier=refresh_identifier,
+                    latest_refresh_work_state=(
+                        WorkState.COMPLETED if refresh_identifier is not None else None
+                    ),
+                    enabled=target.enabled,
+                )
         creation_identifiers = await self.database.requested_work_identifiers(
             requester_kind=("carl", "mcp", "create_workspace_search"),
             requester_identifier=workspace.record_identifier,
@@ -1521,6 +2138,14 @@ class ReviewApplication:
             tracks[identifier] = WorkspaceSearchTrack(
                 track_identifier=identifier,
                 query=self._search_query(work.get("payload")),
+                marketplace=(
+                    Marketplace.EBAY
+                    if work["kind"] == list(COLLECT_EBAY_SEARCH_WORK_KIND)
+                    else Marketplace.FACEBOOK
+                ),
+                listing_state=_ebay_listing_state(work.get("payload"))
+                if work["kind"] == list(COLLECT_EBAY_SEARCH_WORK_KIND)
+                else None,
                 creation_work_identifier=identifier,
                 creation_work_state=WorkState(str(work["state"])),
                 origin_search_run_record_identifier=run_identifier,
@@ -2109,18 +2734,22 @@ class ReviewApplication:
             maximum_failure_rows=maximum_failed_work,
         )
         idle = queued_count == 0 and in_progress_count == 0
+        partial_failures = await self.database.workspace_partial_failure_count(
+            workspace_record_identifier
+        )
         return WorkspaceWorkStatus(
             workspace_record_identifier=workspace_record_identifier,
             captured_at_utc_ns=self.utc_now_ns(),
             queued_count=queued_count,
             in_progress_count=in_progress_count,
             terminal_failure_count=terminal_failure_count,
+            completed_with_failures_count=partial_failures,
             active_work=active_work,
             active_work_truncated=queued_count + in_progress_count > len(active_work),
             failed_work=failed_work,
-            failed_work_truncated=terminal_failure_count > len(failed_work),
+            failed_work_truncated=terminal_failure_count + partial_failures > len(failed_work),
             idle=idle,
-            successful=idle and terminal_failure_count == 0,
+            successful=idle and terminal_failure_count == 0 and partial_failures == 0,
         )
 
     async def get_workspace_work_status(
@@ -2197,6 +2826,133 @@ class ReviewApplication:
             listing_identifiers=listing_identifiers,
         )
 
+    @staticmethod
+    def _historical_scalar_fields(
+        observations: Sequence[ListingObservationCandidate],
+        cards: Sequence[SearchCardCandidate],
+        *,
+        boundary: int,
+        inherit_currency: bool,
+    ) -> ScalarFieldValues:
+        values: dict[str, JsonValue] = {}
+        for name in ("title", "price", "location", "description", "seller"):
+            selected = select_composed_field(
+                "location_text" if name == "location" else name,
+                observations,
+                cards,
+                as_of_completion_sequence=boundary,
+                inherit_price_currency=inherit_currency,
+            )
+            values[name] = None if selected is None else selected.value
+        return ScalarFieldValues.model_validate(values)
+
+    async def _review_scalar_baselines(
+        self,
+        reviews: tuple[ListingReviewRecord, ...],
+        *,
+        cache: dict[str, ScalarFieldValues | None] | None = None,
+        batches: dict[str, ReviewBatch] | None = None,
+    ) -> dict[str, ScalarFieldValues | None]:
+        """Recover exact reviewed values; never infer an old review from current evidence."""
+
+        cache = {} if cache is None else cache
+        batches = {} if batches is None else batches
+        missing = [review for review in reviews if review.record_identifier not in cache]
+        boundaries = await self.database.listing_review_scalar_boundaries(
+            tuple(
+                review.record_identifier
+                for review in missing
+                if review.scalar_fields_snapshot is None and review.batch_record_identifier is None
+            )
+        )
+        historical: dict[int, list[ListingReviewRecord]] = {}
+        for review in missing:
+            cache[review.record_identifier] = None
+            if review.scalar_fields_snapshot is not None:
+                cache[review.record_identifier] = normalize_scalar_fields(
+                    normalize_ebay_scalar_fields(review.scalar_fields_snapshot)
+                    if review.listing_identifier.startswith("ebay:")
+                    else review.scalar_fields_snapshot
+                )
+                continue
+            if review.batch_record_identifier is not None:
+                identifier = review.batch_record_identifier
+                if identifier not in batches:
+                    batches[identifier] = await self.get_review_batch(identifier)
+                old = next(
+                    (
+                        item.projection
+                        for item in batches[identifier].items
+                        if item.projection.listing_identifier == review.listing_identifier
+                        and item.projection.projection_revision == review.projection_revision
+                    ),
+                    None,
+                )
+                if old is not None:
+                    old_fields = projection_scalar_fields(old)
+                    cache[review.record_identifier] = normalize_scalar_fields(
+                        normalize_ebay_scalar_fields(old_fields)
+                        if review.listing_identifier.startswith("ebay:")
+                        else old_fields
+                    )
+                    if (
+                        review.projection_revision.recipe_version == 1
+                        and review.listing_identifier.isdecimal()
+                        and old.price is not None
+                        and isinstance(old.price.value, dict)
+                        and not old.price.value.get("currency")
+                    ):
+                        historical.setdefault(old.as_of_completion_sequence, []).append(review)
+                continue
+            boundary = boundaries.get(review.record_identifier)
+            if boundary is not None and review.listing_identifier.isdecimal():
+                historical.setdefault(boundary, []).append(review)
+        for boundary, group in historical.items():
+            for start in range(0, len(group), 100):
+                chunk = group[start : start + 100]
+                identifiers = tuple(review.listing_identifier for review in chunk)
+                observations = await self.database.facebook_projection_item_observations(
+                    identifiers, as_of_completion_sequence=boundary, maximum_per_listing=100
+                )
+                cards = await self.database.facebook_projection_search_cards(
+                    identifiers, as_of_completion_sequence=boundary, maximum_per_listing=100
+                )
+                observations_by_listing: dict[str, list[ListingObservationCandidate]] = {}
+                cards_by_listing: dict[str, list[SearchCardCandidate]] = {}
+                for observation in observations:
+                    observations_by_listing.setdefault(observation.listing_identifier, []).append(
+                        observation
+                    )
+                for card in cards:
+                    cards_by_listing.setdefault(card.listing_identifier, []).append(card)
+                for review in chunk:
+                    selected_observations = observations_by_listing.get(
+                        review.listing_identifier, ()
+                    )
+                    selected_cards = cards_by_listing.get(review.listing_identifier, ())
+                    raw = self._historical_scalar_fields(
+                        selected_observations,
+                        selected_cards,
+                        boundary=boundary,
+                        inherit_currency=False,
+                    )
+                    # A matching legacy hash proves reconstruction used the values actually reviewed.
+                    if (
+                        scalar_fields_sha256(
+                            raw, normalize=review.projection_revision.recipe_version != 1
+                        )
+                        == review.projection_revision.scalar_fields_sha256
+                    ):
+                        cache[review.record_identifier] = normalize_scalar_fields(
+                            self._historical_scalar_fields(
+                                selected_observations,
+                                selected_cards,
+                                boundary=boundary,
+                                inherit_currency=True,
+                            )
+                        )
+        return cache
+
     async def _build_review_batch_candidate(
         self,
         request: CreateReviewBatchRequest,
@@ -2208,6 +2964,8 @@ class ReviewApplication:
         if not current_runs:
             raise ReviewInputError("The workspace has no completed active search track")
         selected: list[ReviewBatchItem] = []
+        scalar_cache: dict[str, ScalarFieldValues | None] = {}
+        batch_cache: dict[str, ReviewBatch] = {}
         cursor = request.cursor
         scanned_pages = 0
         while len(selected) < request.page_size and scanned_pages < request.maximum_scan_pages:
@@ -2230,6 +2988,9 @@ class ReviewApplication:
             prior_by_listing = await self._latest_listing_reviews(
                 workspace.record_identifier, identifiers
             )
+            baselines = await self._review_scalar_baselines(
+                tuple(prior_by_listing.values()), cache=scalar_cache, batches=batch_cache
+            )
             claimed_identifiers = {
                 listing_identifier
                 for claim in await self.database.active_review_claims(
@@ -2243,10 +3004,12 @@ class ReviewApplication:
                 if projection.listing_identifier in claimed_identifiers:
                     continue
                 prior = prior_by_listing.get(projection.listing_identifier)
+                baseline = None if prior is None else baselines.get(prior.record_identifier)
                 state, changed = classify_review_state(
                     current_revision=projection.projection_revision,
                     previous_review=prior,
                     policy=workspace.staleness_policy,
+                    previous_scalar_fields=baseline,
                 )
                 if state in request.include_review_states:
                     selected.append(
@@ -2255,6 +3018,14 @@ class ReviewApplication:
                             review_state=state,
                             prior_review=prior,
                             changed_components=changed,
+                            scalar_field_changes=(
+                                ()
+                                if baseline is None
+                                else scalar_field_changes(
+                                    baseline, projection_scalar_fields(projection)
+                                )
+                            ),
+                            scalar_comparison_available=baseline is not None,
                         )
                     )
             cursor = page.next_cursor
@@ -2459,6 +3230,14 @@ class ReviewApplication:
         )
         if batch is not None and batch.workspace_record_identifier != workspace.record_identifier:
             raise ReviewInputError("The review batch belongs to a different workspace")
+        reviewed_scalars = (
+            {}
+            if batch is None
+            else {
+                item.projection.listing_identifier: projection_scalar_fields(item.projection)
+                for item in batch.items
+            }
+        )
         batch_revisions = (
             {}
             if batch is None
@@ -2490,6 +3269,7 @@ class ReviewApplication:
                 )
                 if current.projection_revision != review.projection_revision:
                     raise ReviewInputError("A review revision is no longer current")
+                reviewed_scalars[review.listing_identifier] = projection_scalar_fields(current)
         started_utc_ns = self.utc_now_ns()
         started_monotonic_ns = self.monotonic_ns()
         recorded_at = _utc_text(started_utc_ns)
@@ -2504,6 +3284,11 @@ class ReviewApplication:
                 disposition=review.disposition,
                 note=review.note,
                 recorded_at_utc=recorded_at,
+                scalar_fields_snapshot=(
+                    reviewed_scalars[review.listing_identifier]
+                    if review.projection_revision.recipe_version == 2
+                    else None
+                ),
             )
             for review in request.reviews
         )
@@ -2562,17 +3347,58 @@ class ReviewApplication:
     ) -> tuple[int, int, tuple[ComposedListingProjection, ...]]:
         """Compose one bounded workspace snapshot without per-page repeated evidence queries."""
 
+        async with self.database._connections.reader():
+            return await self._workspace_bulk_review_projections_at_snapshot(
+                workspace,
+                maximum_candidate_listings_examined=maximum_candidate_listings_examined,
+                selected_listing_identifiers=selected_listing_identifiers,
+            )
+
+    async def _workspace_bulk_review_projections_at_snapshot(
+        self,
+        workspace: ReviewWorkspace,
+        *,
+        maximum_candidate_listings_examined: int,
+        selected_listing_identifiers: tuple[str, ...] | None = None,
+    ) -> tuple[int, int, tuple[ComposedListingProjection, ...]]:
+        """Share a stable read transaction across source-specific batch composition."""
+
         current_runs = self._workspace_current_search_runs(workspace)
         if not current_runs:
             raise ReviewInputError("The workspace has no completed active search track")
-        as_of = await self.database.current_completion_boundary()
+        if await scope_contains_ebay(self.database, current_runs):
+            return await self._marketplace_workspace_projections(
+                workspace,
+                maximum_candidate_listings_examined=maximum_candidate_listings_examined,
+                selected_listing_identifiers=selected_listing_identifiers,
+            )
+        return await self._facebook_workspace_bulk_review_projections(
+            workspace,
+            current_runs=current_runs,
+            as_of=await self.database.current_completion_boundary(),
+            maximum_candidate_listings_examined=maximum_candidate_listings_examined,
+            selected_listing_identifiers=selected_listing_identifiers,
+        )
+
+    async def _facebook_workspace_bulk_review_projections(
+        self,
+        workspace: ReviewWorkspace,
+        *,
+        current_runs: tuple[str, ...],
+        as_of: int,
+        maximum_candidate_listings_examined: int,
+        selected_listing_identifiers: tuple[str, ...] | None = None,
+        require_complete_ancestry: bool = True,
+    ) -> tuple[int, int, tuple[ComposedListingProjection, ...]]:
+        """Batch Facebook review evidence once, including within mixed workspaces."""
+
         ancestry = await self._projection_search_scope(
             current_runs[0],
             current_runs[1:],
             as_of_completion_sequence=as_of,
             maximum_runs=100,
         )
-        if ancestry.older_ancestry_truncated:
+        if require_complete_ancestry and ancestry.older_ancestry_truncated:
             raise ReviewInputError(
                 "Bulk review requires complete workspace search ancestry within 100 runs"
             )
@@ -2785,6 +3611,7 @@ class ReviewApplication:
                 projection.listing_identifier for projection in selected_projections
             ),
         )
+        baselines = await self._review_scalar_baselines(tuple(prior_by_listing.values()))
         explicitly_excluded_count = 0
         status_excluded_count = 0
         review_state_excluded_count = 0
@@ -2797,10 +3624,12 @@ class ReviewApplication:
                 status_excluded_count += 1
                 continue
             prior = prior_by_listing.get(projection.listing_identifier)
+            baseline = None if prior is None else baselines.get(prior.record_identifier)
             review_state, _ = classify_review_state(
                 current_revision=projection.projection_revision,
                 previous_review=prior,
                 policy=workspace.staleness_policy,
+                previous_scalar_fields=baseline,
             )
             if review_state not in request.include_review_states:
                 review_state_excluded_count += 1
@@ -2821,6 +3650,7 @@ class ReviewApplication:
                 disposition=request.disposition,
                 note=request.note,
                 recorded_at_utc=recorded_at_utc,
+                scalar_fields_snapshot=projection_scalar_fields(projection),
             )
             for projection, _ in selected
         )
@@ -3104,18 +3934,7 @@ class ReviewApplication:
             raise ReviewInputError("Search-run listing offset must not be negative")
         if not 1 <= limit <= 500:
             raise ReviewInputError("Search-run listing limit must be between 1 and 500")
-        kind, _, value = await self.database.get_record(search_run_record_identifier)
-        if kind != ("carl", "facebook", "search_run") or not isinstance(value, dict):
-            raise ReviewInputError("Object is not a Facebook search run")
-        traversal = value.get("traversal")
-        identifiers = (
-            traversal.get("unique_listing_identifiers") if isinstance(traversal, dict) else None
-        )
-        if not isinstance(identifiers, list) or not all(
-            isinstance(identifier, str) and identifier.isascii() and identifier.isdecimal()
-            for identifier in identifiers
-        ):
-            raise ValueError("Stored Facebook search-run listing identifiers are malformed")
+        identifiers = await run_listing_identifiers(self.database, search_run_record_identifier)
         selected = tuple(identifiers[offset : offset + limit])
         next_offset = offset + len(selected)
         return SearchRunListingsPage(
@@ -3126,13 +3945,753 @@ class ReviewApplication:
             next_offset=next_offset if next_offset < len(identifiers) else None,
         )
 
+    async def _require_marketplace_search_record(
+        self, record_identifier: str
+    ) -> MarketplaceSearchRecord:
+        kind, schema_version, value = await self.database.get_record(record_identifier)
+        if kind != MARKETPLACE_SEARCH_KIND or schema_version != 1:
+            raise ReviewInputError("The record is not a supported marketplace search")
+        return MarketplaceSearchRecord.model_validate_json(encode_json(value))
+
+    async def _marketplace_search_target_records(
+        self, search_record_identifier: str
+    ) -> tuple[MarketplaceSearchTargetRecord, ...]:
+        records = tuple(
+            MarketplaceSearchTargetRecord.model_validate_json(encode_json(value))
+            for _, value in await self.database.records_by_kind(MARKETPLACE_SEARCH_TARGET_KIND)
+        )
+        return tuple(
+            record
+            for record in records
+            if record.search_record_identifier == search_record_identifier
+        )
+
+    async def get_marketplace_search(self, record_identifier: str) -> MarketplaceSearch:
+        """Return one search group with every target and retained execution."""
+
+        search = await self._require_marketplace_search_record(record_identifier)
+        target_records = await self._marketplace_search_target_records(record_identifier)
+        enabled_by_target = {target.record_identifier: True for target in target_records}
+        for _, value in await self.database.records_by_kind(MARKETPLACE_SEARCH_TARGET_STATE_KIND):
+            state = MarketplaceSearchTargetStateRecord.model_validate_json(encode_json(value))
+            if state.search_record_identifier == record_identifier:
+                enabled_by_target[state.target_record_identifier] = state.enabled
+
+        execution_records = tuple(
+            MarketplaceSearchExecutionRecord.model_validate_json(encode_json(value))
+            for _, value in await self.database.records_by_kind(MARKETPLACE_SEARCH_EXECUTION_KIND)
+        )
+        executions_by_target: dict[str, list[MarketplaceSearchExecution]] = {}
+        marketplaces_by_target = {
+            target.record_identifier: target.specification.marketplace for target in target_records
+        }
+        historical_runs: list[str] = []
+        for execution in execution_records:
+            if execution.search_record_identifier != record_identifier:
+                continue
+            work = await self.database.work(execution.work_identifier)
+            result = work.get("result")
+            run_identifier: str | None = None
+            classification: EbaySearchResponseClassification | None = None
+            stopping_reason: str | None = None
+            collection_succeeded: bool | None = None
+            if isinstance(result, dict):
+                result_mapping = cast(dict[str, JsonValue], result)
+                candidate = result_mapping.get("search_run_record_identifier")
+                if isinstance(candidate, str):
+                    run_identifier = candidate
+                if marketplaces_by_target[execution.target_record_identifier] is Marketplace.EBAY:
+                    raw_classification = result_mapping.get("response_classification")
+                    if isinstance(raw_classification, dict):
+                        classification = EbaySearchResponseClassification.model_validate_json(
+                            encode_json(raw_classification)
+                        )
+                    raw_stopping_reason = result_mapping.get("stopping_reason")
+                    if isinstance(raw_stopping_reason, str):
+                        stopping_reason = raw_stopping_reason
+                    # Interpret legacy completed-but-unrecognized runs without
+                    # rewriting immutable work results or issuing new requests.
+                    if classification is not None:
+                        collection_succeeded = (
+                            classification.kind not in EBAY_SEARCH_FAILURE_KINDS
+                            and stopping_reason != "invalid_next_page"
+                        )
+                    elif stopping_reason in {
+                        "challenge",
+                        "unrecognized_response",
+                        "error_page",
+                        "http_error",
+                        "invalid_next_page",
+                    }:
+                        collection_succeeded = False
+            if run_identifier is not None and run_identifier not in historical_runs:
+                historical_runs.append(run_identifier)
+            executions_by_target.setdefault(execution.target_record_identifier, []).append(
+                MarketplaceSearchExecution(
+                    record_identifier=execution.record_identifier,
+                    work_identifier=execution.work_identifier,
+                    state=WorkState(str(work["state"])),
+                    requested_at_utc=execution.requested_at_utc,
+                    search_run_record_identifier=run_identifier,
+                    response_classification=classification,
+                    stopping_reason=stopping_reason,
+                    collection_succeeded=collection_succeeded,
+                )
+            )
+        return MarketplaceSearch(
+            record_identifier=search.record_identifier,
+            created_at_utc=search.created_at_utc,
+            targets=tuple(
+                MarketplaceSearchTarget(
+                    record_identifier=target.record_identifier,
+                    specification=target.specification,
+                    enabled=enabled_by_target[target.record_identifier],
+                    created_at_utc=target.created_at_utc,
+                    executions=tuple(executions_by_target.get(target.record_identifier, ())),
+                )
+                for target in target_records
+            ),
+            historical_search_run_record_identifiers=tuple(historical_runs),
+        )
+
+    async def list_marketplace_search_results(
+        self, request: ListMarketplaceSearchResultsRequest
+    ) -> MarketplaceSearchResultsPage:
+        """Project every completed source run in a search group into stable generic cards."""
+
+        cursor: MarketplaceSearchResultsCursor | None = None
+        if request.cursor is not None:
+            try:
+                cursor = decode_marketplace_search_results_cursor(request.cursor)
+            except ValueError as error:
+                raise ReviewInputError(str(error)) from error
+            if cursor.search_record_identifier != request.search_record_identifier:
+                raise ReviewInputError("Search-results cursor belongs to another search group")
+        as_of = (
+            await self.database.current_completion_boundary()
+            if cursor is None
+            else cursor.as_of_completion_sequence
+        )
+        search = await self.get_marketplace_search(request.search_record_identifier)
+        warnings: list[MarketplaceSearchExecutionWarning] = []
+        for target in search.targets:
+            for execution in target.executions:
+                reason: Literal["collection_failure", "work_failure", "collection_pending"]
+                if execution.collection_succeeded is False:
+                    reason = "collection_failure"
+                elif execution.state is WorkState.TERMINAL_FAILURE:
+                    reason = "work_failure"
+                elif execution.state is not WorkState.COMPLETED:
+                    reason = "collection_pending"
+                else:
+                    continue
+                warnings.append(
+                    MarketplaceSearchExecutionWarning(
+                        target_record_identifier=target.record_identifier,
+                        reason=reason,
+                        execution=execution,
+                    )
+                )
+
+        run_contexts: list[
+            tuple[
+                Marketplace,
+                str,
+                str,
+                str,
+                int,
+            ]
+        ] = []
+        for target in search.targets:
+            for execution in target.executions:
+                if execution.state is not WorkState.COMPLETED:
+                    continue
+                work = await self.database.work(execution.work_identifier)
+                completion_sequence = work.get("latest_event_sequence")
+                if (
+                    work.get("latest_event_kind") != "completed"
+                    or not isinstance(completion_sequence, int)
+                    or isinstance(completion_sequence, bool)
+                    or completion_sequence > as_of
+                ):
+                    continue
+                result = work.get("result")
+                source_run = (
+                    cast(dict[str, JsonValue], result).get("search_run_record_identifier")
+                    if isinstance(result, dict)
+                    else None
+                )
+                if not isinstance(source_run, str):
+                    continue
+                run_contexts.append(
+                    (
+                        target.specification.marketplace,
+                        target.record_identifier,
+                        execution.record_identifier,
+                        source_run,
+                        completion_sequence,
+                    )
+                )
+
+        facebook_contexts: dict[str, list[tuple[str, str, str, int]]] = {}
+        ebay_contexts: dict[str, list[tuple[str, str, int]]] = {}
+        for (
+            marketplace,
+            target_identifier,
+            execution_identifier,
+            source_run,
+            sequence,
+        ) in run_contexts:
+            kind, _, run_value = await self.database.get_record(source_run)
+            expected_kind = ("carl", marketplace.value, "search_run")
+            if kind != expected_kind or not isinstance(run_value, dict):
+                raise ValueError(
+                    f"Search execution references an invalid {marketplace.value} search run"
+                )
+            if marketplace is Marketplace.FACEBOOK:
+                internal_identifier = cast(dict[str, JsonValue], run_value).get(
+                    "search_run_identifier"
+                )
+                if not isinstance(internal_identifier, str):
+                    raise ValueError("Stored Facebook search run has no internal identifier")
+                facebook_contexts.setdefault(internal_identifier, []).append(
+                    (target_identifier, execution_identifier, source_run, sequence)
+                )
+            else:
+                ebay_contexts.setdefault(source_run, []).append(
+                    (target_identifier, execution_identifier, sequence)
+                )
+
+        candidates: list[_MarketplaceSearchResultCandidate] = []
+        facebook_records: list[tuple[str, JsonValue]] = []
+        facebook_run_identifiers = tuple(
+            dict.fromkeys(
+                context[2] for contexts in facebook_contexts.values() for context in contexts
+            )
+        )
+        for start in range(0, len(facebook_run_identifiers), 100):
+            facebook_records.extend(
+                await self.database.search_listing_occurrences_for_runs(
+                    "facebook",
+                    facebook_run_identifiers[start : start + 100],
+                    as_of_completion_sequence=as_of,
+                )
+            )
+        for occurrence_identifier, raw_value in facebook_records:
+            if not isinstance(raw_value, dict):
+                continue
+            value = cast(dict[str, JsonValue], raw_value)
+            internal_run = value.get("search_run_identifier")
+            contexts = (
+                facebook_contexts.get(internal_run) if isinstance(internal_run, str) else None
+            )
+            listing_identifier = value.get("listing_identifier")
+            original = value.get("original")
+            if (
+                not contexts
+                or not isinstance(listing_identifier, str)
+                or not isinstance(original, dict)
+            ):
+                continue
+            original_mapping = cast(dict[str, JsonValue], original)
+            title_value = search_card_field_value("title", original_mapping)
+            location_value = search_card_field_value("location_text", original_mapping)
+            acquisition = value.get("acquisition_record_identifier")
+            page_ordinal = _nonnegative_integer(value.get("page_ordinal"))
+            edge_index = _nonnegative_integer(value.get("edge_index"))
+            for target_identifier, execution_identifier, source_run, sequence in contexts:
+                candidates.append(
+                    _MarketplaceSearchResultCandidate(
+                        marketplace=Marketplace.FACEBOOK,
+                        external_identifier=listing_identifier,
+                        canonical_url=(
+                            f"https://www.facebook.com/marketplace/item/{listing_identifier}/"
+                        ),
+                        title=title_value if isinstance(title_value, str) else None,
+                        displayed_price=_facebook_displayed_price(original_mapping),
+                        location=location_value if isinstance(location_value, str) else None,
+                        shipping_text=None,
+                        condition=(
+                            _nested_text(original_mapping.get("condition"))
+                            or _nested_text(original_mapping.get("listing_condition"))
+                        ),
+                        preview_image_url=_facebook_preview_image(original_mapping),
+                        promoted=None,
+                        occurrence=MarketplaceSearchResultOccurrence(
+                            occurrence_record_identifier=occurrence_identifier,
+                            source_search_run_record_identifier=source_run,
+                            target_record_identifier=target_identifier,
+                            execution_record_identifier=execution_identifier,
+                            acquisition_record_identifier=(
+                                acquisition if isinstance(acquisition, str) else None
+                            ),
+                            completion_sequence=sequence,
+                            page_ordinal=page_ordinal,
+                            position=edge_index,
+                        ),
+                    )
+                )
+
+        ebay_records: list[tuple[str, JsonValue]] = []
+        ebay_run_identifiers = tuple(ebay_contexts)
+        for start in range(0, len(ebay_run_identifiers), 100):
+            ebay_records.extend(
+                await self.database.search_listing_occurrences_for_runs(
+                    "ebay",
+                    ebay_run_identifiers[start : start + 100],
+                    as_of_completion_sequence=as_of,
+                )
+            )
+        for occurrence_identifier, raw_value in ebay_records:
+            if not isinstance(raw_value, dict):
+                continue
+            value = cast(dict[str, JsonValue], raw_value)
+            source_run = value.get("search_run_record_identifier")
+            contexts = ebay_contexts.get(source_run) if isinstance(source_run, str) else None
+            listing_identifier = value.get("item_identifier")
+            canonical_url = value.get("canonical_url")
+            if (
+                not contexts
+                or not isinstance(source_run, str)
+                or not isinstance(listing_identifier, str)
+                or not isinstance(canonical_url, str)
+            ):
+                continue
+            acquisition = value.get("acquisition_record_identifier")
+            position = _nonnegative_integer(value.get("position"))
+            for target_identifier, execution_identifier, sequence in contexts:
+                candidates.append(
+                    _MarketplaceSearchResultCandidate(
+                        marketplace=Marketplace.EBAY,
+                        external_identifier=listing_identifier,
+                        canonical_url=canonical_url,
+                        title=_optional_string(value, "title"),
+                        displayed_price=_optional_string(value, "displayed_price"),
+                        location=None,
+                        shipping_text=_optional_string(value, "shipping_text"),
+                        condition=_optional_string(value, "condition"),
+                        preview_image_url=_optional_string(value, "image_url"),
+                        promoted=(
+                            promoted
+                            if isinstance((promoted := value.get("promoted")), bool)
+                            else None
+                        ),
+                        occurrence=MarketplaceSearchResultOccurrence(
+                            occurrence_record_identifier=occurrence_identifier,
+                            source_search_run_record_identifier=source_run,
+                            target_record_identifier=target_identifier,
+                            execution_record_identifier=execution_identifier,
+                            acquisition_record_identifier=(
+                                acquisition if isinstance(acquisition, str) else None
+                            ),
+                            completion_sequence=sequence,
+                            page_ordinal=_nonnegative_integer(value.get("page_ordinal")),
+                            position=position,
+                            listing_state=value.get("listing_state", "active"),
+                            displayed_price=value.get("displayed_price"),
+                            sold_price=value.get("sold_price"),
+                            sold_date=(
+                                date.fromisoformat(raw_date)
+                                if isinstance((raw_date := value.get("sold_date")), str)
+                                else None
+                            ),
+                            sold_date_text=value.get("sold_date_text"),
+                            sold_price_status=value.get("sold_price_status"),
+                        ),
+                    )
+                )
+
+        grouped: dict[tuple[Marketplace, str], list[_MarketplaceSearchResultCandidate]] = {}
+        for candidate in candidates:
+            grouped.setdefault((candidate.marketplace, candidate.external_identifier), []).append(
+                candidate
+            )
+        projected: list[MarketplaceSearchResult] = []
+        for group in grouped.values():
+            newest = tuple(
+                sorted(
+                    group,
+                    key=lambda candidate: (
+                        candidate.occurrence.completion_sequence,
+                        candidate.occurrence.page_ordinal,
+                        candidate.occurrence.position,
+                        candidate.occurrence.occurrence_record_identifier,
+                        candidate.occurrence.execution_record_identifier,
+                    ),
+                    reverse=True,
+                )
+            )
+            representative = newest[0]
+            sale = next(
+                (
+                    candidate.occurrence
+                    for candidate in newest
+                    if candidate.occurrence.listing_state == "sold"
+                ),
+                None,
+            )
+            projected.append(
+                MarketplaceSearchResult(
+                    marketplace=representative.marketplace,
+                    external_identifier=representative.external_identifier,
+                    canonical_url=representative.canonical_url,
+                    title=_newest_value(newest, lambda candidate: candidate.title),
+                    displayed_price=_newest_value(
+                        newest, lambda candidate: candidate.displayed_price
+                    ),
+                    location=_newest_value(newest, lambda candidate: candidate.location),
+                    shipping_text=_newest_value(newest, lambda candidate: candidate.shipping_text),
+                    condition=_newest_value(newest, lambda candidate: candidate.condition),
+                    preview_image_url=_newest_value(
+                        newest, lambda candidate: candidate.preview_image_url
+                    ),
+                    promoted=_newest_value(newest, lambda candidate: candidate.promoted),
+                    listing_state=representative.occurrence.listing_state,
+                    sold_price=sale.sold_price if sale else None,
+                    sold_date=sale.sold_date if sale else None,
+                    sold_date_text=sale.sold_date_text if sale else None,
+                    sold_price_status=sale.sold_price_status if sale else None,
+                    sold_occurrence_record_identifier=(
+                        sale.occurrence_record_identifier if sale else None
+                    ),
+                    occurrences=tuple(candidate.occurrence for candidate in newest),
+                )
+            )
+
+        projected.sort(
+            key=lambda result: (
+                -result.occurrences[0].completion_sequence,
+                result.marketplace.value,
+                result.external_identifier,
+            )
+        )
+        total = len(projected)
+        if cursor is not None and cursor.after_completion_sequence is not None:
+            assert cursor.after_marketplace is not None
+            assert cursor.after_external_identifier is not None
+            after = (
+                -cursor.after_completion_sequence,
+                cursor.after_marketplace.value,
+                cursor.after_external_identifier,
+            )
+            projected = [
+                result
+                for result in projected
+                if (
+                    -result.occurrences[0].completion_sequence,
+                    result.marketplace.value,
+                    result.external_identifier,
+                )
+                > after
+            ]
+        selected = tuple(projected[: request.page_size])
+        next_cursor: str | None = None
+        if len(projected) > len(selected):
+            last = selected[-1]
+            next_cursor = encode_marketplace_search_results_cursor(
+                MarketplaceSearchResultsCursor(
+                    search_record_identifier=request.search_record_identifier,
+                    as_of_completion_sequence=as_of,
+                    after_completion_sequence=last.occurrences[0].completion_sequence,
+                    after_marketplace=last.marketplace,
+                    after_external_identifier=last.external_identifier,
+                )
+            )
+        return MarketplaceSearchResultsPage(
+            search_record_identifier=request.search_record_identifier,
+            as_of_completion_sequence=as_of,
+            total_distinct_results=total,
+            results=selected,
+            next_cursor=next_cursor,
+            execution_warnings=tuple(warnings),
+        )
+
+    async def _request_marketplace_target_execution(
+        self,
+        *,
+        search_record_identifier: str,
+        target: MarketplaceSearchTargetRecord,
+    ) -> None:
+        requester_kind = ("carl", "marketplace", "search_target")
+        specification = target.specification
+        if isinstance(specification, FacebookSearchTargetSpecification):
+            queued = await self._create_search(
+                specification.search,
+                requester_kind=requester_kind,
+                requester_identifier=target.record_identifier,
+            )
+        else:
+            queued = await self._create_ebay_search(
+                specification.search,
+                requester_kind=requester_kind,
+                requester_identifier=target.record_identifier,
+            )
+
+        execution = MarketplaceSearchExecutionRecord(
+            record_identifier=self.new_identifier(),
+            search_record_identifier=search_record_identifier,
+            target_record_identifier=target.record_identifier,
+            work_identifier=queued.work_identifier,
+            requested_at_utc=_utc_text(self.utc_now_ns()),
+        )
+        await self._publish_marketplace_search_records(
+            component_identifier=RUN_MARKETPLACE_SEARCH,
+            records=(
+                RecordDraft(
+                    identifier=execution.record_identifier,
+                    kind=MARKETPLACE_SEARCH_EXECUTION_KIND,
+                    schema_version=1,
+                    value=execution.model_dump(mode="json"),
+                ),
+            ),
+            inputs=(
+                NamedInput(name=("search",), object_identifier=search_record_identifier),
+                NamedInput(name=("target",), object_identifier=target.record_identifier),
+            ),
+            outputs=(
+                NamedOutput(
+                    name=("execution",),
+                    object_identifier=execution.record_identifier,
+                ),
+            ),
+            result={
+                "state": "completed",
+                "work_identifier": queued.work_identifier,
+                "work_created": queued.created,
+                "work_state": queued.state,
+            },
+        )
+
+    async def create_marketplace_search(
+        self, request: CreateMarketplaceSearchRequest
+    ) -> MarketplaceSearch:
+        """Create a search group and queue each initial target once."""
+
+        for specification in request.targets:
+            if isinstance(specification, EbaySearchTargetSpecification):
+                _require_ebay_search_acquisition(specification.search)
+        search_identifier = self.new_identifier()
+        created_at_utc = _utc_text(self.utc_now_ns())
+        search = MarketplaceSearchRecord(
+            record_identifier=search_identifier,
+            created_at_utc=created_at_utc,
+        )
+        targets = tuple(
+            MarketplaceSearchTargetRecord(
+                record_identifier=self.new_identifier(),
+                search_record_identifier=search_identifier,
+                specification=specification,
+                created_at_utc=created_at_utc,
+            )
+            for specification in request.targets
+        )
+        records = (
+            RecordDraft(
+                identifier=search_identifier,
+                kind=MARKETPLACE_SEARCH_KIND,
+                schema_version=1,
+                value=search.model_dump(mode="json"),
+            ),
+            *(
+                RecordDraft(
+                    identifier=target.record_identifier,
+                    kind=MARKETPLACE_SEARCH_TARGET_KIND,
+                    schema_version=1,
+                    value=target.model_dump(mode="json"),
+                )
+                for target in targets
+            ),
+        )
+        await self._publish_marketplace_search_records(
+            component_identifier=CREATE_MARKETPLACE_SEARCH,
+            records=records,
+            inputs=(),
+            outputs=(
+                NamedOutput(name=("search",), object_identifier=search_identifier),
+                *(
+                    NamedOutput(
+                        name=("target", str(index)),
+                        object_identifier=target.record_identifier,
+                    )
+                    for index, target in enumerate(targets)
+                ),
+            ),
+            result={"state": "completed", "target_count": len(targets)},
+        )
+        for target in targets:
+            await self._request_marketplace_target_execution(
+                search_record_identifier=search_identifier,
+                target=target,
+            )
+        return await self.get_marketplace_search(search_identifier)
+
+    async def add_marketplace_search_target(
+        self, request: AddMarketplaceSearchTargetRequest
+    ) -> MarketplaceSearch:
+        """Add and initially execute one target without changing earlier targets or runs."""
+
+        if isinstance(request.target, EbaySearchTargetSpecification):
+            _require_ebay_search_acquisition(request.target.search)
+        _ = await self._require_marketplace_search_record(request.search_record_identifier)
+        target = MarketplaceSearchTargetRecord(
+            record_identifier=self.new_identifier(),
+            search_record_identifier=request.search_record_identifier,
+            specification=request.target,
+            created_at_utc=_utc_text(self.utc_now_ns()),
+        )
+        await self._publish_marketplace_search_records(
+            component_identifier=ADD_MARKETPLACE_SEARCH_TARGET,
+            records=(
+                RecordDraft(
+                    identifier=target.record_identifier,
+                    kind=MARKETPLACE_SEARCH_TARGET_KIND,
+                    schema_version=1,
+                    value=target.model_dump(mode="json"),
+                ),
+            ),
+            inputs=(
+                NamedInput(
+                    name=("search",),
+                    object_identifier=request.search_record_identifier,
+                ),
+            ),
+            outputs=(NamedOutput(name=("target",), object_identifier=target.record_identifier),),
+            result={"state": "completed"},
+            marketplace_target_guard=target,
+        )
+        await self._request_marketplace_target_execution(
+            search_record_identifier=request.search_record_identifier,
+            target=target,
+        )
+        return await self.get_marketplace_search(request.search_record_identifier)
+
+    async def set_marketplace_search_target_enabled(
+        self, request: SetMarketplaceSearchTargetEnabledRequest
+    ) -> MarketplaceSearch:
+        """Change future scheduling eligibility without removing retained executions."""
+
+        search = await self.get_marketplace_search(request.search_record_identifier)
+        target = next(
+            (
+                candidate
+                for candidate in search.targets
+                if candidate.record_identifier == request.target_record_identifier
+            ),
+            None,
+        )
+        if target is None:
+            raise ReviewInputError("The target does not belong to the marketplace search")
+        if target.enabled == request.enabled:
+            return search
+        state = MarketplaceSearchTargetStateRecord(
+            record_identifier=self.new_identifier(),
+            search_record_identifier=request.search_record_identifier,
+            target_record_identifier=request.target_record_identifier,
+            enabled=request.enabled,
+            recorded_at_utc=_utc_text(self.utc_now_ns()),
+        )
+        await self._publish_marketplace_search_records(
+            component_identifier=SET_MARKETPLACE_SEARCH_TARGET_ENABLED,
+            records=(
+                RecordDraft(
+                    identifier=state.record_identifier,
+                    kind=MARKETPLACE_SEARCH_TARGET_STATE_KIND,
+                    schema_version=1,
+                    value=state.model_dump(mode="json"),
+                ),
+            ),
+            inputs=(
+                NamedInput(
+                    name=("search",),
+                    object_identifier=request.search_record_identifier,
+                ),
+                NamedInput(
+                    name=("target",),
+                    object_identifier=request.target_record_identifier,
+                ),
+            ),
+            outputs=(
+                NamedOutput(name=("target_state",), object_identifier=state.record_identifier),
+            ),
+            result={"state": "completed", "enabled": request.enabled},
+        )
+        return await self.get_marketplace_search(request.search_record_identifier)
+
+    async def run_marketplace_search(
+        self, request: RunMarketplaceSearchRequest
+    ) -> MarketplaceSearch:
+        """Queue every currently enabled target while retaining all earlier executions."""
+
+        search = await self.get_marketplace_search(request.search_record_identifier)
+        enabled_identifiers = {
+            target.record_identifier for target in search.targets if target.enabled
+        }
+        if not enabled_identifiers:
+            raise ReviewInputError("The marketplace search has no enabled targets")
+        records = await self._marketplace_search_target_records(request.search_record_identifier)
+        for target in records:
+            if target.record_identifier in enabled_identifiers and isinstance(
+                target.specification, EbaySearchTargetSpecification
+            ):
+                _require_ebay_search_acquisition(target.specification.search)
+        for target in records:
+            if target.record_identifier in enabled_identifiers:
+                await self._request_marketplace_target_execution(
+                    search_record_identifier=request.search_record_identifier,
+                    target=target,
+                )
+        return await self.get_marketplace_search(request.search_record_identifier)
+
     async def create_search(self, request: CreateSearchRequest) -> CreateSearchResult:
-        """Queue one new bounded Marketplace search for the explicit worker pool."""
+        """Queue one new bounded Facebook Marketplace search for an explicit worker pool."""
 
         return await self._create_search(
             request,
             requester_kind=("carl", "mcp", "create_search"),
             requester_identifier=None,
+        )
+
+    async def create_ebay_search(self, request: EbaySearchRequest) -> CreateSearchResult:
+        """Queue one new bounded eBay search for an explicit worker pool."""
+
+        return await self._create_ebay_search(
+            request,
+            requester_kind=("carl", "mcp", "create_search"),
+            requester_identifier=None,
+        )
+
+    async def _create_ebay_search(
+        self,
+        request: EbaySearchRequest,
+        *,
+        requester_kind: tuple[str, ...],
+        requester_identifier: str | None,
+    ) -> CreateSearchResult:
+        _require_ebay_search_acquisition(request)
+        payload = CollectEbaySearchPayload(request=request)
+        requested_identifier = self.new_identifier()
+        enqueued = await self.database.enqueue_work(
+            collect_ebay_search_work(
+                identifier=requested_identifier,
+                payload=payload,
+                not_before_utc_ns=0,
+            ),
+            WorkRequester(
+                request_identifier=self.new_identifier(),
+                kind=requester_kind,
+                identifier=requester_identifier or requested_identifier,
+                context={
+                    "marketplace": "ebay",
+                    "request": request.model_dump(mode="json"),
+                },
+            ),
+            event_identifier=self.new_identifier(),
+            enqueued_at_utc_ns=self.utc_now_ns(),
+        )
+        return CreateSearchResult(
+            work_identifier=enqueued.work_item_identifier,
+            created=enqueued.created,
+            state=(await self.database.work_state(enqueued.work_item_identifier)).value,
         )
 
     async def _create_search(
@@ -3180,11 +4739,19 @@ class ReviewApplication:
         """Queue a new search phrase as another durable track in one workspace."""
 
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
-        result = await self._create_search(
-            request.search,
-            requester_kind=("carl", "mcp", "create_workspace_search"),
-            requester_identifier=workspace.record_identifier,
-        )
+        search = request.search
+        if isinstance(search, EbaySearchTargetSpecification):
+            result = await self._create_ebay_search(
+                search.search,
+                requester_kind=("carl", "mcp", "create_workspace_search"),
+                requester_identifier=workspace.record_identifier,
+            )
+        else:
+            result = await self._create_search(
+                search.search if isinstance(search, FacebookSearchTargetSpecification) else search,
+                requester_kind=("carl", "mcp", "create_workspace_search"),
+                requester_identifier=workspace.record_identifier,
+            )
         return CreateWorkspaceSearchResult(
             workspace_record_identifier=workspace.record_identifier,
             track_identifier=result.work_identifier,
@@ -3206,9 +4773,62 @@ class ReviewApplication:
         if track.creation_work_identifier is None:
             raise ReviewInputError("The workspace's original search run has no creation to retry")
         work = await self.database.work(track.creation_work_identifier)
+        if tuple(work["kind"]) == COLLECT_EBAY_SEARCH_WORK_KIND:
+            payload = CollectEbaySearchPayload.model_validate_json(encode_json(work["payload"]))
+            _require_ebay_search_acquisition(payload.request)
         if WorkState(str(work["state"])) is not WorkState.TERMINAL_FAILURE:
             raise ReviewInputError("The search track creation is not in terminal failure")
         error = work.get("error")
+        if tuple(work["kind"]) == COLLECT_EBAY_SEARCH_WORK_KIND:
+            if not isinstance(error, dict) or error.get("kind") not in {
+                "ebay_search_response_failure",
+                "ebay_search_acquisition_failure",
+            }:
+                raise ReviewInputError("The eBay search failed permanently and cannot be retried")
+            if request.acquisition_stack is not None:
+                try:
+                    configured = load_configuration(user_directories().configuration_file)
+                    stack = configured.configuration.require_acquisition_stack(
+                        request.acquisition_stack
+                    )
+                    transport = configured.configuration.require_http_transport(
+                        stack.http_transport
+                    )
+                    route = configured.configuration.require_route(stack.network_path)
+                except KeyError as missing:
+                    raise ReviewInputError(
+                        "The requested acquisition stack is not configured"
+                    ) from missing
+                except ConfigurationFailure as configuration_error:
+                    raise ReviewInputError(
+                        "Cannot validate acquisition stack: " + configuration_error.code
+                    ) from configuration_error
+                if transport.implementation != "wreq" or route.provider.value != "decodo":
+                    raise ReviewInputError("eBay search requires a configured Decodo/wreq stack")
+            try:
+                previous_attempt = await self.database.retry_terminal_ebay_search_work(
+                    work_item_identifier=track.creation_work_identifier,
+                    retried_at_utc_ns=self.utc_now_ns(),
+                    event_identifier=self.new_identifier(),
+                    reason={
+                        "kind": "operator_workspace_search_track_retry",
+                        "workspace_record_identifier": workspace.record_identifier,
+                        "track_identifier": track.track_identifier,
+                    },
+                    payload_schema_version=COLLECT_EBAY_SEARCH_PAYLOAD_SCHEMA_VERSION,
+                    acquisition_stack=request.acquisition_stack,
+                )
+            except ValueError as retry_error:
+                raise ReviewInputError(str(retry_error)) from retry_error
+            return RetryWorkspaceSearchTrackResult(
+                workspace_record_identifier=workspace.record_identifier,
+                track_identifier=track.track_identifier,
+                work_identifier=track.creation_work_identifier,
+                previous_attempt_count=previous_attempt,
+                state=WorkState.PENDING,
+            )
+        if request.acquisition_stack is not None:
+            raise ReviewInputError("acquisition_stack applies only to eBay search retries")
         if not is_transient_search_failure(error):
             raise ReviewInputError("The search track failed permanently and cannot be retried")
         payload = CollectSearchPayload.model_validate_json(encode_json(work["payload"]))
@@ -3254,8 +4874,18 @@ class ReviewApplication:
         requester_context: JsonValue,
     ) -> SearchRefreshRequestResult:
         kind, _, base = await self.database.get_record(request.base_search_run_record_identifier)
+        if kind == ("carl", "ebay", "search_run") and isinstance(base, dict):
+            return await self._request_ebay_search_refresh(
+                request,
+                base=base,
+                requester_kind=requester_kind,
+                requester_identifier=requester_identifier,
+                requester_context=requester_context,
+            )
         if kind != ("carl", "facebook", "search_run") or not isinstance(base, dict):
-            raise ReviewInputError("Refresh input is not a Facebook search-run record")
+            raise ReviewInputError("Refresh input is not a supported retained search-run record")
+        if request.acquisition_stack is not None or request.maximum_pages is not None:
+            raise ReviewInputError("acquisition_stack and maximum_pages apply only to eBay")
         stored_request = base.get("request")
         stored_traversal = base.get("traversal")
         stored_strategy = base.get("traversal_strategy")
@@ -3315,6 +4945,63 @@ class ReviewApplication:
             base_search_run_record_identifier=request.base_search_run_record_identifier,
         )
 
+    async def _request_ebay_search_refresh(
+        self,
+        request: SearchRefreshRequest,
+        *,
+        base: dict[str, JsonValue],
+        requester_kind: tuple[str, ...],
+        requester_identifier: str,
+        requester_context: JsonValue,
+    ) -> SearchRefreshRequestResult:
+        if request.traversal is not None or request.traversal_strategy is not None:
+            raise ReviewInputError("Facebook traversal overrides do not apply to eBay")
+        if request.proton_route != "carl" or request.decodo_route != "carl":
+            raise ReviewInputError(
+                "eBay uses its acquisition stack and the carl image route; route overrides "
+                "are not supported. Select acquisition_stack for item/search transport."
+            )
+        stored = base.get("request")
+        if not isinstance(stored, dict):
+            raise ReviewInputError("The retained eBay search has no usable request")
+        overrides: dict[str, JsonValue] = dict(stored)
+        if request.acquisition_stack is not None:
+            overrides["stack_identifier"] = request.acquisition_stack
+        if request.maximum_pages is not None:
+            overrides["maximum_pages"] = request.maximum_pages
+        search = EbaySearchRequest.model_validate_json(encode_json(overrides))
+        _require_ebay_search_acquisition(search)
+        payload = RefreshEbaySearchPayload(
+            base_search_run_record_identifier=request.base_search_run_record_identifier,
+            search_work_identifier=self.new_identifier(),
+            search=search,
+            maximum_items=request.maximum_items,
+            maximum_images=request.maximum_images,
+        )
+        for constraint in refresh_ebay_search_work_constraints():
+            await self.database.register_constraint(
+                constraint, registered_at_utc_ns=self.utc_now_ns()
+            )
+        enqueued = await self.database.enqueue_work(
+            refresh_ebay_search_work(
+                identifier=self.new_identifier(), payload=payload, not_before_utc_ns=0
+            ),
+            WorkRequester(
+                request_identifier=self.new_identifier(),
+                kind=requester_kind,
+                identifier=requester_identifier,
+                context=requester_context,
+            ),
+            event_identifier=self.new_identifier(),
+            enqueued_at_utc_ns=self.utc_now_ns(),
+        )
+        return SearchRefreshRequestResult(
+            work_identifier=enqueued.work_item_identifier,
+            created=enqueued.created,
+            state=(await self.database.work_state(enqueued.work_item_identifier)).value,
+            base_search_run_record_identifier=request.base_search_run_record_identifier,
+        )
+
     async def request_workspace_refresh(
         self, request: RequestWorkspaceRefreshRequest
     ) -> RequestWorkspaceRefreshResult:
@@ -3356,6 +5043,8 @@ class ReviewApplication:
             maximum_images=request.maximum_images,
             proton_route=request.proton_route,
             decodo_route=request.decodo_route,
+            acquisition_stack=request.acquisition_stack,
+            maximum_pages=request.maximum_pages,
         )
         result = await self._request_search_refresh(
             refresh_request,
@@ -3563,6 +5252,23 @@ class ReviewApplication:
             candidate_examination_limit_reached,
         )
 
+    async def _marketplace_workspace_projections(
+        self,
+        workspace: ReviewWorkspace,
+        *,
+        maximum_candidate_listings_examined: int,
+        selected_listing_identifiers: tuple[str, ...] | None = None,
+    ) -> tuple[int, int, tuple[ComposedListingProjection, ...]]:
+        try:
+            return await marketplace_bulk_review_projections(
+                self,
+                workspace,
+                maximum_candidate_listings_examined=maximum_candidate_listings_examined,
+                selected_listing_identifiers=selected_listing_identifiers,
+            )
+        except ValueError as error:
+            raise ReviewInputError(str(error)) from error
+
     async def _workspace_analysis_candidates(
         self,
         workspace: ReviewWorkspace,
@@ -3573,6 +5279,37 @@ class ReviewApplication:
         """Select status-matching workspace IDs without composing rich listing views."""
 
         current_runs = self._workspace_current_search_runs(workspace)
+        if await scope_contains_ebay(self.database, current_runs):
+            selected: list[str] = []
+            examined = 0
+            cursor = None
+            while True:
+                page = await self.list_composed_search(
+                    ListComposedSearchRequest(
+                        search_run_record_identifier=current_runs[0],
+                        additional_search_run_record_identifiers=current_runs[1:],
+                        filters=ComposedListingFilters(statuses=tuple(ListingStatus)),
+                        page_size=min(100, maximum_candidate_listings_examined),
+                        maximum_candidate_listings_examined=maximum_candidate_listings_examined,
+                        maximum_analyses_per_listing=0,
+                        cursor=cursor,
+                    )
+                )
+                if page.older_ancestry_truncated:
+                    raise ReviewInputError("Workspace analysis requires complete search ancestry")
+                remaining = maximum_candidate_listings_examined - examined
+                bounded = page.listings[:remaining]
+                selected.extend(
+                    item.listing_identifier for item in bounded if item.status.value in statuses
+                )
+                examined += len(bounded)
+                if len(page.listings) > remaining or (
+                    examined == maximum_candidate_listings_examined and page.next_cursor is not None
+                ):
+                    return tuple(selected), examined, True
+                cursor = page.next_cursor
+                if cursor is None:
+                    return tuple(selected), examined, False
         as_of = await self.database.current_completion_boundary()
         ancestry = await self._projection_search_scope(
             current_runs[0],
@@ -3636,7 +5373,10 @@ class ReviewApplication:
     ) -> ListingAnalysisBatchSelection:
         await self._active_product_guide(request.product_guide_record_identifier)
         refresh = await self.database.work(request.search_refresh_work_identifier)
-        if tuple(refresh["kind"]) != ("carl", "facebook", "work", "refresh_search"):
+        if tuple(refresh["kind"]) not in {
+            ("carl", "facebook", "work", "refresh_search"),
+            REFRESH_EBAY_SEARCH_WORK_KIND,
+        }:
             raise ReviewInputError("Analysis batch source is not a search-refresh work item")
         if refresh["state"] != WorkState.COMPLETED.value:
             raise ReviewInputError(
@@ -3652,16 +5392,7 @@ class ReviewApplication:
             raise ReviewInputError("Search refresh does not identify its source searches")
 
         async def listing_identifiers(record_identifier: str) -> tuple[str, ...]:
-            kind, _, value = await self.database.get_record(record_identifier)
-            traversal = value.get("traversal") if isinstance(value, dict) else None
-            identifiers = (
-                traversal.get("unique_listing_identifiers") if isinstance(traversal, dict) else None
-            )
-            if kind != ("carl", "facebook", "search_run") or not isinstance(identifiers, list):
-                raise ReviewInputError("Search refresh references a malformed search run")
-            if not all(isinstance(identifier, str) for identifier in identifiers):
-                raise ReviewInputError("Search run contains a malformed listing identifier")
-            return tuple(identifiers)
+            return await run_listing_identifiers(self.database, record_identifier)
 
         if source_listing_identifiers is None:
             refreshed_listings = await listing_identifiers(refreshed_identifier)
@@ -3694,13 +5425,23 @@ class ReviewApplication:
             included_listing_ids &= snapshot_listing_ids
         if restrict_listing_identifiers is not None:
             included_listing_ids &= restrict_listing_identifiers
-        sources = tuple(
-            source
-            for source in await self.database.facebook_review_candidate_sources(
-                tuple(included_listing_ids)
-            )
-            if source.listing_identifier in included_listing_ids
+        facebook_ids = tuple(
+            identifier for identifier in included_listing_ids if not identifier.startswith("ebay:")
         )
+        ebay_ids = tuple(
+            identifier for identifier in included_listing_ids if identifier.startswith("ebay:")
+        )
+        sources = (
+            tuple(
+                source
+                for source in await self.database.facebook_review_candidate_sources(facebook_ids)
+                if source.listing_identifier in included_listing_ids
+            )
+            if facebook_ids
+            else ()
+        )
+        if ebay_ids:
+            sources += await ebay_candidate_sources(self.database, ebay_ids)
 
         return select_listing_analysis_batch(
             sources,
@@ -4020,10 +5761,18 @@ class ReviewApplication:
             expected_base_record_identifier=None,
         )
 
+    async def retry_item_failures(
+        self, request: RetryItemFailuresRequest
+    ) -> RetryItemFailuresResult:
+        """Retry linked transient item failures and resume a refresh without repeating its search."""
+        return await retry_refresh_item_failures(
+            self.database, request, utc_ns=self.utc_now_ns(), new_identifier=self.new_identifier
+        )
+
     async def retry_image_failures(
         self, request: RetryImageFailuresRequest
     ) -> RetryImageFailuresResult:
-        """Requeue terminal image work selected by one search run or refresh."""
+        """Requeue terminal image work selected by a source-dispatched run or refresh."""
 
         source_kind: ImageFailureSourceKind | None = None
         try:
@@ -4031,6 +5780,8 @@ class ReviewApplication:
         except KeyError:
             source_work = None
         if source_work is not None:
+            if tuple(source_work.get("kind", ())) == REFRESH_EBAY_SEARCH_WORK_KIND:
+                return await self._retry_ebay_images(request, ImageFailureSourceKind.SEARCH_REFRESH)
             if tuple(source_work.get("kind", ())) != (
                 "carl",
                 "facebook",
@@ -4044,6 +5795,8 @@ class ReviewApplication:
                 record_kind, _, _ = await self.database.get_record(request.source_identifier)
             except KeyError:
                 raise ReviewInputError("The retry source was not found") from None
+            if record_kind == ("carl", "ebay", "search_run"):
+                return await self._retry_ebay_images(request, ImageFailureSourceKind.SEARCH_RUN)
             if record_kind != ("carl", "facebook", "search_run"):
                 raise ReviewInputError("The retry source record is not a search run")
             source_kind = ImageFailureSourceKind.SEARCH_RUN
@@ -4070,6 +5823,25 @@ class ReviewApplication:
             retried=len(retried),
             remaining_terminal_failures=matched - len(retried),
             retried_work_identifier_sample=tuple(retried[:20]),
+        )
+
+    async def _retry_ebay_images(
+        self, request: RetryImageFailuresRequest, source_kind: ImageFailureSourceKind
+    ) -> RetryImageFailuresResult:
+        matched, identifiers = await retry_ebay_image_failures(
+            self.database,
+            request.source_identifier,
+            request.maximum_items,
+            self.utc_now_ns(),
+            self.new_identifier,
+        )
+        return RetryImageFailuresResult(
+            source_identifier=request.source_identifier,
+            source_kind=source_kind,
+            matched_terminal_failures=matched,
+            retried=len(identifiers),
+            remaining_terminal_failures=matched - len(identifiers),
+            retried_work_identifier_sample=identifiers[:20],
         )
 
     async def revise_product_guide(
@@ -4201,10 +5973,17 @@ class ReviewApplication:
         )
 
     async def get_listing_analysis(self, record_identifier: str) -> AnalysisReport:
-        descriptor = await self.database.facebook_analysis_descriptor(record_identifier)
         kind, _, value = await self.database.get_record(record_identifier)
-        if kind != ("carl", "facebook", "item_analysis") or not isinstance(value, dict):
+        if kind not in {
+            ("carl", "facebook", "item_analysis"),
+            ("carl", "ebay", "item_analysis"),
+        } or not isinstance(value, dict):
             raise ValueError("Item analysis record is malformed")
+        descriptor = (
+            await ebay_analysis_descriptor(self.database, record_identifier)
+            if kind == ("carl", "ebay", "item_analysis")
+            else await self.database.facebook_analysis_descriptor(record_identifier)
+        )
         text = value.get("analysis_text")
         if text is not None and not isinstance(text, str):
             raise ValueError("Item analysis text is malformed")
@@ -4234,13 +6013,178 @@ class ReviewApplication:
             outputs=[output.model_dump(mode="json") for output in outputs],
         )
 
+    async def request_listing_details(
+        self, request: RequestEbayListingDetailsRequest
+    ) -> RequestListingDetailsResult:
+        if request.marketplace is Marketplace.FACEBOOK:
+            reused = not request.refresh and bool(
+                await self.database.successful_facebook_item_page_results(
+                    (request.external_identifier,)
+                )
+            )
+            definition = request_facebook_listing_details_work(
+                identifier=self.new_identifier(),
+                payload=RequestFacebookListingDetailsPayload(
+                    listing_identifier=request.external_identifier,
+                    maximum_images=request.maximum_images,
+                    refresh=request.refresh,
+                    item_routing=("decodo", "personal", request.decodo_route),
+                    image_routing=("proton", "personal", request.proton_route),
+                ),
+            )
+            enqueued = await self.database.enqueue_work(
+                definition,
+                WorkRequester(
+                    request_identifier=self.new_identifier(),
+                    kind=("carl", "marketplace", "request_listing_details"),
+                    identifier=definition.identifier,
+                    context=request.model_dump(mode="json"),
+                ),
+                event_identifier=self.new_identifier(),
+                enqueued_at_utc_ns=self.utc_now_ns(),
+            )
+            return RequestListingDetailsResult(
+                marketplace=Marketplace.FACEBOOK,
+                external_identifier=request.external_identifier,
+                work_identifier=enqueued.work_item_identifier,
+                created=enqueued.created,
+                state=(await self.database.work_state(enqueued.work_item_identifier)).value,
+                reused_item_page=reused,
+            )
+        item_request = request.item_request()
+        usable = tuple(
+            (identifier, value)
+            for identifier, value in await ebay_observations(
+                self.database, request.external_identifier
+            )
+            if value.get("classification") == "detail"
+            and isinstance(value.get("request"), dict)
+            and value["request"].get("stack_identifier") == request.stack_identifier
+            and isinstance(value.get("acquisition_record_identifier"), str)
+        )
+        reused = bool(usable) and not request.refresh
+        if reused:
+            definition = extract_ebay_item_work(
+                identifier=self.new_identifier(),
+                payload=ExtractEbayItemPayload(
+                    request=item_request,
+                    acquisition_record_identifier=usable[-1][1]["acquisition_record_identifier"],
+                ),
+            )
+        else:
+            definition = collect_ebay_item_work(
+                identifier=self.new_identifier(),
+                payload=CollectEbayItemPayload(request=item_request),
+            )
+        enqueued = await self.database.enqueue_work(
+            definition,
+            WorkRequester(
+                request_identifier=self.new_identifier(),
+                kind=("carl", "marketplace", "request_listing_details"),
+                identifier=definition.identifier,
+                context=request.model_dump(mode="json"),
+            ),
+            event_identifier=self.new_identifier(),
+            enqueued_at_utc_ns=self.utc_now_ns(),
+        )
+        return RequestListingDetailsResult(
+            marketplace=Marketplace.EBAY,
+            external_identifier=request.external_identifier,
+            work_identifier=enqueued.work_item_identifier,
+            created=enqueued.created,
+            state=(await self.database.work_state(enqueued.work_item_identifier)).value,
+            reused_item_page=reused,
+        )
+
+    async def get_listing_details(
+        self, request: GetMarketplaceListingRequest
+    ) -> MarketplaceListingDetails:
+        if request.marketplace is Marketplace.EBAY:
+            return await read_ebay_listing(self.database, request)
+        try:
+            projection = await self.get_composed_listing(
+                GetComposedListingRequest(
+                    listing_identifier=request.external_identifier,
+                    maximum_gallery_images=request.maximum_images,
+                )
+            )
+        except KeyError:
+            return MarketplaceListingDetails(
+                marketplace=Marketplace.FACEBOOK,
+                external_identifier=request.external_identifier,
+                canonical_url=canonical_facebook_listing_url(request.external_identifier),
+                classification="not_collected",
+            )
+        title = projection.title.value if projection.title is not None else None
+        description = projection.description.value if projection.description is not None else None
+        price = projection.price.value if projection.price is not None else None
+        displayed_price = price if isinstance(price, str) else None
+        currency = None
+        if isinstance(price, dict):
+            amount = price.get("formatted_amount") or price.get("amount_decimal")
+            currency = price.get("currency")
+            displayed_price = str(amount) if isinstance(amount, (str, int, float)) else None
+        images = (
+            tuple(
+                MarketplaceListingImage(
+                    gallery_order=image.descriptor.gallery_order,
+                    url=image.descriptor.original_url,
+                    state=image.descriptor.download_state,
+                    reference_record_identifier=image.descriptor.gallery_reference_record_identifier,
+                    result_record_identifier=image.descriptor.image_result_record_identifier,
+                    artifact_identifier=image.descriptor.image_artifact_identifier,
+                    width=image.descriptor.width,
+                    height=image.descriptor.height,
+                )
+                for image in projection.gallery.images
+            )
+            if projection.gallery is not None
+            else ()
+        )
+        evidence = (
+            projection.description.evidence
+            if projection.description is not None
+            else projection.title.evidence
+            if projection.title is not None
+            else None
+        )
+        return MarketplaceListingDetails(
+            marketplace=Marketplace.FACEBOOK,
+            external_identifier=request.external_identifier,
+            canonical_url=projection.canonical_source_url,
+            classification=projection.status.value.value,
+            title=title if isinstance(title, str) else None,
+            displayed_price=displayed_price,
+            currency=currency if isinstance(currency, str) else None,
+            description=description if isinstance(description, str) else None,
+            description_state="retained" if description else "not_available",
+            observation_record_identifier=evidence.observation_record_identifier
+            if evidence
+            else None,
+            acquisition_record_identifier=evidence.acquisition_record_identifier
+            if evidence
+            else None,
+            images=images,
+            referenced_image_count=projection.gallery.referenced_image_count
+            if projection.gallery
+            else 0,
+            images_truncated=projection.gallery.images_truncated if projection.gallery else False,
+        )
+
     async def get_image(self, artifact_identifier: str) -> ResolvedImage:
         image_results = await self.database.saved_facebook_image_results()
-        if not any(
+        trusted_facebook = any(
             value.get("image_artifact_identifier") == artifact_identifier
             for _, value in image_results
-        ):
-            raise ReviewInputError("Artifact is not a saved Facebook listing image")
+        )
+        trusted_ebay = any(
+            isinstance(value, dict)
+            and value.get("state") == "saved"
+            and value.get("image_artifact_identifier") == artifact_identifier
+            for _, value in await self.database.records_by_kind(("carl", "ebay", "image_result"))
+        )
+        if not trusted_facebook and not trusted_ebay:
+            raise ReviewInputError("Artifact is not a saved listing image")
         metadata, content = await self.database.get_artifact(artifact_identifier)
         media_type = metadata.get("media_type")
         sha256 = metadata.get("sha256")
@@ -4266,6 +6210,14 @@ class ReviewApplication:
         kind, _, observation = await self.database.get_record(
             request.listing_observation_record_identifier
         )
+        if kind == ("carl", "ebay", "listing_observation"):
+            return await request_ebay_listing_analysis(
+                self,
+                request,
+                requester_kind=requester_kind,
+                requester_identifier=requester_identifier,
+                requester_context=requester_context,
+            )
         if kind != ("carl", "facebook", "listing_observation") or not isinstance(observation, dict):
             raise ReviewInputError("Analysis input is not a listing observation")
         classification = observation.get("response_classification")
@@ -4485,22 +6437,41 @@ class ReviewApplication:
             checkpoint_stage_value if isinstance(checkpoint_stage_value, str) else None
         )
         search_progress = None
+        refresh_summary = None
+        outcome = None
         analysis_batch_progress = None
         kind = tuple(str(part) for part in work["kind"])
         state = WorkState(str(work["state"]))
         error_kind = work_error_kind(work.get("error"))
         if state is WorkState.TERMINAL_FAILURE and error_kind is None:
             error_kind = "unknown"
-        if kind == ("carl", "facebook", "work", "refresh_search"):
+        if kind in {("carl", "facebook", "work", "refresh_search"), REFRESH_EBAY_SEARCH_WORK_KIND}:
             refreshed_identifier_value = result_mapping.get(
                 "refreshed_search_run_record_identifier"
             )
             refreshed_identifier = (
                 refreshed_identifier_value if isinstance(refreshed_identifier_value, str) else None
             )
-            child_states = await self.database.search_refresh_child_work_states(
-                refresh_work_identifier=work_identifier,
-                refreshed_search_run_record_identifier=refreshed_identifier,
+            if state in {WorkState.COMPLETED, WorkState.TERMINAL_FAILURE}:
+                if (
+                    "selected_unique_listings" in result_mapping
+                    or "item_failures" in result_mapping
+                ):
+                    refresh_summary = refresh_failure_summary(result_mapping)
+                    outcome = refresh_summary.severity
+                elif result_mapping.get("state") == "completed_with_failures":
+                    outcome = "partial_failure"
+                else:
+                    outcome = "success"
+                if state is WorkState.TERMINAL_FAILURE:
+                    outcome = "failed"
+            child_states = (
+                await ebay_refresh_child_work_states(self.database, work_identifier)
+                if kind == REFRESH_EBAY_SEARCH_WORK_KIND
+                else await self.database.search_refresh_child_work_states(
+                    refresh_work_identifier=work_identifier,
+                    refreshed_search_run_record_identifier=refreshed_identifier,
+                )
             )
             item_pages = work_group_progress(child_states["item_pages"])
             item_extractions = work_group_progress(child_states["item_extractions"])
@@ -4520,6 +6491,11 @@ class ReviewApplication:
                 item_extractions=item_extractions,
                 images=images,
                 image_extractions=image_extractions,
+                descriptions=(
+                    work_group_progress(child_states["descriptions"])
+                    if "descriptions" in child_states
+                    else None
+                ),
             )
         if kind == REQUEST_MISSING_ANALYSES_WORK_KIND:
             payload_value = work.get("payload")
@@ -4650,6 +6626,8 @@ class ReviewApplication:
                 ),
             ),
             search_refresh_progress=search_progress,
+            outcome=outcome,
+            refresh_failure_summary=refresh_summary,
             analysis_batch_progress=analysis_batch_progress,
             details=(
                 WorkStatusDetails(

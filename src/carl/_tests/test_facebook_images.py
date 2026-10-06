@@ -412,8 +412,8 @@ def test_image_url_and_route_are_validated() -> None:
         if isinstance(constraint, ConcurrencyConstraint)
     }
     assert concurrency == {
-        (SchedulingSubjectKind.WORK_ITEM, SchedulingScopeKind.WORK_KIND): 10,
-        (SchedulingSubjectKind.NETWORK_ACTIVITY, SchedulingScopeKind.NETWORK_ACTIVITY_KIND): 10,
+        (SchedulingSubjectKind.WORK_ITEM, SchedulingScopeKind.WORK_KIND): 25,
+        (SchedulingSubjectKind.NETWORK_ACTIVITY, SchedulingScopeKind.NETWORK_ACTIVITY_KIND): 25,
     }
     assert {
         (constraint.maximum_starts, constraint.period_ns)
@@ -1118,7 +1118,7 @@ async def test_image_worker_retains_response_and_validation_result(
                 "collect",
                 "gallery_image",
             ]
-            assert operation["output_schema_version"] == 2
+            assert operation["output_schema_version"] == 3
             acquisition_id = collection["result"]["acquisition_record_identifier"]
             _, _, acquisition = await database.get_record(acquisition_id)
             assert acquisition["request_plan"]["url"] == URL

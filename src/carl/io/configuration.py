@@ -18,6 +18,7 @@ from carl.core.configuration import (
     DecodoRouteConfiguration,
     MullvadRouteConfiguration,
     ProtonRouteConfiguration,
+    WreqTransportConfiguration,
 )
 from carl.core.models import ConfigurationDocumentIdentity, JsonValue, StrictModel
 from carl.io.bright_data import BrightDataProxySettings
@@ -33,6 +34,7 @@ from carl.io.wireproxy import (
     read_private_configuration,
     render_wireguard_configuration,
 )
+from carl.io.wreq import WreqTransportSettings
 
 _MAX_CONFIGURATION_BYTES = 1024 * 1024
 _MAX_WIREGUARD_CONFIGURATION_BYTES = 64 * 1024
@@ -531,6 +533,29 @@ def decodo_settings(
             session_duration_minutes=route.session_duration_minutes,
         ),
         StaticDecodoCredentialSource(DecodoCredentials(proxy_password=SecretStr(password))),
+    )
+
+
+def decodo_wreq_stack_settings(
+    loaded: LoadedCarlConfiguration,
+    directories: CarlDirectories,
+    stack_identifier: str,
+) -> tuple[DecodoProxySettings, StaticDecodoCredentialSource, WreqTransportSettings]:
+    try:
+        stack = loaded.configuration.require_acquisition_stack(stack_identifier)
+    except KeyError:
+        raise ConfigurationLoadFailure("acquisition_stack_not_found") from None
+    try:
+        transport = loaded.configuration.require_http_transport(stack.http_transport)
+    except KeyError:
+        raise ConfigurationLoadFailure("http_transport_not_found") from None
+    if not isinstance(transport, WreqTransportConfiguration):
+        raise ConfigurationLoadFailure("http_transport_implementation_mismatch")
+    route_settings, credential_source = decodo_settings(loaded, directories, stack.network_path)
+    return (
+        route_settings,
+        credential_source,
+        WreqTransportSettings(emulation_profile="Chrome153"),
     )
 
 

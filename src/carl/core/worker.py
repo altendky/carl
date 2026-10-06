@@ -28,6 +28,18 @@ class AttemptContext(StrictModel):
     worker_identifier: str = Field(min_length=1)
     attempt: int = Field(ge=1)
     operation_identifier: str = Field(min_length=1)
+    outage_attempts: tuple[int, ...] = ()
+    retry_budget_start_attempt: int = Field(default=0, ge=0)
+
+    def retry_attempt(self, offset: int = 0) -> int:
+        """Keep physical ordinals, but exempt confirmed outage attempts from budgets."""
+
+        baseline = max(offset, self.retry_budget_start_attempt)
+        return (
+            self.attempt
+            - baseline
+            - sum(baseline < attempt < self.attempt for attempt in self.outage_attempts)
+        )
 
 
 class WorkerSettings(StrictModel):

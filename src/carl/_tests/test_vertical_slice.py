@@ -269,7 +269,11 @@ async def test_version_seven_database_adds_bulk_review_storage(tmp_path: Path) -
     with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             """
-            INSERT INTO operations VALUES (
+            INSERT INTO operations(
+                id, component_parts_json, output_schema_version, code_provenance_json,
+                invocation_json, configuration_json, state, started_at_utc, ended_at_utc,
+                duration_ns, result_json, error_json
+            ) VALUES (
                 'legacy-operation', '["test","legacy"]', 1, ?, '{}', '{}',
                 'completed', '2026-09-28T00:00:00+00:00',
                 '2026-09-28T00:00:01+00:00', 1, '{}', NULL
@@ -351,7 +355,11 @@ async def test_composed_projection_storage_queries_are_targeted_and_bounded(tmp_
         def operation(identifier: str, ended_at_utc: str) -> None:
             connection.execute(
                 """
-                INSERT INTO operations VALUES (?, ?, 1, ?, '{}', '{}', 'completed', ?, ?, 1,
+                INSERT INTO operations(
+                    id, component_parts_json, output_schema_version, code_provenance_json,
+                    invocation_json, configuration_json, state, started_at_utc, ended_at_utc,
+                    duration_ns, result_json, error_json
+                ) VALUES (?, ?, 1, ?, '{}', '{}', 'completed', ?, ?, 1,
                                                 '{}', NULL)
                 """,
                 (

@@ -15,6 +15,7 @@ from carl.core.facebook_work import (
     facebook_network_path_constraint,
 )
 from carl.core.http import RequestPlan, stored_content_encodings, stored_header_values
+from carl.core.marketplace_images import MARKETPLACE_IMAGE_MAXIMUM_ACTIVE, MARKETPLACE_IMAGE_SCOPE
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
 from carl.core.work import (
     ConcurrencyConstraint,
@@ -38,8 +39,8 @@ IMAGE_RATE_PERIOD_NS = 60_000_000_000
 IMAGE_RATE_MAXIMUM_STARTS = FACEBOOK_NETWORK_PATH_RATE_MAXIMUM_STARTS
 IMAGE_SHORT_RATE_PERIOD_NS = 1_000_000_000
 IMAGE_SHORT_RATE_MAXIMUM_STARTS = 3
-IMAGE_MAXIMUM_ACTIVE = 10
-IMAGE_SESSION_MAXIMUM_ACTIVE = 10
+IMAGE_MAXIMUM_ACTIVE = MARKETPLACE_IMAGE_MAXIMUM_ACTIVE
+IMAGE_SESSION_MAXIMUM_ACTIVE = MARKETPLACE_IMAGE_MAXIMUM_ACTIVE
 IMAGE_HOLDOFF_MINIMUM_NS = 0
 IMAGE_HOLDOFF_MAXIMUM_NS = 100_000_000
 MAX_IMAGE_PIXELS = 40_000_000
@@ -367,6 +368,14 @@ def legacy_image_network_constraint_identifiers(
             "all_cdns",
             "v2",
         ),
+        (
+            "carl",
+            "facebook",
+            "image",
+            "network_activity_concurrency",
+            "all_cdns",
+            "v3",
+        ),
         *legacy_image_session_work_constraint_identifiers(),
         ("carl", "facebook", "image", "network_activity_rate", *routing),
         ("carl", "facebook", "image", "network_activity_rate", "all_cdns"),
@@ -378,7 +387,10 @@ def legacy_image_network_constraint_identifiers(
 
 
 def legacy_image_session_work_constraint_identifiers() -> tuple[tuple[str, ...], ...]:
-    return (("carl", "facebook", "image", "work_concurrency", "v1"),)
+    return (
+        ("carl", "facebook", "image", "work_concurrency", "v1"),
+        ("carl", "facebook", "image", "work_concurrency", "v2"),
+    )
 
 
 def image_network_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...]:
@@ -391,7 +403,7 @@ def image_network_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...
                 "image",
                 "network_activity_concurrency",
                 "all_cdns",
-                "v3",
+                "v4",
             ),
             subject_kind=SchedulingSubjectKind.NETWORK_ACTIVITY,
             scope=SchedulingScope(
@@ -443,10 +455,10 @@ def image_network_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...
 
 
 def image_session_work_constraint() -> ConcurrencyConstraint:
-    """Bound image work sharing the worker runtime's Proton transport."""
+    """Bound image work independently of the selected provider transport."""
 
     return ConcurrencyConstraint(
-        identifier=("carl", "facebook", "image", "work_concurrency", "v2"),
+        identifier=("carl", "facebook", "image", "work_concurrency", "v3"),
         subject_kind=SchedulingSubjectKind.WORK_ITEM,
         scope=SchedulingScope(
             kind=SchedulingScopeKind.WORK_KIND,
@@ -481,6 +493,7 @@ def image_network_activity(
             SchedulingScope(
                 kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND, identity=IMAGE_NETWORK_ACTIVITY_KIND
             ),
+            MARKETPLACE_IMAGE_SCOPE,
             SchedulingScope(
                 kind=SchedulingScopeKind.REMOTE_ORIGIN, identity=("https", hostname, "443")
             ),

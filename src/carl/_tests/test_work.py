@@ -3,7 +3,9 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
+from uuid import uuid4
 
 import anyio
 import apsw
@@ -27,6 +29,7 @@ from carl.core.work import (
     WorkState,
 )
 from carl.core.worker import FollowOnWork
+from carl.io.cleanup import shielded_cleanup
 from carl.io.network_activity import NetworkActivityScheduler
 from carl.io.sqlite import Database, LeaseLostError
 
@@ -300,6 +303,104 @@ async def test_cancellation_after_activity_creation_persists_terminal_state(
 
     assert activity["state"] == NetworkActivityState.CANCELLED
     assert activity["result"] == {"kind": "cancelled", "possibly_dispatched": False}
+
+
+async def _admission_scheduler(database: Database) -> NetworkActivityScheduler:
+    await database.begin_operation(
+        operation_id="network-operation",
+        component=Component(ComponentId(("carl", "test", "network")), 1, lambda: None),
+        provenance=_provenance(),
+        invocation={},
+        configuration={},
+        started_at_utc=datetime.now(UTC).isoformat(),
+    )
+    return NetworkActivityScheduler(
+        database=database,
+        new_identifier=lambda: str(uuid4()),
+        utc_now_ns=lambda: 10,
+        sample_uniform_holdoff_ns=lambda minimum, maximum: minimum,
+        permit_duration_ns=1_000_000_000,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dispatched", [False, True])
+async def test_network_activity_normal_exit_finishes_inside_cancelled_scope(
+    tmp_path: Path,
+    dispatched: bool,
+) -> None:
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        scheduler = await _admission_scheduler(database)
+        with anyio.CancelScope() as scope:
+            async with scheduler.admit(_network_activity("normal-exit", ordinal=1)) as permit:
+                if dispatched:
+                    permit.mark_dispatched()
+                scope.cancel()
+        activity = await database.network_activity("normal-exit")
+    assert activity["state"] == (
+        NetworkActivityState.COMPLETED if dispatched else NetworkActivityState.SKIPPED
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+async def test_network_activity_cleanup_failure_preserves_body_error(
+    tmp_path: Path,
+    failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        "carl.io.network_activity.shielded_cleanup",
+        partial(shielded_cleanup, timeout_seconds=0.01),
+    )
+    primary = ValueError("body error")
+
+    async def fail_finish(**_kwargs: object) -> None:
+        if failure == "timeout":
+            await anyio.sleep_forever()
+        raise OSError("private activity details")
+
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        scheduler = await _admission_scheduler(database)
+        monkeypatch.setattr(database, "finish_network_activity", fail_finish)
+        with pytest.raises(ValueError) as caught:
+            async with scheduler.admit(_network_activity("failed-exit", ordinal=1)):
+                raise primary
+    assert caught.value is primary
+    assert "failed network activity" in caplog.text
+    assert ("TimeoutError" if failure == "timeout" else "OSError") in caplog.text
+    assert "private activity details" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_network_activity_cleanup_error_preserves_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cancelled_errors: list[BaseException] = []
+
+    async def fail_finish(**_kwargs: object) -> None:
+        raise OSError("private activity details")
+
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        scheduler = await _admission_scheduler(database)
+        monkeypatch.setattr(database, "finish_network_activity", fail_finish)
+        with anyio.CancelScope() as scope:
+            async with scheduler.admit(_network_activity("cancelled-exit", ordinal=1)):
+                scope.cancel()
+                try:
+                    await anyio.lowlevel.checkpoint()
+                except anyio.get_cancelled_exc_class() as error:
+                    cancelled_errors.append(error)
+                    raise
+        assert scope.cancelled_caught
+    assert len(cancelled_errors) == 1
+    assert any(
+        "cancelled network activity: OSError" in note for note in cancelled_errors[0].__notes__
+    )
+    assert "private activity details" not in caplog.text
 
 
 @pytest.mark.anyio

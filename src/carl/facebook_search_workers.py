@@ -1,6 +1,7 @@
 """Durable worker handler for bounded Facebook Marketplace searches."""
 
 from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from functools import partial
 
@@ -69,7 +70,7 @@ from carl.core.worker import (
 )
 from carl.io.facebook_search import FacebookSearchSessionFactory, FacebookSearchSessionFailure
 from carl.io.httpx import Acquisition, AcquisitionFailure, IdentifierFactory
-from carl.io.network_activity import NetworkActivityScheduler
+from carl.io.network_activity import NetworkActivityScheduler, network_activity_definition
 from carl.io.sqlite import Database
 
 SEARCH_RETRY_DELAY_NS = 1_000_000_000
@@ -103,7 +104,7 @@ def search_session_failure_work(
         "attempt": context.attempt,
         "network_path": list(routing),
     }
-    effective_attempt = context.attempt if policy_attempt is None else policy_attempt
+    effective_attempt = context.retry_attempt() if policy_attempt is None else policy_attempt
     if retryable and effective_attempt < SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS:
         return RetryWork(
             delay_ns=_search_retry_delay_ns(effective_attempt),
@@ -140,7 +141,7 @@ def search_acquisition_failure_work(
         "acquisition": error.result,
     }
     artifacts = _body_artifacts(Acquisition(record=error.result, bodies=error.bodies))
-    effective_attempt = context.attempt if policy_attempt is None else policy_attempt
+    effective_attempt = context.retry_attempt() if policy_attempt is None else policy_attempt
     if (
         error.result.get("stopping_condition") == "transport_failure"
         and effective_attempt < SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS
@@ -722,7 +723,7 @@ def build_search_handler(
     price_partition_planner_component: Component,
 ) -> Callable[[CollectSearchPayload, AttemptContext], Awaitable[WorkOutcome]]:
     async def collect(payload: CollectSearchPayload, context: AttemptContext) -> WorkOutcome:
-        policy_attempt = context.attempt - payload.retry_attempt_offset
+        policy_attempt = context.retry_attempt(payload.retry_attempt_offset)
         if policy_attempt < 1:
             raise ValueError("Search retry attempt offset is inconsistent with durable work")
         search_run_identifier = dependencies.new_identifier()
@@ -783,8 +784,20 @@ def build_search_handler(
         elapsed_accounted_at = dependencies.monotonic_ns()
         try:
             session = None
-            async with dependencies.session_factory(network_session_identifier) as active_session:
-                session = active_session
+            async with AsyncExitStack() as session_stack:
+                setup_activity = network_activity_definition(
+                    identifier=dependencies.new_identifier(),
+                    kind=("carl", "facebook", "network_activity", "search_session_open"),
+                    operation_identifier=context.operation_identifier,
+                    network_session_identifier=network_session_identifier,
+                    network_path=payload.routing,
+                    attempt=context.attempt,
+                )
+                async with dependencies.network_activity_scheduler.admit(setup_activity) as permit:
+                    permit.mark_dispatched()
+                    session = await session_stack.enter_async_context(
+                        dependencies.session_factory(network_session_identifier)
+                    )
                 session_bootstrap_activity = facebook_search_network_activity(
                     identifier=dependencies.new_identifier(),
                     kind=SEARCH_SESSION_BOOTSTRAP_NETWORK_ACTIVITY_KIND,

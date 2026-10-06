@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import sys
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
 import apsw
+
+from carl.io.cleanup import shielded_cleanup
 
 if TYPE_CHECKING:
     from apsw import AsyncConnection
@@ -32,7 +36,10 @@ _CLEANUP_TIMEOUT_SECONDS = 35
 async def _transaction(connection: AsyncConnection) -> AsyncGenerator[None]:
     """Run an APSW savepoint transaction with cancellation-safe cleanup."""
 
-    await connection.__aenter__()
+    # APSW may create the savepoint before its completion reaches this task.
+    # Receive ownership before exposing outer cancellation to the body.
+    with anyio.fail_after(_CLEANUP_TIMEOUT_SECONDS, shield=True):
+        await connection.__aenter__()
     try:
         yield
     except BaseException as error:
@@ -89,6 +96,9 @@ class DatabaseConnections:
     _current_writer_task_identifier: int | None = None
     _reader_by_task_identifier: dict[int, AsyncConnection] = field(default_factory=dict)
     _closed: bool = False
+    _fully_closed: bool = False
+    _closed_resource_identifiers: set[int] = field(default_factory=set)
+    _close_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
     @classmethod
     @asynccontextmanager
@@ -112,6 +122,12 @@ class DatabaseConnections:
         writer = await apsw.Connection.as_async(str(path), flags=writer_flags)
         readers: list[AsyncConnection] = []
         send, receive = anyio.create_memory_object_stream[AsyncConnection](reader_count)
+        wrapper = cls(
+            _writer=writer,
+            _readers=(),
+            _reader_send=send,
+            _reader_receive=receive,
+        )
         try:
             writer.transaction_mode = "IMMEDIATE"
             await _configure_connection(
@@ -130,6 +146,7 @@ class DatabaseConnections:
                     flags=apsw.SQLITE_OPEN_READONLY,
                 )
                 readers.append(reader)
+                wrapper._readers = tuple(readers)
                 reader.transaction_mode = "DEFERRED"
                 await _configure_connection(
                     reader,
@@ -138,36 +155,56 @@ class DatabaseConnections:
                 )
                 await send.send(reader)
 
-        except BaseException:
-            with anyio.fail_after(_CLEANUP_TIMEOUT_SECONDS, shield=True):
-                await send.aclose()
-                await receive.aclose()
-                for reader in readers:
-                    await reader.aclose(force=True)
-                await writer.aclose(force=True)
-            raise
-
-        wrapper = cls(
-            _writer=writer,
-            _readers=tuple(readers),
-            _reader_send=send,
-            _reader_receive=receive,
-        )
-        try:
             yield wrapper
         finally:
-            await wrapper.aclose()
+            await wrapper.aclose(primary_error=sys.exception())
 
-    async def aclose(self) -> None:
-        if self._closed:
+    async def aclose(self, *, primary_error: BaseException | None = None) -> None:
+        if self._fully_closed:
             return
         self._closed = True
-        with anyio.fail_after(_CLEANUP_TIMEOUT_SECONDS, shield=True):
-            await self._reader_send.aclose()
-            await self._reader_receive.aclose()
-            for reader in self._readers:
-                await reader.aclose(force=True)
-            await self._writer.aclose(force=True)
+        acquired = False
+        async with shielded_cleanup(
+            "database close lock",
+            primary_error=primary_error,
+            timeout_seconds=_CLEANUP_TIMEOUT_SECONDS,
+        ):
+            await self._close_lock.acquire()
+            acquired = True
+        if not acquired:
+            return
+        try:
+            actions: list[tuple[object, Callable[[], Awaitable[None]]]] = [
+                (self._reader_send, self._reader_send.aclose),
+                (self._reader_receive, self._reader_receive.aclose),
+                *[(reader, partial(reader.aclose, force=True)) for reader in self._readers],
+                (self._writer, partial(self._writer.aclose, force=True)),
+            ]
+            errors: list[Exception] = []
+            for resource, close in actions:
+                if id(resource) in self._closed_resource_identifiers:
+                    continue
+                try:
+                    # Each resource gets its own budget: one stalled reader must
+                    # not consume the writer's opportunity to close.
+                    async with shielded_cleanup(
+                        "database resource close",
+                        primary_error=primary_error,
+                        timeout_seconds=_CLEANUP_TIMEOUT_SECONDS,
+                    ):
+                        await close()
+                        self._closed_resource_identifiers.add(id(resource))
+                except Exception as error:
+                    errors.append(error)
+            self._fully_closed = all(
+                id(resource) in self._closed_resource_identifiers for resource, _ in actions
+            )
+            if len(errors) == 1:
+                raise errors[0]
+            if errors:
+                raise ExceptionGroup("Database resource cleanup failed", errors)
+        finally:
+            self._close_lock.release()
 
     def _task_identifier(self) -> int:
         return anyio.get_current_task().id

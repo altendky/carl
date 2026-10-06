@@ -1,5 +1,6 @@
 """Bounded HTTP acquisition using HTTPX raw response streams."""
 
+import sys
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -16,6 +17,25 @@ from carl.core.content_encoding import ContentDecodingError, decode_content
 from carl.core.http import FormField, RequestPlan, header_values, redirect_target
 from carl.core.models import Header, JsonValue
 from carl.core.routing import LocalSocks5Endpoint
+from carl.io.cleanup import shielded_cleanup
+
+
+async def close_httpx_client(
+    client: httpx.AsyncClient, *, primary_error: BaseException | None = None
+) -> None:
+    """Clear session material and close the transport even if either step fails."""
+    cookie_error: BaseException | None = None
+    try:
+        async with shielded_cleanup("http_client_cookies", primary_error=primary_error):
+            client.cookies.clear()
+    except BaseException as error:
+        cookie_error = error
+        raise
+    finally:
+        async with shielded_cleanup(
+            "http_client_close", primary_error=primary_error or cookie_error
+        ):
+            await client.aclose()
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +180,7 @@ class _HttpxAcquirer:
         try:
             yield client
         finally:
-            with anyio.CancelScope(shield=True):
-                await client.aclose()
+            await close_httpx_client(client, primary_error=sys.exception())
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         if self.expected_routing is not None and plan.routing != self.expected_routing:
@@ -340,7 +359,9 @@ class _HttpxAcquirer:
                 finally:
                     if response is not None:
                         try:
-                            with anyio.CancelScope(shield=True):
+                            async with shielded_cleanup(
+                                "http_response_close", primary_error=sys.exception()
+                            ):
                                 await response.aclose()
                         except Exception as error:
                             raise AcquisitionFailure(

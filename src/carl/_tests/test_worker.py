@@ -2,6 +2,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 from time import perf_counter_ns, time_ns
+from typing import Any
 from uuid import uuid4
 
 import anyio
@@ -27,6 +28,7 @@ from carl.core.worker import (
     WorkerSettings,
     WorkOutcome,
 )
+from carl.io import worker as worker_io
 from carl.io.sqlite import Database
 from carl.io.worker import (
     TypedWorkHandler,
@@ -738,6 +740,375 @@ async def test_expired_lease_during_setup_never_dispatches_handler(tmp_path: Pat
 
         assert not handler_started
         assert await database.work_state("setup-lease-loss") is WorkState.LEASED
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "stage",
+    (
+        "retry_budget",
+        "provenance",
+        "begin_rollback",
+        "completed",
+        "retried",
+        "terminally_failed",
+        "cleanup_error",
+    ),
+)
+async def test_cancellation_reconciles_the_entire_leased_attempt_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Missing operations, rolled-back starts, and committed outcomes differ."""
+
+    kind = ("carl", "test", "cancelled-lifetime")
+    handler_started = False
+    cancellation: BaseException | None = None
+    committed_work: Any = None
+
+    async def handle(payload: _Payload, context: AttemptContext) -> WorkOutcome:
+        nonlocal handler_started
+        handler_started = True
+        if stage == "retried":
+            return RetryWork(
+                delay_ns=1_000_000_000, reason={"kind": "fixture"}, result={"value": 7}
+            )
+        if stage == "terminally_failed":
+            return TerminalFailureWork(error={"kind": "fixture"}, result={"value": 7})
+        return CompletedWork(result={"value": payload.value})
+
+    registry = WorkHandlerRegistry(
+        handlers=(
+            TypedWorkHandler(
+                capability=WorkCapability(kind=kind, payload_schema_version=1),
+                component=Component(ComponentId(("carl", "test", "lifetime-worker")), 1, handle),
+                payload_type=_Payload,
+                handler=handle,
+            ),
+        )
+    )
+
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await database.enqueue_work(
+            _definition(identifier="cancelled-lifetime", kind=kind),
+            _requester("cancelled-lifetime"),
+            event_identifier=str(uuid4()),
+            enqueued_at_utc_ns=time_ns(),
+        )
+        claim = await database.claim_work(
+            supported_capabilities=registry.capabilities,
+            worker_identifier="worker",
+            lease_token="lease",
+            lease_duration_ns=_settings().lease_duration_ns,
+            utc_now_ns=time_ns,
+            event_identifier=str(uuid4()),
+        )
+        assert claim.lease is not None
+
+        with anyio.CancelScope() as scope:
+
+            async def cancel_setup(*args: Any, **kwargs: Any) -> Any:
+                del args, kwargs
+                scope.cancel()
+                await anyio.lowlevel.checkpoint()
+                raise AssertionError("cancellation checkpoint returned")
+
+            if stage == "retry_budget":
+                monkeypatch.setattr("carl.io.worker.work_retry_budget", cancel_setup)
+            elif stage == "begin_rollback":
+                begin_operation = database._begin_operation
+
+                async def cancel_after_insert(*args: Any, **kwargs: Any) -> None:
+                    await begin_operation(*args, **kwargs)
+                    await cancel_setup()
+
+                monkeypatch.setattr(database, "_begin_operation", cancel_after_insert)
+            elif stage in {"completed", "retried", "terminally_failed"}:
+                complete_operation = {
+                    "completed": database.complete_leased_operation,
+                    "retried": database.retry_leased_operation,
+                    "terminally_failed": database.terminally_fail_leased_operation,
+                }[stage]
+
+                async def cancel_after_commit(*args: Any, **kwargs: Any) -> None:
+                    nonlocal committed_work
+                    await complete_operation(*args, **kwargs)
+                    committed_work = await database.work("cancelled-lifetime")
+                    await cancel_setup()
+
+                monkeypatch.setattr(
+                    database,
+                    {
+                        "completed": "complete_leased_operation",
+                        "retried": "retry_leased_operation",
+                        "terminally_failed": "terminally_fail_leased_operation",
+                    }[stage],
+                    cancel_after_commit,
+                )
+            elif stage == "cleanup_error":
+
+                async def fail_cleanup(*args: Any, **kwargs: Any) -> bool:
+                    del args, kwargs
+                    raise RuntimeError("sensitive fixture detail must not be logged")
+
+                monkeypatch.setattr(database, "finalize_interrupted_work", fail_cleanup)
+
+            services = _services()
+            if stage in {"provenance", "cleanup_error"}:
+                services = WorkerRuntimeServices(
+                    new_identifier=services.new_identifier,
+                    utc_now_ns=services.utc_now_ns,
+                    monotonic_ns=services.monotonic_ns,
+                    code_provenance=cancel_setup,
+                    invocation=services.invocation,
+                )
+            with pytest.raises(anyio.get_cancelled_exc_class()) as caught:
+                await execute_lease(
+                    database=database,
+                    registry=registry,
+                    settings=_settings(),
+                    services=services,
+                    lease=claim.lease,
+                )
+            cancellation = caught.value
+
+        work = await database.work("cancelled-lifetime")
+        if stage in {"completed", "retried", "terminally_failed"}:
+            assert work == committed_work
+            assert (
+                work["state"]
+                == {
+                    "completed": "completed",
+                    "retried": "pending",
+                    "terminally_failed": "terminal_failure",
+                }[stage]
+            )
+            assert work["result"] == {"value": 7}
+            assert len(work["operations"]) == 1
+            operation_identifier = work["operations"][0]["operation_identifier"]
+            assert isinstance(operation_identifier, str)
+            assert (await database.operation(operation_identifier))["state"] == (
+                "completed" if stage == "completed" else "failed"
+            )
+            assert handler_started
+        elif stage == "cleanup_error":
+            assert work["state"] == "leased"
+            assert cancellation is not None
+            assert any("RuntimeError" in note for note in cancellation.__notes__)
+            assert not any("sensitive fixture" in note for note in cancellation.__notes__)
+        else:
+            assert work["state"] == "pending"
+            assert work["operations"] == []
+            assert not handler_started
+
+
+@pytest.mark.anyio
+async def test_cancellation_at_committed_claim_handoff_releases_undispatched_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kind = ("carl", "test", "claim-handoff")
+    handed_off = False
+
+    async def handle(payload: _Payload, context: AttemptContext) -> WorkOutcome:
+        raise AssertionError("a cancelled claim must not dispatch")
+
+    registry = WorkHandlerRegistry(
+        handlers=(
+            TypedWorkHandler(
+                capability=WorkCapability(kind=kind, payload_schema_version=1),
+                component=Component(ComponentId(("carl", "test", "handoff-worker")), 1, handle),
+                payload_type=_Payload,
+                handler=handle,
+            ),
+        )
+    )
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await database.enqueue_work(
+            _definition(identifier="claim-handoff", kind=kind),
+            _requester("claim-handoff"),
+            event_identifier=str(uuid4()),
+            enqueued_at_utc_ns=time_ns(),
+        )
+        claim_work = database.claim_work
+        with anyio.CancelScope() as scope:
+
+            async def cancel_after_claim_commit(*args: Any, **kwargs: Any) -> ClaimResult:
+                nonlocal handed_off
+                claim = await claim_work(*args, **kwargs)
+                assert claim.lease is not None
+                scope.cancel()
+                await anyio.lowlevel.checkpoint()
+                handed_off = True
+                return claim
+
+            monkeypatch.setattr(database, "claim_work", cancel_after_claim_commit)
+            await run_worker_pool(
+                database=database,
+                registry=registry,
+                settings=_settings(),
+                services=_services(),
+                stop=anyio.Event(),
+            )
+
+        assert handed_off
+        work = await database.work("claim-handoff")
+        assert work["state"] == "pending"
+        assert work["operations"] == []
+
+
+@pytest.mark.anyio
+async def test_non_cancellation_base_exception_group_finalizes_the_interrupted_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FixtureAbort(BaseException):
+        pass
+
+    kind = ("carl", "test", "base-exception")
+    failure = BaseExceptionGroup("fixture abort", [FixtureAbort()])
+    unwound_error: BaseException | None = None
+    finalize = worker_io._finalize_interrupted_lease
+
+    async def capture_primary(*args: Any, **kwargs: Any) -> None:
+        nonlocal unwound_error
+        unwound_error = kwargs["primary_error"]
+        await finalize(*args, **kwargs)
+
+    monkeypatch.setattr(worker_io, "_finalize_interrupted_lease", capture_primary)
+
+    async def handle(payload: _Payload, context: AttemptContext) -> WorkOutcome:
+        raise failure
+
+    registry = WorkHandlerRegistry(
+        handlers=(
+            TypedWorkHandler(
+                capability=WorkCapability(kind=kind, payload_schema_version=1),
+                component=Component(ComponentId(("carl", "test", "abort-worker")), 1, handle),
+                payload_type=_Payload,
+                handler=handle,
+            ),
+        )
+    )
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await database.enqueue_work(
+            _definition(identifier="base-exception", kind=kind),
+            _requester("base-exception"),
+            event_identifier=str(uuid4()),
+            enqueued_at_utc_ns=time_ns(),
+        )
+        claim = await database.claim_work(
+            supported_capabilities=registry.capabilities,
+            worker_identifier="worker",
+            lease_token="lease",
+            lease_duration_ns=_settings().lease_duration_ns,
+            utc_now_ns=time_ns,
+            event_identifier=str(uuid4()),
+        )
+        assert claim.lease is not None
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await execute_lease(
+                database=database,
+                registry=registry,
+                settings=_settings(),
+                services=_services(),
+                lease=claim.lease,
+            )
+
+        # Trio wraps/derives groups on nursery exit; lease cleanup must not replace that error.
+        assert caught.value is unwound_error
+        handler_group = caught.value.exceptions[0]
+        assert isinstance(handler_group, BaseExceptionGroup)
+        assert handler_group.message == failure.message
+        assert handler_group.exceptions == failure.exceptions
+        work = await database.work("base-exception")
+        assert work["state"] == "pending"
+        assert work["latest_event_kind"] == "released"
+        operation_identifier = work["operations"][0]["operation_identifier"]
+        assert isinstance(operation_identifier, str)
+        operation = await database.operation(operation_identifier)
+        assert operation["state"] == "failed"
+        assert operation["error"] == {
+            "kind": "worker_runtime_error",
+            "possibly_dispatched": True,
+        }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation_started", (False, True))
+@pytest.mark.parametrize("replacement_lease", (False, True))
+async def test_interrupted_finalization_is_idempotent_and_fenced_to_its_attempt(
+    tmp_path: Path, operation_started: bool, replacement_lease: bool
+) -> None:
+    kind = ("carl", "test", "finalizer-fence")
+    now = 100
+
+    async def handle(payload: _Payload, context: AttemptContext) -> WorkOutcome:
+        return CompletedWork(result={})
+
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await database.enqueue_work(
+            _definition(identifier="finalizer-fence", kind=kind),
+            _requester("finalizer-fence"),
+            event_identifier=str(uuid4()),
+            enqueued_at_utc_ns=now,
+        )
+        capabilities = (WorkCapability(kind=kind, payload_schema_version=1),)
+        claim = await database.claim_work(
+            supported_capabilities=capabilities,
+            worker_identifier="original-worker",
+            lease_token="original-lease",
+            lease_duration_ns=10,
+            utc_now_ns=lambda: now,
+            event_identifier=str(uuid4()),
+        )
+        assert claim.lease is not None
+        if operation_started:
+            await database.begin_leased_operation(
+                work_item_identifier="finalizer-fence",
+                lease_token="original-lease",
+                worker_identifier="original-worker",
+                lease_duration_ns=10,
+                utc_now_ns=lambda: now,
+                event_identifier=str(uuid4()),
+                operation_id="interrupted-operation",
+                component=Component(ComponentId(("carl", "test", "fence-worker")), 1, handle),
+                provenance=_provenance(),
+                invocation={},
+                configuration={},
+                started_at_utc="2026-10-03T00:00:00+00:00",
+            )
+        if replacement_lease:
+            now = 200
+            replacement = await database.claim_work(
+                supported_capabilities=capabilities,
+                worker_identifier="replacement-worker",
+                lease_token="replacement-lease",
+                lease_duration_ns=10,
+                utc_now_ns=lambda: now,
+                event_identifier=str(uuid4()),
+            )
+            assert replacement.lease is not None
+
+        async def finalize() -> bool:
+            return await database.finalize_interrupted_work(
+                work_item_identifier="finalizer-fence",
+                lease_token="original-lease",
+                worker_identifier="original-worker",
+                operation_id="interrupted-operation",
+                utc_now_ns=lambda: now,
+                event_identifier=str(uuid4()),
+                reason="cancelled",
+                ended_at_utc="2026-10-03T00:00:01+00:00",
+                duration_ns=1,
+                possibly_dispatched=operation_started,
+            )
+
+        assert await finalize() is (not replacement_lease)
+        work = await database.work("finalizer-fence")
+        assert await finalize() is False
+        assert await database.work("finalizer-fence") == work
+        assert work["state"] == ("leased" if replacement_lease else "pending")
+        assert work["worker_identifier"] == ("replacement-worker" if replacement_lease else None)
+        if operation_started:
+            assert (await database.operation("interrupted-operation"))["state"] == "failed"
 
 
 @pytest.mark.anyio

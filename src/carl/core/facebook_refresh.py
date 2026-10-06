@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Literal
 
 from pydantic import Field
 
@@ -49,6 +50,8 @@ class SearchRefreshRequest(StrictModel):
     maximum_images: int | None = Field(default=None, ge=1)
     proton_route: str = Field(default="carl", min_length=1)
     decodo_route: str = Field(default="carl", min_length=1)
+    acquisition_stack: str | None = Field(default=None, min_length=1)
+    maximum_pages: int | None = Field(default=None, ge=1, le=20)
 
 
 class RefreshSearchPayload(StrictModel):
@@ -75,16 +78,18 @@ class SearchRunOrigin(JsonStringEnumeration):
 
 
 class SearchRunSummary(StrictModel):
+    marketplace: Literal["facebook", "ebay"] = "facebook"
+    listing_state: Literal["active", "sold", "completed"] | None = None
     record_identifier: str
-    completion_sequence: int = Field(ge=1)
+    completion_sequence: int = Field(ge=0)
     started_at_utc: str
     ended_at_utc: str | None
     origin: SearchRunOrigin
     refresh_source_run_record_identifier: str | None
     query: str
-    facebook_location_identifier: str
-    radius_value: int
-    radius_unit: str
+    facebook_location_identifier: str | None
+    radius_value: int | None
+    radius_unit: str | None
     minimum_price: JsonValue
     maximum_price: JsonValue
     traversal_strategy: JsonValue

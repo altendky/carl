@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -15,6 +16,7 @@ from carl.core.models import (
     JsonValue,
     StrictModel,
 )
+from carl.core.refresh_recovery import RefreshFailureSummary
 from carl.core.work import WorkEventKind, WorkState
 
 
@@ -567,6 +569,7 @@ class SearchRefreshProgress(StrictModel):
     item_extractions: WorkGroupProgress
     images: WorkGroupProgress
     image_extractions: WorkGroupProgress
+    descriptions: WorkGroupProgress | None = None
 
 
 class WorkFailureReasonCount(StrictModel):
@@ -628,6 +631,8 @@ class WorkStatus(StrictModel):
     error_kind: str | None
     operation_count: int = Field(ge=0)
     runtime: WorkRuntimeStatus
+    outcome: Literal["success", "partial_failure", "failed"] | None = None
+    refresh_failure_summary: RefreshFailureSummary | None = None
     search_refresh_progress: SearchRefreshProgress | None = None
     analysis_batch_progress: AnalysisBatchProgress | None = None
     details: WorkStatusDetails | None = None
