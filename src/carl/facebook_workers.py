@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import anyio
 
+from carl.core.acquisition_identity import acquisition_resource_identity
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.content_encoding import decoded_stored_body
 from carl.core.facebook import (
@@ -85,7 +86,7 @@ def build_component_registry() -> Registry:
     return Registry(
         (
             Component(ACQUIRE_HTTP, 1, _acquire_component),
-            Component(COLLECT_FACEBOOK_ITEM, 1, _collect_item_component),
+            Component(COLLECT_FACEBOOK_ITEM, 2, _collect_item_component),
             Component(COLLECT_FACEBOOK_SEARCH, 2, _collect_search_component),
             Component(EXTRACT_FACEBOOK, 1, extract_listing),
             Component(EXTRACT_FACEBOOK_JSON_BLOCKS, 1, parse_json_blocks),
@@ -494,6 +495,53 @@ async def _extract_outcome(
     )
 
 
+async def _usable_retained_item_acquisition(
+    database: Database,
+    acquisition_identifier: str,
+    listing_identifier: str,
+) -> bool:
+    """A completed raw HTTP job is not necessarily a usable listing response."""
+    try:
+        kind, _, acquisition = await database.get_record(acquisition_identifier)
+        if kind != ("carl", "http", "acquisition") or not isinstance(acquisition, dict):
+            return False
+        if acquisition.get("requested_listing_id") != listing_identifier:
+            return False
+        hops = acquisition.get("hops")
+        if not isinstance(hops, list) or not hops or not isinstance(hops[-1], dict):
+            return False
+        response = hops[-1].get("response")
+        if not isinstance(response, dict) or response.get("status_code") != 200:
+            return False
+        body, effective_url = response.get("body"), acquisition.get("effective_url")
+        if (
+            not isinstance(body, dict)
+            or body.get("state") != "available"
+            or not isinstance(effective_url, str)
+        ):
+            return False
+        body_identifier = body.get("artifact_id")
+        if not isinstance(body_identifier, str):
+            return False
+        metadata, content = await database.get_artifact(body_identifier)
+        decoded = await anyio.to_thread.run_sync(
+            _decode_and_extract,
+            content,
+            metadata.get("representation"),
+            response.get("headers"),
+            listing_identifier,
+            acquisition_identifier,
+            effective_url,
+            abandon_on_cancel=True,
+        )
+    except (KeyError, ValueError):
+        return False
+    return decoded.classification.kind in {
+        FacebookItemResponseKind.FULL_LISTING,
+        FacebookItemResponseKind.LISTING_UNAVAILABLE,
+    }
+
+
 def build_facebook_worker_registry(
     dependencies: FacebookWorkerDependencies,
     search_dependencies: FacebookSearchWorkerDependencies | None = None,
@@ -503,6 +551,60 @@ def build_facebook_worker_registry(
     extract_component = components.require(EXTRACT_FACEBOOK)
 
     async def acquire(payload: CollectItemPayload, context: AttemptContext) -> WorkOutcome:
+        resource = acquisition_resource_identity(COLLECT_ITEM_WORK_KIND, payload.as_json())
+        if resource is not None:
+            candidates = await dependencies.database.completed_acquisition_candidates(
+                COLLECT_ITEM_WORK_KIND,
+                resource,
+                work_identifier=context.work_item_identifier,
+                since_work_created=True,
+            )
+            for candidate in candidates:
+                result = candidate.get("result")
+                acquisition_identifier = (
+                    result.get("acquisition_record_identifier")
+                    if isinstance(result, dict)
+                    else None
+                )
+                if not isinstance(acquisition_identifier, str):
+                    continue
+                if not await _usable_retained_item_acquisition(
+                    dependencies.database, acquisition_identifier, payload.listing_id
+                ):
+                    continue
+                extraction = extract_item_work(
+                    identifier=dependencies.new_identifier(),
+                    payload=ExtractItemPayload(
+                        acquisition_record_identifier=acquisition_identifier
+                    ),
+                    extractor_identifier=EXTRACT_FACEBOOK.parts,
+                    extractor_schema_version=extract_component.output_schema_version,
+                    not_before_utc_ns=0,
+                )
+                return CompletedWork(
+                    inputs=(
+                        NamedInput(
+                            name=("reused_acquisition",), object_identifier=acquisition_identifier
+                        ),
+                    ),
+                    follow_on_work=(
+                        FollowOnWork(
+                            definition=extraction,
+                            requester=WorkRequester(
+                                request_identifier=dependencies.new_identifier(),
+                                kind=("carl", "http", "acquisition"),
+                                identifier=acquisition_identifier,
+                                context={"operation_identifier": context.operation_identifier},
+                            ),
+                            event_identifier=dependencies.new_identifier(),
+                        ),
+                    ),
+                    result={
+                        "acquisition_record_identifier": acquisition_identifier,
+                        "extraction_work_identifier": extraction.identifier,
+                        "reused_acquisition": True,
+                    },
+                )
         try:
             if dependencies.network_activity_scheduler is None:
                 acquisition = await dependencies.acquirer.acquire(

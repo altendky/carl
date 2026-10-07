@@ -55,6 +55,11 @@ from carl.core.marketplace_search import (
     SetMarketplaceSearchTargetEnabledRequest,
 )
 from carl.core.models import StrictModel
+from carl.core.pipeline import (
+    RequestSearchPipelineRequest,
+    SearchPipelineRequestResult,
+    SearchPipelineStatus,
+)
 from carl.core.refresh_recovery import RetryItemFailuresRequest, RetryItemFailuresResult
 from carl.core.review import (
     AnalysisReport,
@@ -99,6 +104,7 @@ from carl.core.review_workspace import (
     ReviewWorksetConflict,
     ReviewWorkspace,
     ReviewWorkspaceActivity,
+    ReviseWorkspaceSearchTrackRequest,
     SelectionSnapshot,
     SetReviewWorkspaceArchivedRequest,
     SetWorkspaceDefaultProductGuideRequest,
@@ -109,6 +115,7 @@ from carl.core.review_workspace import (
     WorkspaceListingReview,
     WorkspaceProductGuideBinding,
     WorkspaceSearchTrack,
+    WorkspaceSearchTrackSpecificationRecord,
     WorkspaceWorkStatus,
     WorkspaceWorkWaitResult,
 )
@@ -144,6 +151,12 @@ _OPEN_WORLD_MUTATION = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=False,
     idempotent_hint=False,
+    open_world_hint=True,
+)
+_IDEMPOTENT_OPEN_WORLD_MUTATION = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
     open_world_hint=True,
 )
 
@@ -265,12 +278,13 @@ accepted Best Offers still do not imply a known sale amount. An unqualified doll
 ebay.com uses its USD display convention; that inference is not applied to Facebook prices.
 For eBay item pages and
 gallery images, call request_listing_details with marketplace="ebay" and the external identifier.
-Item and seller-description pages use the configured Decodo browser stack. Facebook searches and
-both marketplaces' images resolve explicit configuration route_overrides before acquisition;
-the default requested Proton route can be cut over to a separate Decodo datacenter route,
-including already queued work. Item-page and eBay search routes remain independent. Inspect
-network activity/acquisition provenance for the effective provider; legacy proton_route options
-name the requested route, not necessarily the effective provider. There is no implicit fallback.
+Item and seller-description pages use the configured Decodo browser stack. New Facebook searches
+and both marketplaces' images default directly to ["decodo","personal","datacenter"], without
+Proton aliases. Facebook search.network_path selects a complete provider-qualified route;
+refresh search_network_path overrides the current track spec, and image_network_path selects
+Facebook gallery transport. Item-page and eBay search routes remain independent. Selecting an
+explicit Proton path means real Proton, never an implicit Decodo fallback. Inspect retained
+network activity/acquisition provenance for the actual provider.
 The request queues item acquisition, then offline extraction, then bounded gallery/description work.
 Poll the returned work and its extraction_work_identifier, then the image_work_identifiers and
 description_work_identifiers in the extraction result. get_listing_details is read-only and accepts
@@ -297,6 +311,21 @@ The override changes this work's next attempt, not the search-group target speci
 refreshes need a new request_workspace_refresh with acquisition_stack, not an initial-track retry.
 Retries and refreshes make provider calls: inspect retained failures and choose a justified change
 before requeueing; do not use repeated paid acquisitions as probes.
+Use request_search_pipeline for durable, bounded source-neutral processing through details, images,
+or analysis. source.kind="new_search" creates and collects its explicit targets once; "search",
+"workspace", and "search_work" process the exact retained or already queued scope without rerunning
+search. Analysis requires options.product_guide_record_identifier naming an exact retained guide.
+maximum_images is a global reservation cap across both sources, maximum_images_per_listing bounds
+each gallery, and maximum_analyses bounds new analysis reservations. Set stop_after="details" or
+"images" to omit analysis. Title and known card-status filters narrow candidates before details
+acquisition; exact item status is checked afterward. Unused reservations are not redistributed.
+The request preserves its exact input scope, budgets, and reuse policy across worker restarts.
+Pass a stable caller-generated request_identifier; replay the unchanged request after a lost response
+to recover the original result. Reusing that ID with different intent fails. Use get_search_pipeline
+with its work_identifier for bounded stage counts, budgets, and listing progress. Inspect successful
+and failed/skipped counts after work settles; a failed collection is not a successful empty plan.
+Workspace processing roots also appear in get_workspace_work_status. Pipeline processing does not
+replace the explicit search-refresh workflow or advance workspace search tracks.
 MCP servers do not run workers. Keep `carl work` or `carl monitor --work` running while queued work
 should progress. Review with list_composed_search or get_composed_listing, fetching full reports or
 images only when needed. These read only retained database evidence, make no network requests, and
@@ -318,8 +347,15 @@ marketplace search-group record and optional guide. A group becomes one track pe
 Workspaces may mix sources. Review IDs use ebay:<item ID> for eBay and bare numeric Facebook IDs;
 copy returned identities unchanged through reviews, claims, worksets, snapshots, and analysis. Add another phrase with create_workspace_search; after it
 completes, refresh that track with request_workspace_refresh before requesting analysis. Refreshes
-advance the selected track without replacing the workspace. request_search_refresh and
-request_workspace_refresh dispatch from the retained run; maximum_images is a global refresh
+advance the selected track without replacing the workspace.
+To adjust the same watch, read get_review_workspace, then revise_workspace_search_track with its
+current search_specification_version as expected_version and the complete replacement search spec.
+This preserves the track ID, listing first/last-seen history, and prior runs; inspect immutable
+versions with list_workspace_search_track_versions. Revision alone performs no acquisition:
+request_workspace_refresh queues the current version, while already queued refreshes keep their
+captured version. Marketplace cannot change. Scope changes conservatively suppress absence
+comparisons against other scopes; a listing outside a narrowed scope is not marked gone or sold.
+request_search_refresh and request_workspace_refresh dispatch from the retained run; maximum_images is a global refresh
 budget. eBay accepts maximum_pages and acquisition_stack overrides; Facebook traversal and route
 overrides are not eBay settings and are rejected there. Analysis dispatches from retained observation
 provenance and uses exact saved gallery and seller-description evidence for either source. Use list_workspace_listings for a
@@ -328,7 +364,9 @@ search absence alone does not mark an older listing unavailable. Use get_workspa
 when the full composed fields and evidence for one exact listing are needed. Use
 set_workspace_search_track_enabled to remove a track from
 or restore it to the active union without deleting its retained history.
-Search acquisition is limited to one active job per proxy route. If an initial track search
+Facebook search acquisition is limited to one active job per Proton route. Decodo Facebook
+searches run concurrently within worker-pool and request-rate limits. eBay retains its
+separate search scheduling policy. If an initial track search
 exhausts a transient transport or session failure, get_workspace_work_status reports it under
 failed_work and successful=false; call retry_workspace_search_track with that stable track ID to
 give the same track a fresh retry budget. Retried legacy tracks are upgraded with the current
@@ -634,6 +672,25 @@ def tool_definitions(
 
         return await expected(lambda: application.retry_workspace_search_track(request))
 
+    async def revise_workspace_search_track(
+        request: ReviseWorkspaceSearchTrackRequest,
+    ) -> WorkspaceSearchTrack:
+        """Version a track's complete search spec without replacing its history or queueing acquisition; expected_version guards concurrent edits."""
+
+        return await expected(lambda: application.revise_workspace_search_track(request))
+
+    async def list_workspace_search_track_versions(
+        workspace_record_identifier: str,
+        track_identifier: str,
+    ) -> tuple[WorkspaceSearchTrackSpecificationRecord, ...]:
+        """Read immutable search-spec versions for one stable workspace track without network calls."""
+
+        return await expected(
+            lambda: application.list_workspace_search_track_versions(
+                workspace_record_identifier, track_identifier
+            )
+        )
+
     async def request_workspace_refresh(
         request: RequestWorkspaceRefreshRequest,
     ) -> RequestWorkspaceRefreshResult:
@@ -834,6 +891,18 @@ def tool_definitions(
         """Queue a durable search, detail-page, and missing-image refresh workflow."""
 
         return await expected(lambda: application.request_search_refresh(request))
+
+    async def request_search_pipeline(
+        request: RequestSearchPipelineRequest,
+    ) -> SearchPipelineRequestResult:
+        """Request bounded details, images, or exact-guide analysis for an explicit search scope; replay safely by request ID."""
+
+        return await expected(lambda: application.request_search_pipeline(request))
+
+    async def get_search_pipeline(work_identifier: str) -> SearchPipelineStatus:
+        """Read a durable processing intent's frozen scope, stage counts, budgets, and bounded listing progress."""
+
+        return await expected(lambda: application.get_search_pipeline(work_identifier))
 
     async def preview_selection_analyses(
         request: SelectionAnalysesRequest,
@@ -1066,6 +1135,20 @@ def tool_definitions(
             _OPEN_WORLD_MUTATION,
         ),
         ToolDefinition(
+            "revise_workspace_search_track",
+            ("carl", "review", "revise_workspace_search_track"),
+            revise_workspace_search_track,
+            revise_workspace_search_track.__doc__ or "",
+            _LOCAL_MUTATION,
+        ),
+        ToolDefinition(
+            "list_workspace_search_track_versions",
+            ("carl", "review", "list_workspace_search_track_versions"),
+            list_workspace_search_track_versions,
+            list_workspace_search_track_versions.__doc__ or "",
+            _READ_ONLY,
+        ),
+        ToolDefinition(
             "request_workspace_refresh",
             ("carl", "review", "request_workspace_refresh"),
             request_workspace_refresh,
@@ -1239,6 +1322,20 @@ def tool_definitions(
             request_search_refresh,
             request_search_refresh.__doc__ or "",
             _OPEN_WORLD_MUTATION,
+        ),
+        ToolDefinition(
+            "request_search_pipeline",
+            ("carl", "marketplace", "request_search_pipeline"),
+            request_search_pipeline,
+            request_search_pipeline.__doc__ or "",
+            _IDEMPOTENT_OPEN_WORLD_MUTATION,
+        ),
+        ToolDefinition(
+            "get_search_pipeline",
+            ("carl", "marketplace", "get_search_pipeline"),
+            get_search_pipeline,
+            get_search_pipeline.__doc__ or "",
+            _READ_ONLY,
         ),
         ToolDefinition(
             "preview_selection_analyses",

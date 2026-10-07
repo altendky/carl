@@ -6,6 +6,7 @@ from time import time_ns
 from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
+from carl.core.acquisition_identity import ebay_image_identity
 from carl.core.components import Component, ComponentId
 from carl.core.ebay import CollectEbaySearchPayload, collect_ebay_search_work
 from carl.core.ebay_items import (
@@ -24,6 +25,7 @@ from carl.core.ebay_search_support import (
 )
 from carl.core.models import JsonValue, NamedInput, NamedOutput, RecordDraft
 from carl.core.refresh_recovery import classify_refresh_completion
+from carl.core.search_scope import search_scope_changed
 from carl.core.work import WorkCapability, WorkDefinition, WorkRequester, WorkState
 from carl.core.worker import (
     AttemptContext,
@@ -226,7 +228,14 @@ async def _item_phase(
         raise ValueError("Refresh checkpoint has no refreshed search run")
     base_ids = await _listing_identifiers(database, payload.base_search_run_record_identifier)
     refreshed_ids = await _listing_identifiers(database, refreshed)
-    selected = tuple(dict.fromkeys((*refreshed_ids, *base_ids)))[: payload.maximum_items]
+    _, _, base = await database.get_record(payload.base_search_run_record_identifier)
+    scope_changed = search_scope_changed(
+        "ebay",
+        base.get("request") if isinstance(base, dict) else None,
+        payload.search.model_dump(mode="json"),
+    )
+    comparison_base_ids = () if scope_changed else base_ids
+    selected = tuple(dict.fromkeys((*refreshed_ids, *comparison_base_ids)))[: payload.maximum_items]
     children: list[str] = []
     reused = 0
     for item in selected:
@@ -278,8 +287,11 @@ async def _item_phase(
         "reused_successful_item_pages": reused,
         "new_listing_identifiers": [item for item in refreshed_ids if item not in set(base_ids)],
         "absent_from_refresh_listing_identifiers": [
-            item for item in base_ids if item not in set(refreshed_ids)
+            item for item in comparison_base_ids if item not in set(refreshed_ids)
         ],
+        "search_scope_comparison_valid": not scope_changed,
+        "search_scope_changed": scope_changed,
+        "comparison_warnings": ["search_scope_changed"] if scope_changed else [],
     }
     if _pending(works):
         return RetryWork(
@@ -377,21 +389,56 @@ async def _image_phase(
             if payload.maximum_images is not None
             else None
         )
-        selected_urls: set[str] = set()
-        saved_urls = {
-            str(_mapping(value).get("url"))
-            for _, value in await database.records_by_kind(("carl", "ebay", "image_result"))
-            if _mapping(value).get("state") == "saved"
-            and isinstance(_mapping(value).get("image_artifact_identifier"), str)
-        }
+        observations: list[tuple[str, dict[str, JsonValue]]] = []
         for observation_identifier in _strings(checkpoint.get("observation_record_identifiers")):
             _, _, observation_value = await database.get_record(observation_identifier)
-            observation = _mapping(observation_value)
+            observations.append((observation_identifier, _mapping(observation_value)))
+        wanted_urls = tuple(
+            dict.fromkeys(
+                url
+                for _, observation in observations
+                for url in _strings(observation.get("gallery_urls"))
+            )
+        )
+        wanted = {ebay_image_identity(url) for url in wanted_urls}
+        selected_renditions: set[tuple[str, ...]] = set()
+        saved_renditions: set[tuple[str, ...]] = set()
+        validated_artifacts: dict[str, bool] = {}
+        saved_candidates = []
+        for start in range(0, len(wanted_urls), 1000):
+            saved_candidates.extend(
+                await database.saved_ebay_image_candidates(wanted_urls[start : start + 1000])
+            )
+        for _, raw in saved_candidates:
+            saved = _mapping(raw)
+            url, artifact = saved.get("url"), saved.get("image_artifact_identifier")
+            if (
+                saved.get("state") != "saved"
+                or not isinstance(url, str)
+                or not isinstance(artifact, str)
+            ):
+                continue
+            identity = ebay_image_identity(url)
+            if identity not in wanted:
+                continue
+            if artifact not in validated_artifacts:
+                try:
+                    await database.get_artifact(artifact)
+                except (KeyError, ValueError, OSError):
+                    validated_artifacts[artifact] = False
+                else:
+                    validated_artifacts[artifact] = True
+            if validated_artifacts[artifact]:
+                saved_renditions.add(identity)
+        for observation_identifier, observation in observations:
             item = observation.get("item_identifier")
             if not isinstance(item, str):
                 raise ValueError("Refresh item observation is malformed") from None
             for order, url in enumerate(_strings(observation.get("gallery_urls"))):
-                needs_budget = url not in selected_urls and url not in saved_urls
+                identity = ebay_image_identity(url)
+                needs_budget = (
+                    identity not in selected_renditions and identity not in saved_renditions
+                )
                 if needs_budget and remaining == 0:
                     continue
                 existing_reference = existing_references.get(
@@ -439,7 +486,7 @@ async def _image_phase(
                             object_identifier=reference_identifier,
                         )
                     )
-                selected_urls.add(url)
+                selected_renditions.add(identity)
                 if needs_budget and remaining is not None:
                     remaining -= 1
         reference_identifiers = tuple(selected_references)
@@ -664,7 +711,7 @@ def build_ebay_refresh_worker_registry(
                 capability=WorkCapability(
                     kind=REFRESH_EBAY_SEARCH_WORK_KIND, payload_schema_version=1
                 ),
-                component=Component(ComponentId(("carl", "ebay", "refresh", "search")), 2, _anchor),
+                component=Component(ComponentId(("carl", "ebay", "refresh", "search")), 4, _anchor),
                 payload_type=RefreshEbaySearchPayload,
                 handler=refresh,
             ),

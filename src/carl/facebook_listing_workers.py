@@ -40,6 +40,7 @@ from carl.core.worker import (
     TerminalFailureWork,
     WorkOutcome,
 )
+from carl.facebook_image_workers import publish_shared_image_reuses, validate_saved_image_results
 from carl.io.browser_identity import brave_navigation_headers
 from carl.io.sqlite import Database
 from carl.io.worker import TypedWorkHandler, WorkHandlerRegistry
@@ -160,7 +161,40 @@ async def _item_phase(
             ),
             not_before_utc_ns=0,
         )
-        children = (await _enqueue(definition, "item", context, dependencies),)
+        if payload.refresh:
+            children = (await _enqueue(definition, "item", context, dependencies),)
+        else:
+            enqueued, retained = await database.enqueue_work_unless_facebook_item_page_is_usable(
+                definition,
+                WorkRequester(
+                    request_identifier=dependencies.new_identifier(),
+                    kind=("carl", "facebook", "listing_details", "item"),
+                    identifier=context.work_item_identifier,
+                    context={},
+                ),
+                listing_identifier=payload.listing_identifier,
+                event_identifier=dependencies.new_identifier(),
+                enqueued_at_utc_ns=dependencies.utc_now_ns(),
+            )
+            if retained is not None:
+                return RetryWork(
+                    delay_ns=0,
+                    reason={"kind": "continue_listing_details"},
+                    inputs=(
+                        NamedInput(
+                            name=("reused_item_page",),
+                            object_identifier=retained.observation_record_identifier,
+                        ),
+                    ),
+                    result={
+                        "stage": "items_complete",
+                        "observation_record_identifier": retained.observation_record_identifier,
+                        "reused_item_page": True,
+                    },
+                )
+            if enqueued is None:
+                raise RuntimeError("Item acquisition registration produced no result")
+            children = (enqueued.work_item_identifier,)
     work = await database.work(children[0])
     result: dict[str, JsonValue] = {
         **checkpoint,
@@ -216,9 +250,14 @@ async def _image_phase(
         _, _, observation = await database.get_record(observation_identifier)
         references = gallery_references(
             observation_identifier=observation_identifier, observation=observation
-        )[: payload.maximum_images]
+        )
         saved: list[SavedImageCandidate] = []
-        for identifier, value in await database.saved_facebook_image_results():
+        for identifier, value in await validate_saved_image_results(
+            database,
+            await database.saved_facebook_image_candidates_for_references(
+                references[: payload.maximum_images]
+            ),
+        ):
             saved.append(
                 SavedImageCandidate.model_validate(
                     {
@@ -230,8 +269,12 @@ async def _image_phase(
                     }
                 )
             )
-        followups = plan_image_followups(references, tuple(saved), payload.maximum_images)
-        existing = dict(await database.facebook_gallery_reference_identifiers())
+        followups = plan_image_followups(
+            references[: payload.maximum_images], tuple(saved), payload.maximum_images
+        )
+        existing = dict(
+            await database.facebook_gallery_reference_identifiers((observation_identifier,))
+        )
         records: list[RecordDraft] = []
         reference_ids: list[str] = []
         for index, reference in enumerate(references):
@@ -460,6 +503,17 @@ async def _image_phase(
         ):
             saved_count += 1
     failures = len(works) - saved_count
+    await publish_shared_image_reuses(
+        database=database,
+        context=context,
+        reference_identifiers=tuple(
+            identifier
+            for group in (cast(list[JsonValue], groups) if isinstance(groups, list) else [])
+            for identifier in _strings(group)
+        ),
+        checkpoint=result,
+        utc_now_ns=dependencies.utc_now_ns,
+    )
     return CompletedWork(
         result={
             **result,

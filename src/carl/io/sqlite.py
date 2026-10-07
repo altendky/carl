@@ -10,13 +10,18 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from time import time_ns
+from time import perf_counter_ns, time_ns
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 import anyio
 import apsw
 
+from carl.core.acquisition_identity import (
+    acquisition_resource_identity,
+    ebay_image_identity,
+    facebook_image_identity,
+)
 from carl.core.activity import (
     ActiveNetworkActivity,
     ActivitySnapshot,
@@ -39,6 +44,8 @@ from carl.core.composed_projection import (
     SearchMembershipOccurrenceCandidate,
     SearchRunCandidate,
     StatusObservationCandidate,
+    normalize_listing_status,
+    search_card_field_value,
     status_candidate_from_search_occurrence,
 )
 from carl.core.connectivity import network_work_kind
@@ -62,6 +69,7 @@ from carl.core.facebook_work import (
     COLLECT_SEARCH_WORK_KIND,
     FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY,
     SuccessfulItemPageResult,
+    facebook_effective_search_scope,
     facebook_effective_search_work_constraint,
 )
 from carl.core.item_analysis import (
@@ -102,12 +110,14 @@ from carl.core.review import (
     ProductGuideSummary,
     candidate_availability,
 )
+from carl.core.review_errors import ReviewInputError
 from carl.core.review_workspace import (
     ACQUIRE_REVIEW_BATCH,
     LISTING_REVIEW_KIND,
     MAXIMUM_WORKSET_LISTINGS,
     REVIEW_BATCH_KIND,
     REVIEW_WORKSET_KIND,
+    WORKSPACE_SEARCH_TRACK_SPECIFICATION_KIND,
     ListingReviewRecord,
     RecordListingReviewsResult,
     RecordWorkspaceBulkReviewResult,
@@ -117,6 +127,7 @@ from carl.core.review_workspace import (
     ReviewClaimLease,
     ReviewWorksetConflict,
 )
+from carl.core.search_scope import search_scope_sha256
 from carl.core.work import (
     CONSTRAINT_ADAPTER,
     ClaimResult,
@@ -141,6 +152,7 @@ from carl.core.work import (
 )
 from carl.core.worker import FollowOnWork
 from carl.io.db import DatabaseConnections
+from carl.route_cutover import rebuild_work_definition
 
 if TYPE_CHECKING:
     from apsw import AsyncConnection
@@ -736,6 +748,13 @@ class Database:
     def __init__(self, path: Path, connections: DatabaseConnections):
         self.path = path
         self._connections = connections
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncGenerator[None]:
+        """Atomically combine database mutations using the existing nested writer."""
+
+        async with self._connections.writer():
+            yield
 
     @classmethod
     @asynccontextmanager
@@ -1464,6 +1483,34 @@ class Database:
             ),
         )
 
+    async def legacy_facebook_search_constraint_identifiers(self) -> tuple[tuple[str, ...], ...]:
+        """Find persisted requested-route and Decodo-only effective search limits.
+
+        Route names can outlive their configuration, so discover old definitions
+        rather than guessing names from the current route configuration.
+        """
+
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT definition_json FROM scheduling_constraints
+                WHERE json_extract(identifier_parts_json, '$[0]') = 'carl'
+                  AND json_extract(identifier_parts_json, '$[1]') = 'facebook'
+                  AND json_extract(identifier_parts_json, '$[2]') = 'search'
+                  AND json_extract(identifier_parts_json, '$[4]') = 'v1'
+                  AND (
+                    json_extract(identifier_parts_json, '$[3]') = 'route_concurrency'
+                    OR (
+                      json_extract(identifier_parts_json, '$[3]') = 'effective_route_concurrency'
+                      AND json_extract(identifier_parts_json, '$[5]') = 'decodo'
+                    )
+                  )
+                ORDER BY identifier_parts_json
+                """
+            )
+            rows = await cursor.fetchall()
+        return tuple(CONSTRAINT_ADAPTER.validate_json(_text(row[0])).identifier for row in rows)
+
     async def supersede_constraints(
         self,
         *,
@@ -2069,6 +2116,20 @@ class Database:
         kind_json = _json(list(definition.kind))
         deduplication_json = _json(list(definition.deduplication_identity))
         async with self._connections.writer() as connection:
+            if requester.kind in (
+                ("carl", "mcp", "request_workspace_refresh"),
+                ("carl", "mcp", "create_workspace_search_revision"),
+            ) and isinstance(requester.context, dict):
+                track = requester.context.get("track_identifier")
+                version = requester.context.get("search_specification_version")
+                if (
+                    isinstance(track, str)
+                    and isinstance(version, int)
+                    and not isinstance(version, bool)
+                ):
+                    await self._require_workspace_track_version(
+                        connection, requester.identifier, track, version
+                    )
             eligible_at = max(definition.not_before_utc_ns, enqueued_at_utc_ns)
             if definition.kind == COLLECT_EBAY_SEARCH_WORK_KIND:
                 stack = _ebay_search_stack_identifier(definition.payload)
@@ -2504,7 +2565,22 @@ class Database:
                         PARTITION BY scope_profile,
                             CASE WHEN kind_parts_json='["carl","ebay","collect","search"]'
                                  THEN COALESCE(json_extract(payload_json,'$.request.stack_identifier'),
-                                               'ebay_anonymous') END
+                                               'ebay_anonymous') END,
+                            CASE kind_parts_json
+                              WHEN '["carl","ebay","collect","item"]' THEN
+                                json_array(json_extract(payload_json, '$.request.item_identifier'),
+                                           json_extract(payload_json, '$.request.stack_identifier'))
+                              WHEN '["carl","ebay","collect","image"]' THEN
+                                json_extract(payload_json, '$.url')
+                              WHEN '["carl","ebay","collect","description"]' THEN
+                                json_array(json_extract(payload_json, '$.url'),
+                                           json_extract(payload_json, '$.request.stack_identifier'))
+                              WHEN '["carl","facebook","work","collect_item"]' THEN
+                                json_extract(payload_json, '$.request_plan')
+                              WHEN '["carl","facebook","work","collect_image"]' THEN
+                                json_array(json_extract(payload_json, '$.reference.photo_id'),
+                                           json_extract(payload_json, '$.request_plan'))
+                            END
                         ORDER BY priority DESC, eligible_at_utc_ns, created_at_utc_ns, id
                     ) AS profile_rank
                     FROM eligible
@@ -2520,6 +2596,7 @@ class Database:
             )
             rows = await cursor.fetchall()
             next_checks: list[int] = []
+            resource_leases: dict[str, tuple[tuple[JsonValue, int], ...]] = {}
             connectivity_cursor = await connection.execute(
                 "SELECT paused, next_probe_utc_ns, probe_expires_utc_ns FROM network_connectivity WHERE singleton = 1"
             )
@@ -2538,6 +2615,35 @@ class Database:
                     cooldown_until = ebay_cooldowns.get(stack, 0) if stack is not None else 0
                     if cooldown_until > now_utc_ns:
                         next_checks.append(cooldown_until)
+                        continue
+                kind_json = _text(row[1])
+                kind = tuple(str(part) for part in cast(list[JsonValue], decode_json(kind_json)))
+                resource = acquisition_resource_identity(kind, decode_json(_text(row[3])))
+                if resource is not None:
+                    # Caller-bound jobs have different payload/evidence identities.
+                    # Serialize their actual fetch resource under this same writer
+                    # transaction, until reusable evidence is durably published.
+                    # Deriving keys from payloads also protects already queued jobs.
+                    if kind_json not in resource_leases:
+                        leases_cursor = await connection.execute(
+                            """
+                            SELECT payload_json, lease_expires_at_utc_ns FROM work_items
+                            WHERE kind_parts_json = ? AND state = 'leased'
+                              AND lease_expires_at_utc_ns > ?
+                            """,
+                            (kind_json, now_utc_ns),
+                        )
+                        resource_leases[kind_json] = tuple(
+                            (decode_json(_text(lease[0])), _integer(lease[1]))
+                            for lease in await leases_cursor.fetchall()
+                        )
+                    matching_expiries = tuple(
+                        expires
+                        for leased_payload, expires in resource_leases[kind_json]
+                        if acquisition_resource_identity(kind, leased_payload) == resource
+                    )
+                    if matching_expiries:
+                        next_checks.append(min(matching_expiries))
                         continue
                 available, next_eligible, constraints = await self._constraint_availability(
                     connection,
@@ -3277,6 +3383,136 @@ class Database:
         assert row is not None
         return _integer(row[0])
 
+    async def cutover_work_routes(
+        self,
+        *,
+        replacements: dict[tuple[str, ...], tuple[str, ...]],
+        operation_identifier: str,
+        audit_record_identifier: str,
+        at_utc_ns: int,
+        started_monotonic_ns: int,
+    ) -> int:
+        """Explicitly revise executable routes and publish their audit atomically.
+
+        Completed work and immutable acquisition evidence are not rewritten.
+        Unexpired leases fence the entire cutover. Definitions are rebuilt while
+        holding the writer reservation, keeping payloads, deduplication and scopes
+        consistent; collisions abort the entire transaction.
+        """
+
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT id, kind_parts_json, payload_json, eligible_at_utc_ns,
+                       state, lease_expires_at_utc_ns, attempt, deduplication_identity_json
+                FROM work_items WHERE state != 'completed' ORDER BY id
+                """
+            )
+            rows = await cursor.fetchall()
+            revisions: list[tuple[WorkDefinition, tuple[apsw.SQLiteValue, ...]]] = []
+            for row in rows:
+                definition = rebuild_work_definition(
+                    identifier=_text(row[0]),
+                    kind=tuple(str(part) for part in decode_json(_text(row[1]))),
+                    payload=decode_json(_text(row[2])),
+                    not_before_utc_ns=_integer(row[3]),
+                    replacements=replacements,
+                )
+                if definition is None:
+                    continue
+                if _text(row[4]) == "leased" and _integer(row[5]) > at_utc_ns:
+                    raise ValueError(
+                        f"Route cutover requires work {_text(row[0])} to release its lease"
+                    )
+                revisions.append((definition, row))
+            audit: list[JsonValue] = []
+            for definition, row in revisions:
+                identifier = definition.identifier
+                previous_state = _text(row[4])
+                if previous_state == "leased":
+                    _ = await self._recover_expired_work_attempt(
+                        connection,
+                        work_item_identifier=identifier,
+                        attempt=_integer(row[6]),
+                        recovered_at_utc_ns=at_utc_ns,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE work_items SET state='pending', lease_token=NULL,
+                            lease_owner=NULL, lease_expires_at_utc_ns=NULL WHERE id=?
+                        """,
+                        (identifier,),
+                    )
+                    await self._append_work_event(
+                        connection,
+                        event_identifier=str(uuid4()),
+                        work_item_identifier=identifier,
+                        event_kind=WorkEventKind.LEASE_EXPIRED,
+                        recorded_at_utc_ns=at_utc_ns,
+                        data={
+                            "reason": "explicit_route_cutover",
+                            "operation_identifier": operation_identifier,
+                        },
+                    )
+                try:
+                    await connection.execute(
+                        """
+                        UPDATE work_items SET payload_json=?, payload_schema_version=?,
+                            deduplication_identity_json=? WHERE id=?
+                        """,
+                        (
+                            _json(definition.payload),
+                            definition.payload_schema_version,
+                            _json(list(definition.deduplication_identity)),
+                            identifier,
+                        ),
+                    )
+                except apsw.ConstraintError as error:
+                    raise ValueError(
+                        f"Route cutover would collide with existing work: {identifier}"
+                    ) from error
+                await connection.execute(
+                    "DELETE FROM work_scopes WHERE work_item_id=?", (identifier,)
+                )
+                for scope in definition.scopes:
+                    await connection.execute(
+                        "INSERT INTO work_scopes VALUES (?, ?, ?)",
+                        (identifier, scope.kind.value, _json(list(scope.identity))),
+                    )
+                audit.append(
+                    {
+                        "work_identifier": identifier,
+                        "previous_state": previous_state,
+                        "previous_payload": decode_json(_text(row[2])),
+                        "previous_payload_sha256": hashlib.sha256(
+                            _text(row[2]).encode()
+                        ).hexdigest(),
+                        "previous_deduplication_identity": decode_json(_text(row[7])),
+                        "definition": definition.model_dump(mode="json"),
+                    }
+                )
+            await self._complete_operation(
+                connection,
+                operation_id=operation_identifier,
+                records=(
+                    RecordDraft(
+                        identifier=audit_record_identifier,
+                        kind=("carl", "work", "route_cutover"),
+                        schema_version=1,
+                        value={"revisions": audit},
+                    ),
+                ),
+                artifacts=(),
+                inputs=(),
+                outputs=(
+                    NamedOutput(name=("route_cutover",), object_identifier=audit_record_identifier),
+                ),
+                result={"state": "completed", "revised_work_count": len(revisions)},
+                ended_at_utc=_utc_text_from_ns(at_utc_ns),
+                duration_ns=max(0, perf_counter_ns() - started_monotonic_ns),
+            )
+        return len(revisions)
+
     async def retry_terminal_collect_search_work(
         self,
         *,
@@ -3921,11 +4157,13 @@ class Database:
 
         Requested scopes and payloads remain intact. Only previous effective-route
         scopes are removed, including when waiting for the new route's capacity.
+        Decodo sessions do not share Proton's transport concurrency gate, but still
+        require a valid lease and retain their effective acquisition scope.
         """
 
         constraint = facebook_effective_search_work_constraint(routing)
         async with self._connections.writer() as connection:
-            scope_json = _json(list(constraint.scope.identity))
+            scope_json = _json(list(facebook_effective_search_scope(routing).identity))
             # Acquire SQLite's writer reservation before reading admission state.
             # A stale/invalid lease rolls this deletion back with the transaction.
             await connection.execute(
@@ -3945,23 +4183,24 @@ class Database:
                 worker_identifier=worker_identifier,
                 now_utc_ns=now_utc_ns,
             )
-            await self._register_constraint(
-                connection, constraint=constraint, registered_at_utc_ns=now_utc_ns
-            )
-            cursor = await connection.execute(
-                """
-                SELECT count(*) FROM work_items
-                JOIN work_scopes ON work_scopes.work_item_id = work_items.id
-                WHERE work_scopes.scope_kind = 'network_path'
-                  AND work_scopes.scope_identity_json = ?
-                  AND work_items.id != ? AND work_items.state = 'leased'
-                  AND work_items.lease_expires_at_utc_ns > ?
-                """,
-                (scope_json, work_item_identifier, now_utc_ns),
-            )
-            rows = await cursor.fetchall()
-            if _integer(rows[0][0]) >= constraint.maximum_active:
-                return False
+            if constraint is not None:
+                await self._register_constraint(
+                    connection, constraint=constraint, registered_at_utc_ns=now_utc_ns
+                )
+                cursor = await connection.execute(
+                    """
+                    SELECT count(*) FROM work_items
+                    JOIN work_scopes ON work_scopes.work_item_id = work_items.id
+                    WHERE work_scopes.scope_kind = 'network_path'
+                      AND work_scopes.scope_identity_json = ?
+                      AND work_items.id != ? AND work_items.state = 'leased'
+                      AND work_items.lease_expires_at_utc_ns > ?
+                    """,
+                    (scope_json, work_item_identifier, now_utc_ns),
+                )
+                rows = await cursor.fetchall()
+                if _integer(rows[0][0]) >= constraint.maximum_active:
+                    return False
             await connection.execute(
                 "INSERT OR IGNORE INTO work_scopes VALUES (?, 'network_path', ?)",
                 (work_item_identifier, scope_json),
@@ -4923,6 +5162,360 @@ class Database:
             rows = await cursor.fetchall()
         return tuple((_text(row[0]), decode_json(_text(row[1]))) for row in rows)
 
+    async def pipeline_completed_analysis_exists(
+        self,
+        marketplace: str,
+        external_identifier: str,
+        product_guide_record_identifier: str | None = None,
+    ) -> bool:
+        """Find successful analysis history through exact observation evidence edges."""
+
+        if (
+            marketplace not in ("facebook", "ebay")
+            or not external_identifier
+            or product_guide_record_identifier == ""
+        ):
+            raise ValueError("Pipeline analysis history scope is invalid")
+        observation_path = "$.listing_id" if marketplace == "facebook" else "$.item_identifier"
+        observation_index = (
+            "records_listing_observation_listing"
+            if marketplace == "facebook"
+            else "records_marketplace_item_observation"
+        )
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM records AS observation_record INDEXED BY {observation_index}
+                    CROSS JOIN objects AS observation ON observation.id = observation_record.object_id
+                      AND observation.kind_parts_json = ?
+                    CROSS JOIN operation_inputs AS evidence_input
+                      INDEXED BY operation_inputs_object_name_operation
+                      ON evidence_input.object_id = observation.id
+                     AND evidence_input.name_parts_json = '["listing_observation"]'
+                    CROSS JOIN objects AS evidence INDEXED BY objects_operation_kind
+                      ON evidence.created_by_operation_id = evidence_input.operation_id
+                     AND evidence.kind_parts_json = ?
+                    CROSS JOIN operation_inputs AS analysis_input
+                      INDEXED BY operation_inputs_object_name_operation
+                      ON analysis_input.object_id = evidence.id
+                     AND analysis_input.name_parts_json = '["listing_analysis_evidence"]'
+                    JOIN work_operations AS owner ON owner.operation_id = analysis_input.operation_id
+                    JOIN work_items AS work ON work.id = owner.work_item_id
+                    JOIN operations AS operation ON operation.id = owner.operation_id
+                    JOIN objects AS analysis ON analysis.created_by_operation_id = owner.operation_id
+                      AND analysis.kind_parts_json = ?
+                    JOIN records AS analysis_record ON analysis_record.object_id = analysis.id
+                    WHERE json_extract(observation_record.value_json, '{observation_path}') = ?
+                      AND json_extract(observation_record.value_json, '{observation_path}') IS NOT NULL
+                      AND work.kind_parts_json = ? AND work.state = 'completed'
+                      AND operation.state = 'completed'
+                      AND json_extract(analysis_record.value_json, '$.state') = 'completed'
+                      AND json_extract(work.payload_json, '$.evidence_set_record_identifier') = evidence.id
+                      AND (? IS NULL OR json_extract(work.payload_json, '$.product_guide_record_identifier') = ?)
+                )
+                """,
+                (
+                    _json(["carl", marketplace, "listing_observation"]),
+                    _json(["carl", marketplace, "listing_analysis_evidence"]),
+                    _json(["carl", marketplace, "item_analysis"]),
+                    external_identifier,
+                    _json(["carl", marketplace, "work", "analyze_item"]),
+                    product_guide_record_identifier,
+                    product_guide_record_identifier,
+                ),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        return bool(row[0])
+
+    async def completed_acquisition_candidates(
+        self,
+        kind: tuple[str, ...],
+        resource_identity: tuple[str, ...],
+        *,
+        work_identifier: str,
+        since_work_created: bool = True,
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Find same-resource committed work without swallowing an explicit refresh.
+
+        Item jobs only share acquisitions completed after their own enqueue time;
+        this bridges the collection/extraction gap without reusing an old page.
+        Matching caller-bound payloads may have different downstream image limits.
+        """
+
+        current = await self.work(work_identifier)
+        current_payload = current["payload"]
+        if acquisition_resource_identity(kind, current_payload) != resource_identity:
+            raise ValueError("Acquisition lookup identity disagrees with its work")
+        payload = cast(dict[str, JsonValue], current_payload)
+        if kind == ("carl", "facebook", "work", "collect_item"):
+            selector = "$.listing_id"
+            selected = payload.get("listing_id")
+        elif kind == ("carl", "ebay", "collect", "item"):
+            selector = "$.request.item_identifier"
+            request = cast(dict[str, JsonValue], payload["request"])
+            selected = request.get("item_identifier")
+        elif kind == ("carl", "ebay", "collect", "description"):
+            selector = "$.url"
+            selected = payload.get("url")
+        else:
+            raise ValueError("Unsupported acquisition candidate kind")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT work.id, work.payload_json, work.result_json
+                FROM work_items AS work
+                WHERE work.kind_parts_json = ? AND work.state = 'completed'
+                  AND work.id != ? AND json_extract(work.payload_json, ?) = ?
+                  AND EXISTS (
+                      SELECT 1 FROM work_events AS event
+                      WHERE event.work_item_id = work.id AND event.event_kind = 'completed'
+                        AND event.recorded_at_utc_ns >= ?
+                  )
+                  AND (? = 0 OR EXISTS (
+                      SELECT 1 FROM objects AS acquisition
+                      JOIN work_operations AS owner
+                        ON owner.operation_id = acquisition.created_by_operation_id
+                      JOIN work_events AS acquired
+                        ON acquired.work_item_id = owner.work_item_id
+                       AND acquired.event_kind = 'completed'
+                       AND json_extract(acquired.data_json, '$.operation_identifier') =
+                           acquisition.created_by_operation_id
+                      WHERE acquisition.id = coalesce(
+                            json_extract(work.result_json, '$.acquisition_record_identifier'),
+                            (SELECT json_extract(description.value_json, '$.acquisition_record_identifier')
+                             FROM records AS description
+                             WHERE description.object_id = json_extract(
+                                work.result_json, '$.description_result_record_identifier'))
+                            )
+                        AND acquired.recorded_at_utc_ns >= ?
+                  ))
+                ORDER BY work.created_at_utc_ns DESC, work.id
+                """,
+                (
+                    _json(list(kind)),
+                    work_identifier,
+                    selector,
+                    selected,
+                    current["created_at_utc_ns"] if since_work_created else 0,
+                    int(since_work_created),
+                    current["created_at_utc_ns"],
+                ),
+            )
+            rows = await cursor.fetchall()
+        return tuple(
+            {
+                "identifier": _text(row[0]),
+                "payload": decode_json(_text(row[1])),
+                "result": None if row[2] is None else decode_json(_text(row[2])),
+            }
+            for row in rows
+            if acquisition_resource_identity(kind, decode_json(_text(row[1]))) == resource_identity
+        )
+
+    async def pipeline_work_rows(
+        self, identifiers: tuple[str, ...]
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read bounded selected work in caller order without loading its history."""
+
+        if len(identifiers) > 1000 or any(not identifier for identifier in identifiers):
+            raise ValueError("Pipeline work scope is invalid")
+        if not identifiers:
+            return ()
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT work.id, work.state, work.payload_json, work.result_json, work.error_json
+                FROM json_each(?) AS requested
+                JOIN work_items AS work ON work.id = requested.value
+                ORDER BY CAST(requested.key AS INTEGER)
+                """,
+                (_json(list(identifiers)),),
+            )
+            rows = await cursor.fetchall()
+        if len(rows) != len(identifiers):
+            raise KeyError("One or more requested pipeline work items do not exist")
+        return tuple(
+            {
+                "identifier": _text(row[0]),
+                "state": _text(row[1]),
+                "payload": decode_json(_text(row[2])),
+                "result": None if row[3] is None else decode_json(_text(row[3])),
+                "error": None if row[4] is None else decode_json(_text(row[4])),
+            }
+            for row in rows
+        )
+
+    async def pipeline_search_occurrences(
+        self,
+        *,
+        search_work_identifiers: tuple[str, ...],
+        search_run_record_identifiers: tuple[str, ...] = (),
+        after_object_rowid: int = 0,
+        limit: int = 100,
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read incremental cards belonging to exact work attempts or completed runs."""
+
+        if (
+            len(search_work_identifiers) > 100
+            or len(search_run_record_identifiers) > 100
+            or any(
+                not identifier
+                for identifier in (*search_work_identifiers, *search_run_record_identifiers)
+            )
+            or after_object_rowid < 0
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("Pipeline search occurrence scope or bounds are invalid")
+        if not search_work_identifiers and not search_run_record_identifiers:
+            return ()
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                WITH requested_work AS MATERIALIZED (
+                    SELECT DISTINCT value AS identifier FROM json_each(?)
+                ), requested_runs AS MATERIALIZED (
+                    SELECT DISTINCT value AS identifier FROM json_each(?)
+                ), owned_operations AS MATERIALIZED (
+                    SELECT owner.operation_id
+                    FROM requested_work AS requested
+                    JOIN work_operations AS owner ON owner.work_item_id = requested.identifier
+                ), completed_runs AS MATERIALIZED (
+                    SELECT run.id, run.kind_parts_json, record.value_json
+                    FROM requested_runs AS requested
+                    JOIN objects AS run ON run.id = requested.identifier
+                    JOIN records AS record ON record.object_id = run.id
+                    JOIN operations AS operation ON operation.id = run.created_by_operation_id
+                    WHERE operation.state = 'completed'
+                      AND run.kind_parts_json IN (
+                          '["carl","facebook","search_run"]',
+                          '["carl","ebay","search_run"]'
+                      )
+                ), ebay_runs AS MATERIALIZED (
+                    SELECT json_extract(record.value_json, '$.search_run_record_identifier') AS id
+                    FROM owned_operations AS owner
+                    JOIN objects AS binding ON binding.created_by_operation_id = owner.operation_id
+                      AND binding.kind_parts_json = '["carl","ebay","search_attempt"]'
+                    JOIN records AS record ON record.object_id = binding.id
+                    UNION
+                    SELECT json_extract(operation.result_json, '$.search_run_record_identifier')
+                    FROM owned_operations AS owner
+                    JOIN operations AS operation ON operation.id = owner.operation_id
+                    JOIN work_operations AS work_owner ON work_owner.operation_id = owner.operation_id
+                    JOIN work_items AS work ON work.id = work_owner.work_item_id
+                    WHERE operation.state = 'completed'
+                      AND work.kind_parts_json = '["carl","ebay","collect","search"]'
+                    UNION
+                    SELECT id FROM completed_runs
+                    WHERE kind_parts_json = '["carl","ebay","search_run"]'
+                ), candidates AS (
+                    SELECT object.rowid AS object_rowid, object.id, 'facebook' AS marketplace,
+                           record.value_json
+                    FROM owned_operations AS owner
+                    JOIN objects AS object ON object.created_by_operation_id = owner.operation_id
+                      AND object.kind_parts_json = '["carl","facebook","search_listing_occurrence"]'
+                    JOIN records AS record ON record.object_id = object.id
+                    WHERE object.rowid > ?
+                    UNION
+                    SELECT object.rowid, object.id, 'facebook', occurrence.value_json
+                    FROM completed_runs AS run
+                    CROSS JOIN records AS occurrence INDEXED BY records_search_occurrence_run_position
+                      ON json_extract(occurrence.value_json, '$.search_run_identifier') =
+                         json_extract(run.value_json, '$.search_run_identifier')
+                    JOIN objects AS object ON object.id = occurrence.object_id
+                    WHERE run.kind_parts_json = '["carl","facebook","search_run"]'
+                      AND object.kind_parts_json = '["carl","facebook","search_listing_occurrence"]'
+                      AND json_extract(occurrence.value_json, '$.listing_identifier') IS NOT NULL
+                      AND json_extract(occurrence.value_json, '$.search_run_identifier') IS NOT NULL
+                      AND object.rowid > ?
+                    UNION
+                    SELECT object.rowid, object.id, 'ebay', occurrence.value_json
+                    FROM ebay_runs AS run
+                    CROSS JOIN records AS occurrence INDEXED BY records_marketplace_source_run
+                      ON json_extract(occurrence.value_json, '$.search_run_record_identifier') = run.id
+                    JOIN objects AS object ON object.id = occurrence.object_id
+                    JOIN operations AS operation ON operation.id = object.created_by_operation_id
+                    WHERE object.kind_parts_json = '["carl","ebay","search_listing_occurrence"]'
+                      AND operation.state = 'completed'
+                      AND object.rowid > ?
+                )
+                SELECT object_rowid, id, marketplace, value_json FROM candidates
+                ORDER BY object_rowid, id LIMIT ?
+                """,
+                (
+                    _json(list(search_work_identifiers)),
+                    _json(list(search_run_record_identifiers)),
+                    after_object_rowid,
+                    after_object_rowid,
+                    after_object_rowid,
+                    limit,
+                ),
+            )
+            rows = await cursor.fetchall()
+        results: list[dict[str, JsonValue]] = []
+        for row in rows:
+            value = decode_json(_text(row[3]))
+            if not isinstance(value, dict):
+                raise ValueError("Stored pipeline search occurrence is malformed")
+            value = cast(dict[str, JsonValue], value)
+            marketplace = _text(row[2])
+            original = value.get("original")
+            title = (
+                search_card_field_value("title", cast(dict[str, JsonValue], original))
+                if marketplace == "facebook" and isinstance(original, dict)
+                else value.get("title")
+            )
+            external_identifier = value.get(
+                "listing_identifier" if marketplace == "facebook" else "item_identifier"
+            )
+            source_identifier = value.get(
+                "search_run_identifier"
+                if marketplace == "facebook"
+                else "search_run_record_identifier"
+            )
+            if not isinstance(external_identifier, str) or not isinstance(source_identifier, str):
+                raise ValueError("Stored pipeline search occurrence has invalid identifiers")
+            results.append(
+                {
+                    "object_rowid": _integer(row[0]),
+                    "occurrence_record_identifier": _text(row[1]),
+                    "marketplace": marketplace,
+                    "external_identifier": external_identifier,
+                    "title": title if isinstance(title, str) else None,
+                    "source_search_run_identifier": source_identifier,
+                    "listing_status": (
+                        {"sold": "sold", "completed": "unavailable"}.get(
+                            str(value.get("listing_state"))
+                        )
+                        if marketplace == "ebay"
+                        else (
+                            status.value
+                            if (
+                                status := normalize_listing_status(
+                                    is_sold=original.get("is_sold")
+                                    if isinstance(original, dict)
+                                    and isinstance(original.get("is_sold"), bool)
+                                    else None,
+                                    is_pending=original.get("is_pending")
+                                    if isinstance(original, dict)
+                                    and isinstance(original.get("is_pending"), bool)
+                                    else None,
+                                    is_live=original.get("is_live")
+                                    if isinstance(original, dict)
+                                    and isinstance(original.get("is_live"), bool)
+                                    else None,
+                                )
+                            )
+                            is not None
+                            else None
+                        )
+                    ),
+                }
+            )
+        return tuple(results)
+
     async def search_listing_occurrences_for_runs(
         self,
         marketplace: str,
@@ -5850,6 +6443,35 @@ class Database:
             )
             return response
 
+    async def _require_workspace_track_version(
+        self,
+        connection: AsyncConnection,
+        workspace_identifier: str,
+        track_identifier: str,
+        expected_version: int,
+    ) -> None:
+        cursor = await connection.execute(
+            """
+            SELECT coalesce(max(json_extract(record.value_json, '$.version')), 1)
+            FROM records AS record JOIN objects AS object ON object.id = record.object_id
+            WHERE object.kind_parts_json = ?
+              AND json_extract(record.value_json, '$.workspace_record_identifier') = ?
+              AND json_extract(record.value_json, '$.track_identifier') = ?
+            """,
+            (
+                _json(list(WORKSPACE_SEARCH_TRACK_SPECIFICATION_KIND)),
+                workspace_identifier,
+                track_identifier,
+            ),
+        )
+        rows = await cursor.fetchall()
+        current_version = _integer(rows[0][0])
+        if current_version != expected_version:
+            raise ReviewInputError(
+                f"Search track version conflict: expected {expected_version}, "
+                f"current {current_version}; read the current track before revising or refreshing"
+            )
+
     async def publish_records_operation(
         self,
         *,
@@ -5865,10 +6487,13 @@ class Database:
         duration_ns: int,
         result: JsonValue,
         marketplace_target_guard: MarketplaceSearchTargetRecord | None = None,
+        workspace_track_guard: tuple[str, str, int] | None = None,
     ) -> None:
         """Atomically publish a small local mutation as a provenance-linked operation."""
 
         async with self._connections.writer() as connection:
+            if workspace_track_guard is not None:
+                await self._require_workspace_track_version(connection, *workspace_track_guard)
             if marketplace_target_guard is not None:
                 cursor = await connection.execute(
                     """
@@ -5913,6 +6538,31 @@ class Database:
                 ended_at_utc=ended_at_utc,
                 duration_ns=duration_ns,
             )
+
+    async def workspace_search_track_specifications(
+        self, workspace_identifier: str, track_identifier: str | None = None
+    ) -> tuple[tuple[str, JsonValue], ...]:
+        """Read immutable versions scoped to one workspace, in version order."""
+
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT record.object_id, record.value_json
+                FROM records AS record JOIN objects AS object ON object.id = record.object_id
+                WHERE object.kind_parts_json = ?
+                  AND json_extract(record.value_json, '$.workspace_record_identifier') = ?
+                  AND (? IS NULL OR json_extract(record.value_json, '$.track_identifier') = ?)
+                ORDER BY json_extract(record.value_json, '$.version'), object.rowid
+                """,
+                (
+                    _json(list(WORKSPACE_SEARCH_TRACK_SPECIFICATION_KIND)),
+                    workspace_identifier,
+                    track_identifier,
+                    track_identifier,
+                ),
+            )
+            rows = await cursor.fetchall()
+        return tuple((_text(row[0]), decode_json(_text(row[1]))) for row in rows)
 
     async def publish_review_workset_revision(
         self,
@@ -6397,7 +7047,8 @@ class Database:
                            ORDER BY request.requested_at_utc_ns, request.id
                            LIMIT 1
                        ),
-                       json_extract(record.value_json, '$.traversal.stopping_reason')
+                       json_extract(record.value_json, '$.traversal.stopping_reason'),
+                       json_extract(record.value_json, '$.request')
                 FROM objects AS search_run
                 JOIN records AS record ON record.object_id = search_run.id
                 JOIN operations AS operation
@@ -6441,6 +7092,9 @@ class Database:
             refresh_source_run_record_identifier=refresh_source,
             stopping_reason=(
                 None if stopping_reason is None else SearchStoppingReason(stopping_reason)
+            ),
+            search_scope_sha256=search_scope_sha256(
+                "facebook", decode_json(_text(row[7])) if row[7] is not None else None
             ),
         )
 
@@ -7793,6 +8447,119 @@ class Database:
             results.append((_text(row[0]), cast(dict[str, JsonValue], value)))
         return tuple(results)
 
+    async def saved_ebay_image_candidates(
+        self, urls: tuple[str, ...]
+    ) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
+        """Read possible saved renditions without materializing unrelated image history.
+
+        The path predicate is deliberately broad; callers still check canonical
+        equality and validate the artifact before reusing its bytes.
+        """
+
+        if len(urls) > 1000:
+            raise ValueError("Image candidate URL scope exceeds its bound")
+        if not urls:
+            return ()
+        requested = []
+        for url in dict.fromkeys(urls):
+            identity = ebay_image_identity(url)
+            requested.append(
+                {"url": url, "path": identity[3] if identity[2] == "rendition" else None}
+            )
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT record.object_id, record.value_json
+                FROM objects AS object
+                JOIN records AS record ON record.object_id = object.id
+                JOIN operations AS operation ON operation.id = object.created_by_operation_id
+                WHERE object.kind_parts_json = '["carl","ebay","image_result"]'
+                  AND operation.state = 'completed'
+                  AND json_extract(record.value_json, '$.state') = 'saved'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(?) AS requested
+                      WHERE json_extract(record.value_json, '$.url') =
+                                json_extract(requested.value, '$.url')
+                         OR (json_extract(requested.value, '$.path') IS NOT NULL
+                             AND instr(json_extract(record.value_json, '$.url'),
+                                       json_extract(requested.value, '$.path')) > 0)
+                  )
+                ORDER BY object.rowid
+                """,
+                (_json(requested),),
+            )
+            rows = await cursor.fetchall()
+        return tuple(
+            (_text(row[0]), cast(dict[str, JsonValue], decode_json(_text(row[1])))) for row in rows
+        )
+
+    async def saved_facebook_image_candidates_for_references(
+        self, references: tuple[GalleryImageReference, ...]
+    ) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
+        """Materialize only possible source photos/URLs for a bounded gallery.
+
+        Canonical equivalence and dimensions are checked by the pure planner;
+        the broad SQL path predicate is intentionally not an equivalence claim.
+        """
+
+        if len(references) > 1000:
+            raise ValueError("Image candidate reference scope exceeds its bound")
+        if not references:
+            return ()
+        requested = []
+        for reference in references:
+            identity = facebook_image_identity(reference.original_url, reference.photo_id)
+            requested.append(
+                {
+                    "photo_id": reference.photo_id,
+                    "url": reference.original_url,
+                    "path": identity[4] if identity[2] == "rendition" else None,
+                }
+            )
+        # Filter the saved-rendition index once before joining object metadata.
+        # Otherwise SQLite can nest a full forced-index scan under every image
+        # object, monopolizing the reader pool as retained history grows.
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                WITH requested AS MATERIALIZED (
+                    SELECT json_extract(value, '$.url') AS url,
+                           json_extract(value, '$.photo_id') AS photo_id,
+                           json_extract(value, '$.path') AS path
+                    FROM json_each(?)
+                ), candidates AS MATERIALIZED (
+                    SELECT record.object_id
+                    FROM records AS record INDEXED BY records_saved_image_rendition
+                    WHERE json_extract(record.value_json, '$.state') = 'saved'
+                      AND json_extract(record.value_json, '$.original_url') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM requested
+                          WHERE json_extract(record.value_json, '$.original_url') =
+                                    requested.url
+                             OR (requested.photo_id IS NOT NULL
+                                 AND json_extract(record.value_json, '$.source_photo_id') =
+                                     requested.photo_id)
+                             OR (requested.path IS NOT NULL
+                                 AND instr(json_extract(record.value_json, '$.original_url'),
+                                           requested.path) > 0)
+                      )
+                )
+                SELECT record.object_id, record.value_json
+                FROM candidates
+                CROSS JOIN records AS record ON record.object_id = candidates.object_id
+                CROSS JOIN objects AS object ON object.id = candidates.object_id
+                CROSS JOIN operations AS operation ON operation.id = object.created_by_operation_id
+                WHERE object.kind_parts_json = '["carl","facebook","image_result"]'
+                  AND operation.state = 'completed'
+                ORDER BY object.rowid
+                """,
+                (_json(requested),),
+            )
+            rows = await cursor.fetchall()
+        return tuple(
+            (_text(row[0]), cast(dict[str, JsonValue], decode_json(_text(row[1])))) for row in rows
+        )
+
     async def saved_facebook_image_results_for_references(
         self, reference_identifiers: Sequence[str]
     ) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
@@ -8825,7 +9592,11 @@ class Database:
                 """,
                 (identifier,),
             )
-            row = await cursor.fetchone()
+            # Exhaust these unique-row queries before releasing the pooled
+            # reader. A later file error retains this frame in its traceback;
+            # an unstepped cursor would retain the reader's old WAL snapshot.
+            rows = await cursor.fetchall()
+            row = rows[0] if rows else None
             if row is None:
                 cursor = await connection.execute(
                     """
@@ -8835,11 +9606,15 @@ class Database:
                     """,
                     (identifier,),
                 )
-                external_row = await cursor.fetchone()
+                external_rows = await cursor.fetchall()
+                external_row = external_rows[0] if external_rows else None
             else:
                 external_row = None
         if row is not None:
-            value = bytes(row[4])
+            inline_bytes = row[4]
+            if not isinstance(inline_bytes, bytes):
+                raise ValueError("Stored artifact content is not bytes")
+            value = inline_bytes
             if len(value) != row[1] or hashlib.sha256(value).hexdigest() != row[0]:
                 raise ValueError("Stored artifact failed integrity verification")
             storage: dict[str, JsonValue] = {"backend": "sqlite"}
@@ -8878,7 +9653,8 @@ class Database:
                 """,
                 (identifier,),
             )
-            row = await cursor.fetchone()
+            rows = await cursor.fetchall()
+            row = rows[0] if rows else None
         if row is None:
             return None
         path, _ = await anyio.to_thread.run_sync(

@@ -127,17 +127,21 @@ def _patch_routes(
         for purpose in ("Image", "Search"):
             name = f"{source}Facebook{purpose}SessionFactory"
             if hasattr(module, name):
-                monkeypatch.setattr(module, name, factory)
+                monkeypatch.setattr(
+                    module, name, factory if source.lower() == expected[0] else unexpected
+                )
     return opened
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("override", (False, True))
 @pytest.mark.parametrize("purpose", ("search", "image", "item"))
+@pytest.mark.parametrize("direct", (False, True))
 async def test_facebook_runtime_resolves_legacy_routes_but_preserves_mobile_items(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, purpose: str, override: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, purpose: str, override: bool, direct: bool
 ) -> None:
-    expected = MOBILE if purpose == "item" else DATACENTER if override else PROTON
+    requested = DATACENTER if direct else PROTON
+    expected = MOBILE if purpose == "item" else DATACENTER if override or direct else PROTON
     images = ebay_fixtures._Acquirer({})
     opened = _patch_routes(
         monkeypatch, facebook_workers, _loaded(tmp_path, override=override), expected, images
@@ -168,14 +172,14 @@ async def test_facebook_runtime_resolves_legacy_routes_but_preserves_mobile_item
                 radius=SearchRadius(value=60, unit=SearchDistanceUnit.MILES),
             ),
             traversal=SearchTraversalPolicy(maximum_pages=2, maximum_results=10),
-            routing=PROTON,
+            routing=requested,
         )
         kind = COLLECT_SEARCH_WORK_KIND
     elif purpose == "image":
         payload = CollectImagePayload(
             reference_record_identifier="reference",
             reference=_reference(),
-            request_plan=RequestPlan(url=URL, follow_redirects=False, routing=PROTON),
+            request_plan=RequestPlan(url=URL, follow_redirects=False, routing=requested),
         )
         kind = COLLECT_IMAGE_WORK_KIND
     else:
@@ -238,7 +242,7 @@ async def test_facebook_runtime_resolves_legacy_routes_but_preserves_mobile_item
             if isinstance(payload, CollectSearchPayload)
             else payload.request_plan.routing
         )
-        assert original == (MOBILE if purpose == "item" else PROTON)
+        assert original == (MOBILE if purpose == "item" else requested)
         if purpose == "image":
             snapshot = await database.activity_snapshot(
                 captured_at_utc_ns=time_ns(), recent_window_ns=60_000_000_000, maximum_rows=10
@@ -249,10 +253,10 @@ async def test_facebook_runtime_resolves_legacy_routes_but_preserves_mobile_item
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("override", (False, True))
-async def test_ebay_image_runtime_and_retained_activity_use_effective_route(
+async def test_ebay_image_defaults_directly_to_datacenter_without_an_alias(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: bool
 ) -> None:
-    expected = DATACENTER if override else PROTON
+    expected = DATACENTER
     images = ebay_fixtures._Acquirer(
         {ebay_fixtures.IMAGE_URL: ebay_fixtures._Response(ebay_fixtures._png(), "image/png")}
     )
@@ -293,7 +297,7 @@ async def test_ebay_image_runtime_and_retained_activity_use_effective_route(
 async def test_routed_facebook_search_retains_datacenter_route_for_bootstrap_and_pagination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    loaded = _loaded(tmp_path, override=True)
+    loaded = _loaded(tmp_path, override=False)
     requests: list[httpx.Request] = []
     clients: list[httpx.AsyncClient] = []
 
@@ -343,7 +347,7 @@ async def test_routed_facebook_search_retains_datacenter_route_for_bootstrap_and
             radius=SearchRadius(value=60, unit=SearchDistanceUnit.MILES),
         ),
         traversal=SearchTraversalPolicy(maximum_pages=3, maximum_results=3),
-        routing=PROTON,
+        routing=DATACENTER,
     )
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         registry = facebook_workers.build_routed_facebook_worker_registry(

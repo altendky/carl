@@ -32,6 +32,7 @@ from carl.core.facebook_images import (
 from carl.core.facebook_refresh import refresh_search_work_constraints
 from carl.core.item_analysis import analysis_work_constraints
 from carl.core.marketplace_images import marketplace_image_network_constraint
+from carl.core.pipeline import pipeline_work_constraints
 from carl.core.worker import WorkerSettings
 from carl.ebay_analysis_workers import build_ebay_analysis_worker_registry
 from carl.ebay_item_workers import EbayItemWorkerDependencies, build_ebay_item_worker_registry
@@ -60,6 +61,11 @@ from carl.io.proton import SharedProtonWireproxyManager
 from carl.io.provenance import collect_code_provenance_async, process_invocation
 from carl.io.sqlite import Database
 from carl.io.worker import WorkerRuntimeServices, WorkHandlerRegistry, run_worker_pool
+from carl.pipeline_listing_workers import (
+    PipelineListingWorkerDependencies,
+    build_pipeline_listing_worker_registry,
+)
+from carl.pipeline_workers import PipelineWorkerDependencies, build_pipeline_worker_registry
 from carl.review import ReviewApplication
 
 
@@ -87,11 +93,13 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
         ebay_search_work_constraint(),
         *ebay_item_work_constraints(),
         *refresh_ebay_search_work_constraints(),
+        *pipeline_work_constraints(),
     )
     retired_identifiers = (
         *legacy_image_session_work_constraint_identifiers(),
         ("carl", "facebook", "image", "network_activity_concurrency", "all_cdns", "v3"),
         *legacy_ebay_item_work_constraint_identifiers(),
+        *await database.legacy_facebook_search_constraint_identifiers(),
     )
     operation_identifier = _identifier()
     started = perf_counter_ns()
@@ -119,7 +127,10 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
                 replacements=constraints,
                 operation_identifier=operation_identifier,
                 at_utc_ns=time_ns(),
-                reason="Apply shared image concurrency 25 and eBay description concurrency 10",
+                reason=(
+                    "Apply shared image concurrency 25, eBay description concurrency 10, "
+                    "and effective-provider Facebook search admission"
+                ),
             )
             await database.complete_operation(
                 operation_id=operation_identifier,
@@ -204,6 +215,19 @@ async def managed_worker_pool(
             ),
         )
     )
+    pipeline_registry = build_pipeline_worker_registry(
+        PipelineWorkerDependencies(database=database)
+    )
+    pipeline_listing_registry = build_pipeline_listing_worker_registry(
+        PipelineListingWorkerDependencies(
+            database=database,
+            application=ReviewApplication(
+                database=database,
+                repository_root=repository_root,
+                claude=claude,
+            ),
+        )
+    )
     ebay_item_registry = build_ebay_item_worker_registry(
         EbayItemWorkerDependencies(
             database=database,
@@ -223,6 +247,8 @@ async def managed_worker_pool(
             *ebay_analysis_registry.handlers,
             *ebay_refresh_registry.handlers,
             *facebook_listing_registry.handlers,
+            *pipeline_registry.handlers,
+            *pipeline_listing_registry.handlers,
         )
     )
     services = WorkerRuntimeServices(

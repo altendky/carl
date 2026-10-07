@@ -15,10 +15,12 @@ identity's workspace bindings first. Retirement preserves exact records and is r
 Use Carl's MCP tools as the source of record. Keep listing IDs, observation record IDs, guide record
 IDs, analysis record IDs, and image artifact IDs distinct.
 
-Facebook search and both marketplaces' image workers resolve explicit configuration
-`route_overrides` before acquisition, including queued/retried work. A requested Proton route may
-therefore use a separately credentialed Decodo datacenter route. Legacy `proton_route` options name
-the requested path; inspect network activity and acquisition provenance for the effective provider.
+New Facebook searches and both marketplaces' images default directly to
+`["decodo","personal","datacenter"]`, without Proton aliases. Facebook search `network_path`
+selects the complete provider-qualified route. Refresh `search_network_path` overrides the current
+track spec; `image_network_path` selects Facebook gallery transport. Use these neutral fields,
+not historical `proton_route` options. An explicit Proton path means real Proton.
+Inspect network activity and acquisition provenance for the actual provider.
 Item pages and eBay search keep their separate mobile/residential route unless explicitly changed.
 There is no automatic fallback. Datacenter Facebook bootstrap and pagination share one client and
 cookie jar; use a static datacenter port to keep the exit stable across the search.
@@ -85,13 +87,26 @@ counts before queueing. Existing analyses remain tied to the exact guide version
 them. Call
 `create_workspace_search` to add another complete search intent/phrase; its returned work ID is also
 the stable track ID. Call `request_workspace_refresh` to advance a track, specifying its track ID
-when more than one completed track exists. Prefer `list_workspace_listings` over
+when more than one completed track exists. To change that same watch's parameters (for example,
+lowering its price cap), read `get_review_workspace`, then call `revise_workspace_search_track`
+with the track's `search_specification_version` as `expected_version` and the complete replacement
+search spec. Keep the source unchanged; use a new track only for a genuinely separate watch.
+Revision preserves the stable track ID, first/last-seen history, and prior runs, and performs no
+acquisition. Inspect `list_workspace_search_track_versions` for its immutable specification history,
+then request a refresh to run the current version. Already queued refreshes keep their captured
+version; wait for a prior-version refresh to settle before starting the revised one. If initial
+acquisition failed before any retained run exists, `retry_workspace_search_track` acquires the
+revised initial spec under the same track ID without rewriting the old failed work. Listings
+outside a narrowed scope remain historical members; cross-scope absence is not
+evidence that they are gone or sold. Prefer `list_workspace_listings` over
 `list_composed_search` for review: it deduplicates the available-only union of every completed track
 and each track's refresh ancestry. A listing missed by a later refresh remains in the union unless
 separate retained evidence changes its status. Use `set_workspace_search_track_enabled` to remove a
 track from or restore it to that union without deleting its history. Use `get_workspace_listing` for
-an exact listing with the same active-track scope and the workspace's guide. Search acquisitions are
-serialized per proxy route. If initial track creation exhausts a transient transport or session
+an exact listing with the same active-track scope and the workspace's guide. Facebook searches are
+serialized only per effective Proton route. Decodo Facebook searches run concurrently within
+worker-pool and request-rate limits. eBay retains its separate search scheduling policy.
+If initial track creation exhausts a transient transport or session
 failure, call `retry_workspace_search_track` with the stable track ID; it preserves the track and its
 history while giving it a fresh retry budget. Retrying legacy work also adds the current route
 scheduler scope. For eBay initial-track failures, optional `acquisition_stack` selects another
@@ -148,12 +163,35 @@ completion boundary. Use `add_search_target` to add and initially execute anothe
 `set_search_target_enabled` to control future scheduling, and `run_search` to execute all enabled
 targets. `get_search` retains execution history even for disabled targets.
 
+When authorized to acquire details/images or run AI analysis automatically, use
+`request_search_pipeline`. For a single end-to-end request, set `source.kind="new_search"`
+and supply the same marketplace-discriminated `targets`. To process existing evidence without
+another search, choose `source.kind="search"` with a group or exact source-run record,
+`"search_work"` with exact search work IDs, or `"workspace"` with its ID and optional track IDs.
+The accepted scope is frozen; later targets and reruns do not expand it. Workspace scope uses
+enabled current tracks and rejects a selected track still refreshing; wait for that refresh or
+explicitly select its search child. Pipeline processing does not advance refresh ancestry.
+Set `options.stop_after` to `details`, `images`, or `analysis`; analysis requires an exact
+`product_guide_record_identifier`. Choose finite item, global image-reservation, per-listing
+image, and analysis-reservation limits before queueing. Reservations are conservative and unused
+capacity is not redistributed. Title filters and known card statuses exclude candidates before
+detail acquisition; item status is checked again before analysis. The default status is available.
+Each saved search page can start details work, and each listing can start analysis once its own
+description and planned images settle. A truncated/failed/empty gallery does not silently become
+complete: incomplete analysis requires `allow_incomplete_gallery=true` and retains missing evidence.
+Use a stable caller-generated `request_identifier`, replay unchanged after interruption, and
+monitor one root with `get_search_pipeline`. It reports stage counts, budgets, source-run IDs,
+and a bounded listing sample; use returned listing work IDs with `get_work_status` for drill-down.
+Check `successful`, failure/skip counts, and `budget_exhausted` before claiming exhaustive success.
+Partial results survive a later search failure. These requests can spend provider/AI calls;
+ordinary `create_search` and `run_search` remain search-only. Keep the shared worker process running.
+
 For eBay item details, call `request_listing_details` with `marketplace="ebay"`, the exact
 `external_identifier`, and optionally `stack_identifier`, `maximum_images` (default twenty, cap
 fifty), or `refresh=true`. Zero images skips downloads but still retains gallery references.
 The request reprocesses a usable retained item page by default; refresh explicitly fetches a new one.
-Item and seller-description pages use the configured Decodo browser stack; gallery images resolve
-the configured Proton-to-datacenter cutover when present. Poll the root work, its returned `extraction_work_identifier` when present, and the
+Item and seller-description pages use the configured Decodo browser stack; gallery images default
+directly to Decodo datacenter. Poll the root work, its returned `extraction_work_identifier` when present, and the
 extraction result's `image_work_identifiers` and `description_work_identifiers`. Completion of item
 acquisition alone does not mean those follow-ups succeeded. Keep `carl work` active.
 Read either marketplace with `get_listing_details`. Check `classification`, `description_state`,
@@ -300,7 +338,8 @@ when none fits. Revise a guide using its current record as the expected base. If
 conflict, read the current version and apply the intended change to that version; never overwrite or
 delete history.
 
-Request analysis through `preview_selection_analyses` and `request_selection_analyses`; direct
+Request fixed-selection analysis through `preview_selection_analyses` and
+`request_selection_analyses`, or opt into per-listing analysis with `request_search_pipeline`; direct
 observation-level requests are intentionally not exposed through MCP. By default, let Carl fail when
 any gallery image is unavailable. Set `allow_incomplete_gallery` only when text-only or partial image
 analysis is useful, and report that limitation in later comparisons. Prefer the workspace status or

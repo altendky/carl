@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from carl.core.activity import WorkActivity
 from carl.core.components import Component, ComponentId, Registry
@@ -26,6 +27,13 @@ from carl.core.facebook_work import CreateSearchRequest
 from carl.core.listing_identity import LISTING_IDENTIFIER_PATTERN, is_listing_identifier
 from carl.core.marketplace_search import Marketplace, SearchTargetSpecification
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
+from carl.core.network_defaults import (
+    DEFAULT_DATACENTER_NETWORK_PATH,
+    AcquisitionNetworkPath,
+    LegacyProtonRoute,
+    populate_legacy_proton_paths,
+    validate_legacy_proton_paths,
+)
 from carl.core.work import WorkState
 
 CREATE_REVIEW_WORKSPACE = ComponentId(("carl", "review", "create", "workspace"))
@@ -50,6 +58,7 @@ CREATE_SELECTION_SNAPSHOT = ComponentId(("carl", "review", "create", "selection_
 SET_WORKSPACE_SEARCH_TRACK_ENABLED = ComponentId(
     ("carl", "review", "set", "workspace_search_track_enabled")
 )
+REVISE_WORKSPACE_SEARCH_TRACK = ComponentId(("carl", "review", "revise", "workspace_search_track"))
 ACQUIRE_REVIEW_BATCH = ComponentId(("carl", "review", "acquire", "batch"))
 RENEW_REVIEW_CLAIM = ComponentId(("carl", "review", "renew", "claim"))
 RELEASE_REVIEW_CLAIM = ComponentId(("carl", "review", "release", "claim"))
@@ -60,6 +69,11 @@ LISTING_REVIEW_KIND = ("carl", "review", "listing_state")
 REVIEW_WORKSET_KIND = ("carl", "review", "workset")
 SELECTION_SNAPSHOT_KIND = ("carl", "review", "selection_snapshot")
 WORKSPACE_SEARCH_TRACK_STATE_KIND = ("carl", "review", "workspace_search_track_state")
+WORKSPACE_SEARCH_TRACK_SPECIFICATION_KIND = (
+    "carl",
+    "review",
+    "workspace_search_track_specification",
+)
 REVIEW_WORKSPACE_IDENTITY_STATE_KIND = ("carl", "review", "workspace_identity_state")
 WORKSPACE_PRODUCT_GUIDE_BINDING_KIND = ("carl", "review", "workspace_product_guide_binding")
 WORKSPACE_DEFAULT_PRODUCT_GUIDE_STATE_KIND = (
@@ -98,6 +112,7 @@ def build_review_workspace_component_registry() -> Registry:
                 UPDATE_REVIEW_WORKSET,
                 CREATE_SELECTION_SNAPSHOT,
                 SET_WORKSPACE_SEARCH_TRACK_ENABLED,
+                REVISE_WORKSPACE_SEARCH_TRACK,
                 ACQUIRE_REVIEW_BATCH,
                 RENEW_REVIEW_CLAIM,
                 RELEASE_REVIEW_CLAIM,
@@ -318,7 +333,28 @@ class WorkspaceSearchTrack(StrictModel):
     current_search_run_record_identifier: str | None = Field(default=None, min_length=1)
     latest_refresh_work_identifier: str | None = Field(default=None, min_length=1)
     latest_refresh_work_state: WorkState | None = None
+    latest_refresh_search_specification_version: int | None = Field(default=None, ge=1)
     enabled: bool = True
+    search_specification: SearchTargetSpecification | None = None
+    search_specification_version: int = Field(default=1, ge=1)
+    search_specification_record_identifier: str | None = Field(default=None, min_length=1)
+
+
+class WorkspaceSearchTrackSpecificationRecord(StrictModel):
+    record_identifier: str | None = Field(default=None, min_length=1)
+    workspace_record_identifier: str = Field(min_length=1)
+    track_identifier: str = Field(min_length=1)
+    version: int = Field(ge=1)
+    search: SearchTargetSpecification
+    previous_record_identifier: str | None = Field(default=None, min_length=1)
+    recorded_at_utc: str
+
+
+class ReviseWorkspaceSearchTrackRequest(StrictModel):
+    workspace_record_identifier: str = Field(min_length=1)
+    track_identifier: str = Field(min_length=1)
+    expected_version: int = Field(ge=1)
+    search: CreateSearchRequest | SearchTargetSpecification
 
 
 class SetWorkspaceSearchTrackEnabledRequest(StrictModel):
@@ -369,10 +405,41 @@ class RequestWorkspaceRefreshRequest(StrictModel):
     traversal_strategy: SearchTraversalStrategy | None = None
     maximum_items: int | None = Field(default=None, ge=1)
     maximum_images: int | None = Field(default=None, ge=1)
-    proton_route: str = Field(default="carl", min_length=1)
+    search_network_path: AcquisitionNetworkPath | None = Field(
+        default=None, description="Explicit Facebook search route; otherwise use the current spec."
+    )
+    image_network_path: AcquisitionNetworkPath = Field(
+        default=DEFAULT_DATACENTER_NETWORK_PATH,
+        description="Gallery acquisition route; defaults directly to Decodo datacenter.",
+    )
+    proton_route: SkipJsonSchema[LegacyProtonRoute | None] = Field(default=None, exclude=True)
     decodo_route: str = Field(default="carl", min_length=1)
     acquisition_stack: str | None = Field(default=None, min_length=1)
     maximum_pages: int | None = Field(default=None, ge=1, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_legacy_route(cls, value: object) -> object:
+        return populate_legacy_proton_paths(
+            value,
+            legacy_field="proton_route",
+            network_fields=("search_network_path", "image_network_path"),
+        )
+
+    @model_validator(mode="after")
+    def validate_legacy_route(self) -> RequestWorkspaceRefreshRequest:
+        validate_legacy_proton_paths(
+            self.proton_route, self.search_network_path, self.image_network_path
+        )
+        return self
+
+    @property
+    def requested_search_network_path(self) -> tuple[str, ...] | None:
+        return self.search_network_path
+
+    @property
+    def requested_image_network_path(self) -> tuple[str, ...]:
+        return self.image_network_path
 
 
 class RequestWorkspaceRefreshResult(StrictModel):

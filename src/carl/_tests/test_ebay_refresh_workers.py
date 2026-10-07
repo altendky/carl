@@ -124,17 +124,19 @@ def _search_handler(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("shared_image", (True, False))
+@pytest.mark.parametrize("shared_image", (True, False, "cdn"))
 async def test_refresh_waits_for_details_descriptions_and_globally_bounded_images(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    shared_image: bool,
+    shared_image: bool | str,
 ) -> None:
     monkeypatch.setattr("carl.ebay_refresh_workers._WAIT_NS", 0)
     identifiers = _identifiers()
     second_url = f"https://www.ebay.com/itm/{SECOND_ITEM}"
     second_description = DESCRIPTION_URL.replace(ITEM, SECOND_ITEM)
     second_image = IMAGE_URL if shared_image else IMAGE_URL.replace("item", "other")
+    if shared_image == "cdn":
+        second_image = IMAGE_URL.replace("i.ebayimg.com", "thumbs.ebayimg.com")
     pages = _Acquirer(
         {
             ITEM_URL: _Response(_item_html()),

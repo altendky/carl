@@ -63,8 +63,8 @@ def test_search_queues_without_running_an_inline_worker(
     assert result["created"]
     assert result["state"] == "pending"
     with sqlite3.connect(database) as connection:
-        state, attempt, schema_version = connection.execute(
-            "SELECT state, attempt, payload_schema_version FROM work_items WHERE id = ?",
+        state, attempt, schema_version, payload_json = connection.execute(
+            "SELECT state, attempt, payload_schema_version, payload_json FROM work_items WHERE id = ?",
             (result["work_identifier"],),
         ).fetchone()
     assert (state, attempt, schema_version) == (
@@ -72,3 +72,24 @@ def test_search_queues_without_running_an_inline_worker(
         0,
         COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
     )
+    assert json.loads(payload_json)["routing"] == ["decodo", "personal", "datacenter"]
+
+
+def test_search_explicit_legacy_proton_option_requests_actual_proton(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "carl.sqlite3"
+    search(
+        "telescope",
+        facebook_location="456",
+        radius=60,
+        maximum_pages=1,
+        proton_route="dedicated-proton",
+        database=database,
+    )
+    result = json.loads(capsys.readouterr().out)
+    with sqlite3.connect(database) as connection:
+        (payload_json,) = connection.execute(
+            "SELECT payload_json FROM work_items WHERE id = ?", (result["work_identifier"],)
+        ).fetchone()
+    assert json.loads(payload_json)["routing"] == ["proton", "personal", "dedicated-proton"]

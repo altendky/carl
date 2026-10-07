@@ -240,6 +240,12 @@ async def test_empty_details_are_read_only_and_unsaved_images_are_rejected(tmp_p
 
 
 def test_listing_request_identity_and_stack_bounds() -> None:
+    assert RequestEbayListingDetailsRequest(
+        external_identifier="256123456789"
+    ).image_network_path == ("decodo", "personal", "datacenter")
+    assert RequestEbayListingDetailsRequest(
+        marketplace=Marketplace.FACEBOOK, external_identifier="123"
+    ).image_network_path == ("decodo", "personal", "datacenter")
     assert (
         RequestEbayListingDetailsRequest(
             external_identifier="256123456789", stack_identifier="Mixed-Case"

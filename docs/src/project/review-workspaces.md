@@ -23,7 +23,44 @@ through `create_workspace_search`; the resulting root work ID is the stable
 track ID. `request_workspace_refresh` advances one track without replacing the
 workspace. Thus the workspace remains the durable scope for review history,
 batches, worksets, selection snapshots, and search evolution.
-Search acquisition admits at most one active job per proxy route. If a track's
+
+The track ID identifies a watch, not one immutable set of search parameters.
+Read `get_review_workspace` for its complete current `search_specification` and
+`search_specification_version`, then call `revise_workspace_search_track` with
+that version as `expected_version` and the complete replacement search spec.
+The compare-and-swap version check rejects a stale editor; the marketplace must
+remain unchanged. Both legacy Facebook search input and source-neutral,
+discriminated Facebook/eBay specifications are accepted, just as for
+`create_workspace_search`. For example, changing a price cap from $3,000 to $300
+revises the same track rather than adding a watch and disabling the original.
+
+`list_workspace_search_track_versions` reads immutable specification history.
+Legacy tracks initially expose version 1 from their original search; the first
+revision persists that original version and its successor. Revision itself
+does not queue acquisition. A subsequent `request_workspace_refresh` captures
+the current version, while refreshes already queued retain their original
+specification. Prior search and refresh ancestry, listing first-seen/last-seen,
+and review history stay attached to the same stable track.
+Wait for a prior-version refresh to settle before queueing the revised one. The
+enqueue transaction checks the captured version again, so a concurrent edit
+cannot queue an outdated specification after the edit has committed. If initial
+acquisition failed before any retained run exists, `retry_workspace_search_track`
+acquires the revised initial spec under the same track ID without rewriting the
+old failed work. A retained failed baseline instead uses `request_workspace_refresh`.
+
+Changing the scope does not turn listings excluded by the new scope into
+missing, gone, or sold listings. Absence comparisons are conservative across
+different search scopes, while historical listings remain in the track's
+retained union. Create a new track for a genuinely separate watch; revise the
+existing one when its search parameters evolve.
+
+Facebook search acquisition admits at most one active job per effective Proton
+route. New Facebook searches and both sources' images default directly to
+`["decodo", "personal", "datacenter"]`, without Proton aliases. Use Facebook
+search `network_path`, refresh `search_network_path`, and `image_network_path`
+for explicit provider-qualified routes. Decodo searches run concurrently within
+worker-pool and request-rate limits. eBay retains its separate
+search scheduling policy. If a track's
 initial search exhausts a transient transport or session failure,
 `retry_workspace_search_track` requeues that same durable track with a fresh
 retry budget rather than creating another track. Retried legacy work gains the
@@ -125,6 +162,25 @@ newer item-page price likewise supersedes an older card price. This applies only
 to listings actually observed by a refresh. A missed listing retains its last
 observed price, including that evidence's original source and timestamp; search
 absence does not make the price current or prove that it is unchanged.
+
+### Incremental processing
+
+`request_search_pipeline` can process enabled current workspace tracks, optionally restricted to
+explicit track IDs, without rerunning search. It freezes their exact search work/run scope and uses
+one supplied exact product guide for analysis. An actively refreshing selected track is rejected;
+wait for that refresh or select its exact search child with the `search_work` source.
+Alternatively, a `new_search` source starts a mixed Facebook/eBay search and its processing intent
+atomically. Search-only tools remain unchanged.
+
+Each listing independently acquires details, descriptions, and a bounded gallery before analysis;
+one listing's slow download does not prevent a ready listing's analysis. Set `stop_after` to
+`details`, `images`, or `analysis`, and choose global item/image/analysis limits before requesting
+paid work. Incomplete galleries require an explicit override. Replay the unchanged caller request
+ID after interruption; later targets and guide versions do not alter its accepted meaning.
+Use `get_search_pipeline` for counts, conservative budget reservations, source-run IDs, and bounded
+listing progress. A budget flag means a caller bound was reached, not exhaustive coverage.
+Workspace work status includes the pipeline root and its propagated failures. Processing does not
+advance refresh tracks or remove the completed-refresh requirement from fixed-selection previews.
 
 ### Projection revision
 

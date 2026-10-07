@@ -200,9 +200,9 @@ configuration_id = "carl"
 relay_hostname = "us-was-wg-001"
 ```
 
-To replace the default Proton path for Facebook searches and Facebook/eBay
-gallery images, add a separately credentialed datacenter route and an explicit
-cutover. The mobile/residential item-page and eBay search stack above is unchanged:
+Facebook searches and Facebook/eBay gallery images default directly to the
+separately credentialed Decodo datacenter route below. No Proton alias is needed.
+The mobile/residential item-page and eBay search stack above is unchanged:
 
 ```toml
 [[routes]]
@@ -218,24 +218,23 @@ country_code = "us"
 host = "dc.decodo.com"
 port = 10001
 
-[[route_overrides]]
-requested_network_path = ["proton", "personal", "carl"]
-network_path = ["decodo", "personal", "datacenter"]
 ```
 
-The cutover is resolved before a queued Facebook search or image acquisition,
-including retries of work created before the configuration change. New request
-plans, network activities, scheduling policies, and provider observations use
-the effective Decodo path. Historical work payloads and past attempts are not
-rewritten. Legacy `proton_route` request options still name the requested route;
-the explicit configuration override determines its effective provider. Other
-Proton aliases are unaffected. There is no automatic provider fallback.
-Overrides must name configured routes and cannot chain or cycle.
-Repeat the override for any older Proton aliases that should also use Decodo.
-Facebook search admission uses the effective route, so aliases converging on
-one route still permit only one active search. Admission waits under the work
-lease without spending another retry attempt; retained request payloads keep
-their original route identity.
+Facebook search `network_path`, refresh `search_network_path`, and Facebook
+`image_network_path` fields select complete provider-qualified routes. CLI
+search and image collection default to `--network-provider decodo
+--network-route datacenter`. Explicit Proton paths use real Proton; there is
+no automatic provider fallback. Decodo searches run concurrently within the
+worker pool and request-rate limits; only actual Proton routes are serialized.
+
+For an installation with older Proton-to-Decodo overrides, stop workers and
+run `carl cutover-route-overrides` before removing those configuration entries.
+It audits unfinished/failed work's old and new payloads, rebuilds their
+deduplication identities and scheduler scopes, and publishes new current
+workspace-track specification versions. It rejects live affected leases and
+deduplication conflicts. Completed work and immutable acquired evidence remain
+unchanged. The command performs no provider requests and is safe to repeat;
+remove the overrides only after it succeeds, then restart MCP and workers.
 
 Datacenter authentication uses `user-<base>-country-<country>` without mobile
 session or duration controls. [Decodo documents port 10000 as rotating on each
@@ -628,8 +627,7 @@ Route selection belongs to the flow or activity policy. A future policy may
 require one path, choose randomly from an eligible set, or try candidates in an
 explicit fallback order. Selection may apply to complete paths or to an
 alternative at one layer of a path. For example, Marketplace search and image
-downloads request the configured Proton path, which an explicit runtime cutover
-can replace with Decodo datacenter, while item details use their separate Decodo
+downloads default directly to Decodo datacenter, while item details use their separate Decodo
 route. A later flow may
 choose among Decodo, Mullvad, Bright Data, or other explicitly configured paths.
 Anonymous eBay acquisition currently selects the named wreq/Chrome 153
@@ -736,8 +734,8 @@ its activity's selection policy. Path layers are always ordered from the
 application toward the network; this direction is part of the schema rather
 than a per-record option.
 
-Facebook searches and both marketplaces' images resolve explicit route
-overrides; a Decodo datacenter cutover replaces their requested Proton paths.
+Facebook searches and both marketplaces' images default directly to the
+Decodo datacenter path, without Proton aliases.
 eBay searches and item-page
 collection defaults to Decodo, with Mullvad available as an explicit override
 and Bright Data retained as another native proxy implementation. No adapter
@@ -995,6 +993,47 @@ The refresh then runs the existing image reuse and routed collection logic again
 usable observations. Including baseline-only IDs preserves their retained detail evidence without
 treating absence from search as evidence of sale. Optional item and image limits bound experiments;
 the first configured search traversal limit remains decisive.
+
+For opt-in incremental processing, `request_search_pipeline` accepts a new mixed-source search,
+an existing search group or exact run, exact search work IDs, or enabled current workspace tracks.
+New-search acceptance publishes the search, its executions, an immutable pipeline intent, and the
+root work atomically. Caller request IDs provide durable replay, including after completion;
+different content under the same ID is rejected. Existing scope is frozen at acceptance and does
+not launch another search or silently include later reruns. A selected workspace track with an
+active refresh must settle first, or the caller can select its exact search child directly.
+
+The pipeline consumes retained pages while searches are still running. Facebook checkpoints are
+attributed through their owning work operation; eBay records an exact work/attempt/run binding
+before acquisition. Source-specific publication cursors prevent delayed legacy eBay attribution
+from being skipped behind newer Facebook publications. Each qualified listing gets one durable
+coordinator, which pins its own item observation, waits for its description and planned gallery,
+then seals analysis evidence under an exact guide. A ready listing can finish analysis while another
+listing or search is pending. Requester edges recover children after enqueue/checkpoint interruption.
+Ordinary search-only tools and fixed-selection analysis previews retain their existing behavior.
+
+Global item/image/analysis bounds and an outstanding-listing window bound queue growth and spending.
+Image and analysis reservations are conservative; unused reservations are not reassigned. Retained
+analysis history excluded by the chosen policy does not reserve a new analysis. Title and known
+card-status filters run before paid details work; exact item status is checked again afterward.
+Missing, truncated, or empty galleries require an explicit incomplete-analysis override. Pipeline
+status exposes counts, reservations, skips/failures, source-run IDs, and up to 100 listing progress
+entries. A reached bound is reported rather than presented as exhaustive processing. Search failures
+preserve partial downstream results; child partial failures propagate to the root and workspace
+status. Coordinators yield their leases while dependencies run under the existing shared queue,
+provider limits, and resource-owning runtime. No schema migration is required for this workflow.
+
+Acquisition sharing is separate from caller evidence identity. The durable queue serializes
+equivalent item/image/description resources across workers, including previously queued jobs,
+while unrelated resources retain their normal concurrency. A waiting caller rechecks committed
+evidence at dispatch and retains its own extraction budget, observation, and gallery-reference
+relationships. Explicit item collection only shares pages actually acquired after its enqueue
+boundary; a later reuse operation cannot make an old page appear fresh. Description reuse also
+allows observations of the same retained parent item acquisition to share seller text.
+Recognized eBay and Facebook CDN renditions can share across hosts; Facebook signatures/expiry
+are excluded from identity, while sizes, formats, crops, and unknown parameters remain distinct.
+Unknown URL layouts fall back to exact matching. Different signed fetch URLs retain separate jobs
+so a failed expired URL does not suppress a caller's valid alternative. Cached image bytes are
+validated before reuse; missing/corrupt storage is not reported as a successful cache hit.
 
 The refresh itself is durable coordinator work and returns immediately. It enqueues ordinary search,
 item, image, and extraction work items, then returns its lease while those children run in the shared

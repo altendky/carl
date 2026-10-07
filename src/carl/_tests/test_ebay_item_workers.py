@@ -37,6 +37,7 @@ from carl.core.models import CodeProvenance, JsonValue, NamedOutput, RecordDraft
 from carl.core.work import WorkDefinition, WorkRequester, WorkState
 from carl.core.worker import AttemptContext, RetryWork, TerminalFailureWork, WorkerSettings
 from carl.ebay_item_workers import EbayItemWorkerDependencies, build_ebay_item_worker_registry
+from carl.io.decodo import ManagedDecodoSession
 from carl.io.facebook_images import FacebookImageHttpSession, FacebookImageSessionFailure
 from carl.io.httpx import AcquiredBody, Acquisition, AcquisitionFailure, IdentifierFactory
 from carl.io.paths import CarlDirectories
@@ -50,7 +51,7 @@ ITEM_URL = f"https://www.ebay.com/itm/{ITEM}"
 IMAGE_URL = "https://i.ebayimg.com/images/g/item/s-l1600.png"
 DESCRIPTION_URL = f"https://vi.vipr.ebaydesc.com/itmdesc/{ITEM}"
 ITEM_ROUTE = ("decodo", "personal", "carl")
-IMAGE_ROUTE = ("proton", "personal", "carl")
+IMAGE_ROUTE = ("decodo", "personal", "datacenter")
 
 
 def _mapping(value: JsonValue) -> dict[str, JsonValue]:
@@ -678,18 +679,18 @@ async def test_image_session_cleanup_failure_retries_without_retaining_unvalidat
         yield FacebookImageHttpSession(
             identifier=identifier,
             acquirer=images,
-            provider_session=cast(ProtonSession, object()),
+            provider_session=cast(ManagedDecodoSession, object()),
         )
         raise FacebookImageSessionFailure("test_close_failure", {"state": "closed"})
 
     def factory(
-        *, manager: object, settings: object
+        *, manager: object, settings: object, credential_source: object
     ) -> Callable[[str], AbstractAsyncContextManager[FacebookImageHttpSession]]:
-        del manager, settings
+        del manager, settings, credential_source
         return failed_session
 
-    def unused_settings(*_args: object) -> None:
-        return None
+    def unused_settings(*_args: object) -> tuple[object, object]:
+        return object(), object()
 
     monkeypatch.setattr(
         ebay_item_workers,
@@ -698,8 +699,8 @@ async def test_image_session_cleanup_failure_retries_without_retaining_unvalidat
             configuration=SimpleNamespace(resolve_network_path=lambda path: path)
         ),
     )
-    monkeypatch.setattr(ebay_item_workers, "proton_settings", unused_settings)
-    monkeypatch.setattr(ebay_item_workers, "ProtonFacebookImageSessionFactory", factory)
+    monkeypatch.setattr(ebay_item_workers, "decodo_settings", unused_settings)
+    monkeypatch.setattr(ebay_item_workers, "DecodoFacebookImageSessionFactory", factory)
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         registry = _registry(database, tmp_path, identifiers)
         await _retain_records(database, (_reference(),), identifiers)
@@ -725,11 +726,13 @@ async def test_image_session_cleanup_failure_retries_without_retaining_unvalidat
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("attempt", (1, 2, 3))
-async def test_transient_image_session_startup_retries_with_a_bounded_budget(
+async def test_explicit_proton_image_session_startup_retries_with_a_bounded_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attempt: int
 ) -> None:
     identifiers = _identifiers()
     images = _Acquirer({})
+    proton_image_route = ("proton", "personal", "carl")
+    monkeypatch.setattr(ebay_item_workers, "IMAGE_NETWORK_PATH", proton_image_route)
 
     @asynccontextmanager
     async def failed_session(identifier: str) -> AsyncIterator[FacebookImageHttpSession]:
@@ -805,6 +808,8 @@ async def test_transient_image_session_startup_retries_with_a_bounded_budget(
         )
         assert snapshot.network.recent_failed == 1
         assert (
-            next(path for path in snapshot.network_paths if path.path == IMAGE_ROUTE).recent_failed
+            next(
+                path for path in snapshot.network_paths if path.path == proton_image_route
+            ).recent_failed
             == 1
         )

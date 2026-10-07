@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from carl.core.facebook import FacebookItemResponseKind, listing_id_from_url
 from carl.core.facebook_search import (
@@ -15,6 +16,13 @@ from carl.core.facebook_search import (
 )
 from carl.core.http import RequestPlan
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
+from carl.core.network_defaults import (
+    DEFAULT_DATACENTER_NETWORK_PATH,
+    AcquisitionNetworkPath,
+    LegacyProtonRoute,
+    populate_legacy_proton_paths,
+    validate_legacy_proton_paths,
+)
 from carl.core.work import (
     ConcurrencyConstraint,
     Constraint,
@@ -110,7 +118,7 @@ def _search_route_scope(routing: tuple[str, ...]) -> SchedulingScope:
 
 
 def facebook_search_work_constraint(routing: tuple[str, ...]) -> ConcurrencyConstraint:
-    """Permit only one active Marketplace search acquisition per network route."""
+    """Historical requested-route limit, retained only to identify old policy."""
 
     return ConcurrencyConstraint(
         identifier=("carl", "facebook", "search", "route_concurrency", "v1", *routing),
@@ -120,16 +128,27 @@ def facebook_search_work_constraint(routing: tuple[str, ...]) -> ConcurrencyCons
     )
 
 
-def facebook_effective_search_work_constraint(routing: tuple[str, ...]) -> ConcurrencyConstraint:
-    """Serialize resolved routes using a scope acquired after the work claim."""
+def facebook_effective_search_scope(routing: tuple[str, ...]) -> SchedulingScope:
+    """Record the actual acquisition route without changing the requested payload."""
+
+    return SchedulingScope(
+        kind=SchedulingScopeKind.NETWORK_PATH,
+        identity=(FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *routing),
+    )
+
+
+def facebook_effective_search_work_constraint(
+    routing: tuple[str, ...],
+) -> ConcurrencyConstraint | None:
+    """Serialize shared Proton transports, not independent Decodo sessions."""
+
+    if routing[0] == "decodo":
+        return None
 
     return ConcurrencyConstraint(
         identifier=("carl", "facebook", "search", "effective_route_concurrency", "v1", *routing),
         subject_kind=SchedulingSubjectKind.WORK_ITEM,
-        scope=SchedulingScope(
-            kind=SchedulingScopeKind.NETWORK_PATH,
-            identity=(FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *routing),
-        ),
+        scope=facebook_effective_search_scope(routing),
         maximum_active=FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE,
     )
 
@@ -229,7 +248,6 @@ def facebook_search_network_constraints(routing: tuple[str, ...]) -> tuple[Const
     constraints: list[Constraint] = [
         *_facebook_remote_origin_network_constraints(),
         facebook_network_path_constraint(routing),
-        facebook_search_work_constraint(routing),
     ]
     for activity_kind in (
         SEARCH_ROUTE_DEFINITION_NETWORK_ACTIVITY_KIND,
@@ -456,14 +474,27 @@ class CreateSearchRequest(StrictModel):
     traversal_strategy: SearchTraversalStrategy = Field(
         default_factory=CursorSearchTraversalStrategy
     )
-    proton_route: str = Field(default="carl", min_length=1)
+    network_path: AcquisitionNetworkPath = Field(
+        default=DEFAULT_DATACENTER_NETWORK_PATH,
+        description="Explicit acquisition route; defaults directly to Decodo datacenter.",
+    )
+    proton_route: SkipJsonSchema[LegacyProtonRoute | None] = Field(default=None, exclude=True)
 
-    @field_validator("proton_route")
+    @model_validator(mode="before")
     @classmethod
-    def validate_proton_route(cls, value: str) -> str:
-        if value != value.strip():
-            raise ValueError("The Proton route identifier must not have surrounding whitespace")
-        return value
+    def populate_legacy_route(cls, value: object) -> object:
+        return populate_legacy_proton_paths(
+            value, legacy_field="proton_route", network_fields=("network_path",)
+        )
+
+    @model_validator(mode="after")
+    def validate_legacy_route(self) -> "CreateSearchRequest":
+        validate_legacy_proton_paths(self.proton_route, self.network_path)
+        return self
+
+    @property
+    def requested_network_path(self) -> tuple[str, ...]:
+        return self.network_path
 
 
 class CreateSearchResult(StrictModel):

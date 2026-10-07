@@ -146,8 +146,9 @@ def test_search_work_retains_intent_and_network_scopes() -> None:
     }
 
 
-def test_search_network_policy_is_typed_and_applies_to_each_followup_request() -> None:
-    routing = ("proton", "personal", "route")
+@pytest.mark.parametrize("provider", ("proton", "decodo"))
+def test_search_network_policy_is_typed_and_applies_to_each_followup_request(provider: str) -> None:
+    routing = (provider, "personal", "route")
 
     constraints = facebook_search_network_constraints(routing)
     activity = facebook_search_network_activity(
@@ -177,9 +178,7 @@ def test_search_network_policy_is_typed_and_applies_to_each_followup_request() -
     }
     assert {(holdoff.minimum_ns, holdoff.maximum_ns) for holdoff in holdoffs} == {(0, 100_000_000)}
     work_limits = tuple(item for item in constraints if isinstance(item, ConcurrencyConstraint))
-    assert [(limit.maximum_active, limit.scope.identity) for limit in work_limits] == [
-        (1, ("search_acquisition", *routing))
-    ]
+    assert work_limits == ()
     item_constraints = facebook_item_network_constraints(routing)
     assert any(
         isinstance(constraint, UniformHoldoffConstraint)
@@ -242,7 +241,7 @@ async def test_search_input_survives_durable_queue_round_trip(tmp_path: Path) ->
 
 
 @pytest.mark.anyio
-async def test_search_work_is_serialized_per_route(tmp_path: Path) -> None:
+async def test_legacy_requested_search_constraint_serializes_per_route(tmp_path: Path) -> None:
     first_payload = _payload().model_copy(update={"routing": ("proton", "personal", "one")})
     second_payload = first_payload.model_copy(
         update={"request": first_payload.request.model_copy(update={"query": "eyepiece"})}

@@ -107,6 +107,8 @@ async def test_selected_listing_acquires_details_and_bounded_gallery_then_reuses
         assert _mapping(completed["result"])["state"] == "completed"
         assert len(pages.plans) == 1
         assert len(images.plans) == maximum_images
+        # Retain the complete gallery's provenance even when its download budget is zero.
+        assert len(await database.facebook_gallery_reference_identifiers()) == 2
         _ = await _enqueue(
             database,
             request_facebook_listing_details_work(identifier="details-two", payload=payload),

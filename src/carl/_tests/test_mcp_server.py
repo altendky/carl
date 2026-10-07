@@ -22,18 +22,31 @@ from carl.core.composed_projection import (
     canonical_facebook_listing_url,
     projection_revision,
 )
+from carl.core.ebay import EbaySearchRequest
 from carl.core.facebook_images import (
     ImageFailureSourceKind,
     RetryImageFailuresRequest,
     RetryImageFailuresResult,
+)
+from carl.core.marketplace_search import EbaySearchTargetSpecification
+from carl.core.pipeline import (
+    PipelineOptions,
+    PipelineStage,
+    RequestSearchPipelineRequest,
+    SearchPipelineRequestResult,
+    SearchPipelineStatus,
 )
 from carl.core.review_workspace import (
     RecordWorkspaceBulkReviewRequest,
     RecordWorkspaceBulkReviewResult,
     ReviewDisposition,
     ReviewState,
+    ReviseWorkspaceSearchTrackRequest,
     WorksetBulkReviewSelection,
+    WorkspaceSearchTrack,
+    WorkspaceSearchTrackSpecificationRecord,
 )
+from carl.core.work import WorkState
 from carl.io.sqlite import Database
 from carl.mcp_server import build_server, managed_mcp_runtime, tool_definitions
 from carl.review import ReviewApplication
@@ -61,6 +74,7 @@ EXPECTED_TOOLS = {
     "get_server_info",
     "get_search",
     "get_search_run_listings",
+    "get_search_pipeline",
     "get_provenance",
     "get_work_status",
     "list_composed_search",
@@ -71,10 +85,12 @@ EXPECTED_TOOLS = {
     "list_review_workspaces",
     "list_workspace_listings",
     "list_workspace_search_results",
+    "list_workspace_search_track_versions",
     "list_workspace_product_guides",
     "preview_selection_analyses",
     "request_selection_analyses",
     "request_search_refresh",
+    "request_search_pipeline",
     "request_listing_details",
     "request_workspace_refresh",
     "rename_review_workspace",
@@ -91,6 +107,7 @@ EXPECTED_TOOLS = {
     "retry_item_failures",
     "retry_workspace_search_track",
     "revise_product_guide",
+    "revise_workspace_search_track",
     "renew_review_claim",
     "update_review_workset",
     "update_workspace_product_guide_binding",
@@ -125,6 +142,75 @@ def _assert_analysis_batch_contracts(tools_by_name: dict[str, Any]) -> None:
         "missing_for_selected_guide",
         "never_analyzed_listing",
     ]
+
+
+@pytest.mark.anyio
+async def test_pipeline_tools_validate_intent_and_return_structured_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    received: list[RequestSearchPipelineRequest] = []
+    options = PipelineOptions(stop_after=PipelineStage.IMAGES, maximum_images=7)
+
+    async def request_pipeline(
+        _application: ReviewApplication, request: RequestSearchPipelineRequest
+    ) -> SearchPipelineRequestResult:
+        received.append(request)
+        return SearchPipelineRequestResult(
+            work_identifier="pipeline-1", created=True, search_work_identifiers=("search-1",)
+        )
+
+    async def get_pipeline(
+        _application: ReviewApplication, work_identifier: str
+    ) -> SearchPipelineStatus:
+        assert work_identifier == "pipeline-1"
+        return SearchPipelineStatus(
+            work_identifier=work_identifier,
+            state=WorkState.PENDING,
+            options=options,
+            search_work_identifiers=("search-1",),
+            image_budget_reserved=7,
+        )
+
+    monkeypatch.setattr(
+        ReviewApplication, "request_search_pipeline", request_pipeline, raising=False
+    )
+    monkeypatch.setattr(ReviewApplication, "get_search_pipeline", get_pipeline, raising=False)
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        application = ReviewApplication(database=database, repository_root=tmp_path)
+        async with Client(build_server(application)) as client:
+            invalid = await client.call_tool(
+                "request_search_pipeline",
+                {
+                    "request": {
+                        "request_identifier": "intent-1",
+                        "source": {"kind": "search_work", "search_work_identifiers": ["search-1"]},
+                        "options": {"stop_after": "analysis"},
+                    }
+                },
+            )
+            assert invalid.is_error
+            assert not received
+            result = await client.call_tool(
+                "request_search_pipeline",
+                {
+                    "request": {
+                        "request_identifier": "intent-1",
+                        "source": {"kind": "search_work", "search_work_identifiers": ["search-1"]},
+                        "options": options.model_dump(mode="json"),
+                    }
+                },
+            )
+            assert not result.is_error
+            assert result.structured_content is not None
+            assert result.structured_content["work_identifier"] == "pipeline-1"
+            assert received[0].options.maximum_images == 7
+            status = await client.call_tool(
+                "get_search_pipeline", {"work_identifier": "pipeline-1"}
+            )
+            assert not status.is_error
+            assert status.structured_content is not None
+            assert status.structured_content["options"]["maximum_images"] == 7
+            assert status.structured_content["image_budget_reserved"] == 7
 
 
 @pytest.mark.anyio
@@ -283,6 +369,83 @@ async def test_workspace_bulk_review_accepts_real_json_and_returns_counts(
 
 
 @pytest.mark.anyio
+async def test_workspace_track_revision_and_history_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    received: list[ReviseWorkspaceSearchTrackRequest] = []
+    specification = EbaySearchTargetSpecification(search=EbaySearchRequest(query="foosball"))
+
+    async def revise(
+        _application: ReviewApplication, request: ReviseWorkspaceSearchTrackRequest
+    ) -> WorkspaceSearchTrack:
+        received.append(request)
+        assert isinstance(request.search, EbaySearchTargetSpecification)
+        return WorkspaceSearchTrack(
+            track_identifier=request.track_identifier,
+            query=request.search.search.query,
+            marketplace=request.search.marketplace,
+            search_specification=request.search,
+            search_specification_version=2,
+            search_specification_record_identifier="specification-2",
+        )
+
+    async def versions(
+        _application: ReviewApplication,
+        workspace_record_identifier: str,
+        track_identifier: str,
+    ) -> tuple[WorkspaceSearchTrackSpecificationRecord, ...]:
+        assert workspace_record_identifier == "workspace"
+        assert track_identifier == "track"
+        return tuple(
+            WorkspaceSearchTrackSpecificationRecord(
+                record_identifier=f"specification-{version}",
+                workspace_record_identifier=workspace_record_identifier,
+                track_identifier=track_identifier,
+                version=version,
+                search=specification,
+                previous_record_identifier="specification-1" if version == 2 else None,
+                recorded_at_utc="2026-10-06T00:00:00+00:00",
+            )
+            for version in (1, 2)
+        )
+
+    monkeypatch.setattr(ReviewApplication, "revise_workspace_search_track", revise)
+    monkeypatch.setattr(ReviewApplication, "list_workspace_search_track_versions", versions)
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        application = ReviewApplication(database=database, repository_root=tmp_path)
+        async with Client(build_server(application)) as client:
+            request = {
+                "workspace_record_identifier": "workspace",
+                "track_identifier": "track",
+                "expected_version": 1,
+                "search": specification.model_dump(mode="json"),
+            }
+            invalid = await client.call_tool(
+                "revise_workspace_search_track",
+                {"request": {**request, "expected_version": 0}},
+            )
+            assert invalid.is_error
+            assert not received
+            revised = await client.call_tool("revise_workspace_search_track", {"request": request})
+            assert not revised.is_error
+            assert revised.structured_content is not None
+            assert revised.structured_content["track_identifier"] == "track"
+            assert revised.structured_content["search_specification_version"] == 2
+            assert revised.structured_content["search_specification_record_identifier"] == (
+                "specification-2"
+            )
+            history = await client.call_tool(
+                "list_workspace_search_track_versions",
+                {"workspace_record_identifier": "workspace", "track_identifier": "track"},
+            )
+            assert not history.is_error
+            assert history.structured_content is not None
+            assert [row["version"] for row in history.structured_content["result"]] == [1, 2]
+            assert len(received) == 1
+            assert received[0].expected_version == 1
+
+
+@pytest.mark.anyio
 async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         application = ReviewApplication(
@@ -299,12 +462,19 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             "record_listing_reviews",
             "renew_review_claim",
             "release_review_claim",
+            "request_search_pipeline",
         ):
             assert definitions_by_name[name].annotations.idempotent_hint
         refresh = next(
             definition for definition in definitions if definition.name == "request_search_refresh"
         )
         assert refresh.annotations.open_world_hint
+        assert definitions_by_name["request_search_pipeline"].annotations.open_world_hint
+        assert definitions_by_name["get_search_pipeline"].annotations.read_only_hint
+        assert definitions_by_name[
+            "list_workspace_search_track_versions"
+        ].annotations.read_only_hint
+        assert not definitions_by_name["revise_workspace_search_track"].annotations.open_world_hint
 
         async with Client(build_server(application)) as client:
             called_tools: set[str] = set()
@@ -329,6 +499,10 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert {tool.name for tool in listing.tools} == EXPECTED_TOOLS
             assert _contract_documents(listing.tools) == _expected_contract_documents()
             tools_by_name = {tool.name: tool for tool in listing.tools}
+            revision_schema = tools_by_name["revise_workspace_search_track"].input_schema
+            revision_request = revision_schema["$defs"]["ReviseWorkspaceSearchTrackRequest"]
+            assert "expected_version" in revision_request["required"]
+            assert revision_request["properties"]["expected_version"]["minimum"] == 1
             activity_properties = tools_by_name["get_activity_snapshot"].input_schema["properties"]
             assert activity_properties["recent_window_minutes"] == {
                 "default": 60,
@@ -391,6 +565,7 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 ("carl", "activity", "snapshot"),
                 ("carl", "marketplace", "create_search"),
                 ("carl", "marketplace", "search_group"),
+                ("carl", "marketplace", "search_pipeline"),
                 ("carl", "marketplace", "search_results_projection"),
                 ("carl", "ebay", "collect_search_work"),
                 ("carl", "facebook", "search_run_summary"),
@@ -426,21 +601,22 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "marketplace", "search_group")] == 2
             assert capability_versions[("carl", "marketplace", "search_results_projection")] == 4
             assert capability_versions[("carl", "ebay", "collect_search_work")] == 9
-            assert capability_versions[("carl", "facebook", "search_transport_retry")] == 4
+            assert capability_versions[("carl", "facebook", "search_transport_retry")] == 5
             assert capability_versions[("carl", "facebook", "search_run_summary")] == 1
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 49
+            assert capability_versions[("carl", "mcp", "instructions")] == 53
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 36
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 39
+            assert capability_versions[("carl", "marketplace", "search_pipeline")] == 1
             assert capability_versions[("carl", "review", "workspace_work")] == 4
             assert capability_versions[("carl", "review", "composed_projection")] == 9
             assert capability_versions[("carl", "review", "workspace")] == 10
             assert capability_versions[("carl", "review", "workspace_bulk_review")] == 4
             assert capability_versions[("carl", "review", "workspace_product_guides")] == 1
             assert capability_versions[("carl", "review", "product_guides")] == 1
-            assert capability_versions[("carl", "review", "workspace_search_tracks")] == 7
+            assert capability_versions[("carl", "review", "workspace_search_tracks")] == 8
             assert capability_versions[("carl", "review", "claims")] == 2
             assert capability_versions[("carl", "review", "selection_snapshot")] == 2
             assert capability_versions[("carl", "review", "selection_analysis")] == 5
@@ -616,9 +792,9 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             ebay_work_identifier = ebay_target["executions"][0]["work_identifier"]
             facebook_work = await database.work(facebook_work_identifier)
             assert facebook_work["payload"]["routing"] == [
-                "proton",
+                "decodo",
                 "personal",
-                "carl",
+                "datacenter",
             ]
             assert facebook_work["payload"]["request"]["price"] == {
                 "currency": "USD",
@@ -920,6 +1096,20 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                     },
                 ),
                 await call_json(
+                    "revise_workspace_search_track",
+                    {
+                        "request": {
+                            "workspace_record_identifier": "missing-workspace",
+                            "track_identifier": "missing-track",
+                            "expected_version": 1,
+                            "search": {
+                                "marketplace": "ebay",
+                                "search": {"query": "foosball"},
+                            },
+                        }
+                    },
+                ),
+                await call_json(
                     "retry_workspace_search_track",
                     {
                         "request": {
@@ -1046,6 +1236,13 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                             "track_identifier": "missing-track",
                             "listing_state": "sold",
                         }
+                    },
+                ),
+                (
+                    "list_workspace_search_track_versions",
+                    {
+                        "workspace_record_identifier": "missing-workspace",
+                        "track_identifier": "missing-track",
                     },
                 ),
                 (
@@ -1176,6 +1373,21 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 assert isinstance(domain_error.content[0], TextContent)
                 assert "instance of" not in domain_error.content[0].text
 
+            missing_pipeline_request = await call_json(
+                "request_search_pipeline",
+                {
+                    "request": {
+                        "request_identifier": "missing-search-pipeline",
+                        "source": {"kind": "search", "search_record_identifier": "missing-search"},
+                        "options": {"stop_after": "details"},
+                    }
+                },
+            )
+            missing_pipeline_status = await call_json(
+                "get_search_pipeline", {"work_identifier": "missing-pipeline"}
+            )
+            assert missing_pipeline_request.is_error
+            assert missing_pipeline_status.is_error
             assert called_tools == EXPECTED_TOOLS
 
 

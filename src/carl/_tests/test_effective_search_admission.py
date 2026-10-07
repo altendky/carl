@@ -29,8 +29,9 @@ from carl.core.worker import AttemptContext
 from carl.io.configuration import LoadedCarlConfiguration
 from carl.io.sqlite import Database, LeaseLostError
 
-TARGET = ("decodo", "personal", "datacenter")
-OTHER = ("decodo", "personal", "other")
+TARGET = ("proton", "personal", "carl")
+OTHER = ("proton", "personal", "other")
+DATACENTER = ("decodo", "personal", "datacenter")
 CAPABILITY = WorkCapability(
     kind=COLLECT_SEARCH_WORK_KIND, payload_schema_version=COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION
 )
@@ -138,6 +139,61 @@ async def test_legacy_alias_and_direct_route_share_admission(
             (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *TARGET),
         }
         assert _external_scopes(path, "first") == await _scopes(database, "first")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("second_route", (("proton", "personal", "alias"), DATACENTER))
+async def test_decodo_alias_and_direct_route_admit_concurrent_searches(
+    tmp_path: Path, second_route: tuple[str, ...]
+) -> None:
+    path = tmp_path / "carl.sqlite3"
+    async with Database.managed(path, initialize=True) as database:
+        first = await _claim(database, "first", ("proton", "personal", "legacy"))
+        second = await _claim(database, "second", second_route)
+        before = await _rows(database, "SELECT id,payload_json FROM work_items ORDER BY id")
+        history = await _rows(database, "SELECT * FROM work_events ORDER BY sequence")
+        assert await _admit(database, first, DATACENTER)
+        async with Database.managed(path) as other_database:
+            assert await _admit(other_database, second, DATACENTER)
+        assert await _admit(database, first, DATACENTER)
+        assert await _rows(database, "SELECT id,payload_json FROM work_items ORDER BY id") == before
+        assert await _rows(database, "SELECT * FROM work_events ORDER BY sequence") == history
+        assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *DATACENTER) in await _scopes(
+            database, "first"
+        )
+        assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *DATACENTER) in await _scopes(
+            database, "second"
+        )
+        assert await _rows(database, "SELECT count(*) FROM scheduling_constraints") == [(0,)]
+
+
+@pytest.mark.anyio
+async def test_decodo_admission_validates_lease_and_rebinding_preserves_proton_exclusion(
+    tmp_path: Path,
+) -> None:
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        first = await _claim(database, "first", TARGET)
+        second = await _claim(database, "second", DATACENTER)
+        expired = await _claim(database, "expired", DATACENTER, duration=100)
+        assert await _admit(database, first, TARGET)
+        assert await _admit(database, second, DATACENTER)
+        scopes = await _scopes(database, "second")
+        with pytest.raises(LeaseLostError):
+            _ = await _admit(database, second.model_copy(update={"token": "wrong"}), OTHER)
+        assert await _scopes(database, "second") == scopes
+        with pytest.raises(LeaseLostError):
+            _ = await _admit(database, expired, DATACENTER, now=110)
+        assert not await _admit(database, second, TARGET)
+        assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *DATACENTER) not in await _scopes(
+            database, "second"
+        )
+        assert await _admit(database, second, DATACENTER)
+        assert await _admit(database, first, DATACENTER)
+        assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *TARGET) not in await _scopes(
+            database, "first"
+        )
+        assert await _admit(database, second, TARGET)
+        assert not await _admit(database, first, TARGET)
 
 
 @pytest.mark.anyio
@@ -259,7 +315,7 @@ async def test_cancelled_routed_wait_does_not_access_provider_or_consume_attempt
 ) -> None:
     now = time_ns()
     path = tmp_path / "carl.sqlite3"
-    loaded = routes._loaded(tmp_path, override=True)
+    loaded = routes._loaded(tmp_path, override=False)
 
     def load(_path: Path) -> LoadedCarlConfiguration:
         return loaded

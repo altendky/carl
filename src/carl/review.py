@@ -130,7 +130,6 @@ from carl.core.facebook_work import (
     CreateSearchRequest,
     CreateSearchResult,
     collect_search_work,
-    facebook_search_work_constraint,
     is_transient_search_failure,
 )
 from carl.core.item_analysis import (
@@ -176,12 +175,20 @@ from carl.core.marketplace_search import (
     MarketplaceSearchTargetRecord,
     MarketplaceSearchTargetStateRecord,
     RunMarketplaceSearchRequest,
+    SearchTargetSpecification,
     SetMarketplaceSearchTargetEnabledRequest,
     build_marketplace_search_component_registry,
     decode_marketplace_search_results_cursor,
     encode_marketplace_search_results_cursor,
 )
 from carl.core.models import CodeProvenance, JsonValue, NamedInput, NamedOutput, RecordDraft
+from carl.core.network_defaults import DEFAULT_DATACENTER_NETWORK_PATH
+from carl.core.pipeline import (
+    PipelineOptions,
+    RequestSearchPipelineRequest,
+    SearchPipelineRequestResult,
+    SearchPipelineStatus,
+)
 from carl.core.refresh_recovery import (
     RetryItemFailuresRequest,
     RetryItemFailuresResult,
@@ -240,6 +247,7 @@ from carl.core.review_workspace import (
     REVIEW_WORKSET_KIND,
     REVIEW_WORKSPACE_IDENTITY_STATE_KIND,
     REVIEW_WORKSPACE_KIND,
+    REVISE_WORKSPACE_SEARCH_TRACK,
     SELECTION_SNAPSHOT_KIND,
     SET_PRODUCT_GUIDE_IDENTITY_RETIRED,
     SET_REVIEW_WORKSPACE_ARCHIVED,
@@ -249,6 +257,7 @@ from carl.core.review_workspace import (
     UPDATE_WORKSPACE_PRODUCT_GUIDE,
     WORKSPACE_DEFAULT_PRODUCT_GUIDE_STATE_KIND,
     WORKSPACE_PRODUCT_GUIDE_BINDING_KIND,
+    WORKSPACE_SEARCH_TRACK_SPECIFICATION_KIND,
     WORKSPACE_SEARCH_TRACK_STATE_KIND,
     AcquireReviewBatchRequest,
     AddWorkspaceProductGuideRequest,
@@ -287,6 +296,7 @@ from carl.core.review_workspace import (
     ReviewWorkspace,
     ReviewWorkspaceActivity,
     ReviewWorkspaceIdentityStateRecord,
+    ReviseWorkspaceSearchTrackRequest,
     SelectionSnapshot,
     SelectionSnapshotBulkReviewSelection,
     SelectionSnapshotItem,
@@ -306,6 +316,7 @@ from carl.core.review_workspace import (
     WorkspaceProductGuideBindingRecord,
     WorkspaceProductGuideVersionPolicy,
     WorkspaceSearchTrack,
+    WorkspaceSearchTrackSpecificationRecord,
     WorkspaceSearchTrackStateRecord,
     WorkspaceWorkStatus,
     WorkspaceWorkWaitResult,
@@ -513,8 +524,9 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=49),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=36),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=53),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=39),
+                ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=3),
                 ServerCapability(identity=("carl", "marketplace", "create_search"), version=1),
@@ -535,7 +547,7 @@ class ReviewApplication:
                 ServerCapability(identity=("carl", "facebook", "search_run_summary"), version=1),
                 ServerCapability(identity=("carl", "facebook", "search_run_membership"), version=1),
                 ServerCapability(
-                    identity=("carl", "facebook", "search_transport_retry"), version=4
+                    identity=("carl", "facebook", "search_transport_retry"), version=5
                 ),
                 ServerCapability(
                     identity=("carl", "facebook", "search_refresh", "child_progress"),
@@ -561,7 +573,7 @@ class ReviewApplication:
                     identity=("carl", "review", "workspace_product_guides"), version=1
                 ),
                 ServerCapability(identity=("carl", "review", "product_guides"), version=1),
-                ServerCapability(identity=("carl", "review", "workspace_search_tracks"), version=7),
+                ServerCapability(identity=("carl", "review", "workspace_search_tracks"), version=8),
                 ServerCapability(identity=("carl", "review", "claims"), version=2),
                 ServerCapability(identity=("carl", "review", "selection_snapshot"), version=2),
                 ServerCapability(identity=("carl", "review", "selection_analysis"), version=5),
@@ -1810,6 +1822,7 @@ class ReviewApplication:
         inputs: tuple[NamedInput, ...],
         outputs: tuple[NamedOutput, ...],
         result: JsonValue,
+        workspace_track_guard: tuple[str, str, int] | None = None,
     ) -> None:
         started_utc_ns = self.utc_now_ns()
         started_monotonic_ns = self.monotonic_ns()
@@ -1827,6 +1840,7 @@ class ReviewApplication:
             ended_at_utc=_utc_text(ended_utc_ns),
             duration_ns=max(0, self.monotonic_ns() - started_monotonic_ns),
             result=result,
+            workspace_track_guard=workspace_track_guard,
         )
 
     async def _publish_marketplace_search_records(
@@ -2039,6 +2053,37 @@ class ReviewApplication:
         query = request.get("query") if isinstance(request, dict) else None
         return query if isinstance(query, str) and query else "unknown"
 
+    @staticmethod
+    def _retained_track_specification(
+        marketplace: Marketplace, value: JsonValue
+    ) -> SearchTargetSpecification | None:
+        """Recover complete legacy intent when present, without breaking partial old records."""
+
+        if not isinstance(value, dict):
+            return None
+        try:
+            if marketplace is Marketplace.EBAY:
+                return EbaySearchTargetSpecification(
+                    search=EbaySearchRequest.model_validate(value.get("request"))
+                )
+            traversal = value.get("traversal")
+            if isinstance(traversal, dict) and "policy" in traversal:
+                traversal = traversal["policy"]
+            routing = value.get("routing")
+            intent = {
+                "request": value.get("request"),
+                "traversal": traversal,
+            }
+            if isinstance(routing, list) and routing:
+                intent["network_path"] = routing
+            if value.get("traversal_strategy") is not None:
+                intent["traversal_strategy"] = value["traversal_strategy"]
+            return FacebookSearchTargetSpecification(
+                search=CreateSearchRequest.model_validate(intent)
+            )
+        except ValueError:
+            return None
+
     async def _workspace_search_tracks(
         self, workspace: ReviewWorkspace
     ) -> tuple[WorkspaceSearchTrack, ...]:
@@ -2116,6 +2161,7 @@ class ReviewApplication:
                         WorkState.COMPLETED if refresh_identifier is not None else None
                     ),
                     enabled=target.enabled,
+                    search_specification=target.specification,
                 )
         creation_identifiers = await self.database.requested_work_identifiers(
             requester_kind=("carl", "mcp", "create_workspace_search"),
@@ -2152,6 +2198,38 @@ class ReviewApplication:
                 current_search_run_record_identifier=run_identifier,
                 latest_refresh_work_identifier=None,
                 latest_refresh_work_state=None,
+                search_specification=self._retained_track_specification(
+                    Marketplace.EBAY
+                    if work["kind"] == list(COLLECT_EBAY_SEARCH_WORK_KIND)
+                    else Marketplace.FACEBOOK,
+                    work.get("payload"),
+                ),
+            )
+        revised_creation_edges = await self.database.requested_work_edges(
+            requester_kind=("carl", "mcp", "create_workspace_search_revision"),
+            requester_identifier=workspace.record_identifier,
+        )
+        for edge in revised_creation_edges:
+            context = edge.get("context")
+            track_identifier = (
+                context.get("track_identifier") if isinstance(context, dict) else None
+            )
+            if not isinstance(track_identifier, str) or track_identifier not in tracks:
+                raise RuntimeError("Revised initial search lost its workspace track")
+            work = await self.database.work(str(edge["work_identifier"]))
+            track = tracks[track_identifier]
+            result = work.get("result")
+            run = result.get("search_run_record_identifier") if isinstance(result, dict) else None
+            successful_run = run if isinstance(run, str) and work["state"] == "completed" else None
+            tracks[track_identifier] = track.model_copy(
+                update={
+                    "creation_work_identifier": work["identifier"],
+                    "creation_work_state": WorkState(str(work["state"])),
+                    "origin_search_run_record_identifier": track.origin_search_run_record_identifier
+                    or successful_run,
+                    "current_search_run_record_identifier": successful_run
+                    or track.current_search_run_record_identifier,
+                }
             )
         refresh_edges = await self.database.requested_work_edges(
             requester_kind=("carl", "mcp", "request_workspace_refresh"),
@@ -2206,6 +2284,11 @@ class ReviewApplication:
                     ),
                     "latest_refresh_work_identifier": identifier,
                     "latest_refresh_work_state": state,
+                    "latest_refresh_search_specification_version": (
+                        context.get("search_specification_version", 1)
+                        if isinstance(context, dict)
+                        else 1
+                    ),
                 }
             )
         for _, value in await self.database.records_by_kind(WORKSPACE_SEARCH_TRACK_STATE_KIND):
@@ -2217,6 +2300,41 @@ class ReviewApplication:
                 tracks[state.track_identifier] = tracks[state.track_identifier].model_copy(
                     update={"enabled": state.enabled}
                 )
+        if initial_kind in (("carl", "facebook", "search_run"), ("carl", "ebay", "search_run")):
+            identifier = workspace.search_run_record_identifier
+            tracks[identifier] = tracks[identifier].model_copy(
+                update={
+                    "search_specification": self._retained_track_specification(
+                        Marketplace(initial_kind[1]), initial_value
+                    )
+                }
+            )
+        for _, value in await self.database.workspace_search_track_specifications(
+            workspace.record_identifier
+        ):
+            revision = WorkspaceSearchTrackSpecificationRecord.model_validate(value)
+            if revision.track_identifier not in tracks:
+                raise RuntimeError("Workspace track revision lost its track")
+            track = tracks[revision.track_identifier]
+            specification = revision.search
+            query = (
+                specification.search.query
+                if isinstance(specification, EbaySearchTargetSpecification)
+                else specification.search.request.query
+            )
+            tracks[revision.track_identifier] = track.model_copy(
+                update={
+                    "search_specification": specification,
+                    "search_specification_version": revision.version,
+                    "search_specification_record_identifier": revision.record_identifier,
+                    "query": query,
+                    "listing_state": (
+                        specification.search.listing_state
+                        if isinstance(specification, EbaySearchTargetSpecification)
+                        else None
+                    ),
+                }
+            )
         return tuple(tracks.values())
 
     async def get_review_workspace(self, record_identifier: str) -> ReviewWorkspace:
@@ -2537,6 +2655,167 @@ class ReviewApplication:
             binding
             for binding in workspace.product_guide_bindings
             if include_disabled or binding.enabled
+        )
+
+    async def list_workspace_search_track_versions(
+        self, workspace_record_identifier: str, track_identifier: str
+    ) -> tuple[WorkspaceSearchTrackSpecificationRecord, ...]:
+        workspace = await self.get_review_workspace(workspace_record_identifier)
+        track = next(
+            (item for item in workspace.search_tracks if item.track_identifier == track_identifier),
+            None,
+        )
+        if track is None:
+            raise ReviewInputError("The search track is not part of this workspace")
+        stored = await self.database.workspace_search_track_specifications(
+            workspace_record_identifier, track_identifier
+        )
+        if stored:
+            return tuple(
+                WorkspaceSearchTrackSpecificationRecord.model_validate(value) for _, value in stored
+            )
+        if track.search_specification is None:
+            raise ReviewInputError(
+                "The legacy track lacks a complete retained search specification"
+            )
+        return (
+            WorkspaceSearchTrackSpecificationRecord(
+                workspace_record_identifier=workspace_record_identifier,
+                track_identifier=track_identifier,
+                version=1,
+                search=track.search_specification,
+                recorded_at_utc=workspace.created_at_utc,
+            ),
+        )
+
+    async def revise_workspace_search_track(
+        self, request: ReviseWorkspaceSearchTrackRequest
+    ) -> WorkspaceSearchTrack:
+        """Change future search intent without changing track identity or retained evidence."""
+
+        workspace = await self.get_review_workspace(request.workspace_record_identifier)
+        track = next(
+            (
+                item
+                for item in workspace.search_tracks
+                if item.track_identifier == request.track_identifier
+            ),
+            None,
+        )
+        if track is None:
+            raise ReviewInputError("The search track is not part of this workspace")
+        if track.search_specification_version != request.expected_version:
+            raise ReviewInputError(
+                f"Search track version conflict: expected {request.expected_version}, "
+                f"current {track.search_specification_version}; read the current track before revising"
+            )
+        search = (
+            FacebookSearchTargetSpecification(search=request.search)
+            if isinstance(request.search, CreateSearchRequest)
+            else request.search
+        )
+        if search.marketplace != track.marketplace:
+            raise ReviewInputError(
+                "A search track's marketplace cannot change; create another track"
+            )
+        if isinstance(search, EbaySearchTargetSpecification):
+            _require_ebay_search_acquisition(search.search)
+        else:
+            CollectSearchPayload(
+                request=search.search.request,
+                traversal=search.search.traversal,
+                traversal_strategy=search.search.traversal_strategy,
+                routing=search.search.requested_network_path,
+            )
+        if track.search_specification is None:
+            raise ReviewInputError(
+                "The legacy track lacks a complete retained search specification"
+            )
+        if track.search_specification == search:
+            return track
+        records = []
+        previous_identifier = track.search_specification_record_identifier
+        if previous_identifier is None:
+            previous_identifier = self.new_identifier()
+            original = WorkspaceSearchTrackSpecificationRecord(
+                record_identifier=previous_identifier,
+                workspace_record_identifier=workspace.record_identifier,
+                track_identifier=track.track_identifier,
+                version=1,
+                search=track.search_specification,
+                recorded_at_utc=workspace.created_at_utc,
+            )
+            records.append(
+                RecordDraft(
+                    identifier=previous_identifier,
+                    kind=WORKSPACE_SEARCH_TRACK_SPECIFICATION_KIND,
+                    schema_version=1,
+                    value=original.model_dump(mode="json"),
+                )
+            )
+        identifier = self.new_identifier()
+        revision = WorkspaceSearchTrackSpecificationRecord(
+            record_identifier=identifier,
+            workspace_record_identifier=workspace.record_identifier,
+            track_identifier=track.track_identifier,
+            version=request.expected_version + 1,
+            search=search,
+            previous_record_identifier=previous_identifier,
+            recorded_at_utc=_utc_text(self.utc_now_ns()),
+        )
+        records.append(
+            RecordDraft(
+                identifier=identifier,
+                kind=WORKSPACE_SEARCH_TRACK_SPECIFICATION_KIND,
+                schema_version=1,
+                value=revision.model_dump(mode="json"),
+            )
+        )
+        inputs = (NamedInput(name=("workspace",), object_identifier=workspace.record_identifier),)
+        if track.search_specification_record_identifier is not None:
+            inputs += (
+                NamedInput(
+                    name=("previous_specification",),
+                    object_identifier=track.search_specification_record_identifier,
+                ),
+            )
+        try:
+            await self._publish_local_records(
+                component_identifier=REVISE_WORKSPACE_SEARCH_TRACK,
+                records=tuple(records),
+                inputs=inputs,
+                outputs=tuple(
+                    NamedOutput(
+                        name=("search_specification", str(index)),
+                        object_identifier=record.identifier,
+                    )
+                    for index, record in enumerate(records)
+                ),
+                result={
+                    "state": "completed",
+                    "track_identifier": track.track_identifier,
+                    "version": revision.version,
+                },
+                workspace_track_guard=(
+                    workspace.record_identifier,
+                    track.track_identifier,
+                    request.expected_version,
+                ),
+            )
+        except ValueError as error:
+            raise ReviewInputError(str(error)) from error
+        return track.model_copy(
+            update={
+                "search_specification": search,
+                "search_specification_version": revision.version,
+                "search_specification_record_identifier": identifier,
+                "query": search.search.query
+                if isinstance(search, EbaySearchTargetSpecification)
+                else search.search.request.query,
+                "listing_state": search.search.listing_state
+                if isinstance(search, EbaySearchTargetSpecification)
+                else None,
+            }
         )
 
     async def set_workspace_search_track_enabled(
@@ -4666,6 +4945,7 @@ class ReviewApplication:
         *,
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
+        requester_context: dict[str, JsonValue] | None = None,
     ) -> CreateSearchResult:
         _require_ebay_search_acquisition(request)
         payload = CollectEbaySearchPayload(request=request)
@@ -4683,6 +4963,7 @@ class ReviewApplication:
                 context={
                     "marketplace": "ebay",
                     "request": request.model_dump(mode="json"),
+                    **(requester_context or {}),
                 },
             ),
             event_identifier=self.new_identifier(),
@@ -4700,16 +4981,13 @@ class ReviewApplication:
         *,
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
+        requester_context: dict[str, JsonValue] | None = None,
     ) -> CreateSearchResult:
         payload = CollectSearchPayload(
             request=request.request,
             traversal=request.traversal,
             traversal_strategy=request.traversal_strategy,
-            routing=("proton", "personal", request.proton_route),
-        )
-        await self.database.register_constraint(
-            facebook_search_work_constraint(payload.routing),
-            registered_at_utc_ns=self.utc_now_ns(),
+            routing=request.requested_network_path,
         )
         requested_identifier = self.new_identifier()
         enqueued = await self.database.enqueue_work(
@@ -4722,7 +5000,7 @@ class ReviewApplication:
                 request_identifier=self.new_identifier(),
                 kind=requester_kind,
                 identifier=requester_identifier or requested_identifier,
-                context={"request": request.model_dump(mode="json")},
+                context={"request": request.model_dump(mode="json"), **(requester_context or {})},
             ),
             event_identifier=self.new_identifier(),
             enqueued_at_utc_ns=self.utc_now_ns(),
@@ -4774,10 +5052,66 @@ class ReviewApplication:
             raise ReviewInputError("The workspace's original search run has no creation to retry")
         work = await self.database.work(track.creation_work_identifier)
         if tuple(work["kind"]) == COLLECT_EBAY_SEARCH_WORK_KIND:
-            payload = CollectEbaySearchPayload.model_validate_json(encode_json(work["payload"]))
-            _require_ebay_search_acquisition(payload.request)
+            original_payload = CollectEbaySearchPayload.model_validate_json(
+                encode_json(work["payload"])
+            )
+            current_search = (
+                track.search_specification.search
+                if track.search_specification_version > 1
+                and isinstance(track.search_specification, EbaySearchTargetSpecification)
+                else original_payload.request
+            )
+            _require_ebay_search_acquisition(current_search)
         if WorkState(str(work["state"])) is not WorkState.TERMINAL_FAILURE:
             raise ReviewInputError("The search track creation is not in terminal failure")
+        if (
+            track.search_specification_version > 1
+            and track.search_specification is not None
+            and self._retained_track_specification(
+                track.search_specification.marketplace, work["payload"]
+            )
+            != track.search_specification
+        ):
+            if track.current_search_run_record_identifier is not None:
+                raise ReviewInputError(
+                    "The track's search specification was revised; use request_workspace_refresh "
+                    "to acquire the current version and preserve its retained baseline"
+                )
+            # No usable baseline exists yet. Acquire the revised initial intent
+            # under its stable requester, never rewrite the old failed payload.
+            specification = track.search_specification
+            context: dict[str, JsonValue] = {
+                "track_identifier": track.track_identifier,
+                "search_specification_version": track.search_specification_version,
+                "search_specification_record_identifier": track.search_specification_record_identifier,
+            }
+            if isinstance(specification, EbaySearchTargetSpecification):
+                if request.acquisition_stack is not None:
+                    raise ReviewInputError(
+                        "Revise the search specification to change its acquisition stack"
+                    )
+                result = await self._create_ebay_search(
+                    specification.search,
+                    requester_kind=("carl", "mcp", "create_workspace_search_revision"),
+                    requester_identifier=workspace.record_identifier,
+                    requester_context=context,
+                )
+            else:
+                if request.acquisition_stack is not None:
+                    raise ReviewInputError("acquisition_stack applies only to eBay search retries")
+                result = await self._create_search(
+                    specification.search,
+                    requester_kind=("carl", "mcp", "create_workspace_search_revision"),
+                    requester_identifier=workspace.record_identifier,
+                    requester_context=context,
+                )
+            return RetryWorkspaceSearchTrackResult(
+                workspace_record_identifier=workspace.record_identifier,
+                track_identifier=track.track_identifier,
+                work_identifier=result.work_identifier,
+                previous_attempt_count=int(work["attempt"]),
+                state=WorkState(result.state),
+            )
         error = work.get("error")
         if tuple(work["kind"]) == COLLECT_EBAY_SEARCH_WORK_KIND:
             if not isinstance(error, dict) or error.get("kind") not in {
@@ -4831,11 +5165,6 @@ class ReviewApplication:
             raise ReviewInputError("acquisition_stack applies only to eBay search retries")
         if not is_transient_search_failure(error):
             raise ReviewInputError("The search track failed permanently and cannot be retried")
-        payload = CollectSearchPayload.model_validate_json(encode_json(work["payload"]))
-        await self.database.register_constraint(
-            facebook_search_work_constraint(payload.routing),
-            registered_at_utc_ns=self.utc_now_ns(),
-        )
         previous_attempt = await self.database.retry_terminal_collect_search_work(
             work_item_identifier=track.creation_work_identifier,
             retried_at_utc_ns=self.utc_now_ns(),
@@ -4872,6 +5201,7 @@ class ReviewApplication:
         requester_kind: tuple[str, ...],
         requester_identifier: str,
         requester_context: JsonValue,
+        search_specification: SearchTargetSpecification | None = None,
     ) -> SearchRefreshRequestResult:
         kind, _, base = await self.database.get_record(request.base_search_run_record_identifier)
         if kind == ("carl", "ebay", "search_run") and isinstance(base, dict):
@@ -4881,6 +5211,7 @@ class ReviewApplication:
                 requester_kind=requester_kind,
                 requester_identifier=requester_identifier,
                 requester_context=requester_context,
+                search_specification=search_specification,
             )
         if kind != ("carl", "facebook", "search_run") or not isinstance(base, dict):
             raise ReviewInputError("Refresh input is not a supported retained search-run record")
@@ -4889,6 +5220,11 @@ class ReviewApplication:
         stored_request = base.get("request")
         stored_traversal = base.get("traversal")
         stored_strategy = base.get("traversal_strategy")
+        if isinstance(search_specification, FacebookSearchTargetSpecification):
+            intent = search_specification.search
+            stored_request = intent.request.model_dump(mode="json")
+            stored_traversal = {"policy": intent.traversal.model_dump(mode="json")}
+            stored_strategy = intent.traversal_strategy.model_dump(mode="json")
         if not isinstance(stored_traversal, dict):
             raise ReviewInputError("The retained search has no traversal policy")
         policy = stored_traversal.get("policy")
@@ -4907,7 +5243,16 @@ class ReviewApplication:
                             if request.traversal_strategy is not None
                             else stored_strategy
                         ),
-                        "routing": ["proton", "personal", request.proton_route],
+                        "routing": list(
+                            request.requested_search_network_path
+                            or (
+                                search_specification.search.requested_network_path
+                                if isinstance(
+                                    search_specification, FacebookSearchTargetSpecification
+                                )
+                                else DEFAULT_DATACENTER_NETWORK_PATH
+                            )
+                        ),
                     }
                 )
             )
@@ -4921,7 +5266,7 @@ class ReviewApplication:
             maximum_items=request.maximum_items,
             maximum_images=request.maximum_images,
             item_routing=("decodo", "personal", request.decodo_route),
-            image_routing=("proton", "personal", request.proton_route),
+            image_routing=request.requested_image_network_path,
         )
         enqueued = await self.database.enqueue_work(
             refresh_search_work(
@@ -4953,15 +5298,25 @@ class ReviewApplication:
         requester_kind: tuple[str, ...],
         requester_identifier: str,
         requester_context: JsonValue,
+        search_specification: SearchTargetSpecification | None = None,
     ) -> SearchRefreshRequestResult:
         if request.traversal is not None or request.traversal_strategy is not None:
             raise ReviewInputError("Facebook traversal overrides do not apply to eBay")
-        if request.proton_route != "carl" or request.decodo_route != "carl":
+        if (
+            request.proton_route is not None
+            or request.search_network_path is not None
+            or request.image_network_path != DEFAULT_DATACENTER_NETWORK_PATH
+            or request.decodo_route != "carl"
+        ):
             raise ReviewInputError(
                 "eBay uses its acquisition stack and the carl image route; route overrides "
                 "are not supported. Select acquisition_stack for item/search transport."
             )
-        stored = base.get("request")
+        stored = (
+            search_specification.search.model_dump(mode="json")
+            if isinstance(search_specification, EbaySearchTargetSpecification)
+            else base.get("request")
+        )
         if not isinstance(stored, dict):
             raise ReviewInputError("The retained eBay search has no usable request")
         overrides: dict[str, JsonValue] = dict(stored)
@@ -5035,6 +5390,15 @@ class ReviewApplication:
             if track.current_search_run_record_identifier is None:
                 raise ReviewInputError("Wait for the search track's initial search to complete")
         assert track.current_search_run_record_identifier is not None
+        if (
+            track.latest_refresh_work_state in (WorkState.PENDING, WorkState.LEASED)
+            and track.latest_refresh_search_specification_version is not None
+            and track.latest_refresh_search_specification_version
+            != track.search_specification_version
+        ):
+            raise ReviewInputError(
+                "Wait for the active refresh to finish before refreshing the revised search version"
+            )
         refresh_request = SearchRefreshRequest(
             base_search_run_record_identifier=track.current_search_run_record_identifier,
             traversal=request.traversal,
@@ -5042,6 +5406,8 @@ class ReviewApplication:
             maximum_items=request.maximum_items,
             maximum_images=request.maximum_images,
             proton_route=request.proton_route,
+            search_network_path=request.search_network_path,
+            image_network_path=request.image_network_path,
             decodo_route=request.decodo_route,
             acquisition_stack=request.acquisition_stack,
             maximum_pages=request.maximum_pages,
@@ -5052,8 +5418,20 @@ class ReviewApplication:
             requester_identifier=workspace.record_identifier,
             requester_context={
                 "track_identifier": track.track_identifier,
+                "search_specification_version": track.search_specification_version,
+                "search_specification_record_identifier": track.search_specification_record_identifier,
                 "request": request.model_dump(mode="json"),
             },
+            search_specification=(
+                track.search_specification
+                if track.search_specification_version > 1
+                or (
+                    track.creation_work_identifier is not None
+                    and isinstance(track.search_specification, FacebookSearchTargetSpecification)
+                    and track.search_specification.search.proton_route is None
+                )
+                else None
+            ),
         )
         return RequestWorkspaceRefreshResult(
             workspace_record_identifier=workspace.record_identifier,
@@ -6013,8 +6391,55 @@ class ReviewApplication:
             outputs=[output.model_dump(mode="json") for output in outputs],
         )
 
+    async def request_search_pipeline(
+        self, request: RequestSearchPipelineRequest
+    ) -> SearchPipelineRequestResult:
+        from carl.pipeline import request_search_pipeline
+
+        return await request_search_pipeline(self, request)
+
+    async def get_search_pipeline(self, work_identifier: str) -> SearchPipelineStatus:
+        from carl.pipeline import get_search_pipeline
+
+        return await get_search_pipeline(self, work_identifier)
+
+    async def pipeline_analysis_reuse(
+        self, observation_identifier: str, options: PipelineOptions
+    ) -> bool:
+        from carl.core.analysis_batch import ListingAnalysisSelectionPolicy
+
+        if options.selection_policy is ListingAnalysisSelectionPolicy.MISSING_FOR_CURRENT_EVIDENCE:
+            return False
+        kind, _, value = await self.database.get_record(observation_identifier)
+        if not isinstance(value, dict):
+            raise ReviewInputError("Pipeline analysis input is not an observation")
+        if kind == ("carl", "facebook", "listing_observation"):
+            marketplace = "facebook"
+            external_identifier = value.get("listing_id")
+        elif kind == ("carl", "ebay", "listing_observation"):
+            marketplace = "ebay"
+            external_identifier = value.get("item_identifier")
+        else:
+            raise ReviewInputError("Pipeline analysis input is not a marketplace observation")
+        if not isinstance(external_identifier, str):
+            raise ReviewInputError("Pipeline observation has no exact listing identity")
+        return await self.database.pipeline_completed_analysis_exists(
+            marketplace=marketplace,
+            external_identifier=external_identifier,
+            product_guide_record_identifier=(
+                options.product_guide_record_identifier
+                if options.selection_policy
+                is ListingAnalysisSelectionPolicy.MISSING_FOR_SELECTED_GUIDE
+                else None
+            ),
+        )
+
     async def request_listing_details(
-        self, request: RequestEbayListingDetailsRequest
+        self,
+        request: RequestEbayListingDetailsRequest,
+        *,
+        requester_kind: tuple[str, ...] = ("carl", "marketplace", "request_listing_details"),
+        requester_identifier: str | None = None,
     ) -> RequestListingDetailsResult:
         if request.marketplace is Marketplace.FACEBOOK:
             reused = not request.refresh and bool(
@@ -6029,15 +6454,15 @@ class ReviewApplication:
                     maximum_images=request.maximum_images,
                     refresh=request.refresh,
                     item_routing=("decodo", "personal", request.decodo_route),
-                    image_routing=("proton", "personal", request.proton_route),
+                    image_routing=request.requested_image_network_path,
                 ),
             )
             enqueued = await self.database.enqueue_work(
                 definition,
                 WorkRequester(
                     request_identifier=self.new_identifier(),
-                    kind=("carl", "marketplace", "request_listing_details"),
-                    identifier=definition.identifier,
+                    kind=requester_kind,
+                    identifier=requester_identifier or definition.identifier,
                     context=request.model_dump(mode="json"),
                 ),
                 event_identifier=self.new_identifier(),
@@ -6080,8 +6505,8 @@ class ReviewApplication:
             definition,
             WorkRequester(
                 request_identifier=self.new_identifier(),
-                kind=("carl", "marketplace", "request_listing_details"),
-                identifier=definition.identifier,
+                kind=requester_kind,
+                identifier=requester_identifier or definition.identifier,
                 context=request.model_dump(mode="json"),
             ),
             event_identifier=self.new_identifier(),

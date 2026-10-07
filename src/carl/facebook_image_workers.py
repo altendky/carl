@@ -1,6 +1,8 @@
 """Durable image acquisitions and offline validation for Marketplace galleries."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from uuid import NAMESPACE_URL, uuid5
 
 import anyio
 
@@ -14,6 +16,7 @@ from carl.core.facebook_images import (
     CollectImagePayload,
     ExtractImagePayload,
     GalleryImageReference,
+    SavedImageCandidate,
     VerifiedImage,
     gallery_references,
     image_network_activity,
@@ -21,6 +24,7 @@ from carl.core.facebook_images import (
     plan_image_followups,
     verify_image,
 )
+from carl.core.json import encode_json
 from carl.core.models import ExternalFileDraft, JsonValue, NamedInput, NamedOutput, RecordDraft
 from carl.core.work import WorkCapability
 from carl.core.worker import (
@@ -69,9 +73,9 @@ def _collect_component() -> None:
 def build_image_component_registry() -> Registry:
     return Registry(
         (
-            Component(COLLECT_FACEBOOK_IMAGE, 3, _collect_component),
+            Component(COLLECT_FACEBOOK_IMAGE, 4, _collect_component),
             Component(EXTRACT_FACEBOOK_IMAGE, 1, verify_image),
-            Component(PLAN_FACEBOOK_IMAGE_FOLLOWUPS, 2, plan_image_followups),
+            Component(PLAN_FACEBOOK_IMAGE_FOLLOWUPS, 3, plan_image_followups),
             Component(EXTRACT_FACEBOOK_GALLERY_REFERENCES, 1, gallery_references),
             Component(REUSE_FACEBOOK_GALLERY_IMAGE, 1, image_reuse_record),
         )
@@ -86,6 +90,133 @@ class ImageWorkerDependencies:
     new_identifier: IdentifierFactory
     network_activity_scheduler: NetworkActivityScheduler | None = None
     network_session_identifier: str | None = None
+
+
+async def validate_saved_image_results(
+    database: Database,
+    saved: tuple[tuple[str, dict[str, JsonValue]], ...],
+) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
+    """Saved metadata is reusable only while the retained bytes still verify."""
+    available: list[tuple[str, dict[str, JsonValue]]] = []
+    verified: dict[str, bool] = {}
+    for identifier, value in saved:
+        artifact_identifier = value.get("image_artifact_identifier")
+        if not isinstance(artifact_identifier, str):
+            continue
+        if artifact_identifier not in verified:
+            try:
+                await database.get_artifact(artifact_identifier)
+            except (KeyError, ValueError, OSError):
+                verified[artifact_identifier] = False
+            else:
+                verified[artifact_identifier] = True
+        if verified[artifact_identifier]:
+            available.append((identifier, value))
+    return tuple(available)
+
+
+async def publish_shared_image_reuses(
+    *,
+    database: Database,
+    context: AttemptContext,
+    reference_identifiers: tuple[str, ...],
+    checkpoint: dict[str, JsonValue],
+    utc_now_ns: Callable[[], int],
+) -> None:
+    """Bind each consumer's gallery edge after a shared acquisition completes."""
+    if not reference_identifiers:
+        return
+    references: list[tuple[str, GalleryImageReference]] = []
+    for identifier in dict.fromkeys(reference_identifiers):
+        _, _, value = await database.get_record(identifier)
+        references.append(
+            (identifier, GalleryImageReference.model_validate_json(encode_json(value)))
+        )
+    values: dict[str, dict[str, JsonValue]] = {}
+    for offset in range(0, len(references), 1000):
+        values.update(
+            await database.saved_facebook_image_candidates_for_references(
+                tuple(reference for _, reference in references[offset : offset + 1000])
+            )
+        )
+    saved = await validate_saved_image_results(database, tuple(values.items()))
+    candidates = tuple(
+        SavedImageCandidate.model_validate(
+            {
+                "image_result_record_identifier": identifier,
+                "source_photo_id": value.get("source_photo_id"),
+                "original_url": value.get("original_url"),
+                "width": value.get("width"),
+                "height": value.get("height"),
+            }
+        )
+        for identifier, value in saved
+    )
+    records: list[RecordDraft] = []
+    inputs: list[NamedInput] = []
+    outputs: list[NamedOutput] = []
+    for reference_identifier, reference in references:
+        decisions = plan_image_followups((reference,), candidates, 0).reuse_decisions
+        if not decisions:
+            continue
+        decision = decisions[0]
+        source_identifier = decision.candidate.image_result_record_identifier
+        if (
+            values[source_identifier].get("image_reference_record_identifier")
+            == reference_identifier
+        ):
+            continue
+        identifier = str(
+            uuid5(
+                NAMESPACE_URL,
+                "\x1f".join(
+                    (
+                        context.work_item_identifier,
+                        "shared_image_reuse",
+                        reference_identifier,
+                        source_identifier,
+                    )
+                ),
+            )
+        )
+        try:
+            await database.get_record(identifier)
+            continue
+        except KeyError:
+            pass
+        records.append(
+            RecordDraft(
+                identifier=identifier,
+                kind=("carl", "facebook", "image_reuse"),
+                schema_version=1,
+                value=image_reuse_record(decision.match_kind).model_dump(mode="json"),
+            )
+        )
+        inputs.extend(
+            (
+                NamedInput(
+                    name=("gallery_image_reference", identifier),
+                    object_identifier=reference_identifier,
+                ),
+                NamedInput(
+                    name=("source_image_result", identifier), object_identifier=source_identifier
+                ),
+            )
+        )
+        outputs.append(NamedOutput(name=("image_reuse", identifier), object_identifier=identifier))
+    if records:
+        await database.publish_leased_operation_checkpoint(
+            work_item_identifier=context.work_item_identifier,
+            lease_token=context.lease_token,
+            worker_identifier=context.worker_identifier,
+            utc_now_ns=utc_now_ns,
+            operation_id=context.operation_identifier,
+            records=tuple(records),
+            artifacts=(),
+            inputs=tuple(inputs),
+            outputs=tuple(outputs),
+            checkpoint_result=checkpoint,
+        )
 
 
 def image_session_failure_work(
@@ -236,6 +367,70 @@ async def _collect(
     context: AttemptContext,
     dependencies: ImageWorkerDependencies,
 ) -> WorkOutcome:
+    saved = await validate_saved_image_results(
+        dependencies.database,
+        await dependencies.database.saved_facebook_image_candidates_for_references(
+            (payload.reference,)
+        ),
+    )
+    values = dict(saved)
+    candidates = tuple(
+        SavedImageCandidate.model_validate(
+            {
+                "image_result_record_identifier": identifier,
+                "source_photo_id": value.get("source_photo_id"),
+                "original_url": value.get("original_url"),
+                "width": value.get("width"),
+                "height": value.get("height"),
+            }
+        )
+        for identifier, value in saved
+    )
+    reusable = plan_image_followups((payload.reference,), candidates, 0).reuse_decisions
+    if reusable:
+        source_identifier = reusable[0].candidate.image_result_record_identifier
+        source = values[source_identifier]
+        result_identifier = dependencies.new_identifier()
+        value = {
+            **source,
+            "image_reference_record_identifier": payload.reference_record_identifier,
+            "listing_id": payload.reference.listing_id,
+            "source_photo_id": payload.reference.photo_id,
+            "original_url": payload.reference.original_url,
+            "declared_width": payload.reference.declared_width,
+            "declared_height": payload.reference.declared_height,
+            "operation_identifier": context.operation_identifier,
+            "reused_image_result_record_identifier": source_identifier,
+            "source_producer": source.get("producer"),
+            "producer": {
+                "component_parts": list(COLLECT_FACEBOOK_IMAGE.parts),
+                "output_schema_version": 4,
+            },
+        }
+        return CompletedWork(
+            inputs=(
+                NamedInput(
+                    name=("gallery_image_reference",),
+                    object_identifier=payload.reference_record_identifier,
+                ),
+                NamedInput(name=("source_image_result",), object_identifier=source_identifier),
+            ),
+            records=(
+                RecordDraft(
+                    identifier=result_identifier,
+                    kind=("carl", "facebook", "image_result"),
+                    schema_version=1,
+                    value=value,
+                ),
+            ),
+            outputs=(NamedOutput(name=("image_result",), object_identifier=result_identifier),),
+            result={
+                "state": "saved",
+                "acquisition_record_identifier": source["acquisition_record_identifier"],
+                "image_result_record_identifier": result_identifier,
+                "reused_image_result_record_identifier": source_identifier,
+            },
+        )
     try:
         if dependencies.network_activity_scheduler is None:
             acquisition = await dependencies.acquirer.acquire(
@@ -393,7 +588,7 @@ async def _collect(
         verified=verified,
         locator=stored.locator,
         producer=COLLECT_FACEBOOK_IMAGE,
-        producer_output_schema_version=2,
+        producer_output_schema_version=4,
     )
     return CompletedWork(
         inputs=inputs,

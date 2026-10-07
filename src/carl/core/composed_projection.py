@@ -202,10 +202,10 @@ class SearchMembershipProjection(StrictModel):
 
     @model_validator(mode="after")
     def validate_absence_comparison(self) -> SearchMembershipProjection:
-        if self.absence_comparison_valid != (
-            self.comparison_coverage is SearchComparisonCoverage.COMPLETE
+        if self.absence_comparison_valid and (
+            self.comparison_coverage is not SearchComparisonCoverage.COMPLETE
         ):
-            raise ValueError("Absence validity must be derived from complete coverage")
+            raise ValueError("Absence validity requires complete coverage")
         return self
 
 
@@ -581,6 +581,7 @@ class SearchRunCandidate(StrictModel):
     completed_at_utc: str | None
     refresh_source_run_record_identifier: str | None = Field(default=None, min_length=1)
     stopping_reason: SearchStoppingReason | None
+    search_scope_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class SearchMembershipOccurrenceCandidate(StrictModel):
@@ -1210,6 +1211,11 @@ def compose_search_membership(
         return selected.observed_at_utc
 
     coverage = classify_search_comparison_coverage(selected_run.stopping_reason)
+    scope_changed = (
+        selected_run.search_scope_sha256 is not None
+        and last_run.search_scope_sha256 is not None
+        and selected_run.search_scope_sha256 != last_run.search_scope_sha256
+    )
     return SearchMembershipProjection(
         lineage_root_search_run_record_identifier=(
             ancestry.lineage_root_search_run_record_identifier
@@ -1228,8 +1234,14 @@ def compose_search_membership(
             None if selected_run.stopping_reason is None else selected_run.stopping_reason.value
         ),
         comparison_coverage=coverage,
-        absence_comparison_valid=coverage is SearchComparisonCoverage.COMPLETE,
-        warnings=ancestry.warnings,
+        absence_comparison_valid=(
+            coverage is SearchComparisonCoverage.COMPLETE and not scope_changed
+        ),
+        warnings=tuple(
+            dict.fromkeys(
+                (*ancestry.warnings, *(("search_scope_changed",) if scope_changed else ()))
+            )
+        ),
     )
 
 

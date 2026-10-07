@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 from pydantic import Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from carl.core.ebay_items import EbayItemRequest
 from carl.core.marketplace_search import Marketplace
 from carl.core.models import StrictModel
+from carl.core.network_defaults import (
+    DEFAULT_DATACENTER_NETWORK_PATH,
+    AcquisitionNetworkPath,
+    LegacyProtonRoute,
+    populate_legacy_proton_paths,
+    validate_legacy_proton_paths,
+)
 
 
 class GetMarketplaceListingRequest(StrictModel):
@@ -31,15 +39,33 @@ class RequestListingDetailsRequest(StrictModel):
     )
     maximum_images: int = Field(default=20, ge=0, le=50)
     refresh: bool = False
-    proton_route: str = Field(default="carl", min_length=1)
+    image_network_path: AcquisitionNetworkPath = Field(
+        default=DEFAULT_DATACENTER_NETWORK_PATH,
+        description="Gallery acquisition route; defaults directly to Decodo datacenter.",
+    )
+    proton_route: SkipJsonSchema[LegacyProtonRoute | None] = Field(default=None, exclude=True)
     decodo_route: str = Field(default="carl", min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_legacy_route(cls, value: object) -> object:
+        return populate_legacy_proton_paths(
+            value, legacy_field="proton_route", network_fields=("image_network_path",)
+        )
+
+    @property
+    def requested_image_network_path(self) -> tuple[str, ...]:
+        return self.image_network_path
 
     @model_validator(mode="after")
     def validate_source_options(self) -> RequestListingDetailsRequest:
+        validate_legacy_proton_paths(self.proton_route, self.image_network_path)
         if self.marketplace is Marketplace.EBAY:
             _ = self.item_request()
-            if self.proton_route != "carl" or self.decodo_route != "carl":
-                raise ValueError("eBay uses stack_identifier and the carl image route")
+            if self.image_network_path != DEFAULT_DATACENTER_NETWORK_PATH:
+                raise ValueError("eBay gallery images use the Decodo datacenter route")
+            if self.decodo_route != "carl":
+                raise ValueError("eBay item pages use stack_identifier, not decodo_route")
         elif self.stack_identifier != "ebay_anonymous":
             raise ValueError("stack_identifier applies only to eBay; Facebook uses route options")
         return self

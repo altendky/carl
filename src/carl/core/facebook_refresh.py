@@ -5,11 +5,19 @@ from __future__ import annotations
 import hashlib
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from carl.core.facebook_search import SearchTraversalPolicy, SearchTraversalStrategy
 from carl.core.facebook_work import CollectSearchPayload
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
+from carl.core.network_defaults import (
+    DEFAULT_DATACENTER_NETWORK_PATH,
+    AcquisitionNetworkPath,
+    LegacyProtonRoute,
+    populate_legacy_proton_paths,
+    validate_legacy_proton_paths,
+)
 from carl.core.work import (
     ConcurrencyConstraint,
     SchedulingScope,
@@ -48,10 +56,41 @@ class SearchRefreshRequest(StrictModel):
     traversal_strategy: SearchTraversalStrategy | None = None
     maximum_items: int | None = Field(default=None, ge=1)
     maximum_images: int | None = Field(default=None, ge=1)
-    proton_route: str = Field(default="carl", min_length=1)
+    search_network_path: AcquisitionNetworkPath | None = Field(
+        default=None, description="Explicit Facebook search route; otherwise use the current spec."
+    )
+    image_network_path: AcquisitionNetworkPath = Field(
+        default=DEFAULT_DATACENTER_NETWORK_PATH,
+        description="Gallery acquisition route; defaults directly to Decodo datacenter.",
+    )
+    proton_route: SkipJsonSchema[LegacyProtonRoute | None] = Field(default=None, exclude=True)
     decodo_route: str = Field(default="carl", min_length=1)
     acquisition_stack: str | None = Field(default=None, min_length=1)
     maximum_pages: int | None = Field(default=None, ge=1, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_legacy_route(cls, value: object) -> object:
+        return populate_legacy_proton_paths(
+            value,
+            legacy_field="proton_route",
+            network_fields=("search_network_path", "image_network_path"),
+        )
+
+    @model_validator(mode="after")
+    def validate_legacy_route(self) -> SearchRefreshRequest:
+        validate_legacy_proton_paths(
+            self.proton_route, self.search_network_path, self.image_network_path
+        )
+        return self
+
+    @property
+    def requested_search_network_path(self) -> tuple[str, ...] | None:
+        return self.search_network_path
+
+    @property
+    def requested_image_network_path(self) -> tuple[str, ...]:
+        return self.image_network_path
 
 
 class RefreshSearchPayload(StrictModel):

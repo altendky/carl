@@ -215,8 +215,11 @@ def _source_component() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "network_path", (None, ("decodo", "personal", "other"), ("proton", "personal", "dedicated"))
+)
 async def test_request_search_refresh_inherits_request_and_accepts_strategy_override(
-    tmp_path: Path,
+    tmp_path: Path, network_path: tuple[str, ...] | None
 ) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         operation_identifier = "source-operation"
@@ -280,6 +283,7 @@ async def test_request_search_refresh_inherits_request_and_accepts_strategy_over
         queued = await application.request_search_refresh(
             SearchRefreshRequest(
                 base_search_run_record_identifier=record_identifier,
+                search_network_path=network_path,
                 traversal=SearchTraversalPolicy(maximum_results=50),
                 traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(
                     width=Decimal("10"), overlap=Decimal("2")
@@ -293,8 +297,11 @@ async def test_request_search_refresh_inherits_request_and_accepts_strategy_over
         assert payload["search"]["request"]["query"] == "telescope"
         assert payload["search"]["traversal"]["maximum_results"] == 50
         assert payload["search"]["traversal_strategy"]["width"] == "10"
+        assert payload["search"]["routing"] == list(
+            network_path or ("decodo", "personal", "datacenter")
+        )
         assert payload["item_routing"] == ["decodo", "personal", "carl"]
-        assert payload["image_routing"] == ["proton", "personal", "carl"]
+        assert payload["image_routing"] == ["decodo", "personal", "datacenter"]
         assert await database.requested_work_identifiers(
             requester_kind=("carl", "mcp", "request_search_refresh"),
             requester_identifier=record_identifier,
@@ -303,6 +310,7 @@ async def test_request_search_refresh_inherits_request_and_accepts_strategy_over
         duplicate = await application.request_search_refresh(
             SearchRefreshRequest(
                 base_search_run_record_identifier=record_identifier,
+                search_network_path=network_path,
                 traversal=SearchTraversalPolicy(maximum_results=50),
                 traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(
                     width=Decimal("10"), overlap=Decimal("2")

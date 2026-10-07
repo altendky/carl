@@ -51,6 +51,7 @@ from carl.core.models import (
     RecordDraft,
 )
 from carl.core.refresh_recovery import classify_refresh_completion, refresh_failure_summary
+from carl.core.search_scope import search_scope_changed
 from carl.core.work import WorkCapability, WorkRequester, WorkState
 from carl.core.worker import (
     AttemptContext,
@@ -63,6 +64,8 @@ from carl.facebook_image_workers import (
     EXTRACT_FACEBOOK_GALLERY_REFERENCES,
     REUSE_FACEBOOK_GALLERY_IMAGE,
     build_image_component_registry,
+    publish_shared_image_reuses,
+    validate_saved_image_results,
 )
 from carl.io.browser_identity import brave_navigation_headers
 from carl.io.provenance import process_invocation
@@ -78,7 +81,7 @@ def _component_anchor() -> None:
 
 
 def build_refresh_component_registry() -> Registry:
-    return Registry((Component(REFRESH_FACEBOOK_SEARCH, 2, _component_anchor),))
+    return Registry((Component(REFRESH_FACEBOOK_SEARCH, 3, _component_anchor),))
 
 
 def _stable_identifier(*parts: str) -> str:
@@ -311,7 +314,15 @@ async def _item_phase(
     _, _, refreshed = await database.get_record(refreshed_identifier)
     base_ids = _search_listing_identifiers(base)
     refreshed_ids = _search_listing_identifiers(refreshed)
-    listing_ids = tuple(dict.fromkeys((*refreshed_ids, *base_ids)))[: payload.maximum_items]
+    scope_changed = search_scope_changed(
+        "facebook",
+        base.get("request") if isinstance(base, dict) else None,
+        payload.search.request.model_dump(mode="json"),
+    )
+    comparison_base_ids = () if scope_changed else base_ids
+    listing_ids = tuple(dict.fromkeys((*refreshed_ids, *comparison_base_ids)))[
+        : payload.maximum_items
+    ]
     successful_results = await database.successful_facebook_item_page_results(listing_ids)
     followup_plan = plan_item_page_followups(
         (
@@ -321,7 +332,7 @@ async def _item_phase(
             ),
             SearchRunListingCandidates(
                 search_run_record_identifier=payload.base_search_run_record_identifier,
-                listing_identifiers=base_ids,
+                listing_identifiers=comparison_base_ids,
             ),
         ),
         successful_results,
@@ -504,8 +515,13 @@ async def _item_phase(
                 identifier for identifier in refreshed_ids if identifier not in set(base_ids)
             ],
             "absent_from_refresh_listing_identifiers": list(
-                identifier for identifier in base_ids if identifier not in set(refreshed_ids)
+                identifier
+                for identifier in comparison_base_ids
+                if identifier not in set(refreshed_ids)
             ),
+            "search_scope_comparison_valid": not scope_changed,
+            "search_scope_changed": scope_changed,
+            "comparison_warnings": ["search_scope_changed"] if scope_changed else [],
             "reused_successful_item_pages": len(reused_results),
             "item_collections": len(collections),
             "item_extractions": len(extractions),
@@ -526,8 +542,18 @@ async def _image_phase(
         raise ValueError("Refresh checkpoint has no search-run record identifier")
     _, _, base = await database.get_record(payload.base_search_run_record_identifier)
     _, _, refreshed = await database.get_record(refreshed_identifier)
+    scope_changed = search_scope_changed(
+        "facebook",
+        base.get("request") if isinstance(base, dict) else None,
+        payload.search.request.model_dump(mode="json"),
+    )
     listing_ids = tuple(
-        dict.fromkeys((*_search_listing_identifiers(refreshed), *_search_listing_identifiers(base)))
+        dict.fromkeys(
+            (
+                *_search_listing_identifiers(refreshed),
+                *(() if scope_changed else _search_listing_identifiers(base)),
+            )
+        )
     )[: payload.maximum_items]
     successful = await database.successful_facebook_item_page_results(listing_ids)
     latest_by_listing = {}
@@ -638,7 +664,16 @@ async def _image_phase(
                 "resumed_image_extraction_work_identifiers": resumed_identifiers,
             },
         )
-    saved_candidates = _saved_image_candidates(await database.saved_facebook_image_results())
+    saved_values: dict[str, dict[str, JsonValue]] = {}
+    for offset in range(0, len(references), 1000):
+        saved_values.update(
+            await database.saved_facebook_image_candidates_for_references(
+                tuple(references[offset : offset + 1000])
+            )
+        )
+    saved_candidates = _saved_image_candidates(
+        await validate_saved_image_results(database, tuple(saved_values.items()))
+    )
     maximum_images = (
         len({reference.rendition_identity for reference in references})
         if plan_exists
@@ -666,7 +701,7 @@ async def _image_phase(
     }
     reuse_records: list[RecordDraft] = []
     reuse_inputs: list[tuple[tuple[str, ...], str]] = []
-    for decision in source_reuses:
+    for decision in plan.reuse_decisions:
         reference_identifier = reference_identifiers[references[decision.reference_index]]
         key = (
             reference_identifier,
@@ -941,6 +976,15 @@ async def _image_phase(
         and isinstance(work.get("result"), dict)
         and work["result"].get("state") == "saved"
         for work in collections
+    )
+    await publish_shared_image_reuses(
+        database=database,
+        context=context,
+        reference_identifiers=tuple(
+            identifier for entries in selected for identifier, _ in entries
+        ),
+        checkpoint=checkpoint,
+        utc_now_ns=dependencies.utc_now_ns,
     )
     failed = len(collections) - saved
     failed += sum(work.get("state") != WorkState.COMPLETED.value for work in extraction_results)

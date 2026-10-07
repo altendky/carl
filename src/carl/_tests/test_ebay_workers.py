@@ -4,6 +4,7 @@ from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from time import perf_counter_ns, time_ns
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -41,6 +42,22 @@ _SEARCH_REFERENCES = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _stub_checkpoint_for_synthetic_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Policy unit tests call handlers without creating their synthetic leases."""
+
+    checkpoint = Database.publish_leased_operation_checkpoint
+
+    async def publish(database: Database, **kwargs: Any) -> None:
+        try:
+            await database.work(kwargs["work_item_identifier"])
+        except KeyError:
+            return
+        await checkpoint(database, **kwargs)
+
+    monkeypatch.setattr(Database, "publish_leased_operation_checkpoint", publish)
+
+
 async def _provenance() -> CodeProvenance:
     return CodeProvenance(
         repository_url=None,
@@ -74,8 +91,9 @@ async def test_worker_links_child_search_records_as_work_inputs(tmp_path: Path) 
         directories: CarlDirectories,
         request: EbaySearchRequest,
         new_identifier: Callable[[], str],
+        search_run_identifier: str,
     ) -> dict[str, object]:
-        del directories, new_identifier
+        del directories, new_identifier, search_run_identifier
         observed.append(request)
         return {
             "state": "completed",
@@ -534,8 +552,9 @@ async def test_worker_completes_with_child_records_already_published(
         directories: CarlDirectories,
         request: EbaySearchRequest,
         new_identifier: Callable[[], str],
+        search_run_identifier: str,
     ) -> dict[str, JsonValue]:
-        del directories, new_identifier
+        del directories, new_identifier, search_run_identifier
         assert request.query == "oscilloscope"
         # Model the real collector: each child has already published its outputs.
         for _, identifier in _SEARCH_REFERENCES:
@@ -644,8 +663,20 @@ async def test_worker_completes_with_child_records_already_published(
             _SEARCH_REFERENCES
         )
         outputs = connection.execute(
-            "SELECT operation_id, object_id FROM operation_outputs"
+            """
+            SELECT operation_id, object_id FROM operation_outputs
+            JOIN objects ON objects.id = operation_outputs.object_id
+            WHERE objects.kind_parts_json != '["carl","ebay","search_attempt"]'
+            """
         ).fetchall()
         assert set(outputs) == {
             (f"collector-{identifier}", identifier) for _, identifier in _SEARCH_REFERENCES
         }
+        assert connection.execute(
+            """
+            SELECT count(*) FROM objects
+            WHERE kind_parts_json = '["carl","ebay","search_attempt"]'
+              AND created_by_operation_id = ?
+            """,
+            (operation_identifier,),
+        ).fetchone() == (1,)
