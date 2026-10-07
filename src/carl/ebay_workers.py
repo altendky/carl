@@ -18,7 +18,7 @@ from carl.core.ebay_search_support import (
     UnsupportedEbaySearchMode,
     require_supported_ebay_search_acquisition,
 )
-from carl.core.models import JsonValue, NamedInput
+from carl.core.models import JsonValue, NamedInput, NamedOutput, RecordDraft
 from carl.core.work import WorkCapability
 from carl.core.worker import (
     AttemptContext,
@@ -74,12 +74,40 @@ async def _collect(
             },
             result={"state": "configuration_failed"},
         )
+    search_run_identifier = dependencies.new_identifier()
+    binding_identifier = dependencies.new_identifier()
+    await dependencies.database.publish_leased_operation_checkpoint(
+        work_item_identifier=context.work_item_identifier,
+        lease_token=context.lease_token,
+        worker_identifier=context.worker_identifier,
+        utc_now_ns=dependencies.utc_now_ns,
+        operation_id=context.operation_identifier,
+        records=(
+            RecordDraft(
+                identifier=binding_identifier,
+                kind=("carl", "ebay", "search_attempt"),
+                schema_version=1,
+                value={
+                    "work_identifier": context.work_item_identifier,
+                    "attempt": context.attempt,
+                    "search_run_record_identifier": search_run_identifier,
+                },
+            ),
+        ),
+        artifacts=(),
+        outputs=(NamedOutput(name=("search", "attempt"), object_identifier=binding_identifier),),
+        checkpoint_result={
+            "state": "collecting",
+            "search_run_identifier": search_run_identifier,
+        },
+    )
     try:
         result = await dependencies.collector(
             dependencies.database,
             directories=dependencies.directories,
             request=payload.request,
             new_identifier=dependencies.new_identifier,
+            search_run_identifier=search_run_identifier,
         )
     except ConfigurationFailure as error:
         return TerminalFailureWork(

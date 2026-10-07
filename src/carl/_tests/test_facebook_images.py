@@ -17,6 +17,7 @@ import pytest
 from PIL import Image
 
 import carl.core.facebook_images as facebook_images
+from carl.core.acquisition_identity import acquisition_resource_identity
 from carl.core.components import Component, ComponentId
 from carl.core.facebook_images import (
     COLLECT_IMAGE_WORK_KIND,
@@ -171,7 +172,7 @@ def test_gallery_planner_keeps_edges_but_deduplicates_requests() -> None:
     assert not exact.download_groups
     assert exact.reuse_decisions[0].match_kind is ImageReuseMatchKind.EXACT_RENDITION
 
-    refreshed = first.model_copy(update={"original_url": URL + "&refreshed=1"})
+    refreshed = first.model_copy(update={"original_url": URL.replace("oe=abc", "oe=def")})
     reused = plan_image_followups((refreshed,), (candidate,), 1)
     assert not reused.download_groups
     assert (
@@ -372,9 +373,17 @@ def test_image_url_and_route_are_validated() -> None:
         reference=_reference(),
         request_plan=RequestPlan(url=URL, follow_redirects=False, routing=ROUTE),
     )
+    resource_identity = acquisition_resource_identity(
+        COLLECT_IMAGE_WORK_KIND, payload.model_dump(mode="json", by_alias=True)
+    )
+    assert resource_identity is not None
     assert collect_image_work(
         identifier="work", payload=payload, not_before_utc_ns=0
-    ).deduplication_identity == (*_reference().rendition_identity, "routing", *ROUTE)
+    ).deduplication_identity == (
+        *resource_identity,
+        "fetch_url",
+        hashlib.sha256(URL.encode("utf-8")).hexdigest(),
+    )
     other_route = payload.model_copy(
         update={
             "request_plan": RequestPlan(
@@ -1118,7 +1127,7 @@ async def test_image_worker_retains_response_and_validation_result(
                 "collect",
                 "gallery_image",
             ]
-            assert operation["output_schema_version"] == 3
+            assert operation["output_schema_version"] == 4
             acquisition_id = collection["result"]["acquisition_record_identifier"]
             _, _, acquisition = await database.get_record(acquisition_id)
             assert acquisition["request_plan"]["url"] == URL
@@ -1146,7 +1155,7 @@ async def test_image_worker_retains_response_and_validation_result(
                 assert metadata["storage"]["backend"] == "filesystem"
                 assert result["producer"] == {
                     "component_parts": ["carl", "facebook", "collect", "gallery_image"],
-                    "output_schema_version": 2,
+                    "output_schema_version": 4,
                 }
                 with closing(sqlite3.connect(tmp_path / "carl.sqlite3")) as connection:
                     assert connection.execute("SELECT count(*) FROM artifacts").fetchone() == (0,)

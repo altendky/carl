@@ -149,6 +149,7 @@ from carl.io.paths import user_directories
 from carl.io.processes import database_process_activity
 from carl.io.proton import ManagedProtonHttpAcquirer, ProtonWireproxyManager
 from carl.io.provenance import collect_code_provenance_async, process_invocation
+from carl.io.route_cutover import cutover_route_overrides as perform_route_cutover
 from carl.io.sqlite import Database
 from carl.io.worker import WorkerRuntimeServices, execute_lease
 from carl.mcp_server import serve_stdio
@@ -157,7 +158,6 @@ from carl.work_runtime import managed_worker_pool, work_forever
 
 app = App(name="carl", help="Preserve web evidence and derived information")
 _HEADER_PAIRS = TypeAdapter(list[tuple[str, str]], config=ConfigDict(strict=True))
-_DEFAULT_PROTON_ROUTE = "carl"
 
 
 def _identifier() -> str:
@@ -1218,10 +1218,36 @@ def collect_search_items(
 
 
 @app.command
+def cutover_route_overrides(database: Path = _DEFAULT_DATABASE) -> None:
+    """Offline: revise unfinished work/tracks before removing Proton-to-Decodo overrides.
+
+    Stop workers first. This preserves completed evidence and performs no network
+    acquisitions. Remove the configuration overrides only after this succeeds.
+    """
+
+    async def perform() -> dict[str, JsonValue]:
+        loaded = load_configuration(user_directories().configuration_file)
+        replacements = {
+            override.requested_network_path: override.network_path
+            for override in loaded.configuration.route_overrides
+            if override.requested_network_path[0] == "proton"
+            and override.network_path[0] == "decodo"
+        }
+        if not replacements:
+            return {"revised_work_count": 0, "revised_track_count": 0}
+        async with Database.managed(database) as evidence_database:
+            return await perform_route_cutover(evidence_database, _repository_root(), replacements)
+
+    _print_json(anyio.run(perform, backend="trio"))
+
+
+@app.command
 def collect_images(
     *search_run_record_identifiers: str,
     maximum_images: int = 10,
-    proton_route: str = _DEFAULT_PROTON_ROUTE,
+    network_provider: NetworkProvider = NetworkProvider.DECODO,
+    network_route: str = "datacenter",
+    proton_route: str | None = None,
     database: Path = _DEFAULT_DATABASE,
 ) -> None:
     """Collect a bounded set of missing gallery renditions from retained search runs."""
@@ -1231,9 +1257,14 @@ def collect_images(
             raise ValueError("Specify at least one Facebook search-run record")
         if maximum_images < 1:
             raise ValueError("The maximum image count must be positive")
-        if not proton_route or proton_route != proton_route.strip():
-            raise ValueError("The Proton route identifier must be nonempty and trimmed")
-        network_path = (NetworkProvider.PROTON.value, "personal", proton_route)
+        selected_route = network_route if proton_route is None else proton_route
+        if not selected_route or selected_route != selected_route.strip():
+            raise ValueError("The network route identifier must be nonempty and trimmed")
+        network_path = (
+            NetworkProvider.PROTON.value if proton_route is not None else network_provider.value,
+            "personal",
+            selected_route,
+        )
         settings = WorkerSettings(
             worker_count=8,
             lease_duration_ns=600_000_000_000,
@@ -1581,7 +1612,7 @@ def collect_images(
                 replacements=image_network_constraints(network_path),
                 operation_identifier=operation_identifier,
                 at_utc_ns=time_ns(),
-                reason="Serialize exclusive Proton image sessions and retain bounded network pacing",
+                reason="Apply bounded image sessions and retain network pacing",
             )
             registry = build_routed_facebook_worker_registry(
                 database=evidence_database,
@@ -2099,7 +2130,9 @@ def search(
     radius: int,
     maximum_results: int | None = None,
     maximum_pages: int | None = None,
-    proton_route: str = _DEFAULT_PROTON_ROUTE,
+    network_provider: NetworkProvider = NetworkProvider.DECODO,
+    network_route: str = "datacenter",
+    proton_route: str | None = None,
     radius_unit: SearchDistanceUnit = SearchDistanceUnit.MILES,
     location_label: str | None = None,
     minimum_price: Decimal | None = None,
@@ -2121,8 +2154,8 @@ def search(
     async def perform() -> dict[str, JsonValue]:
         if maximum_results is None and maximum_pages is None:
             raise ValueError("Specify --maximum-results, --maximum-pages, or both")
-        if not proton_route or proton_route != proton_route.strip():
-            raise ValueError("The Proton route identifier must be nonempty and trimmed")
+        if not network_route or network_route != network_route.strip():
+            raise ValueError("The network route identifier must be nonempty and trimmed")
         price = (
             None
             if minimum_price is None and maximum_price is None
@@ -2171,6 +2204,13 @@ def search(
                 requested_page_size=requested_page_size,
             ),
             traversal_strategy=traversal_strategy,
+            network_path=(
+                NetworkProvider.PROTON.value
+                if proton_route is not None
+                else network_provider.value,
+                "personal",
+                network_route if proton_route is None else proton_route,
+            ),
             proton_route=proton_route,
         )
         async with Database.managed(database, initialize=True) as evidence_database:

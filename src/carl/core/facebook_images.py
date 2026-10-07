@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from PIL import Image, UnidentifiedImageError
 from pydantic import Field, model_validator
 
+from carl.core.acquisition_identity import acquisition_resource_identity, facebook_image_identity
 from carl.core.content_encoding import decoded_stored_body
 from carl.core.facebook_work import (
     FACEBOOK_NETWORK_PATH_RATE_MAXIMUM_STARTS,
@@ -138,12 +139,7 @@ class GalleryImageReference(StrictModel):
 
     @property
     def rendition_identity(self) -> tuple[str, ...]:
-        return (
-            "facebook_marketplace",
-            "source_image_rendition",
-            self.photo_id or "missing_source_photo_id",
-            hashlib.sha256(self.original_url.encode("utf-8")).hexdigest(),
-        )
+        return facebook_image_identity(self.original_url, self.photo_id)
 
 
 def gallery_references(
@@ -203,16 +199,21 @@ def _best_candidate(
             ),
             ImageReuseMatchKind.EXACT_RENDITION,
         )
-    if (
-        reference.photo_id is None
-        or reference.declared_width is None
-        or reference.declared_height is None
-    ):
+    if reference.declared_width is None or reference.declared_height is None:
         return None
+    source = (
+        source_candidates.get(reference.photo_id, ())
+        if reference.photo_id is not None
+        else tuple(
+            candidate for candidates in exact_candidates.values() for candidate in candidates
+        )
+    )
     adequate = tuple(
         candidate
-        for candidate in source_candidates.get(reference.photo_id, ())
-        if candidate.width >= reference.declared_width
+        for candidate in source
+        if facebook_image_identity(candidate.original_url, candidate.source_photo_id)
+        == reference.rendition_identity
+        and candidate.width >= reference.declared_width
         and candidate.height >= reference.declared_height
     )
     if not adequate:
@@ -259,7 +260,7 @@ def plan_image_followups(
     source_candidates = {
         key: tuple(candidates) for key, candidates in source_candidates_lists.items()
     }
-    selected: dict[tuple[str | None, str], list[int]] = {}
+    selected: dict[tuple[str, ...], list[int]] = {}
     reuse_decisions: list[ImageReuseDecision] = []
     for index, reference in enumerate(references):
         reusable = _best_candidate(reference, exact_candidates, source_candidates)
@@ -276,9 +277,10 @@ def plan_image_followups(
         key = (reference.photo_id, reference.original_url)
         if key in excluded_renditions:
             continue
-        if key not in selected and len(selected) >= maximum_images:
+        identity = reference.rendition_identity
+        if identity not in selected and len(selected) >= maximum_images:
             continue
-        selected.setdefault(key, []).append(index)
+        selected.setdefault(identity, []).append(index)
     return ImageFollowupPlan(
         reuse_decisions=tuple(reuse_decisions),
         download_groups=tuple(tuple(group) for group in selected.values()),
@@ -310,15 +312,20 @@ class ExtractImagePayload(StrictModel):
 def collect_image_work(
     *, identifier: str, payload: CollectImagePayload, not_before_utc_ns: int
 ) -> WorkDefinition:
+    identity = acquisition_resource_identity(
+        COLLECT_IMAGE_WORK_KIND, payload.model_dump(mode="json", by_alias=True)
+    )
+    if identity is None:
+        raise ValueError("Image work has no acquisition resource identity")
     return WorkDefinition(
         identifier=identifier,
         kind=COLLECT_IMAGE_WORK_KIND,
         payload_schema_version=COLLECT_IMAGE_WORK_SCHEMA_VERSION,
         payload=payload.model_dump(mode="json", by_alias=True),
         deduplication_identity=(
-            *payload.reference.rendition_identity,
-            "routing",
-            *payload.request_plan.routing,
+            *identity,
+            "fetch_url",
+            hashlib.sha256(payload.request_plan.url.encode("utf-8")).hexdigest(),
         ),
         not_before_utc_ns=not_before_utc_ns,
         scopes=(

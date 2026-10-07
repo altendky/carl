@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import anyio
 
+from carl.core.acquisition_identity import acquisition_resource_identity, ebay_image_identity
 from carl.core.components import Component, ComponentId
 from carl.core.content_encoding import decoded_stored_body
 from carl.core.ebay_items import (
@@ -39,6 +40,7 @@ from carl.core.models import (
     NamedOutput,
     RecordDraft,
 )
+from carl.core.network_defaults import DEFAULT_DATACENTER_NETWORK_PATH
 from carl.core.work import WorkCapability, WorkDefinition, WorkRequester
 from carl.core.worker import (
     AttemptContext,
@@ -78,7 +80,7 @@ COLLECT_ITEM = ComponentId(("carl", "ebay", "collect", "item"))
 EXTRACT_ITEM = ComponentId(("carl", "ebay", "extract", "item"))
 COLLECT_IMAGE = ComponentId(("carl", "ebay", "collect", "gallery_image"))
 COLLECT_DESCRIPTION = ComponentId(("carl", "ebay", "collect", "description"))
-IMAGE_NETWORK_PATH = ("proton", "personal", "carl")
+IMAGE_NETWORK_PATH = DEFAULT_DATACENTER_NETWORK_PATH
 
 
 @dataclass(frozen=True)
@@ -199,11 +201,102 @@ def _item_acquirer(
     ), route.route.network_path
 
 
+async def _acquisition_candidates(
+    dependencies: EbayItemWorkerDependencies,
+    context: AttemptContext,
+    kind: tuple[str, ...],
+    resource: tuple[str, ...],
+    *,
+    since_work_created: bool = True,
+) -> tuple[dict[str, JsonValue], ...]:
+    try:
+        return await dependencies.database.completed_acquisition_candidates(
+            kind,
+            resource,
+            work_identifier=context.work_item_identifier,
+            since_work_created=since_work_created,
+        )
+    except KeyError as error:
+        # Direct handler diagnostics/tests have no queue row; real storage errors
+        # must still propagate rather than silently turning into provider calls.
+        if error.args == (context.work_item_identifier,):
+            return ()
+        raise
+
+
 async def _collect_item(
     payload: CollectEbayItemPayload,
     context: AttemptContext,
     dependencies: EbayItemWorkerDependencies,
 ) -> WorkOutcome:
+    resource = acquisition_resource_identity(COLLECT_EBAY_ITEM_WORK_KIND, payload.as_json())
+    assert resource is not None
+    for source in await _acquisition_candidates(
+        dependencies,
+        context,
+        COLLECT_EBAY_ITEM_WORK_KIND,
+        resource,
+    ):
+        result = source.get("result")
+        acquisition_identifier = (
+            result.get("acquisition_record_identifier") if isinstance(result, dict) else None
+        )
+        if not isinstance(acquisition_identifier, str):
+            continue
+        try:
+            kind, schema, acquisition = await dependencies.database.get_record(
+                acquisition_identifier
+            )
+            if (
+                kind != ("carl", "http", "acquisition")
+                or schema != 1
+                or not isinstance(acquisition, dict)
+                or acquisition.get("purpose") != "ebay_item"
+            ):
+                continue
+            retained = EbayItemRequest.model_validate(acquisition.get("ebay_item_request"))
+            if (
+                retained.item_identifier != payload.request.item_identifier
+                or retained.stack_identifier != payload.request.stack_identifier
+            ):
+                continue
+            html, _, _ = await _html(
+                dependencies.database, acquisition, dependencies.new_identifier
+            )
+            response = _terminal_response(acquisition)
+            extracted = extract_ebay_item(
+                html,
+                item_identifier=payload.request.item_identifier,
+                effective_url=acquisition.get("effective_url", ""),
+                status_code=response.get("status_code", 0),
+            )
+            if extracted.classification != "detail":
+                continue
+        except (KeyError, ValueError, OSError):
+            continue
+        follow = _follow(
+            extract_ebay_item_work(
+                identifier=dependencies.new_identifier(),
+                payload=ExtractEbayItemPayload(
+                    request=payload.request,
+                    acquisition_record_identifier=acquisition_identifier,
+                ),
+            ),
+            context,
+            dependencies,
+        )
+        return CompletedWork(
+            inputs=(
+                NamedInput(name=("reused_acquisition",), object_identifier=acquisition_identifier),
+            ),
+            follow_on_work=(follow,),
+            result={
+                "state": "acquired",
+                "acquisition_record_identifier": acquisition_identifier,
+                "extraction_work_identifier": follow.definition.identifier,
+                "reused": True,
+            },
+        )
     try:
         acquirer, network_path = _item_acquirer(payload.request, dependencies)
         activity = network_activity_definition(
@@ -263,6 +356,7 @@ async def _collect_item(
             "state": "acquired",
             "acquisition_record_identifier": identifier,
             "extraction_work_identifier": follow.definition.identifier,
+            "reused": False,
         },
     )
 
@@ -547,19 +641,23 @@ async def _collect_image(
             )
         ):
             raise ValueError("Image payload disagrees with its retained reference")
-        # Exact-URL reuse shares validated bytes, never the listing relationship.
+        # Share validated rendition bytes, never the listing relationship.
         for source_identifier, result in reversed(
-            await dependencies.database.records_by_kind(("carl", "ebay", "image_result"))
+            await dependencies.database.saved_ebay_image_candidates((payload.url,))
         ):
             if (
                 isinstance(result, dict)
                 and result.get("state") == "saved"
-                and result.get("url") == payload.url
+                and isinstance(result.get("url"), str)
+                and ebay_image_identity(result["url"]) == ebay_image_identity(payload.url)
             ):
                 artifact_identifier = result.get("image_artifact_identifier")
                 if not isinstance(artifact_identifier, str):
                     continue
-                await dependencies.database.get_artifact(artifact_identifier)
+                try:
+                    await dependencies.database.get_artifact(artifact_identifier)
+                except (KeyError, ValueError, OSError):
+                    continue
                 identifier = dependencies.new_identifier()
                 return CompletedWork(
                     inputs=(
@@ -578,6 +676,7 @@ async def _collect_image(
                                 "item_identifier": payload.item_identifier,
                                 "observation_record_identifier": payload.observation_record_identifier,
                                 "reference_record_identifier": payload.reference_record_identifier,
+                                "url": payload.url,
                                 "reused_from_result_record_identifier": source_identifier,
                                 "operation_identifier": context.operation_identifier,
                             },
@@ -767,6 +866,99 @@ async def _collect_description(
             or observation.get("description_url") != payload.url
         ):
             raise ValueError("Description payload disagrees with its observation")
+        resource = acquisition_resource_identity(
+            COLLECT_EBAY_DESCRIPTION_WORK_KIND, payload.as_json()
+        )
+        assert resource is not None
+        candidates = await _acquisition_candidates(
+            dependencies,
+            context,
+            COLLECT_EBAY_DESCRIPTION_WORK_KIND,
+            resource,
+        )
+        fresh_identifiers = {
+            identifier
+            for source in candidates
+            if isinstance(identifier := source.get("identifier"), str)
+        }
+        parent_acquisition = observation.get("acquisition_record_identifier")
+        if isinstance(parent_acquisition, str):
+            candidates = await _acquisition_candidates(
+                dependencies,
+                context,
+                COLLECT_EBAY_DESCRIPTION_WORK_KIND,
+                resource,
+                since_work_created=False,
+            )
+        for source in candidates:
+            result = source.get("result")
+            source_identifier = (
+                result.get("description_result_record_identifier")
+                if isinstance(result, dict)
+                else None
+            )
+            if not isinstance(source_identifier, str):
+                continue
+            try:
+                source_kind, source_schema, source_value = await dependencies.database.get_record(
+                    source_identifier
+                )
+            except (KeyError, ValueError):
+                continue
+            if (
+                source_kind != ("carl", "ebay", "description_result")
+                or source_schema != 1
+                or not isinstance(source_value, dict)
+                or source_value.get("state") != "saved"
+                or source_value.get("item_identifier") != payload.request.item_identifier
+                or source_value.get("url") != payload.url
+                or not isinstance(source_value.get("description"), str)
+            ):
+                continue
+            if source.get("identifier") not in tuple(fresh_identifiers):
+                source_observation_identifier = source_value.get("observation_record_identifier")
+                if not isinstance(source_observation_identifier, str):
+                    continue
+                try:
+                    (
+                        source_observation_kind,
+                        _,
+                        source_observation,
+                    ) = await dependencies.database.get_record(source_observation_identifier)
+                except (KeyError, ValueError):
+                    continue
+                if (
+                    source_observation_kind != ("carl", "ebay", "listing_observation")
+                    or not isinstance(source_observation, dict)
+                    or source_observation.get("acquisition_record_identifier") != parent_acquisition
+                ):
+                    continue
+            identifier = dependencies.new_identifier()
+            return CompletedWork(
+                inputs=(
+                    *inputs,
+                    NamedInput(name=("reused_description",), object_identifier=source_identifier),
+                ),
+                records=(
+                    RecordDraft(
+                        identifier=identifier,
+                        kind=("carl", "ebay", "description_result"),
+                        schema_version=1,
+                        value={
+                            **source_value,
+                            "observation_record_identifier": payload.observation_record_identifier,
+                            "operation_identifier": context.operation_identifier,
+                            "reused_from_result_record_identifier": source_identifier,
+                        },
+                    ),
+                ),
+                outputs=(NamedOutput(name=("description",), object_identifier=identifier),),
+                result={
+                    "state": "saved",
+                    "description_result_record_identifier": identifier,
+                    "reused": True,
+                },
+            )
         acquirer, network_path = _item_acquirer(payload.request, dependencies)
         activity = network_activity_definition(
             identifier=dependencies.new_identifier(),
@@ -859,6 +1051,7 @@ async def _collect_description(
     result = {
         "state": "saved" if text is not None else "failed",
         "description_result_record_identifier": identifier,
+        "reused": False,
     }
     if text is None:
         return TerminalFailureWork(
@@ -897,7 +1090,7 @@ def build_ebay_item_worker_registry(
                 capability=WorkCapability(
                     kind=COLLECT_EBAY_ITEM_WORK_KIND, payload_schema_version=1
                 ),
-                component=Component(COLLECT_ITEM, 2, collect),
+                component=Component(COLLECT_ITEM, 3, collect),
                 payload_type=CollectEbayItemPayload,
                 handler=collect,
             ),
@@ -913,7 +1106,7 @@ def build_ebay_item_worker_registry(
                 capability=WorkCapability(
                     kind=COLLECT_EBAY_IMAGE_WORK_KIND, payload_schema_version=1
                 ),
-                component=Component(COLLECT_IMAGE, 2, image),
+                component=Component(COLLECT_IMAGE, 3, image),
                 payload_type=CollectEbayImagePayload,
                 handler=image,
             ),
@@ -921,7 +1114,7 @@ def build_ebay_item_worker_registry(
                 capability=WorkCapability(
                     kind=COLLECT_EBAY_DESCRIPTION_WORK_KIND, payload_schema_version=1
                 ),
-                component=Component(COLLECT_DESCRIPTION, 2, extract_ebay_description),
+                component=Component(COLLECT_DESCRIPTION, 3, extract_ebay_description),
                 payload_type=CollectEbayDescriptionPayload,
                 handler=description,
             ),

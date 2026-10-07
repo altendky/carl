@@ -5,6 +5,7 @@ import hashlib
 from pydantic import Field
 
 from carl.core.models import StrictModel
+from carl.core.network_defaults import DEFAULT_DATACENTER_NETWORK_PATH
 from carl.core.work import SchedulingScope, SchedulingScopeKind, WorkDefinition
 
 REQUEST_FACEBOOK_LISTING_DETAILS_WORK_KIND = ("carl", "facebook", "work", "listing_details")
@@ -14,7 +15,7 @@ class RequestFacebookListingDetailsPayload(StrictModel):
     listing_identifier: str = Field(pattern=r"^[0-9]+$")
     maximum_images: int = Field(default=20, ge=0, le=50)
     item_routing: tuple[str, ...] = ("decodo", "personal", "carl")
-    image_routing: tuple[str, ...] = ("proton", "personal", "carl")
+    image_routing: tuple[str, ...] = DEFAULT_DATACENTER_NETWORK_PATH
     refresh: bool = False
 
 

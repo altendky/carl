@@ -109,6 +109,7 @@ async def collect_configured_ebay_search(
     directories: CarlDirectories,
     request: EbaySearchRequest,
     new_identifier: Callable[[], str] = _identifier,
+    search_run_identifier: str | None = None,
 ) -> dict[str, JsonValue]:
     require_supported_ebay_search_acquisition(request)
     loaded = load_configuration(directories.configuration_file)
@@ -129,6 +130,7 @@ async def collect_configured_ebay_search(
             network_path=route.route.network_path,
             acquirer=session,
             new_identifier=new_identifier,
+            search_run_identifier=search_run_identifier,
         )
 
 
@@ -140,9 +142,10 @@ async def collect_ebay_search(
     acquirer: HttpAcquirer,
     new_identifier: Callable[[], str] = _identifier,
     provenance: CodeProvenance | None = None,
+    search_run_identifier: str | None = None,
 ) -> dict[str, JsonValue]:
     resolved_provenance = provenance or await collect_code_provenance_async(_repository_root())
-    search_run_identifier = new_identifier()
+    search_run_identifier = search_run_identifier or new_identifier()
     pages: list[dict[str, JsonValue]] = []
     page_number = 1
     seen_page_numbers: set[int] = set()

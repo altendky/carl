@@ -331,7 +331,7 @@ async def test_failed_workspace_search_track_is_visible_and_retryable(tmp_path: 
                 """,
                 (
                     added.work_identifier,
-                    '["search_acquisition","proton","personal","carl"]',
+                    '["search_acquisition","decodo","personal","datacenter"]',
                 ),
             )
         claim = await database.claim_work(
@@ -399,7 +399,7 @@ async def test_failed_workspace_search_track_is_visible_and_retryable(tmp_path: 
                 """,
                 (
                     added.work_identifier,
-                    '["search_acquisition","proton","personal","carl"]',
+                    '["search_acquisition","decodo","personal","datacenter"]',
                 ),
             ).fetchone()
 
