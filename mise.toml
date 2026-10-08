@@ -3,7 +3,7 @@ locked = true
 
 [tools]
 python = ["3.13.16", "3.14.8"]
-uv = "0.12.23"
+uv = "0.12.24"
 "pipx:pre-commit" = "4.6.2"
 "cargo:lychee" = "0.24.2"
 
