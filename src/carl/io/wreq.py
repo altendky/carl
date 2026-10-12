@@ -111,7 +111,7 @@ class _WreqResponse(Protocol):
     url: str
     status: _StatusCode
     version: wreq.Version
-    headers: Iterable[tuple[bytes, bytes]]
+    headers: Iterable[tuple[bytes | memoryview, bytes | memoryview]]
 
     def stream(self) -> _WreqStream: ...
 
@@ -161,8 +161,8 @@ def _default_client_factory(
     return cast(_WreqClient, cast(object, client))
 
 
-def _headers(raw: Iterable[tuple[bytes, bytes]]) -> tuple[Header, ...]:
-    return tuple(Header(name=name, value=value) for name, value in raw)
+def _headers(raw: Iterable[tuple[bytes | memoryview, bytes | memoryview]]) -> tuple[Header, ...]:
+    return tuple(Header(name=bytes(name), value=bytes(value)) for name, value in raw)
 
 
 def _header_evidence(
@@ -341,7 +341,7 @@ def _sync_acquire(
                 trailer_headers: list[Header] = []
                 with response.stream() as stream:
                     for chunk in stream:
-                        if isinstance(chunk, bytes):
+                        if isinstance(chunk, (bytes, memoryview)):
                             if len(body) + len(chunk) > plan.max_body_bytes:
                                 metadata = _response_metadata(
                                     response,
@@ -369,7 +369,12 @@ def _sync_acquire(
                             body.extend(chunk)
                         else:
                             trailer_headers.extend(
-                                _headers(cast(Iterable[tuple[bytes, bytes]], chunk))
+                                _headers(
+                                    cast(
+                                        Iterable[tuple[bytes | memoryview, bytes | memoryview]],
+                                        chunk,
+                                    )
+                                )
                             )
             except _SyncAcquisitionFailure:
                 with suppress(Exception):
