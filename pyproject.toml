@@ -19,7 +19,7 @@ dependencies = [
   "pydantic>=2.13",
   "rich>=14",
   "trio>=0.30",
-  "wreq==0.12.3",
+  "wreq==0.13.0",
   "zstandard>=0.23",
 ]
 
