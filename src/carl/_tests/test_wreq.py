@@ -1,5 +1,5 @@
 import json
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Iterable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,7 +65,10 @@ class _Stream:
         self.chunks = chunks
 
     def __enter__(self) -> Iterator[object]:
-        return iter(self.chunks)
+        for chunk in self.chunks:
+            if isinstance(chunk, Exception):
+                raise chunk
+            yield chunk
 
     def __exit__(
         self,
@@ -83,7 +86,7 @@ class _Response:
         *,
         url: str,
         status: int,
-        headers: tuple[tuple[bytes, bytes], ...],
+        headers: Iterable[tuple[bytes | memoryview, bytes | memoryview]],
         chunks: tuple[object, ...],
     ):
         self.url = url
@@ -168,7 +171,7 @@ def _response(
     *,
     url: str = "https://www.ebay.com/sch/i.html?_nkw=oscilloscope",
     status: int = 200,
-    headers: tuple[tuple[bytes, bytes], ...] = (
+    headers: Iterable[tuple[bytes | memoryview, bytes | memoryview]] = (
         (b"content-type", b"text/html; charset=utf-8"),
         (b"content-encoding", b"br"),
         (b"date", b"today"),
@@ -242,7 +245,7 @@ async def test_profiled_acquisition_runs_in_thread_and_records_truthful_provenan
 
     transport = acquisition.record["transport"]
     assert transport["implementation"] == "wreq"
-    assert transport["implementation_version"] == "0.12.3"
+    assert transport["implementation_version"] == "0.13.0"
     assert transport["emulation_profile"] == "Chrome153"
     assert transport["execution_mode"] == "blocking_worker_thread"
     assert transport["effective_timeouts"]["total_seconds"] == 40.0
@@ -295,8 +298,11 @@ async def test_manual_redirects_reuse_one_client_and_retain_each_body() -> None:
 
 
 @pytest.mark.anyio
-async def test_decoded_body_limit_is_a_retained_acquisition_failure() -> None:
-    response = _response(chunks=(b"123", b"456"))
+@pytest.mark.parametrize("chunk_type", [bytes, memoryview])
+async def test_decoded_body_limit_is_a_retained_acquisition_failure(
+    chunk_type: type[bytes] | type[memoryview],
+) -> None:
+    response = _response(chunks=(chunk_type(b"123"), chunk_type(b"456")))
     factory = _Factory([response])
 
     with pytest.raises(AcquisitionFailure) as raised:
@@ -319,6 +325,68 @@ async def test_decoded_body_limit_is_a_retained_acquisition_failure() -> None:
     assert raised.value.bodies == ()
     assert response.closed is True
     assert factory.client.closed is True
+
+
+@pytest.mark.anyio
+async def test_memoryview_body_and_header_maps_preserve_evidence() -> None:
+    headers = wreq.HeaderMap()
+    headers.append("Content-Type", "text/html")
+    headers.append("X-Repeat", "first")
+    headers.append("X-Repeat", "second")
+    headers.append("Set-Cookie", "response-secret")
+    trailers = wreq.HeaderMap()
+    trailers.append("X-Checksum", "done")
+    trailers.append("Set-Cookie", "trailer-secret")
+    response = _response(
+        headers=headers,
+        chunks=(memoryview(b""), memoryview(b"abc"), memoryview(b"def"), trailers),
+    )
+    factory = _Factory([response])
+
+    acquisition = await _acquirer(factory).acquire(
+        RequestPlan(url=response.url, routing=("proton", "personal", "carl"), max_body_bytes=6),
+        lambda: "body",
+    )
+
+    assert acquisition.bodies[0].content == b"abcdef"
+    assert isinstance(acquisition.bodies[0].content, bytes)
+    response_record = acquisition.record["hops"][0]["response"]
+    assert [
+        header["value_latin1"]
+        for header in response_record["headers"]
+        if header["name_latin1"] == "x-repeat"
+    ] == ["first", "second"]
+    assert response_record["headers"][-1]["value"]["state"] == "redacted"
+    assert response_record["trailers"][0]["value_latin1"] == "done"
+    assert response_record["trailers"][-1]["value"]["state"] == "redacted"
+    retained = json.dumps(acquisition.record)
+    assert "response-secret" not in retained
+    assert "trailer-secret" not in retained
+    assert response.closed and factory.client.closed
+
+
+@pytest.mark.anyio
+async def test_memoryview_stream_failure_does_not_retain_partial_body() -> None:
+    response = _response(
+        chunks=(memoryview(b"partial"), wreq.exceptions.BodyError("secret body diagnostic")),
+    )
+    factory = _Factory([response])
+
+    with pytest.raises(AcquisitionFailure) as raised:
+        await _acquirer(factory).acquire(
+            RequestPlan(url=response.url, routing=("proton", "personal", "carl")),
+            lambda: "unused",
+        )
+
+    assert raised.value.result["stopping_condition"] == "transport_failure"
+    assert raised.value.result["exception_type"] == "BodyError"
+    assert raised.value.result["hops"][0]["response"]["body"] == {
+        "state": "unavailable",
+        "reason": "incomplete_transfer",
+    }
+    assert raised.value.bodies == ()
+    assert "secret body diagnostic" not in json.dumps(raised.value.result)
+    assert response.closed and factory.client.closed
 
 
 @pytest.mark.anyio
@@ -595,7 +663,7 @@ def test_wreq_transport_settings_are_secret_free_and_explicit() -> None:
     settings = WreqTransportSettings()
     safe = settings.safe_configuration(RequestPlan(url="https://www.ebay.com/"))
 
-    assert safe["implementation_version"] == "0.12.3"
+    assert safe["implementation_version"] == "0.13.0"
     assert safe["emulation_profile"] == "Chrome153"
     assert safe["emulation_platform"] == "profile_default"
     assert safe["profile_default_headers"] is True
