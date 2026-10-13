@@ -194,7 +194,17 @@ class RecordClaimedListingReviewsRequest(StrictModel):
         return value
 
 
-_INSTRUCTIONS = """Use Carl to collect and review retained Marketplace evidence.
+_INSTRUCTIONS = """Use Carl to collect and review retained Facebook Marketplace and eBay evidence.
+This MCP stdio server queues work and reads evidence; it never runs workers implicitly. A separate
+carl work or carl monitor --work process must use the same database and per-user configuration.
+carl monitor without --work observes only, and --once is not a persistent worker. A returned work ID
+acknowledges queued intent, not successful collection or analysis. Check root and child outcomes.
+Human setup requires locked dependency sync and carl init for the database; init does not generate
+network configuration or credentials. Live acquisition needs configured routes. AI analysis also
+needs an authenticated claude executable in the worker environment. Retained reads need neither proxy
+requests nor AI execution. After an upgrade stop old servers/workers, sync dependencies, run init,
+and restart both; reload cached tool definitions when necessary. Check the live catalog/capabilities,
+not a proposed feature list: typed guide schemas and general SQL queries are not currently supported.
 Diagnose with get_server_info. Discover queued, active, and recent work and every local process with
 this database open using get_activity_snapshot, then pass an exact full identifier to
 get_work_status for compact progress. Request full details only when raw payload, checkpoint result,
@@ -316,8 +326,8 @@ failure cause. The retry is one bounded database transaction and upgrades select
 the current source-specific payload schema; current workers still accept legacy work.
 For either source, retry_workspace_search_track gives terminal transient search failures a fresh
 bounded retry budget while preserving the same track and prior attempts. For eBay initial-track
-failures, optional acquisition_stack selects another existing configured Decodo/wreq stack,
-preserving active/sold/completed mode. A renamed stack on the same provider route is not an alternate route.
+failures, optional acquisition_stack selects another existing configured Decodo/wreq stack for active
+searches only; closed-mode acquisitions remain unsupported. A renamed stack on the same provider route is not an alternate route.
 The override changes this work's next attempt, not the search-group target specification. Failed
 refreshes need a new request_workspace_refresh with acquisition_stack, not an initial-track retry.
 Retries and refreshes make provider calls: inspect retained failures and choose a justified change
@@ -340,12 +350,16 @@ replace the explicit search-refresh workflow or advance workspace search tracks.
 MCP servers do not run workers. Keep `carl work` or `carl monitor --work` running while queued work
 should progress. Review with list_composed_search or get_composed_listing, fetching full reports or
 images only when needed. These read only retained database evidence, make no network requests, and
-compose a fixed as-of snapshot on demand. list_composed_search defaults to available listings only;
+compose a projection at a fixed database completion boundary. Status, scalar fields, a coherent
+gallery, analyses, and membership select evidence independently and can have different ages;
+the boundary does not imply that their sources were observed together. Re-extraction does not
+advance acquisition age. list_composed_search defaults to available listings only;
 override filters.statuses explicitly for pending, sold, unavailable, or unknown listings. Older
 completed analyses are reused under the initial permissive policy and labeled assumed. Search
 cards supply fallback scalar details and a separately labeled preview_image when item-page evidence
 is absent. Price is the exception to item-page precedence: the newest actual item-page or search-card
-price observation wins. A refresh updates price only for listings it actually observes; omission from
+price observation wins. Ordinary refresh reuses usable retained item pages; it does not establish
+that the remote item page is unchanged. A refresh updates price only for listings it actually observes; omission from
 a later search neither refreshes nor clears an older price. Inspect the selected price evidence for
 its source and observation time. A preview is not a complete gallery, and card prices may lack
 currency. Search membership absence is not treated as proof that a listing is gone. Select an exact product-guide
@@ -353,6 +367,10 @@ record before analysis, and preserve record identifiers in conclusions. When cre
 pass only its identity suffix; Carl adds the carl/product_guide namespace. Retire an unused identity
 with set_product_guide_identity_retired after disabling all of its workspace bindings. Exact retired
 versions remain readable, and include_retired=true reveals them in list_product_guides.
+Product guides are versioned identification instructions, not typed extraction schemas or price/value
+assessment recipes. Reports distinguish seller claims, visual evidence, and agent-reported external
+research; those external pages are not independently archived by Carl. Keep later value or buyer-fit
+judgments separate from this identification evidence.
 For multi-step agent review, create a review workspace from a Facebook/eBay search run or a
 marketplace search-group record and optional guide. A group becomes one track per source target.
 Workspaces may mix sources. Review IDs use ebay:<item ID> for eBay and bare numeric Facebook IDs;
@@ -421,7 +439,8 @@ group as a selection snapshot before a later bulk operation. Projection revision
 prior review is current or stale under the workspace's component policy; response size limits and
 unrelated database activity do not change those revisions. Scalar revisions compare normalized
 review values, not observation identities or redundant price formatting. Missing currency on a
-new price observation carries forward retained known currency; it never implies USD by default.
+new price observation carries forward retained known currency. Facebook does not assume USD;
+eBay's explicit display convention is described above.
 Review batches and get_workspace_listing expose scalar_field_changes (field, previous_value,
 current_value) and scalar_comparison_available. An empty change list with comparison unavailable
 is not proof of unchanged values. Older batch/bulk review baselines are recovered from retained

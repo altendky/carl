@@ -614,7 +614,7 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 54
+            assert capability_versions[("carl", "mcp", "instructions")] == 55
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
             assert capability_versions[("carl", "mcp", "tool_contracts")] == 40
             assert capability_versions[("carl", "marketplace", "search_pipeline")] == 1

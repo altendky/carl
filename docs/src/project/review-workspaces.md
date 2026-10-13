@@ -66,11 +66,12 @@ initial search exhausts a transient transport or session failure,
 retry budget rather than creating another track. Retried legacy work gains the
 current per-route scheduler scope. Transport failures invalidate the shared
 Proton transport and defer queued searches on that route before replacement.
-For eBay, the optional `acquisition_stack` retry field selects another existing
-configured Decodo/wreq stack while retaining the track, attempt history, and
-active/sold/completed mode. It changes the retried work, not the original search-group
-target specification. Refreshes whose search acquisition failed require a new
-`request_workspace_refresh` with that override. Search and item pages already
+For active eBay searches, the optional `acquisition_stack` retry field selects another
+existing configured Decodo/wreq stack while retaining the track and attempt history.
+Sold/completed acquisitions are disabled and cannot be retried through a stack override;
+their retained targets and results remain readable. The override changes the retried work,
+not the original search-group target specification. Refreshes whose search acquisition
+failed require a new `request_workspace_refresh` with that override. Search and item pages already
 use the configured Decodo browser stack; a new name for the same route does not
 provide a different acquisition path.
 Each eBay search attempt shares one sticky Decodo session and cookie-preserving

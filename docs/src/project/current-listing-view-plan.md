@@ -6,8 +6,10 @@ The initial read-only composed projection is implemented as indexed database
 queries plus deterministic application-layer composition. It is exposed through
 MCP and the CLI for one exact listing and for a bounded retained-search lineage.
 It is computed on demand at a fixed completion boundary: there is no
-process-local cache and no materialized projection table. Status monitoring,
-cheap PDP probes, automated freshness policy, and evidence fingerprints remain
+process-local cache and no materialized projection table. Component revision hashes
+are implemented for review staleness: new record IDs from semantically identical
+refetches do not alone make a review stale. Status monitoring, cheap PDP probes,
+automated freshness policy, and additional evidence-fingerprint policies remain
 planned work. Facebook's private protocol is not guaranteed to remain stable.
 
 ## Motivation

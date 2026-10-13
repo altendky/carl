@@ -5,6 +5,28 @@ description: Refresh and review retained Carl marketplace evidence, inspect exac
 
 # Carl Review
 
+## Connection and execution
+
+Use an initialized Carl database. Human setup is in
+[setup and everyday usage](../../docs/src/project/setup-and-usage.md): dependency sync, `carl init`,
+private route configuration, and credentials are separate steps. Live acquisition needs configured
+routes; analysis also needs an authenticated `claude` executable in the worker's environment.
+Reading retained evidence does not require a proxy or running analysis.
+
+The MCP client launches `uv --directory /absolute/path/to/carl run --locked carl mcp`.
+A separate `carl work` or `carl monitor --work` process executes the shared queue. `carl monitor`
+without `--work` observes only; `--once` is not a persistent worker. MCP never starts workers
+implicitly. All processes must use the same database and per-user configuration. A returned work
+ID acknowledges queued intent, not successful completion; check root and child outcomes.
+
+After an upgrade, stop old workers and MCP servers, sync the locked dependencies, run `carl init`,
+and restart both. If a client retains stale tool definitions, reload them or start a new agent
+session. Compare `get_server_info` capabilities and source-tree hash instead of assuming reconnection
+loaded the intended version. Don't claim tools from proposed work exist until the live catalog lists
+them; typed guide schemas and a general SQL query interface are not currently implemented.
+
+## Retained evidence and review
+
 When calling `create_product_guide`, pass only the caller-owned identity suffix, such as
 `["binoculars"]`; Carl supplies the leading `["carl", "product_guide"]` namespace. An already
 prefixed request is normalized for compatibility. Use `set_product_guide_identity_retired` to hide
@@ -61,8 +83,10 @@ fields: the newest usable actual price observation from either a search card or 
 A search refresh updates prices only for listings it actually observes; it does not guarantee
 coverage of older listings, and absence neither clears a price nor makes its evidence newer. Check
 the selected price's evidence source and observation time before describing it as current. Card
-prices omit currency in the observed source shape, so do not infer a currency when the returned
-price has none. A preview image is not a complete gallery; `gallery` remains null until item-page
+prices can omit currency. When a newer price omits it, composition carries forward the newest
+retained known currency; an unqualified dollar price from ebay.com uses its USD display convention,
+not a general assumption for Facebook. Do not guess currency when the composed price still has none.
+A preview image is not a complete gallery; `gallery` remains null until item-page
 gallery evidence exists.
 
 For review, call `create_review_workspace` with one exact Facebook/eBay search-run record or a
@@ -242,6 +266,11 @@ search, without rerunning search or expanding the original image budget. The car
 conservative and can include reuse jobs. It does not retry extraction/challenge failures or permanent
 authentication/configuration failures. Wait for the refresh to settle before another recovery call;
 the operation reports matching, retryable, retried, and remaining terminal item-page jobs.
+For a terminal refresh with `unhandled_handler_error`, fix the cause before calling
+`retry_refresh_finalization` with its exact work ID. It restores the retained downstream checkpoint,
+including older checkpoints recovered from operation history, without rerunning search or resetting
+completed/terminal child jobs. It rejects unsafe recovery and does not automatically retry programming
+errors. A reused item page retains its age; reuse does not establish that the remote page is unchanged.
 For Facebook, omit `traversal` and `traversal_strategy` to reuse
 the retained settings. To change bounds, provide a complete traversal object. To use price buckets,
 provide an `overlapping_price_partitions` strategy with decimal `width`, `overlap`, and either
@@ -354,3 +383,9 @@ Carl's first-pass reports identify the offered item, condition, included or miss
 researchable specifications. Use the retained listing evidence and report together for later value
 or preference assessment. Distinguish seller claims, visible facts, external research reported by
 the analysis agent, and later interpretation.
+
+Unexpected MCP errors return an error ID and redacted traceback, also written to the private rotating
+`mcp-errors.jsonl` reported by `carl locations`. Worker handler errors retain redacted messages and
+structured validation locations/types/messages without rejected inputs or locals. Use exact work and
+attempt IDs to inspect retained failures before paying for another request. Logs may contain unlabeled
+secrets that redaction cannot recognize; do not publish them without review.

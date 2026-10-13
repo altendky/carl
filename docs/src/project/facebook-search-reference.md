@@ -2,6 +2,11 @@
 
 ## Scope
 
+This document preserves dated protocol research, not a current setup recipe.
+Use [setup and everyday usage](setup-and-usage.md) for the MCP/worker split and
+current routes. Earlier Proton experiments below remain historical evidence;
+new Facebook searches default directly to configured Decodo datacenter.
+
 The original findings came from offline inspection of temporary
 proof-of-concept artifacts under `/tmp/agents/OGYrj2TBqy/`. They support design
 work but are not Carl production captures. A later bounded browser inspection
@@ -79,7 +84,7 @@ connection, and cursor. Query IDs, cursors, cookies, and request tokens are
 never static configuration.
 
 The Marketplace root GET, route-definition POST, and pagination POSTs form one
-search session and use one stable Proton tunnel, exit, request identity, and
+search session and use one configured route, stable exit, request identity, and
 cookie jar unless later evidence demonstrates otherwise. The route-definition
 response consists of newline-delimited anti-hijacking-prefixed JSON frames. Carl
 extracts the current search query plan from the first response and accepts the
@@ -100,7 +105,7 @@ for session tokens, a fixed browser version, curl, and a shared header list with
 GraphQL additions. These demonstrate feasibility but are not production
 interfaces. Carl uses typed root-bootstrap, route-definition, and pagination
 extractors, separate navigation and GraphQL request models, current runtime
-identity, retained attempt evidence, and the mandatory Proton network activity.
+identity, retained attempt evidence, and durable activity for the selected network path.
 
 The bounded Proton Free 54 experiment retained 15 listings from the first page,
 the current search query plan, a next-page cursor, and applied filters including
