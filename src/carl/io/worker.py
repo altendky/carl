@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 import anyio
+from pydantic import ValidationError
 
 from carl.core.components import Component
 from carl.core.connectivity import connectivity_failure, network_work_kind
@@ -24,6 +25,7 @@ from carl.core.worker import (
 )
 from carl.io.cleanup import shielded_cleanup
 from carl.io.connectivity import PROBE_INTERVAL_NS, ConnectivityMonitor, work_retry_budget
+from carl.io.mcp_errors import redact_diagnostic
 from carl.io.sqlite import Database, LeaseLostError
 
 
@@ -87,12 +89,55 @@ def _utc_text(utc_ns: int) -> str:
     return datetime.fromtimestamp(utc_ns / 1_000_000_000, tz=UTC).isoformat()
 
 
-def _exception_shape(error: BaseException) -> dict[str, JsonValue]:
-    """Describe exception types without retaining possibly sensitive messages."""
+def _exception_shape(
+    error: BaseException,
+    *,
+    seen: frozenset[int] = frozenset(),
+    remaining: list[int] | None = None,
+) -> dict[str, JsonValue]:
+    """Retain bounded, redacted diagnostics without validation inputs or locals."""
 
     shape: dict[str, JsonValue] = {"type": type(error).__name__}
+    if remaining is None:
+        remaining = [50]
+    if id(error) in seen or len(seen) >= 8 or remaining[0] <= 0:
+        shape["truncated"] = True
+        return shape
+    remaining[0] -= 1
+    seen = seen | {id(error)}
+    if isinstance(error, ValidationError):
+        shape["message"] = redact_diagnostic(
+            f"{error.error_count()} validation errors for {error.title}"
+        )[:4096]
+        shape["validation_error_count"] = error.error_count()
+        shape["validation_errors"] = [
+            {
+                "type": detail["type"],
+                "location": [
+                    redact_diagnostic(part)[:4096] if isinstance(part, str) else part
+                    for part in detail["loc"][:50]
+                ],
+                "message": redact_diagnostic(detail["msg"])[:4096],
+            }
+            for detail in error.errors(
+                include_input=False, include_context=False, include_url=False
+            )[:50]
+        ]
+    else:
+        shape["message"] = redact_diagnostic(str(error))[:4096]
     if isinstance(error, BaseExceptionGroup):
-        shape["exceptions"] = [_exception_shape(child) for child in error.exceptions]
+        children: list[JsonValue] = []
+        for child in error.exceptions:
+            if remaining[0] <= 0:
+                break
+            children.append(_exception_shape(child, seen=seen, remaining=remaining))
+        shape["exceptions"] = children
+        if len(error.exceptions) > len(children):
+            shape["omitted_exceptions"] = len(error.exceptions) - len(children)
+    if error.__cause__ is not None:
+        shape["cause"] = _exception_shape(error.__cause__, seen=seen, remaining=remaining)
+    elif error.__context__ is not None and not error.__suppress_context__:
+        shape["context"] = _exception_shape(error.__context__, seen=seen, remaining=remaining)
     return shape
 
 
@@ -232,6 +277,9 @@ async def execute_lease(
                     except anyio.get_cancelled_exc_class():
                         raise
                     except Exception as error:
+                        # A handler may have published a newer checkpoint before
+                        # failing. Keep that durable progress for explicit recovery.
+                        checkpoint = (await database.work(lease.work_item_identifier))["result"]
                         outcome = TerminalFailureWork(
                             error={
                                 "kind": "unhandled_handler_error",
@@ -239,7 +287,9 @@ async def execute_lease(
                                 "type": type(error).__name__,
                                 "exception": _exception_shape(error),
                             },
-                            result={"state": "terminal_failure"},
+                            result=checkpoint
+                            if checkpoint is not None
+                            else {"state": "terminal_failure"},
                         )
                 finally:
                     stop_renewal.set()

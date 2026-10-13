@@ -22,6 +22,7 @@ from carl.core.json import encode_json
 from carl.core.models import JsonValue, RecordDraft
 from carl.core.refresh_recovery import (
     RetryItemFailuresRequest,
+    RetryRefreshFinalizationRequest,
     classify_refresh_completion,
     refresh_failure_summary,
 )
@@ -32,6 +33,192 @@ from carl.facebook_refresh_workers import RefreshWorkerDependencies, build_refre
 from carl.io.connectivity import work_retry_budget
 from carl.io.sqlite import Database
 from carl.review import ReviewApplication
+
+
+async def _handler_failed_refresh(
+    database: Database, marketplace: str, *, retained_checkpoint: bool
+) -> dict[str, JsonValue]:
+    checkpoint: dict[str, JsonValue] = {
+        "stage": "collecting_images",
+        "refreshed_search_run_record_identifier": "fresh",
+        "item_collections": 141,
+        "item_extractions": 141,
+        "image_collection_work_identifiers": ["saved-image", "failed-image"],
+        "search_scope_changed": True,
+    }
+    await _retain_records(
+        database,
+        (
+            RecordDraft(
+                identifier="fresh",
+                kind=("carl", marketplace, "search_run"),
+                schema_version=1,
+                value={},
+            ),
+        ),
+        _identifiers(),
+    )
+    await database.enqueue_work(
+        _definition(identifier="refresh", kind=("carl", marketplace, "work", "refresh_search")),
+        _requester("refresh"),
+        event_identifier=str(uuid4()),
+        enqueued_at_utc_ns=time_ns(),
+    )
+    for result in ({**checkpoint, "stage": "items_complete"}, checkpoint):
+        async with database._connections.writer() as connection:
+            await connection.execute("UPDATE work_items SET state='pending' WHERE id='refresh'")
+        await _complete(database, "refresh", result=dict[str, object](result))
+    if not retained_checkpoint:
+        async with database._connections.writer() as connection:
+            await connection.execute("UPDATE work_items SET state='pending' WHERE id='refresh'")
+        await _complete(database, "refresh", result={"state": "terminal_failure"})
+    async with database._connections.writer() as connection:
+        await connection.execute(
+            "UPDATE work_items SET state='terminal_failure',result_json=?,error_json=? WHERE id='refresh'",
+            (
+                encode_json(checkpoint if retained_checkpoint else {"state": "terminal_failure"}),
+                encode_json({"kind": "unhandled_handler_error", "type": "ValidationError"}),
+            ),
+        )
+    for identifier, state in (("saved-image", "completed"), ("failed-image", "terminal_failure")):
+        await database.enqueue_work(
+            _definition(identifier=identifier, kind=("carl", marketplace, "collect", "image")),
+            _requester(identifier),
+            event_identifier=str(uuid4()),
+            enqueued_at_utc_ns=time_ns(),
+        )
+        async with database._connections.writer() as connection:
+            await connection.execute(
+                "UPDATE work_items SET state=? WHERE id=?", (state, identifier)
+            )
+    return checkpoint
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("marketplace", ("facebook", "ebay"))
+@pytest.mark.parametrize("retained_checkpoint", (False, True))
+async def test_finalization_recovery_preserves_collected_work_and_latest_checkpoint(
+    tmp_path: Path, marketplace: str, retained_checkpoint: bool
+) -> None:
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        checkpoint = await _handler_failed_refresh(
+            database, marketplace, retained_checkpoint=retained_checkpoint
+        )
+        before = await database.work("refresh")
+        children = [
+            await database.work(identifier) for identifier in ("saved-image", "failed-image")
+        ]
+        result = await ReviewApplication(database, tmp_path).retry_refresh_finalization(
+            RetryRefreshFinalizationRequest(refresh_work_identifier="refresh")
+        )
+        assert result.marketplace == marketplace
+        assert result.resumed_stage == "collecting_images"
+        assert result.refreshed_search_run_record_identifier == "fresh"
+        assert (result.recovered_checkpoint_operation_identifier is None) == retained_checkpoint
+        parent = await database.work("refresh")
+        assert parent["state"] == "pending"
+        assert parent["result"] == checkpoint
+        assert parent["error"] is None
+        assert parent["attempt"] == before["attempt"]
+        assert parent["operations"] == before["operations"]
+        assert [
+            await database.work(identifier) for identifier in ("saved-image", "failed-image")
+        ] == children
+        async with database._connections.reader() as connection:
+            cursor = await connection.execute("SELECT COUNT(*) FROM work_items")
+            assert await cursor.fetchone() == (3,)
+            cursor = await connection.execute(
+                "SELECT data_json FROM work_events WHERE work_item_id='refresh' ORDER BY sequence DESC LIMIT 1"
+            )
+            event = await cursor.fetchone()
+            assert event is not None
+            assert '"retry_refresh_finalization"' in str(event[0])
+        with pytest.raises(ReviewInputError, match="settled"):
+            await ReviewApplication(database, tmp_path).retry_refresh_finalization(
+                RetryRefreshFinalizationRequest(refresh_work_identifier="refresh")
+            )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("change", "message"),
+    (
+        ("wrong_kind", "exact Facebook or eBay"),
+        ("completed", "settled"),
+        ("leased", "settled"),
+        ("different_error", "unhandled handler"),
+        ("search_stage", "no retained downstream"),
+        ("complete_stage", "no retained downstream"),
+        ("missing_search", "matching search run"),
+        ("wrong_search_source", "matching search run"),
+        ("equivalent", "equivalent"),
+    ),
+)
+async def test_finalization_recovery_rejects_unsafe_requests_without_mutation(
+    tmp_path: Path, change: str, message: str
+) -> None:
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await _handler_failed_refresh(database, "facebook", retained_checkpoint=True)
+        async with database._connections.writer() as connection:
+            if change == "wrong_kind":
+                await connection.execute(
+                    "UPDATE work_items SET kind_parts_json='[\"other\"]' WHERE id='refresh'"
+                )
+            elif change == "completed":
+                await connection.execute(
+                    "UPDATE work_items SET state=? WHERE id='refresh'", (change,)
+                )
+            elif change == "leased":
+                await connection.execute(
+                    "UPDATE work_items SET state='leased',lease_token='token',lease_owner='worker',lease_expires_at_utc_ns=? WHERE id='refresh'",
+                    (time_ns() + 60_000_000_000,),
+                )
+            elif change == "different_error":
+                await connection.execute("UPDATE work_items SET error_json='{}' WHERE id='refresh'")
+            elif change in {
+                "search_stage",
+                "complete_stage",
+                "missing_search",
+                "wrong_search_source",
+            }:
+                if change in {"search_stage", "complete_stage"}:
+                    stage = "collecting_search" if change == "search_stage" else "complete"
+                    checkpoint = encode_json(
+                        {"stage": stage, "refreshed_search_run_record_identifier": "fresh"}
+                    )
+                    await connection.execute(
+                        "UPDATE work_items SET result_json=? WHERE id='refresh'", (checkpoint,)
+                    )
+                    await connection.execute(
+                        "UPDATE operations SET result_json=? WHERE id IN (SELECT operation_id FROM work_operations WHERE work_item_id='refresh')",
+                        (checkpoint,),
+                    )
+                else:
+                    await connection.execute(
+                        "UPDATE objects SET kind_parts_json=? WHERE id='fresh'",
+                        (
+                            encode_json(
+                                ["carl", "ebay", "search_run"]
+                                if change == "wrong_search_source"
+                                else ["missing"]
+                            ),
+                        ),
+                    )
+        if change == "equivalent":
+            await database.enqueue_work(
+                _definition(
+                    identifier="refresh", kind=("carl", "facebook", "work", "refresh_search")
+                ).model_copy(update={"identifier": "equivalent"}),
+                _requester("equivalent"),
+                event_identifier=str(uuid4()),
+                enqueued_at_utc_ns=time_ns(),
+            )
+        before = await database.work("refresh")
+        with pytest.raises(ReviewInputError, match=message):
+            await ReviewApplication(database, tmp_path).retry_refresh_finalization(
+                RetryRefreshFinalizationRequest(refresh_work_identifier="refresh")
+            )
+        assert await database.work("refresh") == before
 
 
 @pytest.mark.parametrize(

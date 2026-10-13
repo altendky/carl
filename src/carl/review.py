@@ -192,6 +192,8 @@ from carl.core.pipeline import (
 from carl.core.refresh_recovery import (
     RetryItemFailuresRequest,
     RetryItemFailuresResult,
+    RetryRefreshFinalizationRequest,
+    RetryRefreshFinalizationResult,
     refresh_failure_summary,
 )
 from carl.core.review import (
@@ -364,7 +366,7 @@ from carl.marketplace_projection import (
     run_listing_identifiers,
     scope_contains_ebay,
 )
-from carl.refresh_recovery import retry_refresh_item_failures
+from carl.refresh_recovery import retry_refresh_finalization, retry_refresh_item_failures
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,8 +526,8 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=53),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=39),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=54),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=40),
                 ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=3),
@@ -6137,6 +6139,14 @@ class ReviewApplication:
             display_name=request.display_name,
             text=request.text,
             expected_base_record_identifier=None,
+        )
+
+    async def retry_refresh_finalization(
+        self, request: RetryRefreshFinalizationRequest
+    ) -> RetryRefreshFinalizationResult:
+        """Explicitly retry a refresh handler failure from its retained downstream checkpoint."""
+        return await retry_refresh_finalization(
+            self.database, request, utc_ns=self.utc_now_ns(), new_identifier=self.new_identifier
         )
 
     async def retry_item_failures(
