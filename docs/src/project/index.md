@@ -6,12 +6,15 @@ Carl preserves source evidence and turns it into versioned, traceable derived
 information. Collection, extraction, and assessment are independent so saved
 evidence can be reprocessed without fetching it again.
 
+The [setup and usage guide](setup-and-usage.md) covers local configuration,
+the separate MCP and worker processes, and routine operation.
 The [review workspace design](review-workspaces.md) describes durable agent
 review batches, explicit decisions, reusable overlapping worksets, and frozen
 selection snapshots layered over the composed listing projection.
 
-Facebook Marketplace is the first source adapter. Source-neutral operation,
-provenance, artifact, and storage interfaces must not depend on Facebook.
+Facebook Marketplace and eBay have source-specific acquisition and extraction
+adapters. Operation, provenance, artifact, storage, and review interfaces are
+source-neutral; a workspace can combine evidence from both marketplaces.
 
 ## Architectural boundaries
 
@@ -132,8 +135,14 @@ caller to infer them. Tests inject an explicit directory value object.
 runtime settings. Unknown fields and schema versions fail closed. Structured
 identities use TOML arrays and become tuples in the core; no component parses a
 delimiter-separated identifier. The configuration document's SHA-256 and schema
-identity are available for operation provenance. A minimal two-route document
-has this shape:
+identity are available for operation provenance. The following example illustrates
+the supported route types and a browser-profiled HTTP stack, not a minimal installation.
+Configure only the providers being used; see the [setup guide](setup-and-usage.md)
+for the smaller default Decodo configuration.
+Provider adapters are not available in every workflow, and these declarations do
+not enable arbitrary proxy/VPN chains. The Bright Data credential reference below
+describes an injected adapter credential source; it is not an automatic 1Password
+loader for the standard worker commands.
 
 ```toml
 [schema]
@@ -227,8 +236,9 @@ search and image collection default to `--network-provider decodo
 no automatic provider fallback. Decodo searches run concurrently within the
 worker pool and request-rate limits; only actual Proton routes are serialized.
 
-For an installation with older Proton-to-Decodo overrides, stop workers and
-run `carl cutover-route-overrides` before removing those configuration entries.
+For an installation with older explicit Proton-to-Decodo route overrides, stop MCP
+servers and workers, then run `carl cutover-route-overrides` before removing those
+configuration entries.
 It audits unfinished/failed work's old and new payloads, rebuilds their
 deduplication identities and scheduler scopes, and publishes new current
 workspace-track specification versions. It rejects live affected leases and
@@ -243,7 +253,7 @@ Use a static port for Facebook bootstrap and pagination: they share one
 cookie-preserving client and endpoint throughout the search. Datacenter
 observations record the port and whether a static peer was requested; they do
 not invent a mobile sticky-session lifetime. Import its separate password with
-`carl configure-decodo-credential datacenter` before enabling the override.
+`carl configure-decodo-credential datacenter` before using that route.
 
 Facebook and eBay image downloads share a database-enforced limit of 25
 simultaneous image requests, across network paths and worker processes. Each
@@ -266,8 +276,9 @@ implementation to `network_path`. The `ebay_anonymous` example therefore means
 wreq with its Chrome 153 profile over the configured Decodo route. The stack
 model can represent other route providers, but the initial eBay command
 deliberately resolves Decodo only and has no implicit fallback.
-Carl currently requires `config.toml` to be owned by the current user with mode
-0600. `carl configure-decodo-credential IDENTIFIER` reads the password from a
+Carl requires `config.toml` to be a regular file owned by the current user without
+group/other permissions (`chmod 600` is recommended; owner-read-only also works).
+`carl configure-decodo-credential IDENTIFIER` reads the password from a
 non-echoing prompt and creates a mode-0600 file in Carl's fixed private Decodo
 directory without replacement. Proton uses only a logical `configuration_id`;
 arbitrary secret-file paths are not accepted. `carl import-proton-config` validates an
@@ -906,8 +917,9 @@ discovery alone is a separate state.
 
 The first agent stage is durable queued work over a listing-analysis evidence set. The producing
 operation's typed input edges identify one listing observation and pair each ordered gallery
-reference with the saved image result chosen for it. The evidence-set record itself is empty;
-following its operation inputs reaches the exact
+reference with the saved image result chosen for it. Evidence-set records also retain
+selection metadata, including unavailable gallery positions and reasons; eBay selections
+include seller-description state. Following their operation inputs reaches the exact
 embedded JSON path, item-page acquisition, image acquisition, validated file, content hash, MIME
 type, dimensions, and source gallery order. The analysis queue and result do not copy that upstream
 metadata. It gives Claude Code a private
@@ -977,9 +989,13 @@ per-kind totals, and network-path activity with full identifiers. An agent can t
 current work before using compact `get_work_status` progress. Raw durable payload, result, error, and
 recent operation identifiers are opt-in diagnostics.
 
-The mutations create and revise immutable product guides using optimistic concurrency and
-enqueue analysis for one exact observation and guide record. A stale guide revision returns the
-current record instead of overwriting it. Analysis requires a complete gallery by default; an
+Guide mutations create and revise immutable versions using optimistic concurrency.
+A stale guide revision returns the current record instead of overwriting it. MCP callers
+preview a bounded selection with `preview_selection_analyses`, then queue it with
+`request_selection_analyses`, or explicitly opt into analysis through `request_search_pipeline`.
+The application resolves each listing to an exact observation, evidence set, and guide record;
+direct observation-level analysis requests are not exposed through MCP.
+Analysis requires a complete gallery by default; an
 explicit override can retain and analyze a partial or empty gallery with the missing positions and
 reasons in the evidence set. The MCP surface can queue a fully specified new search, lists recent
 retained searches, and accepts one durable refresh request. New-search requests return pending work

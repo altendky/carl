@@ -526,7 +526,7 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=54),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=55),
                 ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=40),
                 ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
