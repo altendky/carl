@@ -60,7 +60,12 @@ from carl.core.pipeline import (
     SearchPipelineRequestResult,
     SearchPipelineStatus,
 )
-from carl.core.refresh_recovery import RetryItemFailuresRequest, RetryItemFailuresResult
+from carl.core.refresh_recovery import (
+    RetryItemFailuresRequest,
+    RetryItemFailuresResult,
+    RetryRefreshFinalizationRequest,
+    RetryRefreshFinalizationResult,
+)
 from carl.core.review import (
     AnalysisReport,
     CreateProductGuideRequest,
@@ -208,6 +213,12 @@ requeue its linked transient item-page failures with fresh retry budgets, then r
 descriptions, and images from the retained search. It does not rerun search, retry permanent
 authentication/configuration failures, or expand the original image budget. Wait for the refresh to
 settle before another bounded recovery call. Existing missing activity rows are not backfilled.
+Unhandled handler errors retain the downstream checkpoint and diagnostic details. After fixing the
+cause, explicitly use retry_refresh_finalization with an exact terminal Facebook or eBay refresh work
+ID to resume its retained search/item/image stages. It never reruns search or resets completed or
+terminal child jobs. Legacy overwritten checkpoints are recovered from the refresh's operation
+history. Programming errors are not retried automatically; no safe checkpoint means recovery is
+rejected.
 list_search_runs includes the producing attempt's start and
 completion timestamps plus whether the run originated as a fresh search or refresh. get_provenance
 does not contain a search run's consolidated listing membership; page through the exact retained IDs
@@ -993,6 +1004,12 @@ def tool_definitions(
 
         return await expected(lambda: application.set_product_guide_identity_retired(request))
 
+    async def retry_refresh_finalization(
+        request: RetryRefreshFinalizationRequest,
+    ) -> RetryRefreshFinalizationResult:
+        """Explicitly resume a failed refresh handler from retained results without rerunning search."""
+        return await expected(lambda: application.retry_refresh_finalization(request))
+
     async def retry_item_failures(
         request: RetryItemFailuresRequest,
     ) -> RetryItemFailuresResult:
@@ -1427,6 +1444,13 @@ def tool_definitions(
             ("carl", "facebook", "retry_image_failures"),
             retry_image_failures,
             retry_image_failures.__doc__ or "",
+            _OPEN_WORLD_MUTATION,
+        ),
+        ToolDefinition(
+            "retry_refresh_finalization",
+            ("carl", "marketplace", "retry_refresh_finalization"),
+            retry_refresh_finalization,
+            retry_refresh_finalization.__doc__ or "",
             _OPEN_WORLD_MUTATION,
         ),
         ToolDefinition(

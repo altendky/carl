@@ -577,7 +577,8 @@ async def _image_phase(
         else _stable_identifier(context.work_item_identifier, "image_plan")
     )
     plan_exists = True
-    stored_selected_reference_identifiers: frozenset[str] = frozenset()
+    stored_selected_references: list[tuple[str, GalleryImageReference]] = []
+    stored_reuse_counts: dict[str, int] = {}
     try:
         plan_kind, _, stored_plan = await database.get_record(plan_identifier)
         if plan_kind != ("carl", "facebook", "image_followup_plan") or not isinstance(
@@ -589,7 +590,6 @@ async def _image_phase(
             isinstance(identifier, str) for identifier in raw_selected
         ):
             raise ValueError("Stored refresh image plan has no selected references")
-        stored_selected_reference_identifiers = frozenset(raw_selected)
         raw_references = stored_plan.get("reference_record_identifiers")
         if not isinstance(raw_references, list) or not all(
             isinstance(identifier, str) for identifier in raw_references
@@ -600,7 +600,18 @@ async def _image_phase(
         }
         if any(identifier not in references_by_identifier for identifier in raw_references):
             raise ValueError("Stored refresh image plan references missing evidence")
+        if any(identifier not in raw_references for identifier in raw_selected):
+            raise ValueError(
+                "Stored refresh image plan selects references outside its reference set"
+            )
         references = [references_by_identifier[identifier] for identifier in raw_references]
+        stored_selected_references = [
+            (identifier, references_by_identifier[identifier]) for identifier in raw_selected
+        ]
+        for field in ("already_saved_exact_renditions", "reused_source_photo_images"):
+            count = stored_plan.get(field)
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                stored_reuse_counts[field] = count
     except KeyError:
         plan_exists = False
     new_reference_records: list[RecordDraft] = []
@@ -738,15 +749,17 @@ async def _image_phase(
         tuple((reference_identifiers[references[index]], references[index]) for index in group)
         for group in plan.download_groups
     )
-    selected = (
-        tuple(
-            entries
-            for entries in unresolved
-            if any(identifier in stored_selected_reference_identifiers for identifier, _ in entries)
-        )
-        if plan_exists
-        else unresolved
-    )
+    if plan_exists:
+        # Replanning against newly saved images removes completed downloads.  Resume
+        # the original selection instead so its jobs, gallery edges, and totals survive.
+        stored_groups: dict[tuple[str, ...], list[tuple[str, GalleryImageReference]]] = {}
+        for identifier, reference in stored_selected_references:
+            stored_groups.setdefault(reference.rendition_identity, []).append(
+                (identifier, reference)
+            )
+        selected = tuple(tuple(entries) for entries in stored_groups.values())
+    else:
+        selected = unresolved
     if not plan_exists:
         await database.publish_leased_operation_checkpoint(
             work_item_identifier=context.work_item_identifier,
@@ -1011,8 +1024,12 @@ async def _image_phase(
         "stage": "complete",
         "image_followup_plan_record_identifier": plan_identifier,
         "gallery_references": len(references),
-        "already_saved_exact_renditions": exact_reuses,
-        "reused_source_photo_images": len(source_reuses),
+        "already_saved_exact_renditions": stored_reuse_counts.get(
+            "already_saved_exact_renditions", exact_reuses
+        ),
+        "reused_source_photo_images": stored_reuse_counts.get(
+            "reused_source_photo_images", len(source_reuses)
+        ),
         "new_image_collections": len(collections),
         "new_images_saved": saved,
         "new_images_failed": failed,

@@ -24509,6 +24509,97 @@
     }
   },
   {
+    "name": "retry_refresh_finalization",
+    "description": "Explicitly resume a failed refresh handler from retained results without rerunning search.",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "RetryRefreshFinalizationRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "refresh_work_identifier": {
+              "minLength": 1,
+              "title": "Refresh Work Identifier",
+              "type": "string"
+            }
+          },
+          "required": [
+            "refresh_work_identifier"
+          ],
+          "title": "RetryRefreshFinalizationRequest",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/RetryRefreshFinalizationRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "retry_refresh_finalizationArguments"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "refresh_work_identifier": {
+          "title": "Refresh Work Identifier",
+          "type": "string"
+        },
+        "marketplace": {
+          "enum": [
+            "facebook",
+            "ebay"
+          ],
+          "title": "Marketplace",
+          "type": "string"
+        },
+        "resumed_stage": {
+          "title": "Resumed Stage",
+          "type": "string"
+        },
+        "refreshed_search_run_record_identifier": {
+          "title": "Refreshed Search Run Record Identifier",
+          "type": "string"
+        },
+        "recovered_checkpoint_operation_identifier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recovered Checkpoint Operation Identifier"
+        }
+      },
+      "required": [
+        "refresh_work_identifier",
+        "marketplace",
+        "resumed_stage",
+        "refreshed_search_run_record_identifier"
+      ],
+      "title": "RetryRefreshFinalizationResult",
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "marketplace",
+        "retry_refresh_finalization"
+      ]
+    }
+  },
+  {
     "name": "retry_workspace_search_track",
     "description": "Retry a workspace track creation that exhausted a transient network failure.",
     "inputSchema": {

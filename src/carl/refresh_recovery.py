@@ -6,7 +6,12 @@ from typing import Literal, cast
 
 from carl.core.json import encode_json
 from carl.core.models import JsonValue
-from carl.core.refresh_recovery import RetryItemFailuresRequest, RetryItemFailuresResult
+from carl.core.refresh_recovery import (
+    RetryItemFailuresRequest,
+    RetryItemFailuresResult,
+    RetryRefreshFinalizationRequest,
+    RetryRefreshFinalizationResult,
+)
 from carl.core.review_errors import ReviewInputError
 from carl.io.sqlite import Database
 
@@ -14,6 +19,142 @@ _REFRESH_KINDS = {
     ("carl", "facebook", "work", "refresh_search"): "facebook",
     ("carl", "ebay", "work", "refresh_search"): "ebay",
 }
+
+
+async def retry_refresh_finalization(
+    database: Database,
+    request: RetryRefreshFinalizationRequest,
+    *,
+    utc_ns: int,
+    new_identifier: Callable[[], str],
+) -> RetryRefreshFinalizationResult:
+    """Explicitly resume a handler failure from retained downstream work, never a new search."""
+    async with database._connections.writer() as connection:  # pyright: ignore[reportPrivateUsage]
+        cursor = await connection.execute(
+            "SELECT kind_parts_json,state,result_json,error_json,attempt FROM work_items WHERE id=?",
+            (request.refresh_work_identifier,),
+        )
+        row = await cursor.fetchone()
+        if row is None or tuple(json.loads(str(row[0]))) not in _REFRESH_KINDS:
+            raise ReviewInputError(
+                "Finalization recovery requires an exact Facebook or eBay refresh work ID"
+            )
+        marketplace = _REFRESH_KINDS[tuple(json.loads(str(row[0])))]
+        error = json.loads(str(row[3])) if row[3] is not None else None
+        if (
+            row[1] != "terminal_failure"
+            or not isinstance(error, dict)
+            or error.get("kind") != "unhandled_handler_error"
+        ):
+            raise ReviewInputError(
+                "Finalization recovery requires a settled refresh with an unhandled handler error"
+            )
+        cursor = await connection.execute(
+            """SELECT active.id FROM work_items AS active JOIN work_items AS original
+                ON active.kind_parts_json=original.kind_parts_json
+                AND active.deduplication_identity_json=original.deduplication_identity_json
+                WHERE original.id=? AND active.id<>original.id
+                AND active.state IN ('pending','leased') LIMIT 1""",
+            (request.refresh_work_identifier,),
+        )
+        if await cursor.fetchone() is not None:
+            raise ReviewInputError("An equivalent refresh is already active; wait for it to settle")
+        stages = {
+            "search_complete",
+            "collecting_items",
+            "extracting_items",
+            "items_complete",
+            "collecting_images",
+        }
+        if marketplace == "facebook":
+            stages.update(("extracting_resumed_images", "extracting_images"))
+        candidates: list[tuple[str | None, object]] = [
+            (None, json.loads(str(row[2])) if row[2] is not None else None)
+        ]
+        cursor = await connection.execute(
+            """SELECT operation.id,operation.result_json
+                FROM work_operations AS attempt JOIN operations AS operation
+                    ON operation.id=attempt.operation_id
+                JOIN records AS record
+                    ON record.object_id=json_extract(
+                        operation.result_json,'$.refreshed_search_run_record_identifier'
+                    )
+                JOIN objects AS object ON object.id=record.object_id
+                WHERE attempt.work_item_id=?
+                    AND json_type(operation.result_json,'$.refreshed_search_run_record_identifier')='text'
+                    AND json_extract(operation.result_json,'$.stage') IN (SELECT value FROM json_each(?))
+                    AND object.kind_parts_json=?
+                ORDER BY attempt.attempt DESC,operation.started_at_utc DESC,operation.id DESC
+                LIMIT 1""",
+            (
+                request.refresh_work_identifier,
+                encode_json(sorted(stages)),
+                encode_json(["carl", marketplace, "search_run"]),
+            ),
+        )
+        candidates.extend(
+            (str(operation[0]), json.loads(str(operation[1])))
+            for operation in await cursor.fetchall()
+        )
+        checkpoint: dict[str, JsonValue] | None = None
+        checkpoint_operation: str | None = None
+        for operation_identifier, candidate in candidates:
+            if (
+                not isinstance(candidate, dict)
+                or not isinstance(candidate.get("stage"), str)
+                or candidate["stage"] not in stages
+            ):
+                continue
+            refreshed = candidate.get("refreshed_search_run_record_identifier")
+            if not isinstance(refreshed, str) or not refreshed:
+                continue
+            cursor = await connection.execute(
+                """SELECT 1 FROM records AS record JOIN objects AS object ON object.id=record.object_id
+                    WHERE record.object_id=? AND object.kind_parts_json=?""",
+                (refreshed, encode_json(["carl", marketplace, "search_run"])),
+            )
+            if await cursor.fetchone() is None:
+                continue
+            checkpoint = cast(dict[str, JsonValue], candidate)
+            checkpoint_operation = operation_identifier
+            break
+        if checkpoint is None:
+            raise ReviewInputError(
+                "The refresh has no retained downstream checkpoint and matching search run to resume"
+            )
+        await connection.execute(
+            """UPDATE work_items SET state='pending',eligible_at_utc_ns=?,result_json=?,error_json=NULL,
+                lease_token=NULL,lease_owner=NULL,lease_expires_at_utc_ns=NULL
+                WHERE id=? AND state='terminal_failure' AND error_json=?""",
+            (utc_ns, encode_json(checkpoint), request.refresh_work_identifier, row[3]),
+        )
+        if await connection.changes() != 1:
+            raise RuntimeError("Refresh changed during finalization recovery")
+        await connection.execute(
+            "INSERT INTO work_events(id,work_item_id,event_kind,recorded_at_utc_ns,data_json) VALUES (?,?,'enqueued',?,?)",
+            (
+                new_identifier(),
+                request.refresh_work_identifier,
+                utc_ns,
+                encode_json(
+                    {
+                        "reason": {"kind": "retry_refresh_finalization"},
+                        "previous_attempt": int(str(row[4])),
+                        "resumed_stage": checkpoint["stage"],
+                        "recovered_checkpoint_operation_identifier": checkpoint_operation,
+                    }
+                ),
+            ),
+        )
+    return RetryRefreshFinalizationResult(
+        refresh_work_identifier=request.refresh_work_identifier,
+        marketplace=cast(Literal["facebook", "ebay"], marketplace),
+        resumed_stage=cast(str, checkpoint["stage"]),
+        refreshed_search_run_record_identifier=cast(
+            str, checkpoint["refreshed_search_run_record_identifier"]
+        ),
+        recovered_checkpoint_operation_identifier=checkpoint_operation,
+    )
 
 
 async def retry_refresh_item_failures(

@@ -56,6 +56,18 @@ class RetryItemFailuresResult(StrictModel):
     retried_work_identifier_sample: tuple[str, ...] = Field(max_length=20)
 
 
+class RetryRefreshFinalizationRequest(StrictModel):
+    refresh_work_identifier: str = Field(min_length=1)
+
+
+class RetryRefreshFinalizationResult(StrictModel):
+    refresh_work_identifier: str
+    marketplace: Literal["facebook", "ebay"]
+    resumed_stage: str
+    refreshed_search_run_record_identifier: str
+    recovered_checkpoint_operation_identifier: str | None = None
+
+
 def classify_refresh_completion(outcome: CompletedWork) -> CompletedWork | TerminalFailureWork:
     """A refresh losing at least half its selected item pages is a failed refresh."""
     result = dict(outcome.result)

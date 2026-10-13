@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -7,6 +8,7 @@ from uuid import uuid4
 
 import anyio
 import pytest
+from pydantic import ValidationError
 
 from carl.core.components import Component, ComponentId
 from carl.core.models import CodeProvenance, NamedOutput, RecordDraft, StrictModel
@@ -296,6 +298,17 @@ async def test_invalid_registered_payload_becomes_terminal_failure(tmp_path: Pat
 
     assert row is not None
     assert row[0] == "terminal_failure"
+    diagnostic = json.loads(row[1])["exception"]
+    assert diagnostic["type"] == "ValidationError"
+    assert diagnostic["validation_error_count"] == 1
+    assert diagnostic["validation_errors"] == [
+        {
+            "type": "int_type",
+            "location": ["value"],
+            "message": "Input should be a valid integer",
+        }
+    ]
+    assert "not-an-integer" not in row[1]
     assert '"kind":"unhandled_handler_error"' in row[1]
 
 
@@ -351,7 +364,139 @@ async def test_unhandled_exception_group_records_nested_types(tmp_path: Path) ->
         "type": "ExceptionGroup",
         "exception": {
             "type": "ExceptionGroup",
-            "exceptions": [{"type": "ValueError"}, {"type": "RuntimeError"}],
+            "message": "sensitive (2 sub-exceptions)",
+            "exceptions": [
+                {"type": "ValueError", "message": "one"},
+                {"type": "RuntimeError", "message": "two"},
+            ],
+        },
+    }
+
+
+def test_worker_exception_diagnostics_redact_validation_inputs_context_and_causes() -> None:
+    validation = ValidationError.from_exception_data(
+        "WorkerResult",
+        [
+            {
+                "type": "value_error",
+                "loc": ("listing", "amount"),
+                "input": "unlabeled-private-input",
+                "ctx": {"error": ValueError("password=validation-secret")},
+            }
+        ],
+    )
+    failure = RuntimeError("acquisition failed: https://user:proxy-secret@proxy.example/path")
+    failure.__cause__ = validation
+    diagnostic = worker_io._exception_shape(ExceptionGroup("worker failures", [failure]))
+    encoded = json.dumps(diagnostic)
+    assert "proxy-secret" not in encoded
+    assert "validation-secret" not in encoded
+    assert "unlabeled-private-input" not in encoded
+    assert '"input"' not in encoded
+    assert '"ctx"' not in encoded
+    assert '"cause"' in encoded
+    assert '"location": ["listing", "amount"]' in encoded
+    assert "Value error, password=[REDACTED]" in encoded
+    assert "https://[REDACTED]@proxy.example/path" in encoded
+
+
+def test_worker_exception_diagnostics_handle_cyclic_cause() -> None:
+    failure = RuntimeError("worker failed")
+    failure.__cause__ = failure
+    assert worker_io._exception_shape(failure) == {
+        "type": "RuntimeError",
+        "message": "worker failed",
+        "cause": {"type": "RuntimeError", "truncated": True},
+    }
+
+
+def test_worker_exception_diagnostics_bound_total_group_expansion() -> None:
+    failure: Exception = ValueError("nested failure")
+    for _ in range(4):
+        failure = ExceptionGroup[Exception]("repeated children", [failure] * 8)
+    encoded = json.dumps(worker_io._exception_shape(failure))
+    assert encoded.count('"message"') <= 50
+    assert "omitted_exceptions" in encoded
+    assert len(encoded) < 20_000
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("checkpoint_in_failed_attempt", (False, True))
+async def test_unhandled_handler_failure_preserves_latest_durable_checkpoint(
+    tmp_path: Path, checkpoint_in_failed_attempt: bool
+) -> None:
+    path = tmp_path / "carl.sqlite3"
+    kind = ("carl", "test", "checkpoint-failure")
+    checkpoint = {"stage": "collecting_images", "completed_images": 556, "total_images": 557}
+
+    async with Database.managed(path, initialize=True) as database:
+
+        async def handle(payload: _Payload, context: AttemptContext) -> WorkOutcome:
+            assert payload.value == 7
+            if not checkpoint_in_failed_attempt and context.attempt == 1:
+                return RetryWork(delay_ns=0, reason={"kind": "continue"}, result=checkpoint)
+            if checkpoint_in_failed_attempt:
+                await database.publish_leased_operation_checkpoint(
+                    work_item_identifier=context.work_item_identifier,
+                    lease_token=context.lease_token,
+                    worker_identifier=context.worker_identifier,
+                    utc_now_ns=time_ns,
+                    operation_id=context.operation_identifier,
+                    records=(),
+                    artifacts=(),
+                    outputs=(),
+                    checkpoint_result=checkpoint,
+                )
+            raise ValueError("finalization failed: token=private-token")
+
+        registry = WorkHandlerRegistry(
+            handlers=(
+                TypedWorkHandler(
+                    capability=WorkCapability(kind=kind, payload_schema_version=1),
+                    component=Component(
+                        ComponentId(("carl", "test", "checkpoint-failure-worker")), 1, handle
+                    ),
+                    payload_type=_Payload,
+                    handler=handle,
+                ),
+            )
+        )
+        await database.enqueue_work(
+            _definition(identifier="checkpoint-failure", kind=kind),
+            _requester("checkpoint-failure"),
+            event_identifier=str(uuid4()),
+            enqueued_at_utc_ns=time_ns(),
+        )
+        outcome: WorkOutcome | None = None
+        for attempt in range(1 if checkpoint_in_failed_attempt else 2):
+            claim = await database.claim_work(
+                supported_capabilities=registry.capabilities,
+                worker_identifier="worker",
+                lease_token=f"lease-{attempt}",
+                lease_duration_ns=_settings().lease_duration_ns,
+                utc_now_ns=time_ns,
+                event_identifier=str(uuid4()),
+            )
+            assert claim.lease is not None
+            outcome = await execute_lease(
+                database=database,
+                registry=registry,
+                settings=_settings(),
+                services=_services(),
+                lease=claim.lease,
+            )
+        work = await database.work("checkpoint-failure")
+
+    assert isinstance(outcome, TerminalFailureWork)
+    assert work["state"] == "terminal_failure"
+    assert work["result"] == checkpoint
+    assert work["error"] == {
+        "kind": "unhandled_handler_error",
+        "stage": "handler",
+        "type": "ValueError",
+        "exception": {
+            "type": "ValueError",
+            "message": "finalization failed: token=[REDACTED]",
         },
     }
 

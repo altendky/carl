@@ -36,7 +36,7 @@ from carl.core.facebook_listing import (
     RequestFacebookListingDetailsPayload,
     request_facebook_listing_details_work,
 )
-from carl.core.facebook_refresh import RefreshSearchPayload
+from carl.core.facebook_refresh import REFRESH_SEARCH_WORK_KIND, RefreshSearchPayload
 from carl.core.facebook_work import (
     COLLECT_ITEM_WORK_KIND,
     EXTRACT_ITEM_WORK_KIND,
@@ -45,7 +45,9 @@ from carl.core.facebook_work import (
     collect_item_work,
 )
 from carl.core.http import RequestPlan
+from carl.core.json import encode_json
 from carl.core.models import RecordDraft
+from carl.core.refresh_recovery import RetryRefreshFinalizationRequest
 from carl.core.worker import CompletedWork
 from carl.facebook_image_workers import (
     ImageWorkerDependencies,
@@ -56,11 +58,16 @@ from carl.facebook_listing_workers import (
     FacebookListingWorkerDependencies,
     build_facebook_listing_worker_registry,
 )
-from carl.facebook_refresh_workers import RefreshWorkerDependencies, _image_phase
+from carl.facebook_refresh_workers import (
+    RefreshWorkerDependencies,
+    _image_phase,
+    build_refresh_worker_registry,
+)
 from carl.facebook_workers import FacebookWorkerDependencies, build_facebook_worker_registry
 from carl.io.image_files import ImageFileStore
 from carl.io.sqlite import Database
 from carl.io.worker import WorkHandlerRegistry
+from carl.refresh_recovery import retry_refresh_finalization
 
 URL = "https://scontent-lga3-1.xx.fbcdn.net/v/t39.84726-6/photo.jpg?oh=one&oe=abc&stp=c0.0.100.100a"
 OTHER = (
@@ -655,3 +662,169 @@ async def test_refresh_cached_exact_url_preserves_new_observation_gallery_edge(
             len(await database.facebook_image_reuse_resolutions((new_reference_identifier,))) == 1
         )
         assert len(images.plans) == 1
+
+
+@pytest.mark.anyio
+async def test_refresh_finalization_retries_retained_images_with_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finalization bug must not lose completed collection or retry a failed image."""
+    from carl import facebook_image_workers, facebook_refresh_workers
+
+    monkeypatch.setattr(facebook_refresh_workers, "_CHILD_WAIT_DELAY_NS", 0)
+    monkeypatch.setattr(facebook_refresh_workers, "brave_navigation_headers", lambda: ())
+    identifiers = _identifiers()
+    urls = tuple(URL.replace("photo.jpg", f"photo-{index}.jpg") for index in range(3))
+    images = _Acquirer(
+        {
+            urls[0]: _Response(_png(), "image/png"),
+            urls[1]: _Response(_png(), "image/png"),
+            urls[2]: _Response(b"not found", "text/plain", status_code=404),
+        }
+    )
+    payload = RefreshSearchPayload.model_validate_json("""{
+        "base_search_run_record_identifier":"base", "search_work_identifier":"search",
+        "search":{"request":{"query":"iphone pro","location":{"kind":"facebook_location","identifier":"123"},"radius":{"value":60,"unit":"miles"},"price":{"currency":"USD","maximum":"500"}},"traversal":{"maximum_results":1000},"traversal_strategy":{"kind":"overlapping_price_partitions","width":"50","overlap":"0","order":"balanced"},"routing":["decodo","personal","datacenter"]},
+        "item_routing":["decodo","personal","carl"], "image_routing":["decodo","personal","datacenter"]
+    }""")
+    checkpoint = {
+        "stage": "items_complete",
+        "refreshed_search_run_record_identifier": "refreshed",
+        "selected_unique_listings": 1,
+        "item_collections": 1,
+        "item_extractions": 1,
+        "item_failures": 0,
+    }
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await _retain_records(
+            database,
+            (
+                *(
+                    RecordDraft(
+                        identifier=identifier,
+                        kind=("carl", "facebook", "search_run"),
+                        schema_version=1,
+                        value={
+                            "request": payload.search.request.model_dump(mode="json"),
+                            "traversal": {"unique_listing_identifiers": ["123"]},
+                        },
+                    )
+                    for identifier in ("base", "refreshed")
+                ),
+                RecordDraft(
+                    identifier="observation-123",
+                    kind=("carl", "facebook", "listing_observation"),
+                    schema_version=1,
+                    value={
+                        "listing_id": "123",
+                        "images": [
+                            {
+                                "original_url": url,
+                                "role": "listing_gallery",
+                                "gallery_order": index,
+                                "photo_id": f"photo-{index}",
+                                "declared_dimensions": {"width": 4, "height": 3},
+                                "source": {
+                                    "acquisition_record_id": "acquisition-123",
+                                    "block_index": 0,
+                                    "json_path": ["images", index],
+                                },
+                            }
+                            for index, url in enumerate(urls)
+                        ],
+                    },
+                ),
+            ),
+            identifiers,
+        )
+
+        async def retained_results(_identifiers):
+            return (
+                SuccessfulItemPageResult(
+                    listing_id="123",
+                    acquisition_record_identifier="acquisition-123",
+                    observation_record_identifier="observation-123",
+                    response_classification=FacebookItemResponseKind.FULL_LISTING,
+                    acquisition_completion_sequence=1,
+                    extraction_completion_sequence=2,
+                ),
+            )
+
+        monkeypatch.setattr(database, "successful_facebook_item_page_results", retained_results)
+        context = await _attempt(
+            database,
+            "refresh",
+            "facebook",
+            work_kind=REFRESH_SEARCH_WORK_KIND,
+            payload=payload.model_dump(mode="json"),
+        )
+        await database.retry_leased_operation(
+            work_item_identifier=context.work_item_identifier,
+            lease_token=context.lease_token,
+            worker_identifier=context.worker_identifier,
+            utc_now_ns=time_ns,
+            delay_ns=0,
+            event_identifier=identifiers(),
+            operation_id=context.operation_identifier,
+            reason={"kind": "retained_items_complete"},
+            result=checkpoint,
+            ended_at_utc="2026-10-07T00:00:00+00:00",
+            duration_ns=0,
+        )
+        registry = WorkHandlerRegistry(
+            handlers=(
+                *build_refresh_worker_registry(
+                    RefreshWorkerDependencies(
+                        database, identifiers, code_provenance=_async_provenance
+                    )
+                ).handlers,
+                *build_image_worker_registry(
+                    ImageWorkerDependencies(database, images, ImageFileStore(tmp_path), identifiers)
+                ).handlers,
+            )
+        )
+        waiting = await _run_next(database, registry, identifiers, REFRESH_SEARCH_WORK_KIND)
+        retained_checkpoint = _mapping(waiting["result"])
+        assert retained_checkpoint["stage"] == "collecting_images"
+        for _ in range(3):
+            await _run_next(database, registry, identifiers, COLLECT_IMAGE_WORK_KIND)
+        assert len(images.plans) == 3
+
+        async def old_finalizer(**kwargs):
+            # Reproduce the real failure: the persisted envelope includes provenance.
+            _, _, value = await database.get_record(kwargs["reference_identifiers"][0])
+            GalleryImageReference.model_validate_json(encode_json(value))
+
+        monkeypatch.setattr(facebook_refresh_workers, "publish_shared_image_reuses", old_finalizer)
+        failed = await _run_next(database, registry, identifiers, REFRESH_SEARCH_WORK_KIND)
+        assert failed["state"] == "terminal_failure"
+        assert failed["result"] == retained_checkpoint
+        error = _mapping(failed["error"])
+        assert error["type"] == "ValidationError"
+        assert "reference_extractor" in str(error)
+        assert "operation_identifier" in str(error)
+        monkeypatch.setattr(
+            facebook_refresh_workers,
+            "publish_shared_image_reuses",
+            facebook_image_workers.publish_shared_image_reuses,
+        )
+        await retry_refresh_finalization(
+            database,
+            RetryRefreshFinalizationRequest(refresh_work_identifier="refresh"),
+            utc_ns=time_ns(),
+            new_identifier=identifiers,
+        )
+        finished = await _run_next(database, registry, identifiers, REFRESH_SEARCH_WORK_KIND)
+        assert finished["state"] == "completed"
+        result = _mapping(finished["result"])
+        assert result["state"] == "completed_with_failures"
+        assert result["new_image_collections"] == 3
+        assert result["new_images_saved"] == 2
+        assert result["new_images_failed"] == 1
+        assert result["already_saved_exact_renditions"] == 0
+        assert result["reused_source_photo_images"] == 0
+        assert result["item_collections"] == result["item_extractions"] == 1
+        assert len(images.plans) == 3  # No image redownloads, including the terminal child.
+        references = await database.facebook_gallery_reference_identifiers(("observation-123",))
+        assert len(references) == 3

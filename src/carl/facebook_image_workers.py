@@ -128,9 +128,24 @@ async def publish_shared_image_reuses(
         return
     references: list[tuple[str, GalleryImageReference]] = []
     for identifier in dict.fromkeys(reference_identifiers):
-        _, _, value = await database.get_record(identifier)
+        kind, _, value = await database.get_record(identifier)
+        if kind != ("carl", "facebook", "gallery_image_reference") or not isinstance(value, dict):
+            raise ValueError("Stored gallery image reference is malformed")
+        # Retained reference records also contain extractor/operation provenance.  Only
+        # the reference fields belong to this strict model; keep its field validation.
         references.append(
-            (identifier, GalleryImageReference.model_validate_json(encode_json(value)))
+            (
+                identifier,
+                GalleryImageReference.model_validate_json(
+                    encode_json(
+                        {
+                            field: value[field]
+                            for field in GalleryImageReference.model_fields
+                            if field in value
+                        }
+                    )
+                ),
+            )
         )
     values: dict[str, dict[str, JsonValue]] = {}
     for offset in range(0, len(references), 1000):

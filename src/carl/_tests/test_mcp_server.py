@@ -105,6 +105,7 @@ EXPECTED_TOOLS = {
     "release_review_claim",
     "retry_image_failures",
     "retry_item_failures",
+    "retry_refresh_finalization",
     "retry_workspace_search_track",
     "revise_product_guide",
     "revise_workspace_search_track",
@@ -494,6 +495,13 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert item_recovery.is_error
             assert isinstance(item_recovery.content[0], TextContent)
             assert "exact Facebook or eBay refresh work ID" in item_recovery.content[0].text
+            finalization_recovery = await call_json(
+                "retry_refresh_finalization",
+                {"request": {"refresh_work_identifier": "missing-refresh"}},
+            )
+            assert finalization_recovery.is_error
+            assert isinstance(finalization_recovery.content[0], TextContent)
+            assert "exact Facebook or eBay refresh work ID" in finalization_recovery.content[0].text
             assert client.server_info.version.endswith("+source.aaaaaaaaaaaa")
             listing = await client.list_tools()
             assert {tool.name for tool in listing.tools} == EXPECTED_TOOLS
@@ -606,9 +614,9 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 53
+            assert capability_versions[("carl", "mcp", "instructions")] == 54
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 39
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 40
             assert capability_versions[("carl", "marketplace", "search_pipeline")] == 1
             assert capability_versions[("carl", "review", "workspace_work")] == 4
             assert capability_versions[("carl", "review", "composed_projection")] == 9
