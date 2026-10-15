@@ -5092,6 +5092,7 @@ class Database:
         result: JsonValue,
         ended_at_utc: str,
         duration_ns: int,
+        records: Sequence[RecordDraft] = (),
         artifacts: Sequence[ArtifactDraft] = (),
         outputs: Sequence[NamedOutput] = (),
     ) -> None:
@@ -5103,6 +5104,7 @@ class Database:
                 result=result,
                 ended_at_utc=ended_at_utc,
                 duration_ns=duration_ns,
+                records=records,
                 artifacts=artifacts,
                 outputs=outputs,
             )

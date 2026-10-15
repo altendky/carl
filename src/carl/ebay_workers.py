@@ -121,17 +121,37 @@ async def _collect(
             result={"state": "configuration_failed"},
         )
     except AcquisitionFailure as error:
-        if error.result.get("stopping_condition") == "transport_failure":
+        timeout = (
+            error.result.get("stopping_condition") == "transport_failure"
+            and error.result.get("exception_type") == "TimeoutError"
+        ) or (
+            error.result.get("stopping_condition") == "network_activity_failure"
+            and error.result.get("failure_phase") == "network_activity_finalization_timeout"
+        )
+        if error.result.get("stopping_condition") == "transport_failure" or timeout:
+            maximum_attempts = EBAY_BLOCKED_MAXIMUM_ATTEMPTS if timeout else 3
+            delay_ns = ebay_response_retry_delay_ns(policy_attempt, blocked=timeout)
             reason: dict[str, JsonValue] = {
                 "kind": "ebay_search_acquisition_failure",
                 "attempt": context.attempt,
                 "policy_attempt": policy_attempt,
                 "retry_attempt_offset": payload.retry_attempt_offset,
-                "maximum_attempts": 3,
+                "maximum_attempts": maximum_attempts,
             }
-            if policy_attempt < 3:
+            if timeout:
+                reason.update(
+                    {
+                        "exception_type": error.result.get("exception_type"),
+                        "failure_phase": error.result.get("failure_phase"),
+                        "cooldown": {
+                            "stack_identifier": payload.request.stack_identifier,
+                            "until_utc_ns": dependencies.utc_now_ns() + delay_ns,
+                        },
+                    }
+                )
+            if policy_attempt < maximum_attempts:
                 return RetryWork(
-                    delay_ns=2 ** (policy_attempt - 1) * 1_000_000_000,
+                    delay_ns=delay_ns,
                     reason=reason,
                     result={"state": "retryable_failure", "acquisition": error.result},
                 )
