@@ -143,6 +143,19 @@ def _unfinished(works: tuple[dict[str, JsonValue], ...]) -> bool:
     )
 
 
+def _search_child_delay_ns(work: dict[str, JsonValue], now_utc_ns: int) -> int:
+    """Wait out a deferred search retry before polling its collection again."""
+
+    eligible_at = work.get("eligible_at_utc_ns")
+    if (
+        work.get("state") == WorkState.PENDING.value
+        and isinstance(eligible_at, int)
+        and eligible_at > now_utc_ns
+    ):
+        return eligible_at - now_utc_ns
+    return _CHILD_WAIT_DELAY_NS
+
+
 def _search_listing_identifiers(value: JsonValue) -> tuple[str, ...]:
     if not isinstance(value, dict):
         raise ValueError("Search run is malformed")
@@ -213,7 +226,7 @@ async def _search_phase(
                     object_identifier=payload.base_search_run_record_identifier,
                 ),
             ),
-            delay_ns=_CHILD_WAIT_DELAY_NS,
+            delay_ns=_search_child_delay_ns(result, dependencies.utc_now_ns()),
             reason={"kind": "waiting_for_search_collection"},
             result={
                 "stage": "collecting_search",

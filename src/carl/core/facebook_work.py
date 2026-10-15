@@ -14,6 +14,7 @@ from carl.core.facebook_search import (
     SearchTraversalPolicy,
     SearchTraversalStrategy,
 )
+from carl.core.facebook_search_retry import FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS
 from carl.core.http import RequestPlan
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
 from carl.core.network_defaults import (
@@ -508,6 +509,13 @@ def is_transient_search_failure(error: JsonValue) -> bool:
 
     if not isinstance(error, dict):
         return False
+    if error.get("kind") in {
+        "search_session_bootstrap_response_failure",
+        "search_route_definition_response_failure",
+        "search_route_definition_extraction_failure",
+        "search_price_partition_extraction_failure",
+    }:
+        return error.get("response_kind") == "bot_challenge"
     if error.get("kind") == "search_acquisition_failure":
         return error.get("stopping_condition") == "transport_failure"
     if error.get("kind") == "unhandled_handler_error":
@@ -521,6 +529,12 @@ def is_transient_search_failure(error: JsonValue) -> bool:
 def retryable_search_failure(error: JsonValue, *, attempt: int) -> bool:
     """Return whether a terminal search failure can resume under the current policy."""
 
+    if isinstance(error, dict) and error.get("response_kind") == "bot_challenge":
+        return (
+            error.get("decision") != "retry_exhausted"
+            and attempt < FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS
+            and is_transient_search_failure(error)
+        )
     return attempt < SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS and is_transient_search_failure(error)
 
 
