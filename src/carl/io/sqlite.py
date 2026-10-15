@@ -5162,6 +5162,22 @@ class Database:
             rows = await cursor.fetchall()
         return tuple((_text(row[0]), decode_json(_text(row[1]))) for row in rows)
 
+    async def record_identifiers_by_kind_page(
+        self, kind: tuple[str, ...], *, after_identifier: str | None = None, limit: int = 100
+    ) -> tuple[str, ...]:
+        """Read a keyset page of identities without loading growing record payloads."""
+
+        if not 1 <= limit <= 1_000:
+            raise ValueError("Record identity page limit must be between one and 1,000")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """SELECT id FROM objects WHERE kind_parts_json=? AND id>?
+                ORDER BY id LIMIT ?""",
+                (_json(list(kind)), after_identifier or "", limit),
+            )
+            rows = await cursor.fetchall()
+        return tuple(_text(row[0]) for row in rows)
+
     async def pipeline_completed_analysis_exists(
         self,
         marketplace: str,

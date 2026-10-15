@@ -25,6 +25,21 @@ session. Compare `get_server_info` capabilities and source-tree hash instead of 
 loaded the intended version. Don't claim tools from proposed work exist until the live catalog lists
 them; typed guide schemas and a general SQL query interface are not currently implemented.
 
+Read response size and continuation metadata before treating any result as complete. Prefer a tool's
+native pagination and follow returned `next_cursor` or `next_offset` values; inspect `has_more` in
+the page or `carl/response` result metadata. An oversized result can instead
+return `kind="carl_tool_response_page"`: the original tool has already run. Check
+`original_is_error` and `critical_metadata`, then call `get_tool_response_page` with each returned
+`next_cursor`. Concatenate `json_fragment` strings in `offset` order and parse the complete JSON as
+the original MCP `CallToolResult`; `total_json_bytes` and `sha256` describe that complete result.
+Offsets count Unicode characters. After retaining all fragments and reconstructing the complete
+result, acknowledge the final page with
+`get_tool_response_page(cursor=final_page.cursor, acknowledge=true)`.
+Until acknowledged, its cached result remains pinned for recovery if a page response is lost.
+Do not repeat the original tool to fetch missing data, especially
+an acquisition or review mutation. Retrieve all needed pages before restarting the MCP server,
+because these continuation pages live only in that server process.
+
 ## Retained evidence and review
 
 When calling `create_product_guide`, pass only the caller-owned identity suffix, such as
@@ -97,9 +112,13 @@ selects collection, description, gallery, and analysis behavior. Call
 `rename_review_workspace` when its scope becomes clearer. Archive inactive workspaces with
 `set_review_workspace_archived`; `list_review_workspaces` hides them by default, while
 `include_archived=true` reveals them for restoration or exact access. Archiving retains all review
-history and does not invalidate exact workspace IDs. Prefer `list_review_workspaces(compact=true)`
-for discovery: it retains track identities, status, and specification versions without repeating
-full search specifications. Omit `compact` when full specifications are needed. Call
+history and does not invalidate exact workspace IDs. Prefer `list_review_workspace_summaries`
+for discovery: it returns workspace identities, names, guide references, and track counts without
+full track rows or search specifications. Follow `next_cursor` while `has_more` is true; each page
+reports `response_bytes` and `response_byte_budget` and stays within 9,000 UTF-8 bytes.
+`page_size` defaults to twenty, accepts up to one hundred, and may yield fewer rows to meet the byte
+budget. Pass the exact workspace ID to `get_review_workspace_activity` for its recovery index and
+use `list_workspace_search_track_versions` for a known track's specifications. Call
 `add_workspace_product_guide` to make additional guides available. Use `pinned` when future work
 must keep one exact version and `follow_latest` when future requests should resolve the newest
 version of that guide identity. The returned binding always names the exact currently resolved guide
@@ -152,8 +171,13 @@ justified change before queueing; do not make repeated paid probe calls.
 A Facebook transport failure, when Proton is selected, invalidates the shared Proton transport and backs off other
 queued searches on that route before replacement. Use `acquire_review_batch` with a stable caller-generated
 request ID, owner ID, and `compact=true` for routine review. Compact responses retain exact projection
-revisions, scalar values, and a shared `sellers` table keyed by `seller_reference`, while omitting
-repeated field evidence and prior scalar snapshots. The stored batch retains its full evidence.
+revisions and browsing fields while omitting seller profiles, descriptions, field evidence, and prior
+scalar snapshots. The response contains the first page of its frozen batch, plus the lease for all
+claimed members. Follow `batch.next_cursor` with `get_review_batch_page`, passing the batch record ID;
+this pages the same claim and does not acquire another one. The page limit defaults to five and is
+capped at ten, with fewer items when needed to fit the byte budget. After exhausting that batch,
+`batch.workspace_next_cursor` continues workspace acquisition with a new request ID. The stored batch
+retains its full evidence.
 Acquisition atomically issues bounded available-only work and
 claims only listings not leased to another agent. Replay the same unchanged
 request ID to recover the exact response after an interruption. Renew longer
@@ -164,7 +188,11 @@ releases only those submitted listings. Give review recording its own stable
 request ID and replay it unchanged if the response is lost. Release unfinished members with
 `release_review_claim`. The MCP surface intentionally does not expose unclaimed
 batches or direct, unclaimed review writes. Acquiring a batch does not mark its listings
-inspected. Resume the exact retained batch with `get_review_batch`. A later
+inspected. Resume the exact retained batch with `get_review_batch_page`. Fetch one member's full
+frozen projection with `get_review_batch_item`, passing the batch record ID and listing ID; use that
+evidence when inspecting a claimed review. `get_workspace_listing` returns current evidence and may
+have advanced beyond the frozen revision. The full `get_review_batch` also remains available through
+generic response continuation when large. A later
 batch defaults to `unreviewed` and `stale` items. After refresh work finishes, acquiring
 that default batch is the ordinary way to review newly discovered and materially changed listings;
 search absence alone does not classify a retained listing as changed. Component revisions ignore

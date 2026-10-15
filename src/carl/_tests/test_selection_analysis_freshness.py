@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 from mcp import Client
 
+from carl._tests.mcp_response_helpers import complete_tool_result
 from carl._tests.test_marketplace_listing import _publish, _record
 from carl._tests.test_mixed_workspace import _complete
 from carl._tests.test_review_workspace import _search_run_value
@@ -452,6 +453,7 @@ async def test_mcp_lists_workspace_with_more_than_twenty_tracks(
         app, _ = _application(database, tmp_path, monkeypatch, workspace)
         async with Client(build_server(app)) as client:
             result = await client.call_tool("list_review_workspaces")
+            result = await complete_tool_result(client, result)
         assert not result.is_error
         assert result.structured_content is not None
         returned = result.structured_content["result"]

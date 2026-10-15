@@ -15,6 +15,7 @@ from carl.core.composed_projection import (
 from carl.core.ebay import EbayListingState
 from carl.core.marketplace_search import Marketplace
 from carl.core.models import JsonValue, StrictModel
+from carl.core.review_response_pages import PagedReviewBatchAcquisition
 from carl.core.review_workspace import (
     ListingReviewRecord,
     ProjectionRevisionComponent,
@@ -124,7 +125,7 @@ class WorkspaceListingResponse(RootModel[WorkspaceListingReview | CompactWorkspa
 
 
 class ReviewBatchAcquisitionResponse(
-    RootModel[ReviewBatchAcquisition | CompactReviewBatchAcquisition]
+    RootModel[ReviewBatchAcquisition | PagedReviewBatchAcquisition]
 ):
     model_config = ConfigDict(json_schema_extra={"type": "object"})
 

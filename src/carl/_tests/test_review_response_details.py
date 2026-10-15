@@ -6,6 +6,7 @@ from typing import cast
 import pytest
 from mcp import Client
 
+from carl._tests.mcp_response_helpers import complete_tool_result
 from carl.core.compact_review import (
     CompactReviewWorkspace,
     analysis_claude_details,
@@ -148,11 +149,13 @@ async def test_workspace_listing_compact_mode_keeps_default_and_archive_behavior
 
         async with Client(build_server(application)) as client:
             full_wire = await client.call_tool("list_review_workspaces")
+            full_wire = await complete_tool_result(client, full_wire)
             assert not full_wire.is_error
             assert full_wire.structured_content == {
                 "result": [workspaces[0].model_dump(mode="json")]
             }
             compact_wire = await client.call_tool("list_review_workspaces", {"compact": True})
+            compact_wire = await complete_tool_result(client, compact_wire)
             assert not compact_wire.is_error
             assert compact_wire.structured_content == {
                 "result": [compact[0].model_dump(mode="json")]
@@ -160,6 +163,7 @@ async def test_workspace_listing_compact_mode_keeps_default_and_archive_behavior
             archived_wire = await client.call_tool(
                 "list_review_workspaces", {"compact": True, "include_archived": True}
             )
+            archived_wire = await complete_tool_result(client, archived_wire)
             assert not archived_wire.is_error
             assert archived_wire.structured_content is not None
             result = cast(list[dict[str, JsonValue]], archived_wire.structured_content["result"])
@@ -239,5 +243,6 @@ async def test_analysis_report_details_are_opt_in_and_retained_record_is_unchang
             details = await client.call_tool(
                 "get_listing_analysis", {"record_identifier": "analysis", "include_details": True}
             )
+            details = await complete_tool_result(client, details)
             assert not details.is_error
             assert details.structured_content == detailed.model_dump(mode="json")

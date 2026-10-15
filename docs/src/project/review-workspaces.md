@@ -132,7 +132,20 @@ The stable workspace record can be renamed through an immutable identity-state
 record. It can also be archived or restored without deleting any retained
 objects. Ordinary workspace listing hides archived workspaces by default;
 explicit lookup and `list_review_workspaces(include_archived=true)` retain access
-to them. Set `compact=true` on `list_review_workspaces` to retain workspace and
+to them. Prefer `list_review_workspace_summaries` for discovery. It returns
+workspace identities, names, guide references, and track counts without full
+track rows or specifications. The request accepts `include_archived`, `page_size`
+(twenty by default, at most one hundred), `cursor`, and `response_byte_budget`
+(1,500 through 9,000 UTF-8 bytes; 9,000 by default). A page reports its exact
+`response_bytes`, `response_byte_budget`, `has_more`, and `next_cursor`; byte
+limits may produce fewer rows than requested. Continue until `has_more` is false.
+Page size and budget may change between requests while the archive scope stays
+fixed. Workspace IDs sort lexically; this discovery cursor does not freeze later
+workspace edits or creations. Use the exact workspace ID with the activity
+recovery index, or a known track ID with the track-version tool for specifications.
+
+The older `list_review_workspaces` response remains available. Set `compact=true`
+to retain workspace and
 track identities, status, and specification version references while omitting
 full search specifications. Omit `compact` to retrieve complete specifications;
 the ordinary full response remains the default.
@@ -176,18 +189,52 @@ Normalized availability evidence still controls the default available-only
 filter. The exact-listing operation applies the same active-track scope and
 workspace guide.
 
-Set `compact: true` on `acquire_review_batch` or `get_workspace_listing` to receive
-scalar values, image counts, analysis presence, and exact review revisions with
-less response data. Compact responses include a shared `sellers` table keyed by
-`seller_reference`; old/new seller changes refer to the same table. Prior scalar
-snapshots and repeated field evidence are omitted from the response. Stored
-batches retain full projections, so recording reviews and replaying claims keep
-their original evidence and revisions. Full responses remain the default.
+Set `compact: true` on `acquire_review_batch` to receive the first byte-bounded
+page of frozen listing summaries and the lease for the complete claimed batch.
+Summaries retain exact review revisions and browsing fields, while omitting
+descriptions, seller profiles, field evidence, and prior scalar snapshots.
+Follow `batch.next_cursor` with `get_review_batch_page`, passing
+`batch_record_identifier` and the cursor. The limit defaults to five and is
+capped at ten; byte limits can reduce it further. `total_items`, `returned_items`,
+`has_more`, and response size metadata distinguish a page from the whole batch.
+Paging does not change claims. After the frozen batch is exhausted,
+`workspace_next_cursor` continues workspace acquisition under a new request ID.
+
+`get_workspace_listing(compact=true)` provides scalar values and a shared
+`sellers` table keyed by `seller_reference`; old/new seller changes use that
+table. Its prior scalar snapshots and repeated field evidence are omitted.
+This exact-listing lookup returns current evidence. Compare its revision with
+the frozen batch revision before relying on its details for that review.
+For a claimed batch member, use `get_review_batch_item` with the exact
+`batch_record_identifier` and `listing_identifier` to read its full frozen
+projection and review comparison. This preserves the evidence and revision
+actually issued with the claim. The full `get_review_batch` also retains all
+original members and uses generic continuation when large.
+Stored batches retain full projections, so recording reviews and replaying
+claims keep their original evidence and revisions. Full responses remain the
+default when `compact` is omitted.
 
 `get_listing_analysis` returns the retained report text, descriptor, limit
 observations, and Claude metadata while omitting its prompt-bearing `argv`
 by default. Set `include_details=true` to retrieve the exact retained invocation
 for diagnosis. The stored analysis record is unchanged.
+
+Check size and continuation metadata on every response. Follow native
+`next_cursor` or `next_offset` values and inspect `has_more` in the page or
+`carl/response` result metadata before treating a collection as complete.
+If a response instead has
+`kind="carl_tool_response_page"`, its original tool has already executed.
+`original_is_error` and `critical_metadata` preserve immediate outcome details.
+Call `get_tool_response_page` with each `next_cursor` until `has_more` is false,
+concatenate the `json_fragment` strings in `offset` order, and parse the complete
+JSON as the original MCP `CallToolResult`. Offsets count Unicode characters;
+`total_json_bytes` and `sha256` describe the complete original JSON. After
+retaining all fragments and reconstructing the result, acknowledge the final
+page with `get_tool_response_page(cursor=final_page.cursor, acknowledge=true)`. Its cached
+result stays pinned until acknowledgment so a lost final response can be retried.
+Do not repeat
+the original tool to fetch the rest of its response. These cached continuation
+pages must be read before the MCP server process restarts.
 
 A newer usable search-card price supersedes an older item-page price, while a
 newer item-page price likewise supersedes an older card price. This applies only

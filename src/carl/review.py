@@ -31,11 +31,9 @@ from carl.core.analysis_batch import (
     select_listing_analysis_batch,
 )
 from carl.core.compact_review import (
-    CompactReviewBatchAcquisition,
     CompactReviewWorkspace,
     CompactWorkspaceListingReview,
     analysis_claude_details,
-    compact_review_acquisition,
     compact_review_workspace,
     compact_workspace_listing,
 )
@@ -240,6 +238,14 @@ from carl.core.review import (
     work_group_progress,
 )
 from carl.core.review_errors import IncompleteGalleryError, ReviewInputError
+from carl.core.review_response_pages import (
+    GetReviewBatchItemRequest,
+    GetReviewBatchPageRequest,
+    PagedReviewBatchAcquisition,
+    ReviewBatchPage,
+    paged_review_acquisition,
+    review_batch_page,
+)
 from carl.core.review_workspace import (
     ACQUIRE_REVIEW_BATCH,
     ADD_WORKSPACE_PRODUCT_GUIDE,
@@ -347,6 +353,12 @@ from carl.core.workspace_search_results import (
     encode_workspace_search_results_cursor,
     workspace_search_results_scope,
 )
+from carl.core.workspace_summaries import (
+    ListReviewWorkspaceSummariesRequest,
+    ReviewWorkspaceSummariesPage,
+    build_workspace_summary_page,
+    decode_workspace_summaries_cursor,
+)
 from carl.ebay_analysis_workers import request_ebay_listing_analysis
 from carl.ebay_refresh_workers import ebay_refresh_child_work_states
 from carl.ebay_retry import retry_ebay_image_failures
@@ -407,6 +419,20 @@ def _json_strings(value: JsonValue) -> tuple[str, ...]:
         if isinstance(value, list)
         else ()
     )
+
+
+def _review_acquisition_response(
+    acquisition: ReviewBatchAcquisition, *, compact: bool
+) -> ReviewBatchAcquisition | PagedReviewBatchAcquisition:
+    if compact:
+        try:
+            return paged_review_acquisition(acquisition)
+        except ValueError:
+            # A published claim must remain recoverable even if unusually large
+            # immutable identity metadata cannot fit a typed summary page.
+            # The MCP boundary can page the exact original result in that case.
+            return acquisition
+    return acquisition
 
 
 def _projection_analysis_descriptor(value: AnalysisDescriptor) -> ProjectionAnalysisDescriptor:
@@ -546,8 +572,9 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=55),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=40),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=56),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=41),
+                ServerCapability(identity=("carl", "mcp", "response_pages"), version=1),
                 ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=3),
@@ -2922,6 +2949,28 @@ class ReviewApplication:
             else selected
         )
 
+    async def list_review_workspace_summaries(
+        self, request: ListReviewWorkspaceSummariesRequest
+    ) -> ReviewWorkspaceSummariesPage:
+        cursor = decode_workspace_summaries_cursor(request)
+        after = None if cursor is None else cursor.after_workspace_identifier
+        selected: list[ReviewWorkspace] = []
+        target = request.page_size + 1
+        while len(selected) < target:
+            identifiers = await self.database.record_identifiers_by_kind_page(
+                REVIEW_WORKSPACE_KIND, after_identifier=after, limit=max(20, target)
+            )
+            if not identifiers:
+                break
+            for identifier in identifiers:
+                after = identifier
+                workspace = await self.get_review_workspace(identifier)
+                if request.include_archived or not workspace.archived:
+                    selected.append(workspace)
+                    if len(selected) == target:
+                        break
+        return build_workspace_summary_page(selected, request)
+
     @staticmethod
     def _workspace_current_search_runs(workspace: ReviewWorkspace) -> tuple[str, ...]:
         current_runs = tuple(
@@ -3399,7 +3448,7 @@ class ReviewApplication:
 
     async def acquire_review_batch(
         self, request: AcquireReviewBatchRequest
-    ) -> ReviewBatchAcquisition | CompactReviewBatchAcquisition:
+    ) -> ReviewBatchAcquisition | PagedReviewBatchAcquisition:
         """Atomically issue a batch and claim its listings for one review agent."""
 
         action = "acquire_batch"
@@ -3414,7 +3463,7 @@ class ReviewApplication:
             raise ReviewInputError(str(error)) from error
         if replay is not None:
             acquisition = ReviewBatchAcquisition.model_validate_json(encode_json(replay))
-            return compact_review_acquisition(acquisition) if request.compact else acquisition
+            return _review_acquisition_response(acquisition, compact=request.compact)
 
         started_utc_ns = self.utc_now_ns()
         started_monotonic_ns = self.monotonic_ns()
@@ -3441,7 +3490,7 @@ class ReviewApplication:
                 ended_at_utc=_utc_text(ended_utc_ns),
                 duration_ns=max(0, self.monotonic_ns() - started_monotonic_ns),
             )
-            return compact_review_acquisition(acquisition) if request.compact else acquisition
+            return _review_acquisition_response(acquisition, compact=request.compact)
         except ValueError as error:
             raise ReviewInputError(str(error)) from error
 
@@ -3535,6 +3584,20 @@ class ReviewApplication:
         if kind != REVIEW_BATCH_KIND or schema_version != 1:
             raise ReviewInputError("The record is not a supported review batch")
         return ReviewBatch.model_validate_json(encode_json(value))
+
+    async def get_review_batch_page(self, request: GetReviewBatchPageRequest) -> ReviewBatchPage:
+        batch = await self.get_review_batch(request.batch_record_identifier)
+        try:
+            return review_batch_page(batch, limit=request.limit, cursor=request.cursor)
+        except ValueError as error:
+            raise ReviewInputError(str(error)) from error
+
+    async def get_review_batch_item(self, request: GetReviewBatchItemRequest) -> ReviewBatchItem:
+        batch = await self.get_review_batch(request.batch_record_identifier)
+        for item in batch.items:
+            if item.projection.listing_identifier == request.listing_identifier:
+                return item
+        raise ReviewInputError("Listing is not present in the requested review batch")
 
     async def record_listing_reviews(
         self, request: RecordListingReviewsRequest
