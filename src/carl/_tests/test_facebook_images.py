@@ -922,7 +922,9 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("response_kind", ["image", "html", "broken", "incomplete"])
+@pytest.mark.parametrize(
+    "response_kind", ["image", "html", "broken", "incomplete", "http403", "timeout"]
+)
 async def test_image_worker_retains_response_and_validation_result(
     tmp_path: Path, response_kind: str
 ) -> None:
@@ -946,6 +948,10 @@ async def test_image_worker_retains_response_and_validation_result(
     def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == URL
         assert request.headers["accept-encoding"] == "identity"
+        if response_kind == "timeout":
+            raise TimeoutError("Fixture timeout")
+        if response_kind == "http403":
+            return httpx.Response(403, stream=CompleteStream(b"forbidden"))
         if response_kind == "incomplete":
             return httpx.Response(200, headers={"Content-Type": "image/png"}, stream=BrokenStream())
         if response_kind == "html":
@@ -1099,7 +1105,7 @@ async def test_image_worker_retains_response_and_validation_result(
                 lease=claim.lease,
             )
             collection = await database.work("collect")
-            if response_kind == "incomplete":
+            if response_kind in {"incomplete", "timeout"}:
                 assert collection["state"] == WorkState.PENDING.value
                 operation = await database.operation(
                     collection["operations"][0]["operation_identifier"]
@@ -1107,10 +1113,13 @@ async def test_image_worker_retains_response_and_validation_result(
                 assert (
                     operation["result"]["acquisition"]["stopping_condition"] == "transport_failure"
                 )
-                assert (
-                    operation["result"]["acquisition"]["hops"][0]["response"]["body"]["state"]
-                    == "unavailable"
-                )
+                if response_kind == "incomplete":
+                    assert (
+                        operation["result"]["acquisition"]["hops"][0]["response"]["body"]["state"]
+                        == "unavailable"
+                    )
+                else:
+                    assert operation["result"]["acquisition"]["exception_type"] == "TimeoutError"
                 return
             expected_state = (
                 WorkState.COMPLETED.value
@@ -1118,6 +1127,8 @@ async def test_image_worker_retains_response_and_validation_result(
                 else WorkState.TERMINAL_FAILURE.value
             )
             assert collection["state"] == expected_state
+            if response_kind == "http403":
+                assert collection["error"]["failure_kind"] == "site_http_403"
             operation = await database.operation(
                 collection["operations"][0]["operation_identifier"]
             )

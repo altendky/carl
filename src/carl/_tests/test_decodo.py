@@ -24,10 +24,28 @@ from carl.io.decodo import (
     ManagedDecodoHttpAcquirer,
     ManagedDecodoWreqAcquirer,
     StaticDecodoCredentialSource,
+    _provider_result,
     _sticky_proxy_credentials,
 )
 from carl.io.httpx import AcquisitionFailure, RouteConfigurationFailure
 from carl.io.wreq import WreqClientFactory
+
+
+def test_proxy_quota_diagnostic_is_classified_without_retaining_secret_text() -> None:
+    secret_error = httpx.ProxyError("407 Traffic limit reached; password=private")
+    failure = AcquisitionFailure(
+        "Transport failed",
+        result={"stopping_condition": "transport_failure", "exception_type": "ProxyError"},
+    )
+    failure.__cause__ = secret_error
+    result = _provider_result(failure.result, failure)
+    assert result == {
+        "provider": "decodo",
+        "category": "proxy_quota_exhausted",
+        "http_status": None,
+        "error_code": None,
+    }
+    assert "private" not in repr(result)
 
 
 class _Stream(httpx.AsyncByteStream):
@@ -162,9 +180,18 @@ async def test_target_407_remains_target_evidence_and_redacts_proxy_headers() ->
 
 
 @pytest.mark.anyio
-async def test_proxy_transport_failure_is_safe_and_attributed_to_decodo() -> None:
+@pytest.mark.parametrize(
+    ("diagnostic", "category"),
+    [
+        ("credential-bearing diagnostic", "proxy_transport_or_authentication"),
+        ("407 Traffic limit reached; secret=private", "proxy_quota_exhausted"),
+    ],
+)
+async def test_proxy_transport_failure_is_safe_and_attributed_to_decodo(
+    diagnostic: str, category: str
+) -> None:
     def fail(request: httpx.Request) -> httpx.Response:
-        raise httpx.ProxyError("credential-bearing diagnostic", request=request)
+        raise httpx.ProxyError(diagnostic, request=request)
 
     def client_factory(*, proxy: httpx.Proxy, verify: object) -> httpx.AsyncClient:
         del proxy, verify
@@ -191,10 +218,9 @@ async def test_proxy_transport_failure_is_safe_and_attributed_to_decodo() -> Non
             identifiers,
         )
 
-    assert raised.value.result["network_provider_result"]["category"] == (
-        "proxy_transport_or_authentication"
-    )
+    assert raised.value.result["network_provider_result"]["category"] == category
     assert "credential-bearing" not in repr(raised.value.result)
+    assert "private" not in repr(raised.value.result)
 
 
 @pytest.mark.anyio

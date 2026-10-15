@@ -31,6 +31,7 @@ from carl.core.ebay_items import (
 )
 from carl.core.facebook_images import verify_image
 from carl.core.http import stored_content_encodings, stored_header_values, stored_response_charset
+from carl.core.image_failures import image_acquisition_failure_kind
 from carl.core.marketplace_images import MARKETPLACE_IMAGE_SCOPE
 from carl.core.models import (
     BytesDraft,
@@ -116,6 +117,11 @@ def _failure(
     inputs: tuple[NamedInput, ...] = (),
     image: bool = False,
 ) -> WorkOutcome:
+    if image and isinstance(error, TimeoutError):
+        error = AcquisitionFailure(
+            "Image transport timed out",
+            result={"stopping_condition": "transport_failure", "exception_type": "TimeoutError"},
+        )
     if isinstance(error, AcquisitionFailure):
         if image:
             error = AcquisitionFailure(
@@ -132,6 +138,7 @@ def _failure(
         result = {"state": "acquisition_failed", "acquisition": error.result}
         if (
             error.result.get("stopping_condition") == "transport_failure"
+            and image_acquisition_failure_kind(error.result) != "proxy_quota_exhausted"
             and context.retry_attempt() < 3
         ):
             return RetryWork(
@@ -147,7 +154,10 @@ def _failure(
             artifacts=artifacts,
             outputs=outputs,
             result=result,
-            error={"kind": "ebay_acquisition_failure"},
+            error={
+                "kind": "ebay_acquisition_failure",
+                **({"failure_kind": image_acquisition_failure_kind(error.result)} if image else {}),
+            },
         )
     code = (
         error.code
@@ -719,6 +729,7 @@ async def _collect_image(
         RouteConfigurationFailure,
         AcquisitionFailure,
         FacebookImageSessionFailure,
+        TimeoutError,
     ) as error:
         return _failure(error, context, inputs=inputs, image=True)
     acquisition_identifier = dependencies.new_identifier()
@@ -759,6 +770,7 @@ async def _collect_image(
             content=verified.content, media_type=verified.media_type, sha256=verified.sha256
         )
     except (ValueError, OSError, KeyError) as error:
+        failure_kind = image_acquisition_failure_kind(acquisition.record)
         records = (
             RecordDraft(
                 identifier=acquisition_identifier,
@@ -776,6 +788,7 @@ async def _collect_image(
                     "error": {
                         "kind": "image_validation_or_storage_failure",
                         "type": type(error).__name__,
+                        "failure_kind": failure_kind,
                     },
                 },
             ),
@@ -787,8 +800,12 @@ async def _collect_image(
                 NamedOutput(name=("acquisition",), object_identifier=acquisition_identifier),
                 NamedOutput(name=("image_result",), object_identifier=result_identifier),
             ),
-            error={"kind": "image_validation_or_storage_failure"},
-            result={"state": "failed", "image_result_record_identifier": result_identifier},
+            error={"kind": "image_validation_or_storage_failure", "failure_kind": failure_kind},
+            result={
+                "state": "failed",
+                "image_result_record_identifier": result_identifier,
+                "acquisition_record_identifier": acquisition_identifier,
+            },
         )
     artifact_identifier = dependencies.new_identifier()
     records = (

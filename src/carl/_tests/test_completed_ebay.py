@@ -34,6 +34,7 @@ from carl.core.review_workspace import (
     GetWorkspaceListingRequest,
     ListWorkspaceListingsRequest,
     RetryWorkspaceSearchTrackRequest,
+    WorkspaceListingReview,
 )
 from carl.core.work import WorkCapability, WorkRequester, WorkState
 from carl.core.workspace_search_results import ListWorkspaceSearchResultsRequest
@@ -215,6 +216,7 @@ async def test_completed_group_refresh_and_workspace_views_preserve_identity_and
                 listing_identifier=f"ebay:{shared}",
             )
         )
+        assert isinstance(listing, WorkspaceListingReview)
         assert listing.listing_identifier == f"ebay:{shared}"
         assert listing.status.value is ListingStatus.UNAVAILABLE
         assert listing.last_sale is None
@@ -224,6 +226,7 @@ async def test_completed_group_refresh_and_workspace_views_preserve_identity_and
                 listing_identifier=f"ebay:{unknown}",
             )
         )
+        assert isinstance(unknown_listing, WorkspaceListingReview)
         assert unknown_listing.status.value is ListingStatus.UNKNOWN
         assert unknown_listing.last_sale is None
         summaries = await app.list_workspace_listings(
@@ -302,6 +305,7 @@ async def test_completed_group_refresh_and_workspace_views_preserve_identity_and
                 listing_identifier=f"ebay:{shared}",
             )
         )
+        assert isinstance(updated, WorkspaceListingReview)
         assert updated.status.value is ListingStatus.SOLD
         assert updated.last_sale is not None
         await _publish(
@@ -321,6 +325,7 @@ async def test_completed_group_refresh_and_workspace_views_preserve_identity_and
                 listing_identifier=f"ebay:{shared}",
             )
         )
+        assert isinstance(unavailable_page, WorkspaceListingReview)
         # A removed PDP is not evidence that a previously observed sale was unsold.
         assert unavailable_page.status.value is ListingStatus.SOLD
         assert unavailable_page.last_sale == updated.last_sale
@@ -502,6 +507,7 @@ async def test_unavailable_after_newer_active_detail_does_not_resurrect_old_sale
             listing_identifier=f"ebay:{item}",
         )
         sold = await app.get_workspace_listing(request)
+        assert isinstance(sold, WorkspaceListingReview)
         assert sold.status.value is ListingStatus.SOLD
         assert sold.last_sale is not None
         await _publish(
@@ -521,6 +527,7 @@ async def test_unavailable_after_newer_active_detail_does_not_resurrect_old_sale
             ),
         )
         active = await app.get_workspace_listing(request)
+        assert isinstance(active, WorkspaceListingReview)
         assert active.status.value is ListingStatus.AVAILABLE
         assert active.last_sale == sold.last_sale
         await _publish(
@@ -537,5 +544,6 @@ async def test_unavailable_after_newer_active_detail_does_not_resurrect_old_sale
             ),
         )
         unavailable = await app.get_workspace_listing(request)
+        assert isinstance(unavailable, WorkspaceListingReview)
         assert unavailable.status.value is ListingStatus.UNAVAILABLE
         assert unavailable.last_sale == sold.last_sale

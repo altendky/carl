@@ -27,6 +27,7 @@ from carl.core.review_workspace import (
     ListingReviewInput,
     RecordListingReviewsRequest,
     ReviewState,
+    WorkspaceListingReview,
 )
 from carl.core.work import WorkCapability, WorkRequester
 from carl.core.workspace_search_results import ListWorkspaceSearchResultsRequest
@@ -410,6 +411,7 @@ async def test_old_recipe_two_ebay_string_price_review_remains_current(tmp_path:
             workspace_record_identifier=workspace, listing_identifier=listing_identifier
         )
         listing = await app.get_workspace_listing(request)
+        assert isinstance(listing, WorkspaceListingReview)
         recorded = await app.record_listing_reviews(
             RecordListingReviewsRequest(
                 request_identifier="review-price",
@@ -439,6 +441,7 @@ async def test_old_recipe_two_ebay_string_price_review_remains_current(tmp_path:
                 (json.dumps(stored), identifier),
             )
         unchanged = await app.get_workspace_listing(request)
+        assert isinstance(unchanged, WorkspaceListingReview)
         assert unchanged.review_state is ReviewState.CURRENT
         assert unchanged.scalar_comparison_available
         assert unchanged.scalar_field_changes == ()
@@ -455,6 +458,7 @@ async def test_old_recipe_two_ebay_string_price_review_remains_current(tmp_path:
             ),
         )
         changed = await app.get_workspace_listing(request)
+        assert isinstance(changed, WorkspaceListingReview)
         assert changed.review_state is ReviewState.STALE
         assert len(changed.scalar_field_changes) == 1
         assert changed.scalar_field_changes[0].field == "price"

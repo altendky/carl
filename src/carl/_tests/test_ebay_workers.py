@@ -137,7 +137,7 @@ async def test_worker_links_child_search_records_as_work_inputs(tmp_path: Path) 
 @pytest.mark.parametrize(
     "classification", ["challenge", "unrecognized", "error_page", "http_error"]
 )
-@pytest.mark.parametrize("attempt", [1, 2, 3])
+@pytest.mark.parametrize("attempt", [1, 2, 3, 5])
 async def test_worker_bounds_response_failure_retries(
     tmp_path: Path, classification: str, attempt: int
 ) -> None:
@@ -178,7 +178,11 @@ async def test_worker_bounds_response_failure_retries(
             ),
         )
 
-    delay_ns = (120 if classification == "challenge" else 1) * 2 ** (attempt - 1) * 1_000_000_000
+    blocked = classification == "challenge"
+    maximum_attempts = 5 if blocked else 3
+    delay_ns = (
+        min(3600, 600 * 2 ** (attempt - 1)) if blocked else 2 ** (attempt - 1)
+    ) * 1_000_000_000
     reason: dict[str, JsonValue] = {
         "kind": "ebay_search_response_failure",
         "response_classification": result["response_classification"],
@@ -186,14 +190,14 @@ async def test_worker_bounds_response_failure_retries(
         "attempt": attempt,
         "policy_attempt": attempt,
         "retry_attempt_offset": 0,
-        "maximum_attempts": 3,
+        "maximum_attempts": maximum_attempts,
     }
     if classification == "challenge":
         reason["cooldown"] = {
             "stack_identifier": "ebay_anonymous",
             "until_utc_ns": now_utc_ns + delay_ns,
         }
-    if attempt < 3:
+    if attempt < maximum_attempts:
         assert isinstance(outcome, RetryWork)
         assert outcome.delay_ns == delay_ns
         assert outcome.reason == reason
@@ -202,7 +206,7 @@ async def test_worker_bounds_response_failure_retries(
         assert outcome.error == reason
     assert outcome.result == {
         **result,
-        "state": "retryable_failure" if attempt < 3 else "terminal_failure",
+        "state": "retryable_failure" if attempt < maximum_attempts else "terminal_failure",
     }
     assert tuple((value.name, value.object_identifier) for value in outcome.inputs) == (
         _SEARCH_REFERENCES
@@ -213,7 +217,7 @@ async def test_worker_bounds_response_failure_retries(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("evidence", ["http_status_403", "http_status_429"])
-@pytest.mark.parametrize("policy_attempt", [1, 2, 3])
+@pytest.mark.parametrize("policy_attempt", [1, 2, 3, 4, 5])
 async def test_blocked_search_response_emits_stack_cooldown_with_fresh_retry_budget(
     tmp_path: Path, evidence: str, policy_attempt: int
 ) -> None:
@@ -253,10 +257,10 @@ async def test_blocked_search_response_emits_stack_cooldown_with_fresh_retry_bud
             ),
         )
 
-    assert isinstance(outcome, RetryWork if policy_attempt < 3 else TerminalFailureWork)
+    assert isinstance(outcome, RetryWork if policy_attempt < 5 else TerminalFailureWork)
     reason = outcome.reason if isinstance(outcome, RetryWork) else outcome.error
     assert isinstance(reason, dict)
-    delay_ns = 120_000_000_000 * 2 ** (policy_attempt - 1)
+    delay_ns = min(3600, 600 * 2 ** (policy_attempt - 1)) * 1_000_000_000
     assert reason["cooldown"] == {
         "stack_identifier": "alternate",
         "until_utc_ns": now_utc_ns + delay_ns,
@@ -264,12 +268,12 @@ async def test_blocked_search_response_emits_stack_cooldown_with_fresh_retry_bud
     assert reason["attempt"] == offset + policy_attempt
     assert reason["policy_attempt"] == policy_attempt
     assert reason["retry_attempt_offset"] == offset
-    assert reason["maximum_attempts"] == 3
+    assert reason["maximum_attempts"] == 5
     if isinstance(outcome, RetryWork):
         assert outcome.delay_ns == delay_ns
     assert outcome.result == {
         **result,
-        "state": "retryable_failure" if policy_attempt < 3 else "terminal_failure",
+        "state": "retryable_failure" if policy_attempt < 5 else "terminal_failure",
     }
 
 
