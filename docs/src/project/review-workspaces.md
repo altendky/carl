@@ -199,6 +199,9 @@ capped at ten; byte limits can reduce it further. `total_items`, `returned_items
 `has_more`, and response size metadata distinguish a page from the whole batch.
 Paging does not change claims. After the frozen batch is exhausted,
 `workspace_next_cursor` continues workspace acquisition under a new request ID.
+It is a short durable reference to the issued batch; Carl resolves the stored
+workspace cursor when acquiring the next batch. Keep the token opaque. Legacy
+workspace cursors remain accepted, and continuation survives server restarts.
 
 `get_workspace_listing(compact=true)` provides scalar values and a shared
 `sellers` table keyed by `seller_reference`; old/new seller changes use that
@@ -210,14 +213,18 @@ For a claimed batch member, use `get_review_batch_item` with the exact
 projection and review comparison. This preserves the evidence and revision
 actually issued with the claim. The full `get_review_batch` also retains all
 original members and uses generic continuation when large.
+Batch item evidence is emitted once in `evidence_table`. Each typed evidence
+location contains an `evidence_reference` key into that table, including scalar
+fields, status, preview images, gallery images, and gallery reference sets.
+The values, comparison details, and projection revision remain exact.
 Stored batches retain full projections, so recording reviews and replaying
 claims keep their original evidence and revisions. Full responses remain the
 default when `compact` is omitted.
 
 `get_listing_analysis` returns the retained report text, descriptor, limit
-observations, and Claude metadata while omitting its prompt-bearing `argv`
-by default. Set `include_details=true` to retrieve the exact retained invocation
-for diagnosis. The stored analysis record is unchanged.
+observations, and concise Claude metadata. Its prompt-bearing `argv` and
+`output_metadata` usage diagnostics (including `modelUsage`) require
+`include_details=true`. The stored analysis record is unchanged.
 
 Check size and continuation metadata on every response. Follow native
 `next_cursor` or `next_offset` values and inspect `has_more` in the page or
@@ -225,13 +232,18 @@ Check size and continuation metadata on every response. Follow native
 If a response instead has
 `kind="carl_tool_response_page"`, its original tool has already executed.
 `original_is_error` and `critical_metadata` preserve immediate outcome details.
-Call `get_tool_response_page` with each `next_cursor` until `has_more` is false,
-concatenate the `json_fragment` strings in `offset` order, and parse the complete
-JSON as the original MCP `CallToolResult`. Offsets count Unicode characters;
-`total_json_bytes` and `sha256` describe the complete original JSON. After
+Parse `content[0].text` as the full page JSON. Its structured content is a small
+manifest that omits `json_fragment`, so each fragment is sent once. Call
+`get_tool_response_page` with each `next_cursor` until `has_more` is false,
+concatenate the `json_fragment` strings in `offset` order, and parse the compact
+JSON. `payload_format=structured_json` contains the original structured payload;
+`mcp_result_json` preserves the complete MCP result for genuine text, image, or
+mixed content. Offsets count Unicode characters; `total_json_bytes` and `sha256`
+describe this single canonical representation. After
 retaining all fragments and reconstructing the result, acknowledge the final
-page with `get_tool_response_page(cursor=final_page.cursor, acknowledge=true)`. Its cached
-result stays pinned until acknowledgment so a lost final response can be retried.
+page with `get_tool_response_page(cursor=final_page.cursor, acknowledge=true)`.
+This returns a small receipt without repeating the fragment. Its cached result
+stays pinned until acknowledgment so a lost final response can be retried.
 Do not repeat
 the original tool to fetch the rest of its response. These cached continuation
 pages must be read before the MCP server process restarts.

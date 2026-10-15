@@ -30,11 +30,15 @@ native pagination and follow returned `next_cursor` or `next_offset` values; ins
 the page or `carl/response` result metadata. An oversized result can instead
 return `kind="carl_tool_response_page"`: the original tool has already run. Check
 `original_is_error` and `critical_metadata`, then call `get_tool_response_page` with each returned
-`next_cursor`. Concatenate `json_fragment` strings in `offset` order and parse the complete JSON as
-the original MCP `CallToolResult`; `total_json_bytes` and `sha256` describe that complete result.
+`next_cursor`. Read each full page by parsing `content[0].text`; structured content is its manifest
+without the fragment. Concatenate `json_fragment` strings in `offset` order and parse the compact
+JSON. `payload_format=structured_json` contains the original structured payload; `mcp_result_json`
+preserves the original MCP result for genuine text/image/mixed output. `total_json_bytes` and `sha256`
+describe that single representation, rather than duplicated text and structured JSON.
 Offsets count Unicode characters. After retaining all fragments and reconstructing the complete
 result, acknowledge the final page with
 `get_tool_response_page(cursor=final_page.cursor, acknowledge=true)`.
+Acknowledgment returns a small receipt without repeating the last fragment.
 Until acknowledged, its cached result remains pinned for recovery if a page response is lost.
 Do not repeat the original tool to fetch missing data, especially
 an acquisition or review mutation. Retrieve all needed pages before restarting the MCP server,
@@ -176,8 +180,10 @@ scalar snapshots. The response contains the first page of its frozen batch, plus
 claimed members. Follow `batch.next_cursor` with `get_review_batch_page`, passing the batch record ID;
 this pages the same claim and does not acquire another one. The page limit defaults to five and is
 capped at ten, with fewer items when needed to fit the byte budget. After exhausting that batch,
-`batch.workspace_next_cursor` continues workspace acquisition with a new request ID. The stored batch
-retains its full evidence.
+`batch.workspace_next_cursor` continues workspace acquisition with a new request ID. It
+uses a short durable `batch:` reference; keep it opaque and pass it unchanged as
+the next acquisition's `cursor`. It survives server restarts and resolves the stored raw cursor.
+The stored batch retains its full evidence.
 Acquisition atomically issues bounded available-only work and
 claims only listings not leased to another agent. Replay the same unchanged
 request ID to recover the exact response after an interruption. Renew longer
@@ -190,7 +196,9 @@ request ID and replay it unchanged if the response is lost. Release unfinished m
 batches or direct, unclaimed review writes. Acquiring a batch does not mark its listings
 inspected. Resume the exact retained batch with `get_review_batch_page`. Fetch one member's full
 frozen projection with `get_review_batch_item`, passing the batch record ID and listing ID; use that
-evidence when inspecting a claimed review. `get_workspace_listing` returns current evidence and may
+evidence when inspecting a claimed review. Batch item `evidence_table` contains exact evidence once.
+Look up each typed `evidence_reference` in that table, including fields, status, preview images,
+gallery images, and gallery reference sets. `get_workspace_listing` returns current evidence and may
 have advanced beyond the frozen revision. The full `get_review_batch` also remains available through
 generic response continuation when large. A later
 batch defaults to `unreviewed` and `stale` items. After refresh work finishes, acquiring
@@ -397,8 +405,8 @@ Treat approximate location as approximate. Treat a later search absence as unkno
 evidence that a listing sold.
 
 Fetch reports with `get_listing_analysis`; the complete report text and ordinary Claude metadata
-are returned without its prompt-bearing command line. Set `include_details=true` only when
-diagnosing the exact retained invocation. When a conclusion matters, retain the exact
+are returned without its prompt-bearing command line or `output_metadata`/`modelUsage` diagnostics.
+Set `include_details=true` only when diagnosing the exact retained invocation and usage. When a conclusion matters, retain the exact
 analysis, observation, and product-guide record identifiers it depends on. Use `get_provenance` one
 hop at a time when the origin or tooling needs examination; follow returned object identifiers for
 deeper traversal. It reports the total `output_edge_count` but returns no sibling outputs by default.

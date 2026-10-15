@@ -245,6 +245,7 @@ from carl.core.review_response_pages import (
     ReviewBatchPage,
     paged_review_acquisition,
     review_batch_page,
+    workspace_batch_cursor_record_identifier,
 )
 from carl.core.review_workspace import (
     ACQUIRE_REVIEW_BATCH,
@@ -572,9 +573,9 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=56),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=41),
-                ServerCapability(identity=("carl", "mcp", "response_pages"), version=1),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=57),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=42),
+                ServerCapability(identity=("carl", "mcp", "response_pages"), version=2),
                 ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=3),
@@ -3327,6 +3328,23 @@ class ReviewApplication:
                         )
         return cache
 
+    async def _review_batch_workspace_cursor(
+        self, workspace_record_identifier: str, cursor: str | None
+    ) -> str | None:
+        batch_identifier = workspace_batch_cursor_record_identifier(cursor)
+        if batch_identifier is None:
+            return cursor
+        batch = await self.get_review_batch(batch_identifier)
+        if batch.workspace_record_identifier != workspace_record_identifier:
+            raise ReviewInputError("Review batch continuation belongs to another workspace")
+        if batch.next_cursor is None:
+            raise ReviewInputError("Review batch has no workspace continuation")
+        if workspace_batch_cursor_record_identifier(batch.next_cursor) is not None:
+            raise ReviewInputError(
+                "Stored review batch continuation must be a raw workspace cursor"
+            )
+        return batch.next_cursor
+
     async def _build_review_batch_candidate(
         self,
         request: CreateReviewBatchRequest,
@@ -3340,7 +3358,9 @@ class ReviewApplication:
         selected: list[ReviewBatchItem] = []
         scalar_cache: dict[str, ScalarFieldValues | None] = {}
         batch_cache: dict[str, ReviewBatch] = {}
-        cursor = request.cursor
+        cursor = await self._review_batch_workspace_cursor(
+            request.workspace_record_identifier, request.cursor
+        )
         scanned_pages = 0
         while len(selected) < request.page_size and scanned_pages < request.maximum_scan_pages:
             page = await self.list_composed_search(

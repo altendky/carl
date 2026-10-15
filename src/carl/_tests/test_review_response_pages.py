@@ -10,11 +10,14 @@ from pydantic import ValidationError
 
 from carl._tests.test_compact_review import _acquisition, _prior, _projection
 from carl.core.composed_projection import ComposedField, ScalarFieldChange, ScalarFieldName
+from carl.core.review_errors import ReviewInputError
 from carl.core.review_response_pages import (
     REVIEW_RESPONSE_PAGE_BYTE_BUDGET,
     GetReviewBatchPageRequest,
     paged_review_acquisition,
     review_batch_page,
+    workspace_batch_cursor,
+    workspace_batch_cursor_record_identifier,
 )
 from carl.core.review_workspace import (
     ListingReviewInput,
@@ -46,7 +49,7 @@ def _large_acquisition(count: int = 100) -> ReviewBatchAcquisition:
             }
         )
         prior = _prior(projection, seller).model_copy(
-            update={"note": "DO_NOT_EMIT_PRIOR_NOTE" + "N" * 30_000}
+            update={"note": "DO_NOT_EMIT_PRIOR_NOTE" + "N" * 3_000}
         )
         items.append(
             ReviewBatchItem(
@@ -84,7 +87,8 @@ def test_acquisition_first_page_preserves_full_claim_and_stored_evidence() -> No
     assert response.lease is not None
     assert len(response.lease.listing_identifiers) == 100
     assert response.batch.record_identifier == source.batch.record_identifier
-    assert response.batch.workspace_next_cursor == source.batch.next_cursor == "continuation"
+    assert response.batch.workspace_next_cursor == "batch:batch"
+    assert source.batch.next_cursor == "continuation"
     assert response.batch.next_cursor is not None
     assert response.has_more and response.batch.has_more
     assert response.batch.total_items == 100
@@ -181,6 +185,70 @@ def test_smallest_budget_keeps_review_identity_when_all_previews_must_be_omitted
         == batch.items[1].projection.listing_identifier
     )
     assert not following.has_more
+
+
+def test_large_workspace_cursor_is_replaced_by_durable_batch_reference_on_every_page() -> None:
+    source = _large_acquisition(100)
+    raw_cursor = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {"runs": [f"retained-run-{index:03d}-" + "a" * 36 for index in range(100)]}
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+    assert len(raw_cursor) > 6_000
+    batch = source.batch.model_copy(update={"next_cursor": raw_cursor})
+    response = paged_review_acquisition(source.model_copy(update={"batch": batch}), limit=10)
+    assert response.lease is source.lease
+    assert response.batch.workspace_next_cursor == "batch:batch"
+    assert (
+        workspace_batch_cursor_record_identifier(response.batch.workspace_next_cursor)
+        == batch.record_identifier
+    )
+    assert raw_cursor not in response.model_dump_json()
+    assert batch.next_cursor == raw_cursor
+    seen = list(response.batch.items)
+    cursor = response.batch.next_cursor
+    minimum_returned = len(seen)
+    while cursor is not None:
+        page = review_batch_page(batch, cursor=cursor, limit=10)
+        assert page.offset == len(seen)
+        assert page.workspace_next_cursor == "batch:batch"
+        assert page.response_bytes <= REVIEW_RESPONSE_PAGE_BYTE_BUDGET
+        if page.next_cursor is not None:
+            minimum_returned = min(minimum_returned, len(page.items))
+        seen.extend(page.items)
+        cursor = page.next_cursor
+    assert minimum_returned >= 4
+    assert [item.projection.listing_identifier for item in seen] == [
+        item.projection.listing_identifier for item in batch.items
+    ]
+    # References survive JSON storage/reload and do not depend on a server cache.
+    restored = ReviewBatch.model_validate_json(batch.model_dump_json())
+    assert workspace_batch_cursor(restored) == response.batch.workspace_next_cursor
+    assert restored.next_cursor == raw_cursor
+
+
+@pytest.mark.parametrize("cursor", [None, "legacy-base64-cursor", "continuation"])
+def test_workspace_cursor_parser_leaves_legacy_cursors_unchanged(cursor: str | None) -> None:
+    assert workspace_batch_cursor_record_identifier(cursor) is None
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "batch:",
+        "batch:invalid whitespace",
+        "batch:\ninvalid",
+        "batch:invalid\x7f",
+        "batch:" + "a" * 513,
+    ],
+)
+def test_malformed_workspace_batch_references_raise_domain_errors(cursor: str) -> None:
+    with pytest.raises(ReviewInputError, match="cursor reference is malformed"):
+        _ = workspace_batch_cursor_record_identifier(cursor)
 
 
 @pytest.mark.parametrize("cursor", ["", "invalid cursor", "%%%", "YQ", "A" * 2_049])

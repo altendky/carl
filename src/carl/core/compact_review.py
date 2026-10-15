@@ -75,11 +75,15 @@ def compact_review_workspace(workspace: ReviewWorkspace) -> CompactReviewWorkspa
 
 
 def analysis_claude_details(value: JsonValue, *, include_details: bool = False) -> JsonValue:
-    """Omit the prompt-bearing command line from ordinary report responses."""
+    """Keep invocation and usage diagnostics behind the explicit details option."""
 
     if include_details or not isinstance(value, dict):
         return value
-    return {key: item for key, item in cast(dict[str, JsonValue], value).items() if key != "argv"}
+    return {
+        key: item
+        for key, item in cast(dict[str, JsonValue], value).items()
+        if key not in {"argv", "output_metadata", "modelUsage"}
+    }
 
 
 class CompactReviewProjection(WorkspaceListingSummary):

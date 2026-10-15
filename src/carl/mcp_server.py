@@ -84,6 +84,7 @@ from carl.core.review import (
     SetProductGuideIdentityRetiredRequest,
     WorkStatus,
 )
+from carl.core.review_evidence import InternedReviewBatchItem, intern_review_batch_item
 from carl.core.review_response_pages import (
     GetReviewBatchItemRequest,
     GetReviewBatchPageRequest,
@@ -113,7 +114,6 @@ from carl.core.review_workspace import (
     RetryWorkspaceSearchTrackRequest,
     RetryWorkspaceSearchTrackResult,
     ReviewBatch,
-    ReviewBatchItem,
     ReviewClaimLease,
     ReviewWorkset,
     ReviewWorksetConflict,
@@ -133,7 +133,7 @@ from carl.core.review_workspace import (
     WorkspaceWorkStatus,
     WorkspaceWorkWaitResult,
 )
-from carl.core.tool_response_pages import ToolResponsePage
+from carl.core.tool_response_pages import ToolResponseReadResult
 from carl.core.workspace_search_results import (
     ListWorkspaceSearchResultsRequest,
     WorkspaceSearchResultsPage,
@@ -465,15 +465,18 @@ is not proof of unchanged values. Older batch/bulk review baselines are recovere
 evidence only when verified against the recorded revision; new reviews retain scalar snapshots.
 Use compact=true on acquire_review_batch for a bounded first summary page and the full claim.
 Continue with get_review_batch_page using batch.next_cursor; workspace_next_cursor is a separate
-cursor for acquiring another batch. Every summary retains the exact projection revision for review
+short durable cursor for acquiring another batch. Treat it as opaque. Every summary retains the exact projection revision for review
 recording. Fetch descriptions, images, and seller details from that exact issued batch with
-get_review_batch_item. get_workspace_listing returns current evidence; its compact=true mode
+get_review_batch_item; its evidence_table contains exact evidence once, with evidence_reference keys
+at each evidence location. get_workspace_listing returns current evidence; its compact=true mode
 deduplicates seller profiles through a sellers map. Full stored batches remain
 available for drill-down. Page responses report response_bytes and has_more. MCP results also report
 size and continuation under _meta["carl/response"]. If kind=carl_tool_response_page appears, follow
-get_tool_response_page and concatenate json_fragment values as instructed. The original operation
+get_tool_response_page and read each full page from content[0].text; structuredContent is only its
+manifest without the fragment. Concatenate json_fragment values as instructed. payload_format
+distinguishes a single compact structured payload from a genuine text/image/mixed MCP result. The original operation
 already ran; do not repeat it. After retaining every fragment, acknowledge the final page's cursor
-with acknowledge=true. Retrieve unread pages before restarting this server.
+with acknowledge=true for a small receipt. Retrieve unread pages before restarting this server.
 Preview analysis with preview_selection_analyses, then queue the unchanged intent with
 request_selection_analyses. The workspace supplies the exact refreshed search run and product guide;
 the selection may be the whole workspace, a claimed review batch, a workset, a frozen selection
@@ -486,7 +489,8 @@ scope, missing usable observations, policy exclusions, or maximum_items. Batch w
 and adds runtime input failures. Whole-workspace selection scans at most maximum_candidate_listings_examined
 members (2,500 by default). Check candidate_examination_limit_reached and increase that bound deliberately
 when a complete whole-workspace plan is required.
-get_listing_analysis omits Claude argv and its prompt by default; set include_details=true only for diagnostics.
+get_listing_analysis omits Claude argv, its prompt, and output_metadata/modelUsage by default;
+set include_details=true only for diagnostics.
 Poll the returned work identifier with get_work_status when detailed diagnostics are needed. Prefer
 get_workspace_work_status to check all root work requested by a workspace, or
 wait_for_workspace_work for a short progress-reporting wait until it is idle. It defaults to 30
@@ -594,11 +598,13 @@ def tool_definitions(
 
     response_store = response_store or ToolResponseStore()
 
-    async def get_tool_response_page(cursor: str, acknowledge: bool = False) -> ToolResponsePage:
+    async def get_tool_response_page(
+        cursor: str, acknowledge: bool = False
+    ) -> ToolResponseReadResult:
         """Continue an oversized response; acknowledge its final cursor after retaining every fragment."""
 
         try:
-            return response_store.get_page(cursor, acknowledge=acknowledge)
+            return ToolResponseReadResult(response_store.get_page(cursor, acknowledge=acknowledge))
         except ValueError as error:
             raise ToolError(str(error)) from error
 
@@ -885,10 +891,12 @@ def tool_definitions(
 
         return await expected(lambda: application.get_review_batch_page(request))
 
-    async def get_review_batch_item(request: GetReviewBatchItemRequest) -> ReviewBatchItem:
-        """Get one item's full frozen evidence and exact revision from its issued batch."""
+    async def get_review_batch_item(request: GetReviewBatchItemRequest) -> InternedReviewBatchItem:
+        """Get one frozen item with exact evidence interned once in its evidence_table."""
 
-        return await expected(lambda: application.get_review_batch_item(request))
+        return intern_review_batch_item(
+            await expected(lambda: application.get_review_batch_item(request))
+        )
 
     async def record_listing_reviews(
         request: RecordClaimedListingReviewsRequest,

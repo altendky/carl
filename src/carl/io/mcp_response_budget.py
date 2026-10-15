@@ -16,7 +16,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
@@ -31,7 +31,12 @@ from mcp.types import (
 )
 
 from carl.core.models import JsonValue
-from carl.core.tool_response_pages import ToolResponsePage
+from carl.core.tool_response_pages import (
+    ToolResponseAcknowledgement,
+    ToolResponsePage,
+    ToolResponsePageManifest,
+    ToolResponseReadResult,
+)
 
 TARGET_RESPONSE_BYTES = 24_000
 HARD_RESPONSE_BYTES = 40_000
@@ -62,17 +67,86 @@ def _annotated[T: CallToolResult | InputRequiredResult](result: T, *, has_more: 
 
 
 def page_result(
-    page: ToolResponsePage, *, result_meta: dict[str, JsonValue] | None = None
+    page: ToolResponsePage | ToolResponseAcknowledgement,
+    *,
+    result_meta: dict[str, JsonValue] | None = None,
 ) -> CallToolResult:
-    """Expose the same bounded page to structured and legacy text-only clients."""
+    """Keep the fragment once in text; structured clients receive a manifest."""
+    structured = page.model_dump(mode="json")
+    if isinstance(page, ToolResponsePage):
+        structured.pop("json_fragment")
     return _annotated(
         CallToolResult(
             content=[TextContent(type="text", text=page.model_dump_json())],
-            structured_content=page.model_dump(mode="json"),
+            structured_content=structured,
             _meta=result_meta,
         ),
         has_more=page.has_more,
     )
+
+
+def _duplicate_structured_text(result: CallToolResult) -> bool:
+    """Recognize SDK JSON mirrors, preserving genuine text and binary content."""
+    if result.structured_content is None:
+        return False
+    if not result.content:
+        return True
+    if not all(isinstance(content, TextContent) for content in result.content):
+        return False
+    if any(
+        set(content.model_dump(mode="json", by_alias=True, exclude_none=True)) - {"type", "text"}
+        for content in result.content
+    ):
+        return False
+    try:
+        values = [
+            json.loads(content.text)
+            for content in result.content
+            if isinstance(content, TextContent)
+        ]
+        structured = result.model_dump(mode="json", by_alias=True)["structuredContent"]
+
+        def equal(left: JsonValue, right: JsonValue) -> bool:
+            # Python equality equates True and 1; their JSON representations
+            # are different and must not be treated as mirrored content.
+            return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(
+                right, sort_keys=True, allow_nan=False
+            )
+
+        return (len(values) == 1 and equal(values[0], structured)) or (
+            isinstance(structured, dict)
+            and set(structured) == {"result"}
+            and equal(structured["result"], values)
+        )
+    except (ValueError, RecursionError, TypeError, OverflowError):
+        return False
+
+
+def _compact_json(value: JsonValue) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _compact_normal(
+    result: CallToolResult | InputRequiredResult,
+) -> CallToolResult | InputRequiredResult:
+    if not isinstance(result, CallToolResult) or not _duplicate_structured_text(result):
+        return result
+    structured = result.model_dump(mode="json", by_alias=True)["structuredContent"]
+    return result.model_copy(
+        update={"content": [TextContent(type="text", text=_compact_json(structured))]}
+    )
+
+
+def canonical_payload(
+    result: CallToolResult | InputRequiredResult,
+) -> tuple[str, Literal["structured_json", "mcp_result_json"]]:
+    """Store one structured representation or preserve genuine MCP content whole."""
+    if isinstance(result, CallToolResult) and _duplicate_structured_text(result):
+        metadata = result.meta or {}
+        if not (set(metadata) - {SERVER_INFO_META_KEY, _RESPONSE_META}):
+            structured = result.model_dump(mode="json", by_alias=True)["structuredContent"]
+            return _compact_json(structured), "structured_json"
+    return response_json(result), "mcp_result_json"
 
 
 def _critical_metadata(result: CallToolResult | InputRequiredResult) -> dict[str, JsonValue]:
@@ -117,7 +191,9 @@ class _CachedResponse:
     sha256: str
     is_error: bool
     critical_metadata: dict[str, JsonValue]
+    payload_format: Literal["structured_json", "mcp_result_json"]
     complete: bool = False
+    final_page_offsets: set[int] | None = None
 
 
 class ResponseCapacityError(ValueError):
@@ -197,6 +273,7 @@ class ToolResponseStore:
     def bound(
         self, tool_name: str, result: CallToolResult | InputRequiredResult
     ) -> CallToolResult | InputRequiredResult:
+        result = _compact_normal(result)
         if self.result_meta:
             result = result.model_copy(update={"meta": {**self.result_meta, **(result.meta or {})}})
         structured = result.structured_content if isinstance(result, CallToolResult) else None
@@ -212,7 +289,7 @@ class ToolResponseStore:
         normal = _annotated(result, has_more=has_more)
         if response_bytes(normal) <= self.target_bytes:
             return normal
-        text = response_json(result)
+        text, payload_format = canonical_payload(result)
         identifier = secrets.token_urlsafe(24)
         self._entries[identifier] = _CachedResponse(
             tool_name=tool_name,
@@ -221,16 +298,29 @@ class ToolResponseStore:
             sha256=hashlib.sha256(text.encode()).hexdigest(),
             is_error=result.is_error if isinstance(result, CallToolResult) else False,
             critical_metadata=_critical_metadata(result),
+            payload_format=payload_format,
         )
         return page_result(self.get_page(self._cursor(identifier, 0)), result_meta=self.result_meta)
 
-    def get_page(self, cursor: str, *, acknowledge: bool = False) -> ToolResponsePage:
+    def get_page(
+        self, cursor: str, *, acknowledge: bool = False
+    ) -> ToolResponsePage | ToolResponseAcknowledgement:
         identifier, offset = self._decode_cursor(cursor)
         entry = self._entries.get(identifier)
         if entry is None:
             raise ValueError("Tool-response cursor is no longer available in this server process")
         if offset > len(entry.text):
             raise ValueError("Invalid tool-response cursor offset")
+        if acknowledge:
+            if offset not in (entry.final_page_offsets or set()):
+                raise ValueError(
+                    "Only a previously retrieved final response page may be acknowledged"
+                )
+            entry.complete = True
+            self._entries.move_to_end(identifier)
+            return ToolResponseAcknowledgement(
+                tool_name=entry.tool_name, cursor=cursor, sha256=entry.sha256
+            )
 
         def candidate(count: int) -> ToolResponsePage:
             end = offset + count
@@ -238,6 +328,7 @@ class ToolResponseStore:
             return ToolResponsePage(
                 tool_name=entry.tool_name,
                 cursor=cursor,
+                payload_format=entry.payload_format,
                 total_json_bytes=entry.size_bytes,
                 sha256=entry.sha256,
                 offset=offset,
@@ -245,7 +336,6 @@ class ToolResponseStore:
                 next_cursor=self._cursor(identifier, end) if has_more else None,
                 has_more=has_more,
                 original_is_error=entry.is_error,
-                acknowledged=entry.complete or acknowledge,
                 critical_metadata=entry.critical_metadata if offset == 0 else {},
             )
 
@@ -264,10 +354,10 @@ class ToolResponseStore:
             raise ValueError("Response-page manifest exceeds the configured wire budget")
         if response_bytes(page_result(page, result_meta=self.result_meta)) >= self.hard_bytes:
             raise AssertionError("Response-page exceeded its hard wire budget")
-        if acknowledge and page.has_more:
-            raise ValueError("Only the final response page may be acknowledged")
-        if acknowledge:
-            entry.complete = True
+        if not page.has_more:
+            if entry.final_page_offsets is None:
+                entry.final_page_offsets = set()
+            entry.final_page_offsets.add(offset)
         self._entries.move_to_end(identifier)
         return page
 
@@ -276,7 +366,7 @@ def paging_output_schema(original: dict[str, Any]) -> dict[str, Any]:
     """Advertise continuation without changing the original runtime validator."""
     original = dict(original)
     definitions = original.pop("$defs", {})
-    page = ToolResponsePage.model_json_schema()
+    page = ToolResponsePageManifest.model_json_schema()
     page_definitions = page.pop("$defs", {})
     renamed: dict[str, str] = {}
     for key in page_definitions:
@@ -349,8 +439,13 @@ class BudgetedMCPServer(MCPServer[Any]):
                     content=[TextContent(type="text", text=str(error))], is_error=True
                 )
             if isinstance(result, CallToolResult) and not result.is_error:
+                page = ToolResponseReadResult.model_validate(result.structured_content).root
+                if not isinstance(page, (ToolResponsePage, ToolResponseAcknowledgement)):
+                    raise ToolError(
+                        "Continuation endpoint did not return a fragment or acknowledgement"
+                    )
                 return page_result(
-                    ToolResponsePage.model_validate(result.structured_content),
+                    page,
                     result_meta=self.response_store.result_meta,
                 )
             return self.response_store.bound(name, result)

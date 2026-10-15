@@ -30,6 +30,7 @@ from carl.core.composed_projection import (
 )
 from carl.core.models import CodeProvenance, JsonValue, NamedOutput, RecordDraft
 from carl.core.review_errors import ReviewInputError
+from carl.core.review_evidence import InternedReviewBatchItem, rehydrate_review_batch_item
 from carl.core.review_response_pages import (
     GetReviewBatchItemRequest,
     GetReviewBatchPageRequest,
@@ -415,7 +416,11 @@ async def test_compact_acquisition_replays_and_retains_full_review_batch(
                 "get_review_batch_item", {"request": detail_request.model_dump(mode="json")}
             )
             assert not detail.is_error
-            assert detail.structured_content == last.model_dump(mode="json")
+            reduced = InternedReviewBatchItem.model_validate_json(
+                json.dumps(detail.structured_content)
+            )
+            assert rehydrate_review_batch_item(reduced) == last
+            assert len(reduced.evidence_table) < 5
             assert len(detail.model_dump_json(by_alias=True, exclude_none=True).encode()) < 25_000
             with pytest.raises(ReviewInputError, match=r"[Ll]isting"):
                 _ = await application.get_review_batch_item(
