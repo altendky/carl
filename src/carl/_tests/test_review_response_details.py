@@ -77,6 +77,8 @@ def test_compact_workspaces_omit_specifications_but_keep_track_scope_and_version
 def test_analysis_details_omit_argv_without_changing_retained_metadata() -> None:
     metadata: JsonValue = {
         "argv": ["claude", "-p", "full retained prompt " * 10_000],
+        "output_metadata": {"modelUsage": {"model": {"inputTokens": 1000}}},
+        "modelUsage": {"legacy": {"inputTokens": 1000}},
         "version": "2.0",
         "tool_calls": [{"name": "WebSearch", "input": {"query": "telescope"}}],
         "external_research_provenance": "agent_reported_urls",
@@ -84,6 +86,8 @@ def test_analysis_details_omit_argv_without_changing_retained_metadata() -> None
     ordinary = analysis_claude_details(metadata)
     assert isinstance(ordinary, dict)
     assert "argv" not in ordinary
+    assert "output_metadata" not in ordinary
+    assert "modelUsage" not in ordinary
     assert ordinary["version"] == "2.0"
     assert ordinary["tool_calls"] == metadata["tool_calls"]
     assert analysis_claude_details(metadata, include_details=True) == metadata
@@ -195,6 +199,7 @@ async def test_analysis_report_details_are_opt_in_and_retained_record_is_unchang
     monkeypatch.setattr(Database, "facebook_analysis_descriptor", analysis_descriptor)
     claude: JsonValue = {
         "argv": ["claude", "-p", "full retained prompt " * 10_000],
+        "output_metadata": {"modelUsage": {"model": {"inputTokens": 1000}}},
         "version": "2.0",
         "tool_calls": [],
     }

@@ -14,6 +14,7 @@ from pydantic import Field, model_validator
 from carl.core.composed_projection import ListingStatus, ProjectionRevision, ScalarFieldName
 from carl.core.listing_identity import LISTING_IDENTIFIER_PATTERN
 from carl.core.models import JsonValue, StrictModel
+from carl.core.review_errors import ReviewInputError
 from carl.core.review_workspace import (
     ProjectionRevisionComponent,
     ReviewBatch,
@@ -27,6 +28,7 @@ from carl.core.review_workspace import (
 REVIEW_RESPONSE_PAGE_BYTE_BUDGET = 9_000
 REVIEW_RESPONSE_PAGE_DEFAULT_LIMIT = 5
 REVIEW_RESPONSE_PAGE_MAXIMUM_LIMIT = 10
+WORKSPACE_BATCH_CURSOR_PREFIX = "batch:"
 
 
 class GetReviewBatchPageRequest(StrictModel):
@@ -82,7 +84,9 @@ class ReviewBatchPage(StrictModel):
     items: tuple[ReviewBatchItemSummary, ...] = Field(max_length=10)
     has_more: bool
     next_cursor: str | None
-    workspace_next_cursor: str | None
+    workspace_next_cursor: str | None = Field(
+        description="Durable continuation for a later workspace batch; pass as acquire_review_batch.cursor."
+    )
     scanned_page_count: int = Field(ge=1)
     status_counts: dict[ListingStatus, int]
     review_state_counts: dict[ReviewState, int]
@@ -116,6 +120,34 @@ class _ReviewBatchCursor(StrictModel):
     batch_record_identifier: str
     batch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     offset: int = Field(ge=0, le=100)
+
+
+def workspace_batch_cursor(batch: ReviewBatch) -> str | None:
+    """Reference the immutable batch's retained workspace continuation."""
+
+    return (
+        None
+        if batch.next_cursor is None
+        else f"{WORKSPACE_BATCH_CURSOR_PREFIX}{batch.record_identifier}"
+    )
+
+
+def workspace_batch_cursor_record_identifier(cursor: str | None) -> str | None:
+    """Recognize durable references while leaving legacy raw cursors untouched."""
+
+    if cursor is None or not cursor.startswith(WORKSPACE_BATCH_CURSOR_PREFIX):
+        return None
+    identifier = cursor.removeprefix(WORKSPACE_BATCH_CURSOR_PREFIX)
+    if (
+        not identifier
+        or len(identifier) > 512
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in identifier
+        )
+    ):
+        raise ReviewInputError("Workspace batch cursor reference is malformed")
+    return identifier
 
 
 def _encoded_size(value: StrictModel) -> int:
@@ -284,7 +316,7 @@ def _build_page(
                 next_cursor=_cursor(batch, identity, next_offset)
                 if next_offset < len(batch.items)
                 else None,
-                workspace_next_cursor=batch.next_cursor,
+                workspace_next_cursor=workspace_batch_cursor(batch),
                 scanned_page_count=batch.scanned_page_count,
                 status_counts=dict(Counter(item.projection.status.value for item in batch.items)),
                 review_state_counts=dict(Counter(item.review_state for item in batch.items)),

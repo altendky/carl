@@ -6,14 +6,21 @@ from typing import Any
 
 import anyio
 import pytest
-from mcp.types import CallToolResult, ImageContent, TextContent
+from mcp import Client
+from mcp.types import Annotations, CallToolResult, ContentBlock, ImageContent, TextContent
 
+from carl._tests.mcp_response_helpers import tool_response_page
 from carl.core.models import JsonValue, StrictModel
-from carl.core.tool_response_pages import ToolResponsePage
+from carl.core.tool_response_pages import (
+    ToolResponseAcknowledgement,
+    ToolResponsePage,
+    ToolResponseReadResult,
+)
 from carl.io.mcp_response_budget import (
     BudgetedMCPServer,
     ResponseCapacityError,
     ToolResponseStore,
+    canonical_payload,
     page_result,
     paging_output_schema,
     response_bytes,
@@ -27,12 +34,20 @@ class _Payload(StrictModel):
 
 
 def _page(result: CallToolResult) -> ToolResponsePage:
-    page = ToolResponsePage.model_validate(result.structured_content)
+    page = tool_response_page(result)
+    assert page is not None
     assert isinstance(result.content[0], TextContent)
-    assert json.loads(result.content[0].text) == result.structured_content
+    assert page.model_dump(mode="json", exclude={"json_fragment"}) == result.structured_content
+    assert "json_fragment" not in result.structured_content
     assert result.meta is not None
     assert result.meta["carl/response"]["response_bytes"] == response_bytes(result)
     assert result.meta["carl/response"]["has_more"] == page.has_more
+    return page
+
+
+def _stored_page(store: ToolResponseStore, cursor: str) -> ToolResponsePage:
+    page = store.get_page(cursor)
+    assert isinstance(page, ToolResponsePage)
     return page
 
 
@@ -40,7 +55,11 @@ def _page(result: CallToolResult) -> ToolResponsePage:
 def test_huge_unicode_and_nested_strings_reassemble_exactly(value: JsonValue) -> None:
     store = ToolResponseStore()
     original = CallToolResult(
-        content=[TextContent(type="text", text=json.dumps(value, ensure_ascii=False))],
+        content=[
+            TextContent(
+                type="text", text=json.dumps({"value": value}, ensure_ascii=False, indent=2)
+            )
+        ],
         structured_content={"value": value},
     )
     result = store.bound("get_analysis", original)
@@ -53,9 +72,10 @@ def test_huge_unicode_and_nested_strings_reassemble_exactly(value: JsonValue) ->
         chunks.append(page.json_fragment)
         if page.next_cursor is None:
             break
-        result = page_result(store.get_page(page.next_cursor))
+        result = page_result(_stored_page(store, page.next_cursor))
     rebuilt = "".join(chunks)
-    assert rebuilt == response_json(original)
+    assert page.payload_format == "structured_json"
+    assert rebuilt == json.dumps({"value": value}, ensure_ascii=False, separators=(",", ":"))
     assert len(rebuilt.encode()) == page.total_json_bytes
     assert hashlib.sha256(rebuilt.encode()).hexdigest() == page.sha256
 
@@ -70,10 +90,149 @@ def test_binary_image_content_is_budgeted_and_recoverable() -> None:
     page = _page(result)
     chunks = [page.json_fragment]
     while page.next_cursor:
-        page = store.get_page(page.next_cursor)
+        page = _stored_page(store, page.next_cursor)
         assert response_bytes(page_result(page)) <= store.target_bytes
         chunks.append(page.json_fragment)
     assert json.loads("".join(chunks))["content"][0]["data"] == "A" * 100_000
+
+
+def test_pages_transmit_one_compact_payload_with_bounded_manifest_overhead() -> None:
+    payload = {"value": "single-copy-" + "x" * 80_000}
+    compact = json.dumps(payload, separators=(",", ":"))
+    original = CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, indent=2))],
+        structured_content=payload,
+    )
+    store = ToolResponseStore()
+    result = store.bound("report", original)
+    assert isinstance(result, CallToolResult)
+    wire_bytes, page_count, fragments = 0, 0, []
+    while True:
+        page = _page(result)
+        wire_bytes += response_bytes(result)
+        page_count += 1
+        fragments.append(page.json_fragment)
+        assert page.payload_format == "structured_json"
+        assert page.total_json_bytes == len(compact.encode())
+        assert isinstance(result.content[0], TextContent)
+        assert "\n" not in result.content[0].text
+        if page.next_cursor is None:
+            break
+        result = page_result(_stored_page(store, page.next_cursor))
+    assert "".join(fragments) == compact
+    assert sum(len(fragment.encode()) for fragment in fragments) == len(compact.encode())
+    assert wire_bytes <= len(compact.encode()) + 6_000 * page_count
+    assert wire_bytes < response_bytes(original)
+
+
+@pytest.mark.parametrize("binary", [False, True])
+def test_genuine_additional_content_preserves_complete_mcp_semantics(binary: bool) -> None:
+    contents: list[ContentBlock] = [
+        TextContent(type="text", text="Actual explanation: " + "text" * 15_000)
+    ]
+    original = CallToolResult(
+        content=[*contents, ImageContent(type="image", data="A" * 20_000, mime_type="image/png")]
+        if binary
+        else contents,
+        structured_content={"summary": "separate"},
+        is_error=True,
+    )
+    store = ToolResponseStore()
+    result = store.bound("mixed", original)
+    assert isinstance(result, CallToolResult)
+    chunks: list[str] = []
+    while True:
+        page = _page(result)
+        assert page.payload_format == "mcp_result_json"
+        assert page.original_is_error
+        chunks.append(page.json_fragment)
+        if page.next_cursor is None:
+            break
+        result = page_result(_stored_page(store, page.next_cursor))
+    assert CallToolResult.model_validate_json("".join(chunks)) == original
+
+
+@pytest.mark.parametrize("text", ['{"value":1}', '{"value":1.0}'])
+def test_json_text_with_different_boolean_value_is_not_discarded(text: str) -> None:
+    original = CallToolResult(
+        content=[TextContent(type="text", text=text)], structured_content={"value": True}
+    )
+    encoded, payload_format = canonical_payload(original)
+    assert payload_format == "mcp_result_json"
+    assert CallToolResult.model_validate_json(encoded) == original
+
+
+@pytest.mark.parametrize("annotation", ["annotations", "meta"])
+def test_annotated_json_text_is_not_discarded(annotation: str) -> None:
+    original = CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text='{"value":"same"}',
+                annotations=Annotations(audience=["assistant"])
+                if annotation == "annotations"
+                else None,
+                _meta={"render": "special"} if annotation == "meta" else None,
+            )
+        ],
+        structured_content={"value": "same"},
+    )
+    encoded, payload_format = canonical_payload(original)
+    assert payload_format == "mcp_result_json"
+    assert CallToolResult.model_validate_json(encoded) == original
+
+
+def test_sdk_wrapped_sequence_uses_one_compact_structured_representation() -> None:
+    values = [{"value": "first"}, {"value": "second"}]
+    original = CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(value, indent=2)) for value in values],
+        structured_content={"result": values},
+    )
+    encoded, payload_format = canonical_payload(original)
+    assert payload_format == "structured_json"
+    assert encoded == json.dumps({"result": values}, separators=(",", ":"))
+
+
+@pytest.mark.anyio
+async def test_public_mcp_text_only_client_recovers_payload_and_receives_tiny_ack() -> None:
+    store = ToolResponseStore()
+    server = BudgetedMCPServer(name="text-only-test", response_store=store)
+    original = {"report": "large" * 30_000, "count": 30_000}
+
+    async def report() -> _Payload:
+        return _Payload(value=original)
+
+    async def get_tool_response_page(
+        cursor: str, acknowledge: bool = False
+    ) -> ToolResponseReadResult:
+        return ToolResponseReadResult(store.get_page(cursor, acknowledge=acknowledge))
+
+    server.add_tool(report)
+    server.add_tool(get_tool_response_page)
+    fragments: list[str] = []
+    async with Client(server) as client:
+        result = await client.call_tool("report", {})
+        while True:
+            assert not result.is_error and response_bytes(result) <= store.target_bytes
+            # Simulate a client that displays only TextContent, not structuredContent.
+            text_only = result.model_copy(update={"structured_content": None})
+            page = tool_response_page(text_only)
+            assert page is not None
+            assert page.payload_format == "structured_json"
+            fragments.append(page.json_fragment)
+            if not page.has_more:
+                break
+            result = await client.call_tool("get_tool_response_page", {"cursor": page.next_cursor})
+        assert json.loads("".join(fragments)) == {"value": original, "lease": None}
+        acknowledgement = await client.call_tool(
+            "get_tool_response_page", {"cursor": page.cursor, "acknowledge": True}
+        )
+        assert not acknowledgement.is_error
+        assert response_bytes(acknowledgement) < 1_000
+        assert isinstance(acknowledgement.content[0], TextContent)
+        receipt = ToolResponseAcknowledgement.model_validate_json(acknowledgement.content[0].text)
+        assert receipt.acknowledged and receipt.sha256 == page.sha256
+        assert "json_fragment" not in response_json(acknowledgement)
 
 
 def test_unread_results_are_pinned_and_finished_results_can_be_evicted() -> None:
@@ -83,20 +242,23 @@ def test_unread_results_are_pinned_and_finished_results_can_be_evicted() -> None
     )
     assert isinstance(result, CallToolResult)
     page = _page(result)
-    with pytest.raises(ValueError, match="Only the final"):
+    with pytest.raises(ValueError, match="final response page"):
         store.get_page(page.cursor, acknowledge=True)
     first_cursor = page.cursor
     assert store.retained_bytes > store.soft_max_bytes
     with pytest.raises(ResponseCapacityError), store.admit():
         pytest.fail("An unread response must prevent admission")
-    assert store.get_page(first_cursor).json_fragment == page.json_fragment
+    assert _stored_page(store, first_cursor).json_fragment == page.json_fragment
     while page.next_cursor:
-        page = store.get_page(page.next_cursor)
+        page = _stored_page(store, page.next_cursor)
     # Delivery of the last page is not an acknowledgement: it may be lost.
     with pytest.raises(ResponseCapacityError), store.admit():
         pytest.fail("Unacknowledged final page must remain replayable")
-    assert store.get_page(page.cursor).json_fragment == page.json_fragment
-    assert store.get_page(page.cursor, acknowledge=True).acknowledged
+    assert _stored_page(store, page.cursor).json_fragment == page.json_fragment
+    acknowledgement = store.get_page(page.cursor, acknowledge=True)
+    assert isinstance(acknowledgement, ToolResponseAcknowledgement) and acknowledgement.acknowledged
+    assert response_bytes(page_result(acknowledgement)) < 1_000
+    assert "json_fragment" not in page_result(acknowledgement).model_dump_json()
     with store.admit():
         assert store.retained_bytes == 0
     with pytest.raises(ValueError, match="no longer available"):
@@ -183,8 +345,10 @@ async def test_mutation_response_and_claim_token_recover_without_repeating_mutat
             },
         )
 
-    async def get_tool_response_page(cursor: str, acknowledge: bool = False) -> ToolResponsePage:
-        return store.get_page(cursor, acknowledge=acknowledge)
+    async def get_tool_response_page(
+        cursor: str, acknowledge: bool = False
+    ) -> ToolResponseReadResult:
+        return ToolResponseReadResult(store.get_page(cursor, acknowledge=acknowledge))
 
     server.add_tool(mutate)
     server.add_tool(get_tool_response_page)
@@ -204,14 +368,17 @@ async def test_mutation_response_and_claim_token_recover_without_repeating_mutat
         page = _page(result)
         chunks.append(page.json_fragment)
     recovered = json.loads("".join(chunks))
-    assert recovered["structuredContent"]["lease"]["claim_token"] == "claim-secret"
-    assert recovered["structuredContent"]["value"] == "huge" * 40_000
+    assert page.payload_format == "structured_json"
+    assert recovered["lease"]["claim_token"] == "claim-secret"
+    assert recovered["value"] == "huge" * 40_000
     assert invocations == 1
     ack = await server.call_tool(
         "get_tool_response_page", {"cursor": page.cursor, "acknowledge": True}
     )
     assert isinstance(ack, CallToolResult)
-    assert _page(ack).acknowledged
+    assert ToolResponseAcknowledgement.model_validate(ack.structured_content).acknowledged
+    assert response_bytes(ack) < 1_000
+    assert "json_fragment" not in response_json(ack)
     subsequent = await server.call_tool("mutate", {})
     assert isinstance(subsequent, CallToolResult) and not subsequent.is_error
     assert invocations == 2
