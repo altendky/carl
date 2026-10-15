@@ -392,7 +392,7 @@ Workspaces may mix sources. Review IDs use ebay:<item ID> for eBay and bare nume
 copy returned identities unchanged through reviews, claims, worksets, snapshots, and analysis. Add another phrase with create_workspace_search; after it
 completes, refresh that track with request_workspace_refresh before requesting analysis. Refreshes
 advance the selected track without replacing the workspace.
-To adjust the same watch, read get_review_workspace_activity.workspace, then revise_workspace_search_track with its
+To adjust the same watch, read get_review_workspace, then revise_workspace_search_track with its
 current search_specification_version as expected_version and the complete replacement search spec.
 This preserves the track ID, listing first/last-seen history, and prior runs; inspect immutable
 versions with list_workspace_search_track_versions. Revision alone performs no acquisition:
@@ -420,8 +420,9 @@ Rename a workspace with rename_review_workspace. Archive or restore it with
 set_review_workspace_archived; ordinary list_review_workspaces calls hide archived workspaces, while
 include_archived=true reveals them and exact workspace operations remain available.
 Use list_review_workspace_summaries for discovery: follow next_cursor while has_more is true.
-It returns small identities and counts without per-track definitions. Inspect exact versions with
-list_workspace_search_track_versions, or request full definitions with list_review_workspaces.
+It returns small identities and counts without per-track definitions. list_review_workspaces(compact=true)
+adds concise track identities and states. Retrieve full work/run/specification references for one
+workspace with get_review_workspace, or inspect exact versions with list_workspace_search_track_versions.
 Attach multiple guides with add_workspace_product_guide. A binding is either pinned to one exact
 record or follows the latest version of one guide identity; list_workspace_product_guides reports
 the exact version currently resolved. Use update_workspace_product_guide_binding to rename,
@@ -465,15 +466,16 @@ is not proof of unchanged values. Older batch/bulk review baselines are recovere
 evidence only when verified against the recorded revision; new reviews retain scalar snapshots.
 Use compact=true on acquire_review_batch for a bounded first summary page and the full claim.
 Continue with get_review_batch_page using batch.next_cursor; workspace_next_cursor is a separate
-short durable cursor for acquiring another batch. Treat it as opaque. Every summary retains the exact projection revision for review
-recording. Fetch descriptions, images, and seller details from that exact issued batch with
+short durable cursor for acquiring another batch. Treat it as opaque. Each summary carries only
+projection_revision.aggregate_sha256. Fetch the full component revision needed to record a review,
+along with descriptions, images, and seller details from that exact issued batch, with
 get_review_batch_item; its evidence_table contains exact evidence once, with evidence_reference keys
 at each evidence location. get_workspace_listing returns current evidence; its compact=true mode
 deduplicates seller profiles through a sellers map. Full stored batches remain
 available for drill-down. Page responses report response_bytes and has_more. MCP results also report
 size and continuation under _meta["carl/response"]. If kind=carl_tool_response_page appears, follow
-get_tool_response_page and read each full page from content[0].text; structuredContent is only its
-manifest without the fragment. Concatenate json_fragment values as instructed. payload_format
+get_tool_response_page and read json_fragment directly from structuredContent. All structured response
+data is in structuredContent; text contains only a short notice for these responses. Concatenate json_fragment values as instructed. payload_format
 distinguishes a single compact structured payload from a genuine text/image/mixed MCP result. The original operation
 already ran; do not repeat it. After retaining every fragment, acknowledge the final page's cursor
 with acknowledge=true for a small receipt. Retrieve unread pages before restarting this server.
@@ -662,6 +664,11 @@ def tool_definitions(
                 include_archived=include_archived, compact=compact
             )
         )
+
+    async def get_review_workspace(record_identifier: str) -> ReviewWorkspace:
+        """Get one workspace's full track specifications and work/run references."""
+
+        return await expected(lambda: application.get_review_workspace(record_identifier))
 
     async def list_review_workspace_summaries(
         request: ListReviewWorkspaceSummariesRequest | None = None,
@@ -1192,6 +1199,13 @@ def tool_definitions(
             ("carl", "review", "list_workspaces"),
             list_review_workspaces,
             list_review_workspaces.__doc__ or "",
+            _READ_ONLY,
+        ),
+        ToolDefinition(
+            "get_review_workspace",
+            ("carl", "review", "get_workspace"),
+            get_review_workspace,
+            get_review_workspace.__doc__ or "",
             _READ_ONLY,
         ),
         ToolDefinition(

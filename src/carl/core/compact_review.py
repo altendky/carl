@@ -33,22 +33,15 @@ from carl.core.work import WorkState
 
 
 class CompactWorkspaceSearchTrack(StrictModel):
-    """Track identity and current work status without its full acquisition recipe."""
+    """Track discovery fields without acquisition or provenance identifiers."""
 
     track_identifier: str = Field(min_length=1)
     query: str = Field(min_length=1)
     marketplace: Marketplace | None
     listing_state: EbayListingState | None
-    creation_work_identifier: str | None
-    creation_work_state: WorkState | None
-    origin_search_run_record_identifier: str | None
-    current_search_run_record_identifier: str | None
-    latest_refresh_work_identifier: str | None
-    latest_refresh_work_state: WorkState | None
-    latest_refresh_search_specification_version: int | None
     enabled: bool
     search_specification_version: int = Field(ge=1)
-    search_specification_record_identifier: str | None
+    latest_refresh_work_state: WorkState | None
 
 
 class CompactReviewWorkspace(StrictModel):
@@ -65,12 +58,24 @@ class CompactReviewWorkspace(StrictModel):
 
 
 def compact_review_workspace(workspace: ReviewWorkspace) -> CompactReviewWorkspace:
-    """Keep exact track version references so callers can retrieve full specifications."""
+    """Keep track identities and versions for exact workspace drill-down."""
 
     return CompactReviewWorkspace.model_validate(
-        workspace.model_dump(
-            mode="python", exclude={"search_tracks": {"__all__": {"search_specification"}}}
-        )
+        {
+            **workspace.model_dump(mode="python", exclude={"search_tracks"}),
+            "search_tracks": tuple(
+                CompactWorkspaceSearchTrack(
+                    track_identifier=track.track_identifier,
+                    query=track.query,
+                    marketplace=track.marketplace,
+                    listing_state=track.listing_state,
+                    enabled=track.enabled,
+                    search_specification_version=track.search_specification_version,
+                    latest_refresh_work_state=track.latest_refresh_work_state,
+                )
+                for track in workspace.search_tracks
+            ),
+        }
     )
 
 

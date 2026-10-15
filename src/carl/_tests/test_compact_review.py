@@ -380,8 +380,8 @@ async def test_compact_acquisition_replays_and_retains_full_review_batch(
             assert [item.projection.listing_identifier for item in summaries] == [
                 item.listing_identifier for item in projections
             ]
-            assert [item.projection.projection_revision for item in summaries] == [
-                item.projection_revision for item in projections
+            assert [item.projection.projection_revision.aggregate_sha256 for item in summaries] == [
+                item.projection_revision.aggregate_sha256 for item in projections
             ]
             claims = await database.active_review_claims(
                 workspace_record_identifier=workspace.record_identifier,
@@ -472,7 +472,7 @@ async def test_compact_acquisition_replays_and_retains_full_review_batch(
                 reviews=(
                     ListingReviewInput(
                         listing_identifier=summaries[-1].projection.listing_identifier,
-                        projection_revision=summaries[-1].projection.projection_revision,
+                        projection_revision=frozen.projection.projection_revision,
                     ),
                 ),
             )

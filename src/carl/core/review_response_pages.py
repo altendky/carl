@@ -11,7 +11,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from carl.core.composed_projection import ListingStatus, ProjectionRevision, ScalarFieldName
+from carl.core.composed_projection import ListingStatus, ScalarFieldName
 from carl.core.listing_identity import LISTING_IDENTIFIER_PATTERN
 from carl.core.models import JsonValue, StrictModel
 from carl.core.review_errors import ReviewInputError
@@ -42,11 +42,17 @@ class GetReviewBatchItemRequest(StrictModel):
     listing_identifier: str = Field(pattern=LISTING_IDENTIFIER_PATTERN)
 
 
+class ProjectionRevisionSummary(StrictModel):
+    """Stable identity for browsing; full revision components are on the frozen item."""
+
+    aggregate_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class ReviewBatchProjectionSummary(StrictModel):
     listing_identifier: str
     canonical_source_url: str
     as_of_completion_sequence: int = Field(ge=0)
-    projection_revision: ProjectionRevision
+    projection_revision: ProjectionRevisionSummary
     status: ListingStatus
     title: JsonValue
     price: JsonValue
@@ -258,7 +264,9 @@ def _item_summary(item: ReviewBatchItem, *, minimal: bool = False) -> ReviewBatc
             listing_identifier=projection.listing_identifier,
             canonical_source_url=projection.canonical_source_url,
             as_of_completion_sequence=projection.as_of_completion_sequence,
-            projection_revision=projection.projection_revision,
+            projection_revision=ProjectionRevisionSummary(
+                aggregate_sha256=projection.projection_revision.aggregate_sha256
+            ),
             status=projection.status.value,
             title=values["title"],
             price=values["price"],

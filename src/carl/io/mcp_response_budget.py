@@ -34,7 +34,6 @@ from carl.core.models import JsonValue
 from carl.core.tool_response_pages import (
     ToolResponseAcknowledgement,
     ToolResponsePage,
-    ToolResponsePageManifest,
     ToolResponseReadResult,
 )
 
@@ -71,14 +70,16 @@ def page_result(
     *,
     result_meta: dict[str, JsonValue] | None = None,
 ) -> CallToolResult:
-    """Keep the fragment once in text; structured clients receive a manifest."""
-    structured = page.model_dump(mode="json")
-    if isinstance(page, ToolResponsePage):
-        structured.pop("json_fragment")
+    """Keep the complete page once in structuredContent, with a small text notice."""
+    notice = (
+        "Response page is in structuredContent. Follow its recovery_instructions."
+        if isinstance(page, ToolResponsePage)
+        else "Response acknowledged; receipt is in structuredContent."
+    )
     return _annotated(
         CallToolResult(
-            content=[TextContent(type="text", text=page.model_dump_json())],
-            structured_content=structured,
+            content=[TextContent(type="text", text=notice)],
+            structured_content=page.model_dump(mode="json"),
             _meta=result_meta,
         ),
         has_more=page.has_more,
@@ -131,9 +132,8 @@ def _compact_normal(
 ) -> CallToolResult | InputRequiredResult:
     if not isinstance(result, CallToolResult) or not _duplicate_structured_text(result):
         return result
-    structured = result.model_dump(mode="json", by_alias=True)["structuredContent"]
     return result.model_copy(
-        update={"content": [TextContent(type="text", text=_compact_json(structured))]}
+        update={"content": [TextContent(type="text", text="Tool result is in structuredContent.")]}
     )
 
 
@@ -273,9 +273,12 @@ class ToolResponseStore:
     def bound(
         self, tool_name: str, result: CallToolResult | InputRequiredResult
     ) -> CallToolResult | InputRequiredResult:
-        result = _compact_normal(result)
         if self.result_meta:
             result = result.model_copy(update={"meta": {**self.result_meta, **(result.meta or {})}})
+        # Retain the SDK mirror for canonical detection before replacing its
+        # redundant text with a notice in the wire result.
+        original = result
+        result = _compact_normal(result)
         structured = result.structured_content if isinstance(result, CallToolResult) else None
         has_more = (
             structured["has_more"]
@@ -289,7 +292,7 @@ class ToolResponseStore:
         normal = _annotated(result, has_more=has_more)
         if response_bytes(normal) <= self.target_bytes:
             return normal
-        text, payload_format = canonical_payload(result)
+        text, payload_format = canonical_payload(original)
         identifier = secrets.token_urlsafe(24)
         self._entries[identifier] = _CachedResponse(
             tool_name=tool_name,
@@ -366,7 +369,7 @@ def paging_output_schema(original: dict[str, Any]) -> dict[str, Any]:
     """Advertise continuation without changing the original runtime validator."""
     original = dict(original)
     definitions = original.pop("$defs", {})
-    page = ToolResponsePageManifest.model_json_schema()
+    page = ToolResponsePage.model_json_schema()
     page_definitions = page.pop("$defs", {})
     renamed: dict[str, str] = {}
     for key in page_definitions:

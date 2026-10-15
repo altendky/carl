@@ -1,5 +1,6 @@
 """Routine responses omit bulky acquisition recipes and prompt-bearing argv."""
 
+import json
 from pathlib import Path
 from typing import cast
 
@@ -43,9 +44,12 @@ def _workspace(identifier: str, *, archived: bool = False) -> ReviewWorkspace:
                 track_identifier=f"track-{index}",
                 query=f"telescope {index}",
                 marketplace=Marketplace.EBAY,
-                origin_search_run_record_identifier=f"origin-{index}",
-                current_search_run_record_identifier=f"current-{index}",
-                latest_refresh_work_identifier=f"refresh-{index}",
+                listing_state="active",
+                creation_work_identifier=f"create-{index}-" + "c" * 128,
+                creation_work_state=WorkState.COMPLETED,
+                origin_search_run_record_identifier=f"origin-{index}-" + "o" * 128,
+                current_search_run_record_identifier=f"current-{index}-" + "r" * 128,
+                latest_refresh_work_identifier=f"refresh-{index}-" + "w" * 128,
                 latest_refresh_work_state=WorkState.COMPLETED,
                 latest_refresh_search_specification_version=2,
                 enabled=index % 2 == 0,
@@ -53,23 +57,48 @@ def _workspace(identifier: str, *, archived: bool = False) -> ReviewWorkspace:
                     search=EbaySearchRequest(query=f"telescope {index}")
                 ),
                 search_specification_version=3,
-                search_specification_record_identifier=f"specification-{index}-3",
+                search_specification_record_identifier=f"specification-{index}-3-" + "s" * 128,
             )
             for index in range(30)
         ),
     )
 
 
-def test_compact_workspaces_omit_specifications_but_keep_track_scope_and_versions() -> None:
+def test_compact_workspaces_keep_discovery_fields_without_per_track_provenance() -> None:
     workspace = _workspace("workspace")
     before = workspace.model_dump_json()
     compact = compact_review_workspace(workspace)
     assert len(compact.search_tracks) == 30
-    expected = workspace.model_dump(
+    fields = {
+        "track_identifier",
+        "query",
+        "marketplace",
+        "listing_state",
+        "enabled",
+        "search_specification_version",
+        "latest_refresh_work_state",
+    }
+    expected = workspace.model_dump(mode="json", exclude={"search_tracks"})
+    expected["search_tracks"] = [
+        track.model_dump(mode="json", include=fields) for track in workspace.search_tracks
+    ]
+    assert compact.model_dump(mode="json") == expected
+    assert all(set(track) == fields for track in expected["search_tracks"])
+    encoded = compact.model_dump_json()
+    for track in workspace.search_tracks:
+        for identifier in (
+            track.creation_work_identifier,
+            track.origin_search_run_record_identifier,
+            track.current_search_run_record_identifier,
+            track.latest_refresh_work_identifier,
+            track.search_specification_record_identifier,
+        ):
+            assert identifier is not None
+            assert identifier not in encoded
+    previous_compact = workspace.model_dump(
         mode="json", exclude={"search_tracks": {"__all__": {"search_specification"}}}
     )
-    assert compact.model_dump(mode="json") == expected
-    assert all("search_specification" not in track for track in expected["search_tracks"])
+    assert len(encoded.encode()) < len(json.dumps(previous_compact).encode()) / 2
     assert workspace.model_dump_json() == before
     assert compact_review_workspace(workspace) == compact
 
@@ -158,6 +187,23 @@ async def test_workspace_listing_compact_mode_keeps_default_and_archive_behavior
             assert full_wire.structured_content == {
                 "result": [workspaces[0].model_dump(mode="json")]
             }
+            exact_wire = await client.call_tool(
+                "get_review_workspace", {"record_identifier": "active"}
+            )
+            exact_wire = await complete_tool_result(client, exact_wire)
+            assert not exact_wire.is_error
+            assert exact_wire.structured_content == workspaces[0].model_dump(mode="json")
+            assert exact_wire.structured_content is not None
+            assert (
+                exact_wire.structured_content["search_tracks"][0]["creation_work_identifier"]
+                == workspaces[0].search_tracks[0].creation_work_identifier
+            )
+            assert (
+                exact_wire.structured_content["search_tracks"][0][
+                    "origin_search_run_record_identifier"
+                ]
+                == workspaces[0].search_tracks[0].origin_search_run_record_identifier
+            )
             compact_wire = await client.call_tool("list_review_workspaces", {"compact": True})
             compact_wire = await complete_tool_result(client, compact_wire)
             assert not compact_wire.is_error

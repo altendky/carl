@@ -34,6 +34,7 @@ from carl.core.review_workspace import (
     RecordListingReviewsRequest,
     ReleaseReviewClaimRequest,
     RequestWorkspaceRefreshRequest,
+    ReviewBatchAcquisition,
     ReviewState,
     ReviewWorkset,
     WorkspaceProductGuideVersionPolicy,
@@ -200,6 +201,7 @@ async def test_mixed_review_batch_fills_across_reviewed_and_claimed_listings(
                 page_size=8,
             )
         )
+        assert isinstance(prior, ReviewBatchAcquisition)
         assert prior.lease is not None
         assert len(prior.batch.items) == 8
         await app.record_listing_reviews(

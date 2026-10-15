@@ -138,15 +138,17 @@ def test_all_hundred_items_are_reachable_once_with_limit_independent_cursors() -
         item.projection.listing_identifier for item in source.batch.items
     ]
     for original, summary in zip(source.batch.items, seen, strict=True):
-        assert summary.projection.projection_revision == original.projection.projection_revision
+        assert summary.projection.projection_revision.model_dump() == {
+            "aggregate_sha256": original.projection.projection_revision.aggregate_sha256
+        }
         assert summary.projection.seller_available and summary.projection.description_available
         assert summary.projection.truncated_fields == (ScalarFieldName.TITLE, ScalarFieldName.PRICE)
         assert summary.prior_note_available
         assert summary.scalar_fields_changed == (ScalarFieldName.DESCRIPTION,)
-        # The exact revision needed to record the review is present on every page.
+        # Browsing retains the identity; recording uses the full frozen item's revision.
         _ = ListingReviewInput(
             listing_identifier=summary.projection.listing_identifier,
-            projection_revision=summary.projection.projection_revision,
+            projection_revision=original.projection.projection_revision,
             disposition=ReviewDisposition.REJECTED,
         )
 
@@ -165,19 +167,17 @@ def test_page_byte_budget_can_return_fewer_items_than_the_requested_limit() -> N
     )
 
 
-def test_smallest_budget_keeps_review_identity_when_all_previews_must_be_omitted() -> None:
+def test_smallest_budget_keeps_review_identity_and_continuation() -> None:
     batch = _large_acquisition(2).batch
     page = review_batch_page(batch, byte_budget=2_048)
     assert page.response_bytes <= 2_048
     assert len(page.items) == 1
     projection = page.items[0].projection
-    assert projection.title is None
-    assert projection.condition is None
-    assert projection.shipping is None
-    assert projection.last_sale is None
     assert ScalarFieldName.TITLE in projection.truncated_fields
-    assert ScalarFieldName.CONDITION in projection.truncated_fields
-    assert projection.projection_revision == batch.items[0].projection.projection_revision
+    assert (
+        projection.projection_revision.aggregate_sha256
+        == batch.items[0].projection.projection_revision.aggregate_sha256
+    )
     assert page.next_cursor is not None
     following = review_batch_page(batch, cursor=page.next_cursor, byte_budget=2_048)
     assert (
