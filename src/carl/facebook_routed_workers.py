@@ -17,6 +17,7 @@ from carl.core.facebook_images import (
     LEGACY_COLLECT_IMAGE_WORK_SCHEMA_VERSION,
     CollectImagePayload,
     ExtractImagePayload,
+    facebook_image_url_expiry_utc_ns,
     image_network_constraints,
     legacy_image_network_constraint_identifiers,
 )
@@ -279,6 +280,11 @@ def build_routed_facebook_worker_registry(
         return await _execute(registry, item_capability, payload, context)
 
     async def collect_image(payload: CollectImagePayload, context: AttemptContext) -> WorkOutcome:
+        expiry = facebook_image_url_expiry_utc_ns(payload.reference.original_url)
+        if expiry is not None and expiry <= time_ns():
+            # The ordinary handler can reuse retained bytes or report stale
+            # gallery evidence before opening a provider session.
+            return await _execute(direct_image_registry, image_capability, payload, context)
         try:
             loaded = load_configuration(directories.configuration_file)
             routing = loaded.configuration.resolve_network_path(payload.request_plan.routing)

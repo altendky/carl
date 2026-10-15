@@ -19,6 +19,7 @@ from carl.core.ebay_items import (
     CollectEbayImagePayload,
     CollectEbayItemPayload,
     EbayItemRequest,
+    EbayItemResponseKind,
     ExtractEbayItemPayload,
     collect_ebay_description_work,
     collect_ebay_image_work,
@@ -29,6 +30,7 @@ from carl.core.ebay_items import (
     extract_ebay_item,
     extract_ebay_item_work,
 )
+from carl.core.ebay_retry import EBAY_BLOCKED_MAXIMUM_ATTEMPTS, ebay_response_retry_delay_ns
 from carl.core.facebook_images import verify_image
 from carl.core.http import stored_content_encodings, stored_header_values, stored_response_charset
 from carl.core.image_failures import image_acquisition_failure_kind
@@ -332,6 +334,78 @@ async def _collect_item(
         return _failure(error, context)
     identifier = dependencies.new_identifier()
     artifacts = _body_artifacts(acquisition)
+    records = (
+        RecordDraft(
+            identifier=identifier,
+            kind=("carl", "http", "acquisition"),
+            schema_version=1,
+            value={
+                **acquisition.record,
+                "purpose": "ebay_item",
+                "ebay_item_request": payload.request.model_dump(mode="json"),
+            },
+        ),
+    )
+    outputs = (
+        NamedOutput(name=("acquisition",), object_identifier=identifier),
+        *(
+            NamedOutput(name=("body", str(i)), object_identifier=a.identifier)
+            for i, a in enumerate(artifacts)
+        ),
+    )
+    response = _terminal_response(acquisition.record)
+    terminal_body = response.get("body")
+    body_identifier = terminal_body.get("artifact_id") if isinstance(terminal_body, dict) else None
+    body = next((body for body in acquisition.bodies if body.identifier == body_identifier), None)
+    try:
+        html = (
+            _decode_html(body.content, body.representation, response.get("headers"))[0]
+            if body is not None
+            else ""
+        )
+        extracted = extract_ebay_item(
+            html,
+            item_identifier=payload.request.item_identifier,
+            effective_url=acquisition.record.get("effective_url", ""),
+            status_code=response.get("status_code", 0),
+        )
+    except ValueError:
+        extracted = None
+    if extracted is None or extracted.classification not in {
+        EbayItemResponseKind.DETAIL,
+        EbayItemResponseKind.UNAVAILABLE,
+    }:
+        blocked = (
+            extracted is not None and extracted.classification == EbayItemResponseKind.CHALLENGE
+        )
+        attempt = context.retry_attempt()
+        maximum_attempts = EBAY_BLOCKED_MAXIMUM_ATTEMPTS if blocked else 3
+        reason = {
+            "kind": "ebay_item_response_failure",
+            "classification": None if extracted is None else extracted.classification,
+            "issues": [] if extracted is None else list(extracted.issues),
+            "attempt": context.attempt,
+            "policy_attempt": attempt,
+            "maximum_attempts": maximum_attempts,
+        }
+        result = {
+            "state": "retryable_failure" if attempt < maximum_attempts else "terminal_failure",
+            "acquisition_record_identifier": identifier,
+            "classification": reason["classification"],
+            "issues": reason["issues"],
+        }
+        if attempt < maximum_attempts:
+            return RetryWork(
+                records=records,
+                artifacts=artifacts,
+                outputs=outputs,
+                delay_ns=ebay_response_retry_delay_ns(attempt, blocked=blocked),
+                reason=reason,
+                result=result,
+            )
+        return TerminalFailureWork(
+            records=records, artifacts=artifacts, outputs=outputs, error=reason, result=result
+        )
     extraction = ExtractEbayItemPayload(
         request=payload.request, acquisition_record_identifier=identifier
     )
@@ -341,26 +415,9 @@ async def _collect_item(
         dependencies,
     )
     return CompletedWork(
-        records=(
-            RecordDraft(
-                identifier=identifier,
-                kind=("carl", "http", "acquisition"),
-                schema_version=1,
-                value={
-                    **acquisition.record,
-                    "purpose": "ebay_item",
-                    "ebay_item_request": payload.request.model_dump(mode="json"),
-                },
-            ),
-        ),
+        records=records,
         artifacts=artifacts,
-        outputs=(
-            NamedOutput(name=("acquisition",), object_identifier=identifier),
-            *(
-                NamedOutput(name=("body", str(i)), object_identifier=a.identifier)
-                for i, a in enumerate(artifacts)
-            ),
-        ),
+        outputs=outputs,
         follow_on_work=(follow,),
         result={
             "state": "acquired",
@@ -369,6 +426,17 @@ async def _collect_item(
             "reused": False,
         },
     )
+
+
+def _decode_html(
+    content: bytes, representation: JsonValue, headers: JsonValue
+) -> tuple[str, str, str]:
+    decoded = decoded_stored_body(content, representation, stored_content_encodings(headers))
+    charset, source = stored_response_charset(headers)
+    try:
+        return decoded.decode(charset), charset, source
+    except (LookupError, UnicodeError):
+        return decoded.decode("utf-8", errors="replace"), "utf-8", "replacement_fallback"
 
 
 async def _html(
@@ -385,15 +453,7 @@ async def _html(
     identifier = body["artifact_id"]
     metadata, content = await database.get_artifact(identifier)
     headers = response.get("headers")
-    decoded = decoded_stored_body(
-        content, metadata.get("representation"), stored_content_encodings(headers)
-    )
-    charset, source = stored_response_charset(headers)
-    try:
-        html = decoded.decode(charset)
-    except (LookupError, UnicodeError):
-        html = decoded.decode("utf-8", errors="replace")
-        charset, source = "utf-8", "replacement_fallback"
+    html, charset, source = _decode_html(content, metadata.get("representation"), headers)
     artifact = BytesDraft(
         identifier=new_identifier(),
         kind=("carl", "http", "decoded_text"),
@@ -534,6 +594,29 @@ async def _extract_item(
             ],
         },
     )
+    if extraction.classification not in {
+        EbayItemResponseKind.DETAIL,
+        EbayItemResponseKind.UNAVAILABLE,
+    }:
+        return TerminalFailureWork(
+            inputs=(
+                *inputs,
+                NamedInput(name=("terminal_body",), object_identifier=body_identifier),
+            ),
+            records=tuple(records),
+            artifacts=(decoded,),
+            outputs=tuple(outputs),
+            error={
+                "kind": "ebay_item_response_failure",
+                "classification": extraction.classification,
+                "issues": list(extraction.issues),
+            },
+            result={
+                "state": "response_failed",
+                "classification": extraction.classification,
+                "observation_record_identifier": identifier,
+            },
+        )
     return CompletedWork(
         inputs=(*inputs, NamedInput(name=("terminal_body",), object_identifier=body_identifier)),
         records=tuple(records),

@@ -69,11 +69,11 @@ from carl.io.sqlite import Database
 from carl.io.worker import WorkHandlerRegistry
 from carl.refresh_recovery import retry_refresh_finalization
 
-URL = "https://scontent-lga3-1.xx.fbcdn.net/v/t39.84726-6/photo.jpg?oh=one&oe=abc&stp=c0.0.100.100a"
+URL = "https://scontent-lga3-1.xx.fbcdn.net/v/t39.84726-6/photo.jpg?oh=one&oe=FFFFFFFF&stp=c0.0.100.100a"
 OTHER = (
     URL.replace("scontent-lga3-1", "scontent-lhr8-2")
     .replace("oh=one", "oh=two")
-    .replace("oe=abc", "oe=def")
+    .replace("oe=FFFFFFFF", "oe=FFFFFFFE")
 )
 
 

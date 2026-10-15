@@ -17,6 +17,7 @@ from carl.core.facebook_images import (
     ImageReuseMatchKind,
     SavedImageCandidate,
     collect_image_work,
+    facebook_image_url_expiry_utc_ns,
     gallery_references,
     image_network_constraints,
     image_reuse_record,
@@ -339,7 +340,12 @@ async def _item_phase(
         maximum_items=payload.maximum_items,
     )
     collection_identifiers: list[str] = []
+    collection_listings: dict[str, str] = {}
     reused_results: list[SuccessfulItemPageResult] = []
+    gallery_refresh_listings = set(checkpoint.get("gallery_refresh_listing_identifiers", []))
+    has_image_budget = payload.maximum_images is None or payload.maximum_images > int(
+        checkpoint.get("prior_image_collection_count", 0)
+    )
     headers: tuple[Header, ...] | None = None
     for decision in followup_plan.decisions:
         listing_identifier = decision.listing_id
@@ -354,10 +360,30 @@ async def _item_phase(
             raise RuntimeError("Search refresh requested an item page more than once")
         if requested:
             collection_identifiers.append(requested[0])
+            collection_listings[requested[0]] = listing_identifier
+            # A crash can happen after enqueue but before the coordinator
+            # checkpoint records why this page was renewed.
+            edges = await database.requested_work_edges(
+                requester_kind=("carl", "facebook", "search_refresh", "item"),
+                requester_identifier=requester_identifier,
+            )
+            if any(
+                isinstance(edge.get("context"), dict)
+                and edge["context"].get("reason") == "expired_gallery"
+                for edge in edges
+            ):
+                gallery_refresh_listings.add(listing_identifier)
             continue
+        refresh_gallery = False
         if decision.latest_successful_result is not None:
-            reused_results.append(decision.latest_successful_result)
-            continue
+            if has_image_budget:
+                refresh_gallery = await _expired_gallery_needs_refresh(
+                    decision.latest_successful_result, dependencies
+                )
+            if not refresh_gallery:
+                reused_results.append(decision.latest_successful_result)
+                continue
+            gallery_refresh_listings.add(listing_identifier)
         if headers is None:
             await _activate_page_policy(
                 dependencies, payload.item_routing, context.operation_identifier
@@ -379,29 +405,43 @@ async def _item_phase(
                 "search_refresh_work_identifier": context.work_item_identifier,
                 "base_search_run_record_identifier": payload.base_search_run_record_identifier,
                 "refreshed_search_run_record_identifier": refreshed_identifier,
+                "reason": "expired_gallery" if refresh_gallery else "missing_item_page",
             },
         )
         if existing is None:
-            enqueued, late_reuse = await database.enqueue_work_unless_facebook_item_page_is_usable(
-                collect_item_work(
-                    identifier=requested_identifier,
-                    payload=CollectItemPayload(
-                        listing_id=listing_identifier,
-                        request_plan=RequestPlan(
-                            url=(
-                                f"https://www.facebook.com/marketplace/item/{listing_identifier}/"
-                            ),
-                            headers=headers,
-                            routing=payload.item_routing,
-                        ),
+            definition = collect_item_work(
+                identifier=requested_identifier,
+                payload=CollectItemPayload(
+                    listing_id=listing_identifier,
+                    request_plan=RequestPlan(
+                        url=(f"https://www.facebook.com/marketplace/item/{listing_identifier}/"),
+                        headers=headers,
+                        routing=payload.item_routing,
                     ),
-                    not_before_utc_ns=0,
                 ),
-                requester,
-                listing_identifier=listing_identifier,
-                event_identifier=dependencies.new_identifier(),
-                enqueued_at_utc_ns=dependencies.utc_now_ns(),
+                not_before_utc_ns=0,
             )
+            if refresh_gallery:
+                # One stable requester per listing bounds gallery renewal even
+                # when the replacement page still has an expired signature.
+                enqueued = await database.enqueue_work(
+                    definition,
+                    requester,
+                    event_identifier=dependencies.new_identifier(),
+                    enqueued_at_utc_ns=dependencies.utc_now_ns(),
+                )
+                late_reuse = None
+            else:
+                (
+                    enqueued,
+                    late_reuse,
+                ) = await database.enqueue_work_unless_facebook_item_page_is_usable(
+                    definition,
+                    requester,
+                    listing_identifier=listing_identifier,
+                    event_identifier=dependencies.new_identifier(),
+                    enqueued_at_utc_ns=dependencies.utc_now_ns(),
+                )
             if late_reuse is not None:
                 reused_results.append(late_reuse)
                 continue
@@ -416,6 +456,7 @@ async def _item_phase(
                 requested_at_utc_ns=dependencies.utc_now_ns(),
             )
         collection_identifiers.append(requested_identifier)
+        collection_listings[requested_identifier] = listing_identifier
     collections = await _works(database, tuple(collection_identifiers))
     if _unfinished(collections):
         return RetryWork(
@@ -437,6 +478,7 @@ async def _item_phase(
                 ),
                 "refreshed_search_run_record_identifier": refreshed_identifier,
                 "reused_successful_item_pages": len(reused_results),
+                "gallery_refresh_listing_identifiers": sorted(gallery_refresh_listings),
                 "item_collection_work_identifiers": collection_identifiers,
             },
         )
@@ -470,12 +512,42 @@ async def _item_phase(
                 ),
                 "refreshed_search_run_record_identifier": refreshed_identifier,
                 "reused_successful_item_pages": len(reused_results),
+                "gallery_refresh_listing_identifiers": sorted(gallery_refresh_listings),
                 "item_collection_work_identifiers": collection_identifiers,
                 "item_extraction_work_identifiers": list(extraction_identifiers),
             },
         )
-    failed = sum(work.get("state") != WorkState.COMPLETED.value for work in collections)
-    failed += sum(work.get("state") != WorkState.COMPLETED.value for work in extractions)
+    gallery_collection_ids = {
+        identifier
+        for identifier, listing_id in collection_listings.items()
+        if listing_id in gallery_refresh_listings
+    }
+    gallery_extraction_ids = {
+        collection["result"]["extraction_work_identifier"]
+        for collection in collections
+        if collection.get("identifier") in gallery_collection_ids
+        and isinstance(collection.get("result"), dict)
+        and isinstance(collection["result"].get("extraction_work_identifier"), str)
+    }
+    failed = sum(
+        work.get("state") != WorkState.COMPLETED.value
+        for work in collections
+        if work.get("identifier") not in gallery_collection_ids
+    )
+    failed += sum(
+        work.get("state") != WorkState.COMPLETED.value
+        for work in extractions
+        if work.get("identifier") not in gallery_extraction_ids
+    )
+    gallery_failed = sum(
+        work.get("state") != WorkState.COMPLETED.value
+        for work in collections
+        if work.get("identifier") in gallery_collection_ids
+    ) + sum(
+        work.get("state") != WorkState.COMPLETED.value
+        for work in extractions
+        if work.get("identifier") in gallery_extraction_ids
+    )
     return RetryWork(
         inputs=(
             NamedInput(
@@ -523,10 +595,40 @@ async def _item_phase(
             "search_scope_changed": scope_changed,
             "comparison_warnings": ["search_scope_changed"] if scope_changed else [],
             "reused_successful_item_pages": len(reused_results),
+            "gallery_refresh_listing_identifiers": sorted(gallery_refresh_listings),
+            "gallery_refresh_failures": gallery_failed,
             "item_collections": len(collections),
             "item_extractions": len(extractions),
             "item_failures": failed,
         },
+    )
+
+
+async def _expired_gallery_needs_refresh(
+    result: SuccessfulItemPageResult, dependencies: RefreshWorkerDependencies
+) -> bool:
+    """Renew expired signatures only when validated local images cannot satisfy them."""
+    _, _, observation = await dependencies.database.get_record(result.observation_record_identifier)
+    references = gallery_references(
+        observation_identifier=result.observation_record_identifier, observation=observation
+    )
+    now = dependencies.utc_now_ns()
+    expired = tuple(
+        reference
+        for reference in references
+        if (expiry := facebook_image_url_expiry_utc_ns(reference.original_url)) is not None
+        and expiry <= now
+    )
+    if not expired:
+        return False
+    saved = await validate_saved_image_results(
+        dependencies.database,
+        await dependencies.database.saved_facebook_image_candidates_for_references(expired),
+    )
+    return bool(
+        plan_image_followups(
+            expired, _saved_image_candidates(saved), len(expired), observed_at_utc_ns=now
+        ).expired_reference_indices
     )
 
 
@@ -579,6 +681,7 @@ async def _image_phase(
     plan_exists = True
     stored_selected_references: list[tuple[str, GalleryImageReference]] = []
     stored_reuse_counts: dict[str, int] = {}
+    stored_expired_reference_identifiers: set[str] = set()
     try:
         plan_kind, _, stored_plan = await database.get_record(plan_identifier)
         if plan_kind != ("carl", "facebook", "image_followup_plan") or not isinstance(
@@ -608,6 +711,11 @@ async def _image_phase(
         stored_selected_references = [
             (identifier, references_by_identifier[identifier]) for identifier in raw_selected
         ]
+        stored_expired_reference_identifiers = {
+            identifier
+            for identifier in stored_plan.get("expired_reference_record_identifiers", [])
+            if isinstance(identifier, str)
+        }
         for field in ("already_saved_exact_renditions", "reused_source_photo_images"):
             count = stored_plan.get(field)
             if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
@@ -695,7 +803,16 @@ async def _image_phase(
         saved_candidates,
         maximum_images,
         frozenset(resumed_keys),
+        observed_at_utc_ns=dependencies.utc_now_ns(),
     )
+    expired_references = [references[index] for index in plan.expired_reference_indices]
+    expired_renditions_skipped = {
+        reference.rendition_identity
+        for reference in expired_references
+        if not plan_exists
+        or reference_identifiers[reference] in stored_expired_reference_identifiers
+    }
+    gallery_stale_listings = {reference.listing_id for reference in expired_references}
     source_reuses = tuple(
         decision
         for decision in plan.reuse_decisions
@@ -782,6 +899,9 @@ async def _image_phase(
                         "reused_source_photo_images": len(source_reuses),
                         "selected_new_renditions": len(selected),
                         "resumed_extractions": len(resumed_results),
+                        "expired_reference_record_identifiers": [
+                            reference_identifiers[reference] for reference in expired_references
+                        ],
                         "reference_record_identifiers": [
                             reference_identifiers[reference] for reference in references
                         ],
@@ -897,6 +1017,13 @@ async def _image_phase(
         )
         existing = await _work_or_none(database, requested_identifier)
         if existing is None:
+            expiry = facebook_image_url_expiry_utc_ns(reference.original_url)
+            if expiry is not None and expiry <= dependencies.utc_now_ns():
+                expired_renditions_skipped.add(reference.rendition_identity)
+                gallery_stale_listings.update(
+                    image_reference.listing_id for _, image_reference in entries
+                )
+                continue
             definition = collect_image_work(
                 identifier=requested_identifier,
                 payload=CollectImagePayload(
@@ -953,6 +1080,14 @@ async def _image_phase(
             requested_identifier = collection_identifier
         collection_identifiers.append(requested_identifier)
     collections = await _works(database, tuple(collection_identifiers))
+    gallery_status = {
+        "gallery_state": "stale" if gallery_stale_listings else "current",
+        "gallery_stale_listing_identifiers": sorted(gallery_stale_listings),
+        "expired_image_renditions_skipped": len(expired_renditions_skipped),
+        "gallery_warnings": ["expired_gallery_urls_require_item_refresh"]
+        if gallery_stale_listings
+        else [],
+    }
     if _unfinished(collections):
         return RetryWork(
             delay_ns=_CHILD_WAIT_DELAY_NS,
@@ -960,6 +1095,7 @@ async def _image_phase(
             result={
                 **checkpoint,
                 "stage": "collecting_images",
+                **gallery_status,
                 "image_collection_work_identifiers": collection_identifiers,
             },
         )
@@ -980,6 +1116,7 @@ async def _image_phase(
             result={
                 **checkpoint,
                 "stage": "extracting_images",
+                **gallery_status,
                 "image_collection_work_identifiers": collection_identifiers,
                 "image_extraction_work_identifiers": list(extraction_identifiers),
             },
@@ -1016,9 +1153,15 @@ async def _image_phase(
     )
     result_value: dict[str, JsonValue] = {
         **checkpoint,
+        **gallery_status,
         "state": (
             "completed"
-            if item_failures + failed + resumed_failed == 0
+            if item_failures
+            + failed
+            + resumed_failed
+            + len(expired_renditions_skipped)
+            + int(checkpoint.get("gallery_refresh_failures", 0))
+            == 0
             else "completed_with_failures"
         ),
         "stage": "complete",

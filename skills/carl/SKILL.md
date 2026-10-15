@@ -97,7 +97,9 @@ selects collection, description, gallery, and analysis behavior. Call
 `rename_review_workspace` when its scope becomes clearer. Archive inactive workspaces with
 `set_review_workspace_archived`; `list_review_workspaces` hides them by default, while
 `include_archived=true` reveals them for restoration or exact access. Archiving retains all review
-history and does not invalidate exact workspace IDs. Call
+history and does not invalidate exact workspace IDs. Prefer `list_review_workspaces(compact=true)`
+for discovery: it retains track identities, status, and specification versions without repeating
+full search specifications. Omit `compact` when full specifications are needed. Call
 `add_workspace_product_guide` to make additional guides available. Use `pinned` when future work
 must keep one exact version and `follow_latest` when future requests should resolve the newest
 version of that guide identity. The returned binding always names the exact currently resolved guide
@@ -112,7 +114,7 @@ them. Call
 `create_workspace_search` to add another complete search intent/phrase; its returned work ID is also
 the stable track ID. Call `request_workspace_refresh` to advance a track, specifying its track ID
 when more than one completed track exists. To change that same watch's parameters (for example,
-lowering its price cap), read `get_review_workspace`, then call `revise_workspace_search_track`
+lowering its price cap), read `list_review_workspaces(compact=false)`, then call `revise_workspace_search_track`
 with the track's `search_specification_version` as `expected_version` and the complete replacement
 search spec. Keep the source unchanged; use a new track only for a genuinely separate watch.
 Revision preserves the stable track ID, first/last-seen history, and prior runs, and performs no
@@ -140,14 +142,19 @@ same configured Decodo browser transport as item pages; a renamed stack on the s
 is not an alternative acquisition path. The override applies to the retried work, not the original
 search-group target specification. When a refresh's search acquisition failed, request a new
 `request_workspace_refresh` with `acquisition_stack` instead; item-only transport recovery uses
-`retry_item_failures` below. Challenges and HTTP 403/429 defer searches on the same stack for
-two, four, then eight minutes after successive failures, including the terminal third failure.
+`retry_item_failures` below. Search challenges and HTTP 403/429 defer searches on the same stack for
+10, 20, 40, then 60 minutes across five attempts; the terminal fifth failure retains the 60-minute cap.
 The durable cooldown also applies to new work and operator retries, without consuming attempts
-while waiting. Retries and refreshes spend provider calls: inspect retained evidence and select a
+while waiting. Blocked eBay item pages use the same five-attempt backoff policy. A refresh parent
+defers until its pending child is eligible, rather than repeatedly polling a delayed acquisition.
+Retries and refreshes spend provider calls: inspect retained evidence and select a
 justified change before queueing; do not make repeated paid probe calls.
 A Facebook transport failure, when Proton is selected, invalidates the shared Proton transport and backs off other
 queued searches on that route before replacement. Use `acquire_review_batch` with a stable caller-generated
-request ID and owner ID. It atomically issues bounded available-only work and
+request ID, owner ID, and `compact=true` for routine review. Compact responses retain exact projection
+revisions, scalar values, and a shared `sellers` table keyed by `seller_reference`, while omitting
+repeated field evidence and prior scalar snapshots. The stored batch retains its full evidence.
+Acquisition atomically issues bounded available-only work and
 claims only listings not leased to another agent. Replay the same unchanged
 request ID to recover the exact response after an interruption. Renew longer
 work with `renew_review_claim`. After actually inspecting items, call
@@ -289,6 +296,12 @@ because the current one is pending or leased. Keep a separate long-running `carl
 `carl monitor --work` process active while queued work should progress. MCP servers never run
 workers implicitly, so concurrent or leaked clients do not multiply worker pools.
 
+When a reused Facebook item page has expired, unsaved signed gallery URLs, a refresh requests one
+replacement item page per listing. If that page still has expired URLs, those renditions are skipped
+and the gallery remains stale. Inspect `search_refresh_progress.gallery_state`,
+`expired_image_renditions_skipped`, and the bounded stale listing IDs; an image job presented an
+expired URL stops with `expired_url` before acquisition. Saved matching image evidence remains reusable.
+
 Transient search and image session failures retry automatically with exponential backoff.
 When Proton is selected, a failed request invalidates the shared transport so the next attempt opens and probes a fresh
 WireProxy child instead of reusing a dead local endpoint. Search refreshes resume retryable search
@@ -310,18 +323,21 @@ through durable requester edges, so child counts can advance while
 child identifiers, and grouped failure reasons for routine monitoring rather than fetching every
 child status.
 
-After every completed workspace track has a completed refresh, call
-`preview_selection_analyses` with that workspace and select the whole
+Call `preview_selection_analyses` with the workspace and select the whole
 workspace, a review batch, a workset, a selection snapshot, or an explicit bounded ID list. Use
 `selection_policy=missing_for_current_evidence` to analyze fresher evidence again, or the top-level
 `selection_policy=never_analyzed_listing` to select only listing IDs with no completed analysis from
 any earlier observation. Available listings are the default; override `statuses` explicitly when
-needed. The preview reports matching, excluded, eligible, and selected counts without queueing work.
-It uses bounded retained-evidence selection across both marketplaces. The request examines at
-most `maximum_candidate_listings_examined` workspace members (2,500 by default) and reports
-`candidate_examination_limit_reached`; raise the bound, up to 10,000, when an exact larger-workspace
-plan is needed. Use the same bound in the subsequent request so preview and queueing describe the
-same selection.
+needed. Whole-workspace analysis requires every completed enabled track to have a completed refresh;
+explicit selections require freshness only for tracks containing their listings. The preview reports
+matching, excluded, eligible, and selected counts without queueing work. Explicit listing IDs, batch,
+workset, and snapshot members are looked up directly across both marketplaces, so unrelated workspace
+members do not consume `maximum_candidate_listings_examined`. Whole-workspace selection scans at
+most that many candidates (2,500 by default), reports `candidate_examination_limit_reached`, and
+accepts a bound up to 10,000. Use the same bound in the subsequent workspace request.
+Inspect `skipped` in both preview and request responses for each omitted listing ID and its reason,
+including workspace/status exclusion, missing usable observations, reused analyses, selection policy,
+or `maximum_items`.
 If those counts are acceptable, pass the same request to `request_selection_analyses`. Carl freezes
 the matching latest-observation snapshot,
 revisits each selected observation against its current saved images and the chosen guide, reuses
@@ -340,16 +356,21 @@ coordinator; compatible item analyses may still be shared with other workspaces.
 Use `get_work_status` with the returned batch work ID when detailed diagnostics are needed;
 `analysis_batch_progress` reports observations processed, jobs created or reused,
 skipped observations, and child analysis states. The batch is complete only after its child analyses
-are terminal. A later batch may create new work when its exact evidence or analysis configuration
+are terminal. Runtime skips retain listing IDs, observation IDs, and reasons in
+`get_work_status(include_details=true).details.result.skipped`; inspect these when the skip count is
+nonzero. A later batch may create new work when its exact evidence or analysis configuration
 differs.
 
-Use `get_workspace_listing` for a selected workspace listing's current normalized fields, gallery, and completed
-analysis descriptors. Each analysis descriptor names its own
+Use `get_workspace_listing(compact=true)` for a selected listing's scalar values and review changes.
+Omit `compact` when its full gallery, field evidence, or completed analysis descriptors are needed.
+Each analysis descriptor names its own
 `listing_observation_record_identifier`; do not assume it analyzed the projection's newest evidence.
 Treat approximate location as approximate. Treat a later search absence as unknown rather than
 evidence that a listing sold.
 
-Fetch complete reports with `get_listing_analysis`. When a conclusion matters, retain the exact
+Fetch reports with `get_listing_analysis`; the complete report text and ordinary Claude metadata
+are returned without its prompt-bearing command line. Set `include_details=true` only when
+diagnosing the exact retained invocation. When a conclusion matters, retain the exact
 analysis, observation, and product-guide record identifiers it depends on. Use `get_provenance` one
 hop at a time when the origin or tooling needs examination; follow returned object identifiers for
 deeper traversal. It reports the total `output_edge_count` but returns no sibling outputs by default.

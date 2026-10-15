@@ -124,7 +124,8 @@ def _acquisition(items: tuple[ReviewBatchItem, ...]) -> ReviewBatchAcquisition:
     )
 
 
-def test_compact_batch_deduplicates_sellers_and_preserves_review_identity() -> None:
+@pytest.mark.parametrize("item_count", [20, 100])
+def test_compact_batch_deduplicates_sellers_and_preserves_review_identity(item_count: int) -> None:
     seller: JsonValue = {"profile": {"name": "Seller", "biography": "A" * 50_000}}
     items = tuple(
         ReviewBatchItem(
@@ -134,7 +135,7 @@ def test_compact_batch_deduplicates_sellers_and_preserves_review_identity() -> N
             changed_components=(),
             scalar_comparison_available=True,
         )
-        for index in range(20)
+        for index in range(item_count)
     )
     acquisition = _acquisition(items)
     full_before = acquisition.model_dump_json()

@@ -80,6 +80,23 @@ def _pending(works: tuple[dict[str, JsonValue], ...]) -> bool:
     return any(work.get("state") in {"pending", "leased"} for work in works)
 
 
+def _pending_delay_ns(works: tuple[dict[str, JsonValue], ...], now_utc_ns: int) -> int:
+    """Sleep until deferred children are eligible, polling only runnable/leased work."""
+
+    delays: list[int] = []
+    for work in works:
+        if work.get("state") == "leased":
+            delays.append(_WAIT_NS)
+        elif work.get("state") == "pending":
+            eligible_at = work.get("eligible_at_utc_ns")
+            delays.append(
+                eligible_at - now_utc_ns
+                if isinstance(eligible_at, int) and eligible_at > now_utc_ns
+                else _WAIT_NS
+            )
+    return min(delays, default=_WAIT_NS)
+
+
 async def _enqueue(
     definition: WorkDefinition,
     context: AttemptContext,
@@ -193,7 +210,7 @@ async def _search_phase(
     if _pending((work,)):
         return RetryWork(
             inputs=inputs,
-            delay_ns=_WAIT_NS,
+            delay_ns=_pending_delay_ns((work,), dependencies.utc_now_ns()),
             reason={"kind": "waiting_for_search_collection"},
             result=checkpoint,
         )
@@ -295,7 +312,9 @@ async def _item_phase(
     }
     if _pending(works):
         return RetryWork(
-            delay_ns=_WAIT_NS, reason={"kind": "waiting_for_item_collections"}, result=result
+            delay_ns=_pending_delay_ns(works, dependencies.utc_now_ns()),
+            reason={"kind": "waiting_for_item_collections"},
+            result=result,
         )
     extractions: list[str] = []
     for identifier, work in zip(children, works, strict=True):
@@ -308,7 +327,9 @@ async def _item_phase(
     result.update(stage="extracting_items", item_extraction_work_identifiers=list(extractions))
     if _pending(extracted):
         return RetryWork(
-            delay_ns=_WAIT_NS, reason={"kind": "waiting_for_item_extractions"}, result=result
+            delay_ns=_pending_delay_ns(extracted, dependencies.utc_now_ns()),
+            reason={"kind": "waiting_for_item_extractions"},
+            result=result,
         )
     observations: list[str] = []
     descriptions: list[str] = []
@@ -336,7 +357,9 @@ async def _item_phase(
     )
     if _pending(description_works):
         return RetryWork(
-            delay_ns=_WAIT_NS, reason={"kind": "waiting_for_item_descriptions"}, result=result
+            delay_ns=_pending_delay_ns(description_works, dependencies.utc_now_ns()),
+            reason={"kind": "waiting_for_item_descriptions"},
+            result=result,
         )
     result.update(
         description_failures=sum(
@@ -573,7 +596,9 @@ async def _image_phase(
     }
     if _pending(works):
         return RetryWork(
-            delay_ns=_WAIT_NS, reason={"kind": "waiting_for_image_collections"}, result=result
+            delay_ns=_pending_delay_ns(works, dependencies.utc_now_ns()),
+            reason={"kind": "waiting_for_image_collections"},
+            result=result,
         )
     saved = sum(
         work.get("state") == "completed" and _mapping(work.get("result")).get("state") == "saved"

@@ -4,7 +4,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from io import BytesIO
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image, UnidentifiedImageError
 from pydantic import Field, model_validator
@@ -106,6 +106,31 @@ class ImageReuseDecision:
 class ImageFollowupPlan:
     reuse_decisions: tuple[ImageReuseDecision, ...]
     download_groups: tuple[tuple[int, ...], ...]
+    expired_reference_indices: tuple[int, ...] = ()
+
+
+def facebook_image_url_expiry_utc_ns(url: str) -> int | None:
+    """Read an unambiguous hexadecimal CDN expiry; unknown is not expired.
+
+    Facebook's signed CDN URLs encode Unix seconds in ``oe``. Missing,
+    malformed, or repeated values do not establish an expiry and must not turn
+    unrelated image URLs into expired Facebook signatures.
+    """
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".fbcdn.net"):
+            return None
+    except ValueError:
+        return None
+    values = parse_qs(parsed.query, keep_blank_values=True).get("oe", [])
+    if len(values) != 1:
+        return None
+    value = values[0]
+    if not 1 <= len(value) <= 16 or any(
+        character not in "0123456789abcdefABCDEF" for character in value
+    ):
+        return None
+    return int(value, 16) * 1_000_000_000
 
 
 class GalleryImageReference(StrictModel):
@@ -241,6 +266,8 @@ def plan_image_followups(
     saved_images: tuple[SavedImageCandidate, ...],
     maximum_images: int,
     excluded_renditions: frozenset[tuple[str | None, str]] = frozenset(),
+    *,
+    observed_at_utc_ns: int | None = None,
 ) -> ImageFollowupPlan:
     """Reuse adequate source photos and group the remaining exact requests."""
 
@@ -262,6 +289,7 @@ def plan_image_followups(
     }
     selected: dict[tuple[str, ...], list[int]] = {}
     reuse_decisions: list[ImageReuseDecision] = []
+    expired_reference_indices: list[int] = []
     for index, reference in enumerate(references):
         reusable = _best_candidate(reference, exact_candidates, source_candidates)
         if reusable is not None:
@@ -280,10 +308,15 @@ def plan_image_followups(
         identity = reference.rendition_identity
         if identity not in selected and len(selected) >= maximum_images:
             continue
+        expiry = facebook_image_url_expiry_utc_ns(reference.original_url)
+        if observed_at_utc_ns is not None and expiry is not None and expiry <= observed_at_utc_ns:
+            expired_reference_indices.append(index)
+            continue
         selected.setdefault(identity, []).append(index)
     return ImageFollowupPlan(
         reuse_decisions=tuple(reuse_decisions),
         download_groups=tuple(tuple(group) for group in selected.values()),
+        expired_reference_indices=tuple(expired_reference_indices),
     )
 
 

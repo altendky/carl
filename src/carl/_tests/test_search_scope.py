@@ -100,6 +100,12 @@ class _Database:
         self.selected: tuple[str, ...] = ()
 
     async def get_record(self, identifier: str) -> tuple[tuple[str, ...], int, JsonValue]:
+        if identifier.startswith("observation-"):
+            return (
+                ("carl", self.marketplace, "listing_observation"),
+                1,
+                {"listing_id": identifier.removeprefix("observation-"), "images": []},
+            )
         ids = ["1"] if identifier == "base" else ["2"]
         request: JsonValue = (
             _facebook_request("3000" if identifier == "base" else "300")

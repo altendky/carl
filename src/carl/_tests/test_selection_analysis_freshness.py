@@ -179,8 +179,8 @@ def _application(
         restrict_listing_identifiers: frozenset[str] | None = None,
         source_listing_identifiers: frozenset[str] | None = None,
     ) -> ListingAnalysisBatchSelection:
-        assert source_listing_identifiers == frozenset({FACEBOOK_ID, EBAY_ID})
         assert restrict_listing_identifiers is not None
+        assert source_listing_identifiers == restrict_listing_identifiers
         assert request.product_guide_record_identifier == "guide"
         observations = tuple(
             f"observation-{identifier}" for identifier in sorted(restrict_listing_identifiers)
@@ -219,6 +219,18 @@ def _application(
 
     monkeypatch.setattr(ReviewApplication, "get_review_workspace", get_workspace)
     monkeypatch.setattr(ReviewApplication, "_workspace_analysis_candidates", candidates)
+
+    async def selected_statuses(
+        _app: ReviewApplication, scoped_workspace: ReviewWorkspace, identifiers: tuple[str, ...]
+    ) -> dict[str, ListingStatus]:
+        observed_candidate_tracks.append(
+            tuple(track.track_identifier for track in scoped_workspace.search_tracks)
+        )
+        return dict.fromkeys(identifiers, ListingStatus.AVAILABLE)
+
+    monkeypatch.setattr(
+        ReviewApplication, "_selected_workspace_analysis_statuses", selected_statuses
+    )
     monkeypatch.setattr(ReviewApplication, "_plan_missing_listing_analyses", plan)
     monkeypatch.setattr(Database, "work", work)
     return ReviewApplication(database, tmp_path), observed_candidate_tracks

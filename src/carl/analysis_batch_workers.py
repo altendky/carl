@@ -8,6 +8,7 @@ from typing import Protocol
 
 from carl.core.analysis_batch import (
     LEGACY_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
+    MULTI_SOURCE_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
     PREVIOUS_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
     REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
     REQUEST_MISSING_ANALYSES_WORK_KIND,
@@ -94,7 +95,11 @@ async def _request_missing_analyses(
     created_count = _integer(checkpoint.get("newly_created_work"))
     reused_count = _integer(checkpoint.get("reused_work"))
     child_identifiers = _strings(checkpoint.get("analysis_work_identifiers"))
-    skipped = _skips(checkpoint.get("skipped"))
+    skipped = (
+        _skips(checkpoint["skipped"])
+        if "skipped" in checkpoint
+        else [entry.model_dump(mode="json") for entry in payload.selection_skipped]
+    )
     selected = payload.listing_observation_record_identifiers
     stop = min(len(selected), next_index + _BATCH_SIZE)
     processed_inputs: list[NamedInput] = []
@@ -129,6 +134,9 @@ async def _request_missing_analyses(
             skipped.append(
                 {
                     "listing_observation_record_identifier": observation_identifier,
+                    "listing_identifier": payload.listing_identifiers_by_observation.get(
+                        observation_identifier
+                    ),
                     "kind": type(error).__name__,
                     "message": str(error),
                 }
@@ -198,6 +206,7 @@ def build_analysis_batch_worker_registry(
             for schema_version in (
                 LEGACY_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
                 PREVIOUS_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
+                MULTI_SOURCE_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
                 REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
             )
         )

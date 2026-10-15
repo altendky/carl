@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import time_ns
 from uuid import NAMESPACE_URL, uuid5
 
 import anyio
@@ -18,6 +19,7 @@ from carl.core.facebook_images import (
     GalleryImageReference,
     SavedImageCandidate,
     VerifiedImage,
+    facebook_image_url_expiry_utc_ns,
     gallery_references,
     image_network_activity,
     image_reuse_record,
@@ -91,6 +93,7 @@ class ImageWorkerDependencies:
     new_identifier: IdentifierFactory
     network_activity_scheduler: NetworkActivityScheduler | None = None
     network_session_identifier: str | None = None
+    utc_now_ns: Callable[[], int] = time_ns
 
 
 async def validate_saved_image_results(
@@ -447,6 +450,31 @@ async def _collect(
                 "reused_image_result_record_identifier": source_identifier,
             },
         )
+
+    def expired_outcome() -> TerminalFailureWork | None:
+        checked_at = dependencies.utc_now_ns()
+        expiry = facebook_image_url_expiry_utc_ns(payload.reference.original_url)
+        if expiry is None or expiry > checked_at:
+            return None
+        return TerminalFailureWork(
+            inputs=(
+                NamedInput(
+                    name=("gallery_image_reference",),
+                    object_identifier=payload.reference_record_identifier,
+                ),
+            ),
+            error={"kind": "expired_url", "failure_kind": "expired_url"},
+            result={
+                "state": "gallery_stale",
+                "gallery_stale_reason": "expired_url",
+                "expired_at_utc_ns": expiry,
+                "checked_at_utc_ns": checked_at,
+            },
+        )
+
+    expired = expired_outcome()
+    if expired is not None:
+        return expired
     try:
         if dependencies.network_activity_scheduler is None:
             acquisition = await dependencies.acquirer.acquire(
@@ -464,6 +492,9 @@ async def _collect(
                 url=payload.request_plan.url,
             )
             async with dependencies.network_activity_scheduler.admit(activity) as permit:
+                expired = expired_outcome()
+                if expired is not None:
+                    return expired
                 permit.mark_dispatched()
                 acquisition = await dependencies.acquirer.acquire(
                     payload.request_plan, dependencies.new_identifier
@@ -550,7 +581,9 @@ async def _collect(
             sha256=verified.sha256,
         )
     except (OSError, KeyError, ValueError) as error:
-        failure_kind = image_acquisition_failure_kind(acquisition.record)
+        failure_kind = image_acquisition_failure_kind(
+            acquisition.record, observed_at_utc_ns=dependencies.utc_now_ns()
+        )
         result_identifier = dependencies.new_identifier()
         failed_acquisition = _image_acquisition_record(
             acquisition.record,

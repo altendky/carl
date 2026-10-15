@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from typing import cast
 
 from pydantic import ConfigDict, Field, RootModel
 
@@ -11,6 +12,8 @@ from carl.core.composed_projection import (
     ScalarFieldChange,
     ScalarFieldName,
 )
+from carl.core.ebay import EbayListingState
+from carl.core.marketplace_search import Marketplace
 from carl.core.models import JsonValue, StrictModel
 from carl.core.review_workspace import (
     ListingReviewRecord,
@@ -18,10 +21,64 @@ from carl.core.review_workspace import (
     ReviewBatchAcquisition,
     ReviewBatchItem,
     ReviewClaimLease,
+    ReviewStalenessPolicy,
     ReviewState,
+    ReviewWorkspace,
     WorkspaceListingReview,
     WorkspaceListingSummary,
+    WorkspaceProductGuideBinding,
 )
+from carl.core.work import WorkState
+
+
+class CompactWorkspaceSearchTrack(StrictModel):
+    """Track identity and current work status without its full acquisition recipe."""
+
+    track_identifier: str = Field(min_length=1)
+    query: str = Field(min_length=1)
+    marketplace: Marketplace | None
+    listing_state: EbayListingState | None
+    creation_work_identifier: str | None
+    creation_work_state: WorkState | None
+    origin_search_run_record_identifier: str | None
+    current_search_run_record_identifier: str | None
+    latest_refresh_work_identifier: str | None
+    latest_refresh_work_state: WorkState | None
+    latest_refresh_search_specification_version: int | None
+    enabled: bool
+    search_specification_version: int = Field(ge=1)
+    search_specification_record_identifier: str | None
+
+
+class CompactReviewWorkspace(StrictModel):
+    record_identifier: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    search_run_record_identifier: str = Field(min_length=1)
+    product_guide_record_identifier: str | None
+    staleness_policy: ReviewStalenessPolicy
+    created_at_utc: str
+    archived: bool
+    search_tracks: tuple[CompactWorkspaceSearchTrack, ...]
+    product_guide_bindings: tuple[WorkspaceProductGuideBinding, ...]
+    default_product_guide_binding_identifier: str | None
+
+
+def compact_review_workspace(workspace: ReviewWorkspace) -> CompactReviewWorkspace:
+    """Keep exact track version references so callers can retrieve full specifications."""
+
+    return CompactReviewWorkspace.model_validate(
+        workspace.model_dump(
+            mode="python", exclude={"search_tracks": {"__all__": {"search_specification"}}}
+        )
+    )
+
+
+def analysis_claude_details(value: JsonValue, *, include_details: bool = False) -> JsonValue:
+    """Omit the prompt-bearing command line from ordinary report responses."""
+
+    if include_details or not isinstance(value, dict):
+        return value
+    return {key: item for key, item in cast(dict[str, JsonValue], value).items() if key != "argv"}
 
 
 class CompactReviewProjection(WorkspaceListingSummary):

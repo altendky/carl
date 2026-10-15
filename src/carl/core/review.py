@@ -576,6 +576,12 @@ class SearchRefreshProgress(StrictModel):
     image_extractions: WorkGroupProgress
     descriptions: WorkGroupProgress | None = None
     image_failure_reason_counts: tuple[WorkFailureReasonCount, ...] = ()
+    gallery_state: Literal["current", "stale"] | None = None
+    expired_image_renditions_skipped: int = Field(default=0, ge=0)
+    gallery_stale_listing_count: int = Field(default=0, ge=0)
+    gallery_stale_listing_identifiers: tuple[str, ...] = Field(default=(), max_length=20)
+    gallery_stale_listing_identifiers_truncated: bool = False
+    gallery_warnings: tuple[str, ...] = Field(default=(), max_length=20)
 
 
 class WorkFailureSummary(StrictModel):

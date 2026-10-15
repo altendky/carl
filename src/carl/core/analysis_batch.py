@@ -33,7 +33,8 @@ REQUEST_MISSING_ANALYSES_WORK_KIND = (
 )
 LEGACY_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION = 1
 PREVIOUS_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION = 2
-REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION = 3
+MULTI_SOURCE_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION = 3
+REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION = 4
 REQUEST_MISSING_ANALYSES_MAXIMUM_ACTIVE = 10
 
 
@@ -79,6 +80,21 @@ def apply_listing_analysis_selection_policy(
     )
 
 
+class AnalysisSelectionSkip(StrictModel):
+    listing_identifier: str
+    listing_observation_record_identifier: str | None = None
+    kind: Literal[
+        "outside_workspace",
+        "status_excluded",
+        "no_usable_observation",
+        "availability_excluded",
+        "analysis_reused",
+        "selection_policy_excluded",
+        "maximum_items",
+    ]
+    message: str
+
+
 class ListingAnalysisBatchSelection(StrictModel):
     source_as_of_completion_sequence: int = Field(ge=0)
     matching_observation_record_identifiers: tuple[str, ...]
@@ -87,6 +103,8 @@ class ListingAnalysisBatchSelection(StrictModel):
     reusable_observation_record_identifiers: tuple[str, ...] = ()
     policy_excluded_observation_record_identifiers: tuple[str, ...] = ()
     excluded_observation_record_identifiers: tuple[str, ...] = ()
+    skipped: tuple[AnalysisSelectionSkip, ...] = ()
+    listing_identifiers_by_observation: dict[str, str] = Field(default_factory=dict)
 
 
 def select_listing_analysis_batch(
@@ -157,6 +175,11 @@ def select_listing_analysis_batch(
             for identifier in matching
             if identifier not in selected_set and identifier not in reusable_set
         ),
+        listing_identifiers_by_observation={
+            source.observation_record_identifier: source.listing_identifier
+            for source in sources
+            if source.observation_record_identifier in selected_set
+        },
     )
 
 
@@ -202,6 +225,7 @@ class RequestMissingListingAnalysesRequest(StrictModel):
     )
     maximum_items: int | None = Field(default=None, ge=1)
     allow_incomplete_gallery: bool = False
+    report_listing_skips: bool = False
 
     @model_validator(mode="after")
     def validate_analysis_selection(self) -> RequestMissingListingAnalysesRequest:
@@ -224,6 +248,8 @@ class RequestMissingAnalysesPayload(StrictModel):
         ListingAnalysisSelectionPolicy.MISSING_FOR_CURRENT_EVIDENCE
     )
     allow_incomplete_gallery: bool
+    selection_skipped: tuple[AnalysisSelectionSkip, ...] = ()
+    listing_identifiers_by_observation: dict[str, str] = Field(default_factory=dict)
 
 
 class RequestMissingListingAnalysesResult(StrictModel):
@@ -325,6 +351,7 @@ class SelectionAnalysesPreview(StrictModel):
     new_analysis_count: int = Field(ge=0)
     reused_analysis_count: int = Field(ge=0)
     excluded_observation_count: int = Field(ge=0)
+    skipped: tuple[AnalysisSelectionSkip, ...] = ()
 
 
 class SelectionAnalysesRequestResult(StrictModel):
@@ -342,6 +369,7 @@ class SelectionAnalysesRequestResult(StrictModel):
     candidate_examination_limit_reached: bool
     selected_observation_count: int = Field(ge=0)
     source_as_of_completion_sequence: int = Field(ge=0)
+    skipped: tuple[AnalysisSelectionSkip, ...] = ()
 
 
 def request_missing_analyses_work(

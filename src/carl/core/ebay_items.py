@@ -477,6 +477,12 @@ def extract_ebay_item(
     html: str, *, item_identifier: str, effective_url: str, status_code: int = 200
 ) -> EbayItemExtraction:
     _ = EbayItemRequest(item_identifier=item_identifier)
+    if status_code in {403, 429}:
+        return EbayItemExtraction(
+            classification=EbayItemResponseKind.CHALLENGE,
+            item_identifier=item_identifier,
+            issues=({"kind": "blocked_response", "http_status": status_code},),
+        )
     if len(html) > 20_000_000:
         return EbayItemExtraction(
             classification=EbayItemResponseKind.UNRECOGNIZED,
@@ -494,7 +500,12 @@ def extract_ebay_item(
             classification=kind, item_identifier=item_identifier, issues=tuple(issues)
         )
 
-    if any(marker in visible for marker in _CHALLENGE) or "/captcha" in effective_url.casefold():
+    if (
+        any(marker in visible for marker in _CHALLENGE)
+        or "/captcha" in effective_url.casefold()
+        or ("access denied" in visible and "errors.edgesuite.net" in html.casefold())
+    ):
+        issues.append({"kind": "blocked_response", "http_status": status_code})
         return classified(EbayItemResponseKind.CHALLENGE)
     identifiers = {
         identifier

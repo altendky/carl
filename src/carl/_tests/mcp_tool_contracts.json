@@ -8311,6 +8311,11 @@
         "record_identifier": {
           "title": "Record Identifier",
           "type": "string"
+        },
+        "include_details": {
+          "default": false,
+          "title": "Include Details",
+          "type": "boolean"
         }
       },
       "required": [
@@ -13495,6 +13500,57 @@
               },
               "title": "Image Failure Reason Counts",
               "type": "array"
+            },
+            "gallery_state": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "current",
+                    "stale"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Gallery State"
+            },
+            "expired_image_renditions_skipped": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Expired Image Renditions Skipped",
+              "type": "integer"
+            },
+            "gallery_stale_listing_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Gallery Stale Listing Count",
+              "type": "integer"
+            },
+            "gallery_stale_listing_identifiers": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 20,
+              "title": "Gallery Stale Listing Identifiers",
+              "type": "array"
+            },
+            "gallery_stale_listing_identifiers_truncated": {
+              "default": false,
+              "title": "Gallery Stale Listing Identifiers Truncated",
+              "type": "boolean"
+            },
+            "gallery_warnings": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 20,
+              "title": "Gallery Warnings",
+              "type": "array"
             }
           },
           "required": [
@@ -16960,13 +17016,18 @@
   },
   {
     "name": "list_review_workspaces",
-    "description": "List active workspaces by default, optionally including archived workspaces.",
+    "description": "List active workspaces; compact mode omits full search specifications.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "include_archived": {
           "default": false,
           "title": "Include Archived",
+          "type": "boolean"
+        },
+        "compact": {
+          "default": false,
+          "title": "Compact",
           "type": "boolean"
         }
       },
@@ -16979,6 +17040,236 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "CompactReviewWorkspace": {
+          "additionalProperties": false,
+          "properties": {
+            "record_identifier": {
+              "minLength": 1,
+              "title": "Record Identifier",
+              "type": "string"
+            },
+            "name": {
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "search_run_record_identifier": {
+              "minLength": 1,
+              "title": "Search Run Record Identifier",
+              "type": "string"
+            },
+            "product_guide_record_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Product Guide Record Identifier"
+            },
+            "staleness_policy": {
+              "$ref": "#/$defs/ReviewStalenessPolicy"
+            },
+            "created_at_utc": {
+              "title": "Created At Utc",
+              "type": "string"
+            },
+            "archived": {
+              "title": "Archived",
+              "type": "boolean"
+            },
+            "search_tracks": {
+              "items": {
+                "$ref": "#/$defs/CompactWorkspaceSearchTrack"
+              },
+              "title": "Search Tracks",
+              "type": "array"
+            },
+            "product_guide_bindings": {
+              "items": {
+                "$ref": "#/$defs/WorkspaceProductGuideBinding"
+              },
+              "title": "Product Guide Bindings",
+              "type": "array"
+            },
+            "default_product_guide_binding_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Default Product Guide Binding Identifier"
+            }
+          },
+          "required": [
+            "record_identifier",
+            "name",
+            "search_run_record_identifier",
+            "product_guide_record_identifier",
+            "staleness_policy",
+            "created_at_utc",
+            "archived",
+            "search_tracks",
+            "product_guide_bindings",
+            "default_product_guide_binding_identifier"
+          ],
+          "title": "CompactReviewWorkspace",
+          "type": "object"
+        },
+        "CompactWorkspaceSearchTrack": {
+          "additionalProperties": false,
+          "description": "Track identity and current work status without its full acquisition recipe.",
+          "properties": {
+            "track_identifier": {
+              "minLength": 1,
+              "title": "Track Identifier",
+              "type": "string"
+            },
+            "query": {
+              "minLength": 1,
+              "title": "Query",
+              "type": "string"
+            },
+            "marketplace": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Marketplace"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "listing_state": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EbayListingState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "creation_work_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Creation Work Identifier"
+            },
+            "creation_work_state": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "origin_search_run_record_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Origin Search Run Record Identifier"
+            },
+            "current_search_run_record_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Current Search Run Record Identifier"
+            },
+            "latest_refresh_work_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Latest Refresh Work Identifier"
+            },
+            "latest_refresh_work_state": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "latest_refresh_search_specification_version": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Latest Refresh Search Specification Version"
+            },
+            "enabled": {
+              "title": "Enabled",
+              "type": "boolean"
+            },
+            "search_specification_version": {
+              "minimum": 1,
+              "title": "Search Specification Version",
+              "type": "integer"
+            },
+            "search_specification_record_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Search Specification Record Identifier"
+            }
+          },
+          "required": [
+            "track_identifier",
+            "query",
+            "marketplace",
+            "listing_state",
+            "creation_work_identifier",
+            "creation_work_state",
+            "origin_search_run_record_identifier",
+            "current_search_run_record_identifier",
+            "latest_refresh_work_identifier",
+            "latest_refresh_work_state",
+            "latest_refresh_search_specification_version",
+            "enabled",
+            "search_specification_version",
+            "search_specification_record_identifier"
+          ],
+          "title": "CompactWorkspaceSearchTrack",
+          "type": "object"
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
@@ -17864,11 +18155,21 @@
       },
       "properties": {
         "result": {
-          "items": {
-            "$ref": "#/$defs/ReviewWorkspace"
-          },
-          "title": "Result",
-          "type": "array"
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ReviewWorkspace"
+              },
+              "type": "array"
+            },
+            {
+              "items": {
+                "$ref": "#/$defs/CompactReviewWorkspace"
+              },
+              "type": "array"
+            }
+          ],
+          "title": "Result"
         }
       },
       "required": [
@@ -20612,6 +20913,51 @@
     },
     "outputSchema": {
       "$defs": {
+        "AnalysisSelectionSkip": {
+          "additionalProperties": false,
+          "properties": {
+            "listing_identifier": {
+              "title": "Listing Identifier",
+              "type": "string"
+            },
+            "listing_observation_record_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Listing Observation Record Identifier"
+            },
+            "kind": {
+              "enum": [
+                "outside_workspace",
+                "status_excluded",
+                "no_usable_observation",
+                "availability_excluded",
+                "analysis_reused",
+                "selection_policy_excluded",
+                "maximum_items"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "message": {
+              "title": "Message",
+              "type": "string"
+            }
+          },
+          "required": [
+            "listing_identifier",
+            "kind",
+            "message"
+          ],
+          "title": "AnalysisSelectionSkip",
+          "type": "object"
+        },
         "ListingAnalysisSelectionPolicy": {
           "enum": [
             "missing_for_current_evidence",
@@ -20714,6 +21060,14 @@
           "minimum": 0,
           "title": "Excluded Observation Count",
           "type": "integer"
+        },
+        "skipped": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AnalysisSelectionSkip"
+          },
+          "title": "Skipped",
+          "type": "array"
         }
       },
       "required": [
@@ -24307,6 +24661,53 @@
       "title": "request_selection_analysesArguments"
     },
     "outputSchema": {
+      "$defs": {
+        "AnalysisSelectionSkip": {
+          "additionalProperties": false,
+          "properties": {
+            "listing_identifier": {
+              "title": "Listing Identifier",
+              "type": "string"
+            },
+            "listing_observation_record_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Listing Observation Record Identifier"
+            },
+            "kind": {
+              "enum": [
+                "outside_workspace",
+                "status_excluded",
+                "no_usable_observation",
+                "availability_excluded",
+                "analysis_reused",
+                "selection_policy_excluded",
+                "maximum_items"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "message": {
+              "title": "Message",
+              "type": "string"
+            }
+          },
+          "required": [
+            "listing_identifier",
+            "kind",
+            "message"
+          ],
+          "title": "AnalysisSelectionSkip",
+          "type": "object"
+        }
+      },
       "additionalProperties": false,
       "properties": {
         "work_identifier": {
@@ -24374,6 +24775,14 @@
           "minimum": 0,
           "title": "Source As Of Completion Sequence",
           "type": "integer"
+        },
+        "skipped": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AnalysisSelectionSkip"
+          },
+          "title": "Skipped",
+          "type": "array"
         }
       },
       "required": [

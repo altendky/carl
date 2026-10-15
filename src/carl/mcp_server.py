@@ -26,7 +26,11 @@ from carl.core.analysis_batch import (
     SelectionAnalysesRequest,
     SelectionAnalysesRequestResult,
 )
-from carl.core.compact_review import ReviewBatchAcquisitionResponse, WorkspaceListingResponse
+from carl.core.compact_review import (
+    CompactReviewWorkspace,
+    ReviewBatchAcquisitionResponse,
+    WorkspaceListingResponse,
+)
 from carl.core.composed_projection import (
     ComposedListingPage,
     ComposedListingProjection,
@@ -376,7 +380,7 @@ Workspaces may mix sources. Review IDs use ebay:<item ID> for eBay and bare nume
 copy returned identities unchanged through reviews, claims, worksets, snapshots, and analysis. Add another phrase with create_workspace_search; after it
 completes, refresh that track with request_workspace_refresh before requesting analysis. Refreshes
 advance the selected track without replacing the workspace.
-To adjust the same watch, read get_review_workspace, then revise_workspace_search_track with its
+To adjust the same watch, read get_review_workspace_activity.workspace, then revise_workspace_search_track with its
 current search_specification_version as expected_version and the complete replacement search spec.
 This preserves the track ID, listing first/last-seen history, and prior runs; inspect immutable
 versions with list_workspace_search_track_versions. Revision alone performs no acquisition:
@@ -403,6 +407,8 @@ backs off every queued search on that route before a replacement transport is us
 Rename a workspace with rename_review_workspace. Archive or restore it with
 set_review_workspace_archived; ordinary list_review_workspaces calls hide archived workspaces, while
 include_archived=true reveals them and exact workspace operations remain available.
+Use list_review_workspaces(compact=true) for discovery without full search specifications. Omit
+compact for the full definitions, or inspect exact versions with list_workspace_search_track_versions.
 Attach multiple guides with add_workspace_product_guide. A binding is either pinned to one exact
 record or follows the latest version of one guide identity; list_workspace_product_guides reports
 the exact version currently resolved. Use update_workspace_product_guide_binding to rename,
@@ -454,9 +460,13 @@ the selection may be the whole workspace, a claimed review batch, a workset, a f
 snapshot, or an explicit bounded ID list. Available status is the default. Refresh the enabled tracks
 containing the selected listings before requesting analyses; whole-workspace selection requires every
 completed enabled track. The same workspace follows its refreshes.
-Preview and request scan at most maximum_candidate_listings_examined workspace members (2,500 by
-default) through bounded retained-evidence selection. Check candidate_examination_limit_reached; increase the
-bound deliberately when an exact whole-workspace plan is required.
+Explicit IDs, batches, worksets, and snapshots look up their exact members directly and are independent
+of the workspace candidate scan bound. Preview and request return skipped IDs with reasons for status,
+scope, missing usable observations, policy exclusions, or maximum_items. Batch work preserves those skips
+and adds runtime input failures. Whole-workspace selection scans at most maximum_candidate_listings_examined
+members (2,500 by default). Check candidate_examination_limit_reached and increase that bound deliberately
+when a complete whole-workspace plan is required.
+get_listing_analysis omits Claude argv and its prompt by default; set include_details=true only for diagnostics.
 Poll the returned work identifier with get_work_status when detailed diagnostics are needed. Prefer
 get_workspace_work_status to check all root work requested by a workspace, or
 wait_for_workspace_work for a short progress-reporting wait until it is idle. It defaults to 30
@@ -606,11 +616,14 @@ def tool_definitions(
 
     async def list_review_workspaces(
         include_archived: bool = False,
-    ) -> tuple[ReviewWorkspace, ...]:
-        """List active workspaces by default, optionally including archived workspaces."""
+        compact: bool = False,
+    ) -> tuple[ReviewWorkspace, ...] | tuple[CompactReviewWorkspace, ...]:
+        """List active workspaces; compact mode omits full search specifications."""
 
         return await expected(
-            lambda: application.list_review_workspaces(include_archived=include_archived)
+            lambda: application.list_review_workspaces(
+                include_archived=include_archived, compact=compact
+            )
         )
 
     async def rename_review_workspace(
@@ -956,10 +969,16 @@ def tool_definitions(
 
         return await expected(lambda: application.request_selection_analyses(request))
 
-    async def get_listing_analysis(record_identifier: str) -> AnalysisReport:
+    async def get_listing_analysis(
+        record_identifier: str, include_details: bool = False
+    ) -> AnalysisReport:
         """Get one complete retained analysis report by its exact record identifier."""
 
-        return await expected(lambda: application.get_listing_analysis(record_identifier))
+        return await expected(
+            lambda: application.get_listing_analysis(
+                record_identifier, include_details=include_details
+            )
+        )
 
     async def get_provenance(
         object_identifier: str,

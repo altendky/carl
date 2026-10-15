@@ -80,13 +80,16 @@ sessions; expiry stops traversal rather than silently changing the exit during
 pagination. Page acquisitions retain the shared safe session record identifier
 and request counters as observed at acquisition time, before session cleanup.
 
-eBay challenges and HTTP 403/429 have a five-attempt retry budget. Successive
+eBay search challenges and HTTP 403/429 have a five-attempt retry budget. Successive
 failures impose stack-wide cooldowns of 10, 20, 40, then 60 minutes, with the
 60-minute cap also applied after terminal failure. Each retry opens a fresh
 provider session and cookie jar.
 Pending siblings, new work, and same-stack manual retries respect these durable
 deadlines across restarts without consuming attempts while waiting. Other
-response failures retain short bounded backoff. Retrying or refreshing makes
+response failures retain short bounded backoff. Blocked eBay item pages use
+the same five-attempt, 10-to-60-minute backoff policy. Refresh parents defer
+until pending children are eligible, while runnable or leased work retains
+ordinary progress polling. Retrying or refreshing makes
 real provider calls; inspect retained evidence and choose a justified route
 change before requeueing rather than repeatedly probing paid acquisitions.
 
@@ -108,6 +111,12 @@ also identify historical mostly-failed refreshes without rewriting their history
 image work by retained cause, including site HTTP status, transport timeout, and
 explicit proxy quota exhaustion. HTTP 403/429 alone does not establish a quota
 failure. Older acquisitions are consulted when their work errors were generic.
+When a reused Facebook item page contains expired, unsaved signed gallery URLs,
+refresh requests one replacement page per listing. Remaining expired renditions
+are skipped and the gallery is marked stale; matching saved images remain reusable.
+The progress view reports `gallery_state`, `expired_image_renditions_skipped`,
+and bounded stale listing IDs. Image work presented an expired URL stops with
+`expired_url` before acquisition, rather than retrying the same signed URL.
 `retry_item_failures` accepts an exact settled Facebook/eBay refresh work ID
 and a bounded `maximum_items` (default 1,000; maximum 10,000). It atomically
 requeues linked terminal collection jobs with transient transport/session errors,
@@ -123,7 +132,10 @@ The stable workspace record can be renamed through an immutable identity-state
 record. It can also be archived or restored without deleting any retained
 objects. Ordinary workspace listing hides archived workspaces by default;
 explicit lookup and `list_review_workspaces(include_archived=true)` retain access
-to them.
+to them. Set `compact=true` on `list_review_workspaces` to retain workspace and
+track identities, status, and specification version references while omitting
+full search specifications. Omit `compact` to retrieve complete specifications;
+the ordinary full response remains the default.
 
 A workspace can hold several product-guide bindings. Each binding has a
 workspace-local alias and is either pinned to an exact immutable guide record or
@@ -171,6 +183,11 @@ less response data. Compact responses include a shared `sellers` table keyed by
 snapshots and repeated field evidence are omitted from the response. Stored
 batches retain full projections, so recording reviews and replaying claims keep
 their original evidence and revisions. Full responses remain the default.
+
+`get_listing_analysis` returns the retained report text, descriptor, limit
+observations, and Claude metadata while omitting its prompt-bearing `argv`
+by default. Set `include_details=true` to retrieve the exact retained invocation
+for diagnosis. The stored analysis record is unchanged.
 
 A newer usable search-card price supersedes an older item-page price, while a
 newer item-page price likewise supersedes an older card price. This applies only
@@ -320,10 +337,14 @@ or explicit bounded ID list.
    Freshness errors identify the track, refresh work, and retained failure reason.
 7. Preview and request analysis from the workspace-native selection. The
    workspace supplies the relevant current search runs, their refresh coordinators, and
-   the exact product guide. Preview and request use a bounded indexed status
-   scan rather than full listing composition. They examine 2,500 candidate
-   listings by default, report whether that bound was reached, and allow an
-   explicit bound up to 10,000.
+   the exact product guide. Explicit listing IDs and batch, workset, or snapshot
+   members are looked up directly; unrelated members do not consume the
+   `maximum_candidate_listings_examined` bound. Whole-workspace selections use
+   a bounded status scan: 2,500 candidates by default, an explicit limit up to
+   10,000, and `candidate_examination_limit_reached` when the bound is reached.
+   Both preview and request return `skipped` entries with listing IDs and reasons
+   for exclusions, missing observations, reused analyses, selection-policy
+   filtering, and `maximum_items`.
 8. Check all queued, in-progress, or failed workspace-root work with
    `get_workspace_work_status`, or wait for the workspace to become idle with
    `wait_for_workspace_work`. The wait reports progress every five seconds when
@@ -340,6 +361,10 @@ summaries, recent selection snapshots, and active claim summaries. Claim tokens
 are omitted from activity output; recover a lost acquisition response by
 replaying its request ID. Exact batch and snapshot getters then recover the full
 bounded objects.
+
+Analysis-batch progress reports the runtime skip count. To inspect skipped
+listing IDs, observation IDs, and reasons encountered after queueing, request
+`get_work_status(include_details=true)` and read `details.result.skipped`.
 
 Workspace work discovery follows durable requester edges whose requester
 identifier is the workspace record ID. Replayed requests are deduplicated by
