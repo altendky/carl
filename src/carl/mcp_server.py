@@ -26,7 +26,11 @@ from carl.core.analysis_batch import (
     SelectionAnalysesRequest,
     SelectionAnalysesRequestResult,
 )
-from carl.core.compact_review import ReviewBatchAcquisitionResponse, WorkspaceListingResponse
+from carl.core.compact_review import (
+    CompactReviewWorkspace,
+    ReviewBatchAcquisitionResponse,
+    WorkspaceListingResponse,
+)
 from carl.core.composed_projection import (
     ComposedListingPage,
     ComposedListingProjection,
@@ -80,6 +84,11 @@ from carl.core.review import (
     SetProductGuideIdentityRetiredRequest,
     WorkStatus,
 )
+from carl.core.review_response_pages import (
+    GetReviewBatchItemRequest,
+    GetReviewBatchPageRequest,
+    ReviewBatchPage,
+)
 from carl.core.review_workspace import (
     AcquireReviewBatchRequest,
     AddWorkspaceProductGuideRequest,
@@ -104,6 +113,7 @@ from carl.core.review_workspace import (
     RetryWorkspaceSearchTrackRequest,
     RetryWorkspaceSearchTrackResult,
     ReviewBatch,
+    ReviewBatchItem,
     ReviewClaimLease,
     ReviewWorkset,
     ReviewWorksetConflict,
@@ -123,12 +133,18 @@ from carl.core.review_workspace import (
     WorkspaceWorkStatus,
     WorkspaceWorkWaitResult,
 )
+from carl.core.tool_response_pages import ToolResponsePage
 from carl.core.workspace_search_results import (
     ListWorkspaceSearchResultsRequest,
     WorkspaceSearchResultsPage,
 )
+from carl.core.workspace_summaries import (
+    ListReviewWorkspaceSummariesRequest,
+    ReviewWorkspaceSummariesPage,
+)
 from carl.io.claude import ClaudeCli
 from carl.io.mcp_errors import report_mcp_failure
+from carl.io.mcp_response_budget import BudgetedMCPServer, ToolResponseStore
 from carl.io.provenance import collect_code_provenance_async, source_tree_sha256_async
 from carl.io.sqlite import Database
 from carl.review import IncompleteGalleryError, ReviewApplication, ReviewInputError
@@ -376,7 +392,7 @@ Workspaces may mix sources. Review IDs use ebay:<item ID> for eBay and bare nume
 copy returned identities unchanged through reviews, claims, worksets, snapshots, and analysis. Add another phrase with create_workspace_search; after it
 completes, refresh that track with request_workspace_refresh before requesting analysis. Refreshes
 advance the selected track without replacing the workspace.
-To adjust the same watch, read get_review_workspace, then revise_workspace_search_track with its
+To adjust the same watch, read get_review_workspace_activity.workspace, then revise_workspace_search_track with its
 current search_specification_version as expected_version and the complete replacement search spec.
 This preserves the track ID, listing first/last-seen history, and prior runs; inspect immutable
 versions with list_workspace_search_track_versions. Revision alone performs no acquisition:
@@ -403,6 +419,9 @@ backs off every queued search on that route before a replacement transport is us
 Rename a workspace with rename_review_workspace. Archive or restore it with
 set_review_workspace_archived; ordinary list_review_workspaces calls hide archived workspaces, while
 include_archived=true reveals them and exact workspace operations remain available.
+Use list_review_workspace_summaries for discovery: follow next_cursor while has_more is true.
+It returns small identities and counts without per-track definitions. Inspect exact versions with
+list_workspace_search_track_versions, or request full definitions with list_review_workspaces.
 Attach multiple guides with add_workspace_product_guide. A binding is either pinned to one exact
 record or follows the latest version of one guide identity; list_workspace_product_guides reports
 the exact version currently resolved. Use update_workspace_product_guide_binding to rename,
@@ -444,19 +463,30 @@ Review batches and get_workspace_listing expose scalar_field_changes (field, pre
 current_value) and scalar_comparison_available. An empty change list with comparison unavailable
 is not proof of unchanged values. Older batch/bulk review baselines are recovered from retained
 evidence only when verified against the recorded revision; new reviews retain scalar snapshots.
-Use compact=true on acquire_review_batch or get_workspace_listing to return scalar values, image
-counts, and analysis presence without repeated evidence or prior scalar snapshots. Compact responses
-include a sellers map keyed by seller_reference; seller changes also use these references for their
-previous/current values. Full stored batches and review revisions remain available for drill-down.
+Use compact=true on acquire_review_batch for a bounded first summary page and the full claim.
+Continue with get_review_batch_page using batch.next_cursor; workspace_next_cursor is a separate
+cursor for acquiring another batch. Every summary retains the exact projection revision for review
+recording. Fetch descriptions, images, and seller details from that exact issued batch with
+get_review_batch_item. get_workspace_listing returns current evidence; its compact=true mode
+deduplicates seller profiles through a sellers map. Full stored batches remain
+available for drill-down. Page responses report response_bytes and has_more. MCP results also report
+size and continuation under _meta["carl/response"]. If kind=carl_tool_response_page appears, follow
+get_tool_response_page and concatenate json_fragment values as instructed. The original operation
+already ran; do not repeat it. After retaining every fragment, acknowledge the final page's cursor
+with acknowledge=true. Retrieve unread pages before restarting this server.
 Preview analysis with preview_selection_analyses, then queue the unchanged intent with
 request_selection_analyses. The workspace supplies the exact refreshed search run and product guide;
 the selection may be the whole workspace, a claimed review batch, a workset, a frozen selection
 snapshot, or an explicit bounded ID list. Available status is the default. Refresh the enabled tracks
 containing the selected listings before requesting analyses; whole-workspace selection requires every
 completed enabled track. The same workspace follows its refreshes.
-Preview and request scan at most maximum_candidate_listings_examined workspace members (2,500 by
-default) through bounded retained-evidence selection. Check candidate_examination_limit_reached; increase the
-bound deliberately when an exact whole-workspace plan is required.
+Explicit IDs, batches, worksets, and snapshots look up their exact members directly and are independent
+of the workspace candidate scan bound. Preview and request return skipped IDs with reasons for status,
+scope, missing usable observations, policy exclusions, or maximum_items. Batch work preserves those skips
+and adds runtime input failures. Whole-workspace selection scans at most maximum_candidate_listings_examined
+members (2,500 by default). Check candidate_examination_limit_reached and increase that bound deliberately
+when a complete whole-workspace plan is required.
+get_listing_analysis omits Claude argv and its prompt by default; set include_details=true only for diagnostics.
 Poll the returned work identifier with get_work_status when detailed diagnostics are needed. Prefer
 get_workspace_work_status to check all root work requested by a workspace, or
 wait_for_workspace_work for a short progress-reporting wait until it is idle. It defaults to 30
@@ -558,8 +588,19 @@ def tool_definitions(
     *,
     before_tool_call: Callable[[], Awaitable[None]] = _already_ready,
     error_log_path: Path | None = None,
+    response_store: ToolResponseStore | None = None,
 ) -> tuple[ToolDefinition, ...]:
     """Construct the immutable, duplicate-checked Carl MCP tool registry."""
+
+    response_store = response_store or ToolResponseStore()
+
+    async def get_tool_response_page(cursor: str, acknowledge: bool = False) -> ToolResponsePage:
+        """Continue an oversized response; acknowledge its final cursor after retaining every fragment."""
+
+        try:
+            return response_store.get_page(cursor, acknowledge=acknowledge)
+        except ValueError as error:
+            raise ToolError(str(error)) from error
 
     async def expected[T](operation: Callable[[], Awaitable[T]]) -> T:
         return await _expected(
@@ -606,11 +647,25 @@ def tool_definitions(
 
     async def list_review_workspaces(
         include_archived: bool = False,
-    ) -> tuple[ReviewWorkspace, ...]:
-        """List active workspaces by default, optionally including archived workspaces."""
+        compact: bool = False,
+    ) -> tuple[ReviewWorkspace, ...] | tuple[CompactReviewWorkspace, ...]:
+        """List active workspaces; compact mode omits full search specifications."""
 
         return await expected(
-            lambda: application.list_review_workspaces(include_archived=include_archived)
+            lambda: application.list_review_workspaces(
+                include_archived=include_archived, compact=compact
+            )
+        )
+
+    async def list_review_workspace_summaries(
+        request: ListReviewWorkspaceSummariesRequest | None = None,
+    ) -> ReviewWorkspaceSummariesPage:
+        """Page small workspace identities and counts within a byte budget."""
+
+        return await expected(
+            lambda: application.list_review_workspace_summaries(
+                request or ListReviewWorkspaceSummariesRequest()
+            )
         )
 
     async def rename_review_workspace(
@@ -825,6 +880,16 @@ def tool_definitions(
 
         return await expected(lambda: application.get_review_batch(record_identifier))
 
+    async def get_review_batch_page(request: GetReviewBatchPageRequest) -> ReviewBatchPage:
+        """Read a byte-bounded page of immutable batch summaries without acquiring another claim."""
+
+        return await expected(lambda: application.get_review_batch_page(request))
+
+    async def get_review_batch_item(request: GetReviewBatchItemRequest) -> ReviewBatchItem:
+        """Get one item's full frozen evidence and exact revision from its issued batch."""
+
+        return await expected(lambda: application.get_review_batch_item(request))
+
     async def record_listing_reviews(
         request: RecordClaimedListingReviewsRequest,
     ) -> RecordListingReviewsResult:
@@ -956,10 +1021,16 @@ def tool_definitions(
 
         return await expected(lambda: application.request_selection_analyses(request))
 
-    async def get_listing_analysis(record_identifier: str) -> AnalysisReport:
+    async def get_listing_analysis(
+        record_identifier: str, include_details: bool = False
+    ) -> AnalysisReport:
         """Get one complete retained analysis report by its exact record identifier."""
 
-        return await expected(lambda: application.get_listing_analysis(record_identifier))
+        return await expected(
+            lambda: application.get_listing_analysis(
+                record_identifier, include_details=include_details
+            )
+        )
 
     async def get_provenance(
         object_identifier: str,
@@ -1060,6 +1131,20 @@ def tool_definitions(
 
     definitions = (
         ToolDefinition(
+            "get_review_batch_item",
+            ("carl", "review", "get_batch_item"),
+            get_review_batch_item,
+            get_review_batch_item.__doc__ or "",
+            _READ_ONLY,
+        ),
+        ToolDefinition(
+            "get_tool_response_page",
+            ("carl", "mcp", "get_tool_response_page"),
+            get_tool_response_page,
+            get_tool_response_page.__doc__ or "",
+            _READ_ONLY,
+        ),
+        ToolDefinition(
             "get_server_info",
             ("carl", "mcp", "get_server_info"),
             get_server_info,
@@ -1099,6 +1184,13 @@ def tool_definitions(
             ("carl", "review", "list_workspaces"),
             list_review_workspaces,
             list_review_workspaces.__doc__ or "",
+            _READ_ONLY,
+        ),
+        ToolDefinition(
+            "list_review_workspace_summaries",
+            ("carl", "review", "list_workspace_summaries"),
+            list_review_workspace_summaries,
+            list_review_workspace_summaries.__doc__ or "",
             _READ_ONLY,
         ),
         ToolDefinition(
@@ -1253,6 +1345,13 @@ def tool_definitions(
             ("carl", "review", "get_batch"),
             get_review_batch,
             get_review_batch.__doc__ or "",
+            _READ_ONLY,
+        ),
+        ToolDefinition(
+            "get_review_batch_page",
+            ("carl", "review", "get_batch_page"),
+            get_review_batch_page,
+            get_review_batch_page.__doc__ or "",
             _READ_ONLY,
         ),
         ToolDefinition(
@@ -1513,8 +1612,12 @@ def build_server(
 ) -> MCPServer:
     """Build a transport-independent Carl MCP server."""
 
+    response_store = ToolResponseStore()
     definitions = tool_definitions(
-        application, before_tool_call=before_tool_call, error_log_path=error_log_path
+        application,
+        before_tool_call=before_tool_call,
+        error_log_path=error_log_path,
+        response_store=response_store,
     )
     package_version = version("carl")
     source_version = application.server_source_tree_sha256
@@ -1523,7 +1626,8 @@ def build_server(
         if source_version is None
         else f"{package_version}+source.{source_version[:12]}"
     )
-    server = MCPServer(
+    server = BudgetedMCPServer(
+        response_store=response_store,
         name="carl",
         description="Review retained Carl evidence and request provenance-linked analysis",
         instructions=_INSTRUCTIONS,

@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 from mcp import Client
 
+from carl._tests.mcp_response_helpers import complete_tool_result
 from carl._tests.test_marketplace_listing import _publish, _record
 from carl._tests.test_mixed_workspace import _complete
 from carl._tests.test_review_workspace import _search_run_value
@@ -179,8 +180,8 @@ def _application(
         restrict_listing_identifiers: frozenset[str] | None = None,
         source_listing_identifiers: frozenset[str] | None = None,
     ) -> ListingAnalysisBatchSelection:
-        assert source_listing_identifiers == frozenset({FACEBOOK_ID, EBAY_ID})
         assert restrict_listing_identifiers is not None
+        assert source_listing_identifiers == restrict_listing_identifiers
         assert request.product_guide_record_identifier == "guide"
         observations = tuple(
             f"observation-{identifier}" for identifier in sorted(restrict_listing_identifiers)
@@ -219,6 +220,18 @@ def _application(
 
     monkeypatch.setattr(ReviewApplication, "get_review_workspace", get_workspace)
     monkeypatch.setattr(ReviewApplication, "_workspace_analysis_candidates", candidates)
+
+    async def selected_statuses(
+        _app: ReviewApplication, scoped_workspace: ReviewWorkspace, identifiers: tuple[str, ...]
+    ) -> dict[str, ListingStatus]:
+        observed_candidate_tracks.append(
+            tuple(track.track_identifier for track in scoped_workspace.search_tracks)
+        )
+        return dict.fromkeys(identifiers, ListingStatus.AVAILABLE)
+
+    monkeypatch.setattr(
+        ReviewApplication, "_selected_workspace_analysis_statuses", selected_statuses
+    )
     monkeypatch.setattr(ReviewApplication, "_plan_missing_listing_analyses", plan)
     monkeypatch.setattr(Database, "work", work)
     return ReviewApplication(database, tmp_path), observed_candidate_tracks
@@ -440,6 +453,7 @@ async def test_mcp_lists_workspace_with_more_than_twenty_tracks(
         app, _ = _application(database, tmp_path, monkeypatch, workspace)
         async with Client(build_server(app)) as client:
             result = await client.call_tool("list_review_workspaces")
+            result = await complete_tool_result(client, result)
         assert not result.is_error
         assert result.structured_content is not None
         returned = result.structured_content["result"]

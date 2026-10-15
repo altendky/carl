@@ -757,6 +757,16 @@ async def test_workspace_analysis_preview_resolves_claimed_batch(
     monkeypatch.setattr("carl.review.expand_search_runs", search_ancestry)
     monkeypatch.setattr("carl.review.run_listing_identifiers", search_members)
 
+    async def selected_statuses(
+        _application: ReviewApplication, _workspace: ReviewWorkspace, identifiers: tuple[str, ...]
+    ) -> dict[str, ListingStatus]:
+        assert identifiers == ("123",)
+        return {"123": ListingStatus.AVAILABLE}
+
+    monkeypatch.setattr(
+        ReviewApplication, "_selected_workspace_analysis_statuses", selected_statuses
+    )
+
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         application = ReviewApplication(database, tmp_path)
         request = SelectionAnalysesRequest(

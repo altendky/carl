@@ -475,6 +475,15 @@ async def test_item_phase_reuses_successful_pages_without_decodo_work(
                     schema_version=1,
                     value=refreshed_record,
                 ),
+                *(
+                    RecordDraft(
+                        identifier=f"observation-{listing_id}",
+                        kind=("carl", "facebook", "listing_observation"),
+                        schema_version=1,
+                        value={"listing_id": listing_id, "images": []},
+                    )
+                    for listing_id in ("1", "2", "3")
+                ),
             ),
             artifacts=(),
             outputs=(

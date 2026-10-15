@@ -29,6 +29,8 @@ def refresh_failure_summary(result: dict[str, JsonValue]) -> RefreshFailureSumma
         + count("description_failures")
         + count("new_images_failed")
         + count("resumed_images_failed")
+        + count("expired_image_renditions_skipped")
+        + count("gallery_refresh_failures")
         > 0
     )
     return RefreshFailureSummary(

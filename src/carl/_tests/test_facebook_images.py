@@ -88,7 +88,7 @@ from carl.io.worker import (
 )
 from carl.review import ReviewApplication
 
-URL = "https://scontent-lga3-1.xx.fbcdn.net/v/t39.84726-6/p.jpg?oh=signed%2Bvalue&oe=abc"
+URL = "https://scontent-lga3-1.xx.fbcdn.net/v/t39.84726-6/p.jpg?oh=signed%2Bvalue&oe=FFFFFFFF"
 ROUTE = ("proton", "personal", "test")
 
 
@@ -172,7 +172,7 @@ def test_gallery_planner_keeps_edges_but_deduplicates_requests() -> None:
     assert not exact.download_groups
     assert exact.reuse_decisions[0].match_kind is ImageReuseMatchKind.EXACT_RENDITION
 
-    refreshed = first.model_copy(update={"original_url": URL.replace("oe=abc", "oe=def")})
+    refreshed = first.model_copy(update={"original_url": URL.replace("oe=FFFFFFFF", "oe=FFFFFFFE")})
     reused = plan_image_followups((refreshed,), (candidate,), 1)
     assert not reused.download_groups
     assert (

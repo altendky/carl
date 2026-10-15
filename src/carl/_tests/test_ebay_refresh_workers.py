@@ -4,6 +4,7 @@
 # pyright: reportPrivateUsage=false
 
 from pathlib import Path
+from time import time_ns
 from typing import cast
 
 import pytest
@@ -44,9 +45,9 @@ from carl.core.ebay_refresh import (
     RefreshEbaySearchPayload,
     refresh_ebay_search_work,
 )
-from carl.core.models import NamedOutput, RecordDraft
+from carl.core.models import JsonValue, NamedOutput, RecordDraft
 from carl.core.refresh_recovery import RetryItemFailuresRequest
-from carl.core.work import WorkCapability
+from carl.core.work import WorkCapability, WorkState
 from carl.core.worker import (
     AttemptContext,
     CompletedWork,
@@ -57,6 +58,7 @@ from carl.core.worker import (
 from carl.ebay_analysis_workers import select_ebay_analysis_evidence
 from carl.ebay_refresh_workers import (
     EbayRefreshWorkerDependencies,
+    _pending_delay_ns,
     build_ebay_refresh_worker_registry,
     ebay_refresh_child_work_states,
 )
@@ -121,6 +123,94 @@ def _search_handler(
         payload_type=CollectEbaySearchPayload,
         handler=search,
     )
+
+
+@pytest.mark.parametrize(
+    "states,expected",
+    [
+        (({"state": "pending", "eligible_at_utc_ns": 610_000_000_000},), 600_000_000_000),
+        (
+            (
+                {"state": "pending", "eligible_at_utc_ns": 610_000_000_000},
+                {"state": "pending", "eligible_at_utc_ns": 310_000_000_000},
+            ),
+            300_000_000_000,
+        ),
+        (({"state": "pending", "eligible_at_utc_ns": 0},), 5_000_000_000),
+        (({"state": "leased", "eligible_at_utc_ns": 610_000_000_000},), 5_000_000_000),
+    ],
+)
+def test_refresh_waits_until_pending_children_are_eligible(
+    states: tuple[dict[str, JsonValue], ...], expected: int
+) -> None:
+    assert _pending_delay_ns(states, 10_000_000_000) == expected
+
+
+@pytest.mark.anyio
+async def test_refresh_parent_is_not_claimed_repeatedly_during_search_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("carl.ebay_refresh_workers._WAIT_NS", 0)
+    identifiers = _identifiers()
+
+    async def delayed_search(
+        _payload: CollectEbaySearchPayload, _context: AttemptContext
+    ) -> RetryWork:
+        return RetryWork(
+            delay_ns=600_000_000_000,
+            reason={"kind": "blocked"},
+            result={"state": "retryable_failure"},
+        )
+
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await _retain_records(database, _source_records("base", (ITEM,)), identifiers)
+        search = _search_handler()
+        registry = WorkHandlerRegistry(
+            handlers=(
+                TypedWorkHandler(
+                    capability=search.capability,
+                    component=search.component,
+                    payload_type=CollectEbaySearchPayload,
+                    handler=delayed_search,
+                ),
+                *build_ebay_refresh_worker_registry(
+                    EbayRefreshWorkerDependencies(database, identifiers)
+                ).handlers,
+            )
+        )
+        _ = await _enqueue(
+            database,
+            refresh_ebay_search_work(
+                identifier="refresh",
+                payload=RefreshEbaySearchPayload(
+                    base_search_run_record_identifier="base",
+                    search_work_identifier="search",
+                    search=EbaySearchRequest(query="eyepiece"),
+                ),
+            ),
+            identifiers,
+        )
+        _ = await _run_next(database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND)
+        child = await _run_next(database, registry, identifiers, COLLECT_EBAY_SEARCH_WORK_KIND)
+        parent = await _run_next(database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND)
+        child_eligible = int(str(child["eligible_at_utc_ns"]))
+        parent_eligible = int(str(parent["eligible_at_utc_ns"]))
+        assert parent["state"] == "pending"
+        assert child_eligible <= parent_eligible < child_eligible + 1_000_000_000
+        assert parent["attempt"] == 2
+        claim = await database.claim_work(
+            supported_capabilities=tuple(
+                capability
+                for capability in registry.capabilities
+                if capability.kind == REFRESH_EBAY_SEARCH_WORK_KIND
+            ),
+            worker_identifier=identifiers(),
+            lease_token=identifiers(),
+            lease_duration_ns=60_000_000_000,
+            utc_now_ns=lambda: time_ns() + 60_000_000_000,
+            event_identifier=identifiers(),
+        )
+        assert claim.lease is None
 
 
 @pytest.mark.anyio
@@ -385,10 +475,16 @@ async def test_retry_failed_item_finishes_same_refresh_without_repeating_search(
 
 
 @pytest.mark.anyio
-async def test_completed_challenge_extraction_is_counted_as_failure(
+async def test_blocked_item_retries_then_terminal_failure_is_counted_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("carl.ebay_refresh_workers._WAIT_NS", 0)
+
+    def no_delay(_attempt: int, *, blocked: bool) -> int:
+        assert blocked
+        return 0
+
+    monkeypatch.setattr("carl.ebay_item_workers.ebay_response_retry_delay_ns", no_delay)
     identifiers = _identifiers()
     pages = _Acquirer(
         {
@@ -427,7 +523,10 @@ async def test_completed_challenge_extraction_is_counted_as_failure(
             REFRESH_EBAY_SEARCH_WORK_KIND,
             REFRESH_EBAY_SEARCH_WORK_KIND,
             COLLECT_EBAY_ITEM_WORK_KIND,
-            EXTRACT_EBAY_ITEM_WORK_KIND,
+            COLLECT_EBAY_ITEM_WORK_KIND,
+            COLLECT_EBAY_ITEM_WORK_KIND,
+            COLLECT_EBAY_ITEM_WORK_KIND,
+            COLLECT_EBAY_ITEM_WORK_KIND,
             REFRESH_EBAY_SEARCH_WORK_KIND,
         ):
             _ = await _run_next(database, registry, identifiers, kind)
@@ -438,6 +537,10 @@ async def test_completed_challenge_extraction_is_counted_as_failure(
         assert _mapping(completed["error"])["kind"] == "mostly_failed_refresh"
         assert result["item_failures"] == 1
         assert result["new_images_saved"] == 0
+        assert len(pages.plans) == 5
+        child_states = await ebay_refresh_child_work_states(database, "refresh")
+        assert child_states["item_pages"] == (WorkState.TERMINAL_FAILURE,)
+        assert child_states["item_extractions"] == ()
         assert not await database.records_by_kind(("carl", "ebay", "gallery_image_reference"))
 
 

@@ -14,6 +14,7 @@ from carl.core.ebay import (
     LEGACY_COLLECT_EBAY_SEARCH_PAYLOAD_SCHEMA_VERSION,
     CollectEbaySearchPayload,
 )
+from carl.core.ebay_retry import EBAY_BLOCKED_MAXIMUM_ATTEMPTS, ebay_response_retry_delay_ns
 from carl.core.ebay_search_support import (
     UnsupportedEbaySearchMode,
     require_supported_ebay_search_acquisition,
@@ -37,10 +38,6 @@ from carl.io.httpx import AcquisitionFailure, RouteConfigurationFailure
 from carl.io.paths import CarlDirectories
 from carl.io.sqlite import Database
 from carl.io.worker import TypedWorkHandler, WorkHandlerRegistry
-
-_BLOCKED_SEARCH_MAXIMUM_ATTEMPTS = 5
-_BLOCKED_SEARCH_INITIAL_BACKOFF_NS = 600_000_000_000
-_BLOCKED_SEARCH_MAXIMUM_BACKOFF_NS = 3_600_000_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,18 +201,11 @@ async def _collect(
             isinstance(evidence, list)
             and any(marker in evidence for marker in ("http_status_403", "http_status_429"))
         )
-        maximum_attempts = _BLOCKED_SEARCH_MAXIMUM_ATTEMPTS if blocked else 3
+        maximum_attempts = EBAY_BLOCKED_MAXIMUM_ATTEMPTS if blocked else 3
         reason["maximum_attempts"] = maximum_attempts
         # Each collector invocation already opens a fresh provider session and
         # cookie jar. Give blocked queries time to recover between those sessions.
-        delay_ns = (
-            min(
-                _BLOCKED_SEARCH_MAXIMUM_BACKOFF_NS,
-                _BLOCKED_SEARCH_INITIAL_BACKOFF_NS * 2 ** min(policy_attempt - 1, 3),
-            )
-            if blocked
-            else 2 ** (policy_attempt - 1) * 1_000_000_000
-        )
+        delay_ns = ebay_response_retry_delay_ns(policy_attempt, blocked=blocked)
         if blocked:
             reason["cooldown"] = {
                 "stack_identifier": payload.request.stack_identifier,

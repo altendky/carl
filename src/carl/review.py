@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from time import perf_counter_ns, time_ns
-from typing import Literal, cast
+from typing import Literal, cast, overload
 from uuid import uuid4
 
 import anyio
@@ -16,6 +16,7 @@ import anyio
 from carl.core.activity import ActivitySnapshot, work_error_kind
 from carl.core.analysis_batch import (
     REQUEST_MISSING_ANALYSES_WORK_KIND,
+    AnalysisSelectionSkip,
     ListingAnalysisBatchSelection,
     MissingListingAnalysesPreview,
     RequestMissingAnalysesPayload,
@@ -30,9 +31,10 @@ from carl.core.analysis_batch import (
     select_listing_analysis_batch,
 )
 from carl.core.compact_review import (
-    CompactReviewBatchAcquisition,
+    CompactReviewWorkspace,
     CompactWorkspaceListingReview,
-    compact_review_acquisition,
+    analysis_claude_details,
+    compact_review_workspace,
     compact_workspace_listing,
 )
 from carl.core.components import ComponentId
@@ -236,6 +238,14 @@ from carl.core.review import (
     work_group_progress,
 )
 from carl.core.review_errors import IncompleteGalleryError, ReviewInputError
+from carl.core.review_response_pages import (
+    GetReviewBatchItemRequest,
+    GetReviewBatchPageRequest,
+    PagedReviewBatchAcquisition,
+    ReviewBatchPage,
+    paged_review_acquisition,
+    review_batch_page,
+)
 from carl.core.review_workspace import (
     ACQUIRE_REVIEW_BATCH,
     ADD_WORKSPACE_PRODUCT_GUIDE,
@@ -343,6 +353,12 @@ from carl.core.workspace_search_results import (
     encode_workspace_search_results_cursor,
     workspace_search_results_scope,
 )
+from carl.core.workspace_summaries import (
+    ListReviewWorkspaceSummariesRequest,
+    ReviewWorkspaceSummariesPage,
+    build_workspace_summary_page,
+    decode_workspace_summaries_cursor,
+)
 from carl.ebay_analysis_workers import request_ebay_listing_analysis
 from carl.ebay_refresh_workers import ebay_refresh_child_work_states
 from carl.ebay_retry import retry_ebay_image_failures
@@ -364,6 +380,7 @@ from carl.io.provenance import (
 from carl.io.sqlite import Database
 from carl.marketplace_listing import ebay_observations, read_ebay_listing
 from carl.marketplace_projection import (
+    _facebook_listing_statuses,
     ebay_analysis_descriptor,
     ebay_candidate_sources,
     expand_search_runs,
@@ -394,6 +411,28 @@ def _utc_text(utc_ns: int) -> str:
 
 def _nonnegative_integer(value: JsonValue) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _json_strings(value: JsonValue) -> tuple[str, ...]:
+    return (
+        tuple(item for item in cast(list[JsonValue], value) if isinstance(item, str))
+        if isinstance(value, list)
+        else ()
+    )
+
+
+def _review_acquisition_response(
+    acquisition: ReviewBatchAcquisition, *, compact: bool
+) -> ReviewBatchAcquisition | PagedReviewBatchAcquisition:
+    if compact:
+        try:
+            return paged_review_acquisition(acquisition)
+        except ValueError:
+            # A published claim must remain recoverable even if unusually large
+            # immutable identity metadata cannot fit a typed summary page.
+            # The MCP boundary can page the exact original result in that case.
+            return acquisition
+    return acquisition
 
 
 def _projection_analysis_descriptor(value: AnalysisDescriptor) -> ProjectionAnalysisDescriptor:
@@ -533,8 +572,9 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=55),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=40),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=56),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=41),
+                ServerCapability(identity=("carl", "mcp", "response_pages"), version=1),
                 ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=3),
@@ -2875,9 +2915,24 @@ class ReviewApplication:
         )
         return track.model_copy(update={"enabled": request.enabled})
 
+    @overload
     async def list_review_workspaces(
-        self, *, include_archived: bool = False
-    ) -> tuple[ReviewWorkspace, ...]:
+        self, *, include_archived: bool = False, compact: Literal[False] = False
+    ) -> tuple[ReviewWorkspace, ...]: ...
+
+    @overload
+    async def list_review_workspaces(
+        self, *, include_archived: bool = False, compact: Literal[True]
+    ) -> tuple[CompactReviewWorkspace, ...]: ...
+
+    @overload
+    async def list_review_workspaces(
+        self, *, include_archived: bool = False, compact: bool
+    ) -> tuple[ReviewWorkspace, ...] | tuple[CompactReviewWorkspace, ...]: ...
+
+    async def list_review_workspaces(
+        self, *, include_archived: bool = False, compact: bool = False
+    ) -> tuple[ReviewWorkspace, ...] | tuple[CompactReviewWorkspace, ...]:
         stored = tuple(
             ReviewWorkspace.model_validate_json(encode_json(value))
             for _, value in await self.database.records_by_kind(REVIEW_WORKSPACE_KIND)
@@ -2885,9 +2940,36 @@ class ReviewApplication:
         workspaces = tuple(
             [await self.get_review_workspace(workspace.record_identifier) for workspace in stored]
         )
-        return tuple(
+        selected = tuple(
             workspace for workspace in workspaces if include_archived or not workspace.archived
         )
+        return (
+            tuple(compact_review_workspace(workspace) for workspace in selected)
+            if compact
+            else selected
+        )
+
+    async def list_review_workspace_summaries(
+        self, request: ListReviewWorkspaceSummariesRequest
+    ) -> ReviewWorkspaceSummariesPage:
+        cursor = decode_workspace_summaries_cursor(request)
+        after = None if cursor is None else cursor.after_workspace_identifier
+        selected: list[ReviewWorkspace] = []
+        target = request.page_size + 1
+        while len(selected) < target:
+            identifiers = await self.database.record_identifiers_by_kind_page(
+                REVIEW_WORKSPACE_KIND, after_identifier=after, limit=max(20, target)
+            )
+            if not identifiers:
+                break
+            for identifier in identifiers:
+                after = identifier
+                workspace = await self.get_review_workspace(identifier)
+                if request.include_archived or not workspace.archived:
+                    selected.append(workspace)
+                    if len(selected) == target:
+                        break
+        return build_workspace_summary_page(selected, request)
 
     @staticmethod
     def _workspace_current_search_runs(workspace: ReviewWorkspace) -> tuple[str, ...]:
@@ -3366,7 +3448,7 @@ class ReviewApplication:
 
     async def acquire_review_batch(
         self, request: AcquireReviewBatchRequest
-    ) -> ReviewBatchAcquisition | CompactReviewBatchAcquisition:
+    ) -> ReviewBatchAcquisition | PagedReviewBatchAcquisition:
         """Atomically issue a batch and claim its listings for one review agent."""
 
         action = "acquire_batch"
@@ -3381,7 +3463,7 @@ class ReviewApplication:
             raise ReviewInputError(str(error)) from error
         if replay is not None:
             acquisition = ReviewBatchAcquisition.model_validate_json(encode_json(replay))
-            return compact_review_acquisition(acquisition) if request.compact else acquisition
+            return _review_acquisition_response(acquisition, compact=request.compact)
 
         started_utc_ns = self.utc_now_ns()
         started_monotonic_ns = self.monotonic_ns()
@@ -3408,7 +3490,7 @@ class ReviewApplication:
                 ended_at_utc=_utc_text(ended_utc_ns),
                 duration_ns=max(0, self.monotonic_ns() - started_monotonic_ns),
             )
-            return compact_review_acquisition(acquisition) if request.compact else acquisition
+            return _review_acquisition_response(acquisition, compact=request.compact)
         except ValueError as error:
             raise ReviewInputError(str(error)) from error
 
@@ -3502,6 +3584,20 @@ class ReviewApplication:
         if kind != REVIEW_BATCH_KIND or schema_version != 1:
             raise ReviewInputError("The record is not a supported review batch")
         return ReviewBatch.model_validate_json(encode_json(value))
+
+    async def get_review_batch_page(self, request: GetReviewBatchPageRequest) -> ReviewBatchPage:
+        batch = await self.get_review_batch(request.batch_record_identifier)
+        try:
+            return review_batch_page(batch, limit=request.limit, cursor=request.cursor)
+        except ValueError as error:
+            raise ReviewInputError(str(error)) from error
+
+    async def get_review_batch_item(self, request: GetReviewBatchItemRequest) -> ReviewBatchItem:
+        batch = await self.get_review_batch(request.batch_record_identifier)
+        for item in batch.items:
+            if item.projection.listing_identifier == request.listing_identifier:
+                return item
+        raise ReviewInputError("Listing is not present in the requested review batch")
 
     async def record_listing_reviews(
         self, request: RecordListingReviewsRequest
@@ -5529,6 +5625,7 @@ class ReviewApplication:
         str,
         int,
         bool,
+        tuple[AnalysisSelectionSkip, ...],
     ]:
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
         guide_binding_identifier, guide_record_identifier = self._selected_workspace_product_guide(
@@ -5592,6 +5689,8 @@ class ReviewApplication:
             selection_snapshot_record_identifier = snapshot.record_identifier
             selected_listing_identifiers = tuple(item.listing_identifier for item in snapshot.items)
 
+        selection_skipped: list[AnalysisSelectionSkip] = []
+        selected_members: set[str] = set()
         if selected_listing_identifiers is not None:
             selected_ids = frozenset(selected_listing_identifiers)
             as_of = await self.database.current_completion_boundary()
@@ -5605,15 +5704,25 @@ class ReviewApplication:
                     maximum_runs=None,
                 )
                 for run_identifier in ancestry:
-                    if selected_ids.intersection(
+                    members = selected_ids.intersection(
                         await run_listing_identifiers(self.database, run_identifier)
-                    ):
+                    )
+                    selected_members.update(members)
+                    if members and track not in relevant_tracks:
                         relevant_tracks.append(track)
-                        break
             completed_tracks = tuple(relevant_tracks)
             if not completed_tracks:
                 raise ReviewInputError(
-                    "The selection contains no listings in active workspace tracks"
+                    "The selection contains no listings in active workspace tracks; skipped="
+                    + encode_json(
+                        [
+                            {
+                                "listing_identifier": identifier,
+                                "kind": "outside_workspace",
+                            }
+                            for identifier in selected_listing_identifiers
+                        ]
+                    )
                 )
             workspace = workspace.model_copy(update={"search_tracks": completed_tracks})
 
@@ -5657,15 +5766,49 @@ class ReviewApplication:
         refresh_work_identifier = next(iter(completed_tracks)).latest_refresh_work_identifier
         assert refresh_work_identifier is not None
 
-        (
-            status_matching_listing_identifiers,
-            candidate_listings_examined,
-            candidate_examination_limit_reached,
-        ) = await self._workspace_analysis_candidates(
-            workspace,
-            statuses=frozenset(request.statuses),
-            maximum_candidate_listings_examined=(request.maximum_candidate_listings_examined),
-        )
+        if selected_listing_identifiers is None:
+            (
+                status_matching_listing_identifiers,
+                candidate_listings_examined,
+                candidate_examination_limit_reached,
+            ) = await self._workspace_analysis_candidates(
+                workspace,
+                statuses=frozenset(request.statuses),
+                maximum_candidate_listings_examined=request.maximum_candidate_listings_examined,
+            )
+        else:
+            member_identifiers = tuple(
+                identifier
+                for identifier in selected_listing_identifiers
+                if identifier in selected_members
+            )
+            selected_statuses = await self._selected_workspace_analysis_statuses(
+                workspace, member_identifiers
+            )
+            status_matching_listing_identifiers = tuple(
+                identifier
+                for identifier in member_identifiers
+                if selected_statuses[identifier] in request.statuses
+            )
+            candidate_listings_examined = len(selected_listing_identifiers)
+            candidate_examination_limit_reached = False
+            for identifier in selected_listing_identifiers:
+                if identifier not in selected_members:
+                    selection_skipped.append(
+                        AnalysisSelectionSkip(
+                            listing_identifier=identifier,
+                            kind="outside_workspace",
+                            message="The listing is not in an enabled workspace track or its retained ancestry.",
+                        )
+                    )
+                elif selected_statuses[identifier] not in request.statuses:
+                    selection_skipped.append(
+                        AnalysisSelectionSkip(
+                            listing_identifier=identifier,
+                            kind="status_excluded",
+                            message=f"Current status {selected_statuses[identifier].value} is excluded by the requested statuses.",
+                        )
+                    )
         status_matching = frozenset(status_matching_listing_identifiers)
         selected_listing_identifiers = (
             tuple(status_matching_listing_identifiers)
@@ -5684,6 +5827,7 @@ class ReviewApplication:
             filters=CandidateFilters(),
             maximum_items=request.maximum_items,
             allow_incomplete_gallery=request.allow_incomplete_gallery,
+            report_listing_skips=not isinstance(selection, WorkspaceAnalysisSelection),
         )
         return (
             low_level_request,
@@ -5693,7 +5837,39 @@ class ReviewApplication:
             guide_binding_identifier,
             candidate_listings_examined,
             candidate_examination_limit_reached,
+            tuple(selection_skipped),
         )
+
+    async def _selected_workspace_analysis_statuses(
+        self, _workspace: ReviewWorkspace, listing_identifiers: tuple[str, ...]
+    ) -> dict[str, ListingStatus]:
+        """Look up the requested IDs directly, independently of workspace scan bounds."""
+
+        as_of = await self.database.current_completion_boundary()
+        statuses: dict[str, ListingStatus] = {}
+        facebook_ids = tuple(
+            identifier for identifier in listing_identifiers if not identifier.startswith("ebay:")
+        )
+        for start in range(0, len(facebook_ids), 500):
+            statuses.update(
+                await _facebook_listing_statuses(
+                    self, facebook_ids[start : start + 500], as_of=as_of
+                )
+            )
+        for identifier in listing_identifiers:
+            if identifier.startswith("ebay:"):
+                # Membership was already checked against complete track ancestry.
+                # Status evidence is global to the item; reapplying a bounded
+                # composed search scope here could lose an older selected member.
+                projection = await self.get_composed_listing(
+                    GetComposedListingRequest(
+                        listing_identifier=identifier,
+                        maximum_gallery_images=0,
+                        maximum_analyses=0,
+                    )
+                )
+                statuses[identifier] = projection.status.value
+        return statuses
 
     async def _marketplace_workspace_projections(
         self,
@@ -5886,13 +6062,74 @@ class ReviewApplication:
         if ebay_ids:
             sources += await ebay_candidate_sources(self.database, ebay_ids)
 
-        return select_listing_analysis_batch(
+        plan = select_listing_analysis_batch(
             sources,
             filters=request.filters,
             selection_policy=request.selection_policy,
             product_guide_record_identifier=request.product_guide_record_identifier,
             maximum_items=request.maximum_items,
         )
+        if not request.report_listing_skips:
+            return plan
+        selected_observations = set(plan.selected_observation_record_identifiers)
+        reusable_observations = set(plan.reusable_observation_record_identifiers)
+        policy_excluded = set(plan.policy_excluded_observation_record_identifiers)
+        matching_observations = set(plan.matching_observation_record_identifiers)
+        selected_listings = {
+            source.listing_identifier
+            for source in sources
+            if source.observation_record_identifier in selected_observations
+        }
+        skipped: list[AnalysisSelectionSkip] = []
+        for identifier in sorted(included_listing_ids - selected_listings):
+            history = tuple(source for source in sources if source.listing_identifier == identifier)
+            observations = {source.observation_record_identifier for source in history}
+            observation_identifier = (
+                None
+                if not history
+                else max(
+                    history,
+                    key=lambda source: (
+                        source.acquisition_completion_sequence,
+                        source.observation_completion_sequence,
+                        source.observation_record_identifier,
+                    ),
+                ).observation_record_identifier
+            )
+            if not history:
+                reason, message = (
+                    "no_usable_observation",
+                    "No usable retained item-page observation is available for analysis.",
+                )
+            elif observations & reusable_observations:
+                reason, message = (
+                    "analysis_reused",
+                    "An existing analysis under the selected guide satisfies the selection policy.",
+                )
+            elif observations & policy_excluded:
+                reason, message = (
+                    "selection_policy_excluded",
+                    "The listing's analysis history is excluded by the requested selection policy.",
+                )
+            elif observations & matching_observations:
+                reason, message = (
+                    "maximum_items",
+                    "The requested maximum_items bound excluded this listing from the batch.",
+                )
+            else:
+                reason, message = (
+                    "availability_excluded",
+                    "The latest usable observation does not satisfy the analysis availability filters.",
+                )
+            skipped.append(
+                AnalysisSelectionSkip(
+                    listing_identifier=identifier,
+                    listing_observation_record_identifier=observation_identifier,
+                    kind=reason,
+                    message=message,
+                )
+            )
+        return plan.model_copy(update={"skipped": tuple(skipped)})
 
     async def preview_selection_analyses(
         self, request: SelectionAnalysesRequest
@@ -5905,6 +6142,7 @@ class ReviewApplication:
             guide_binding_identifier,
             candidate_listings_examined,
             candidate_examination_limit_reached,
+            selection_skipped,
         ) = await self._selection_analysis_request(request)
         plan = await self._plan_missing_listing_analyses(
             low_level_request,
@@ -5941,6 +6179,7 @@ class ReviewApplication:
             new_analysis_count=len(plan.selected_observation_record_identifiers),
             reused_analysis_count=len(plan.reusable_observation_record_identifiers),
             excluded_observation_count=len(plan.excluded_observation_record_identifiers),
+            skipped=(*selection_skipped, *plan.skipped),
         )
 
     async def request_selection_analyses(
@@ -5954,6 +6193,7 @@ class ReviewApplication:
             guide_binding_identifier,
             candidate_listings_examined,
             candidate_examination_limit_reached,
+            selection_skipped,
         ) = await self._selection_analysis_request(request)
         plan = await self._plan_missing_listing_analyses(
             low_level_request,
@@ -5982,6 +6222,8 @@ class ReviewApplication:
             ),
             selection_policy=request.selection_policy,
             allow_incomplete_gallery=request.allow_incomplete_gallery,
+            selection_skipped=(*selection_skipped, *plan.skipped),
+            listing_identifiers_by_observation=plan.listing_identifiers_by_observation,
         )
         payload = payload.model_copy(
             update={
@@ -6018,6 +6260,7 @@ class ReviewApplication:
             candidate_examination_limit_reached=(candidate_examination_limit_reached),
             selected_observation_count=len(plan.selected_observation_record_identifiers),
             source_as_of_completion_sequence=plan.source_as_of_completion_sequence,
+            skipped=(*selection_skipped, *plan.skipped),
         )
 
     async def preview_missing_listing_analyses(
@@ -6423,7 +6666,9 @@ class ReviewApplication:
             ),
         )
 
-    async def get_listing_analysis(self, record_identifier: str) -> AnalysisReport:
+    async def get_listing_analysis(
+        self, record_identifier: str, *, include_details: bool = False
+    ) -> AnalysisReport:
         kind, _, value = await self.database.get_record(record_identifier)
         if kind not in {
             ("carl", "facebook", "item_analysis"),
@@ -6442,7 +6687,7 @@ class ReviewApplication:
             descriptor=descriptor,
             text=text,
             limit_observations=value.get("limit_observations"),
-            claude=value.get("claude"),
+            claude=analysis_claude_details(value.get("claude"), include_details=include_details),
         )
 
     async def get_provenance(
@@ -6975,8 +7220,24 @@ class ReviewApplication:
             item_extractions = work_group_progress(child_states["item_extractions"])
             images = work_group_progress(child_states["images"])
             image_extractions = work_group_progress(child_states["image_extractions"])
+            stale_gallery_listings = _json_strings(
+                result_mapping.get("gallery_stale_listing_identifiers")
+            )
             search_progress = SearchRefreshProgress(
                 checkpoint_stage=checkpoint_stage,
+                gallery_state=(
+                    result_mapping["gallery_state"]
+                    if isinstance(result_mapping.get("gallery_state"), str)
+                    and result_mapping["gallery_state"] in {"current", "stale"}
+                    else None
+                ),
+                expired_image_renditions_skipped=_nonnegative_integer(
+                    result_mapping.get("expired_image_renditions_skipped")
+                ),
+                gallery_stale_listing_count=len(stale_gallery_listings),
+                gallery_stale_listing_identifiers=stale_gallery_listings[:20],
+                gallery_stale_listing_identifiers_truncated=len(stale_gallery_listings) > 20,
+                gallery_warnings=_json_strings(result_mapping.get("gallery_warnings"))[:20],
                 image_failure_reason_counts=await refresh_image_failure_reason_counts(
                     self.database, work_identifier
                 ),

@@ -738,7 +738,7 @@ class AcquireReviewBatchRequest(CreateReviewBatchRequest):
     lease_duration_seconds: int = Field(default=600, ge=30, le=3_600)
     compact: bool = Field(
         default=False,
-        description="Return compact listings and a shared seller table; retain full review evidence in the stored batch.",
+        description="Return the first byte-bounded summary page and the original claim; continue with get_review_batch_page. Full review evidence remains in the stored batch.",
     )
 
     @field_validator("request_identifier", "owner_identifier")

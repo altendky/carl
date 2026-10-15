@@ -68,6 +68,9 @@ EXPECTED_TOOLS = {
     "get_listing_details",
     "get_product_guide",
     "get_review_batch",
+    "get_review_batch_item",
+    "get_review_batch_page",
+    "get_tool_response_page",
     "get_review_workspace_activity",
     "get_workspace_work_status",
     "get_workspace_listing",
@@ -83,6 +86,7 @@ EXPECTED_TOOLS = {
     "list_product_guides",
     "list_review_worksets",
     "list_review_workspaces",
+    "list_review_workspace_summaries",
     "list_workspace_listings",
     "list_workspace_search_results",
     "list_workspace_search_track_versions",
@@ -614,9 +618,10 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 55
+            assert capability_versions[("carl", "mcp", "instructions")] == 56
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 40
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 41
+            assert capability_versions[("carl", "mcp", "response_pages")] == 1
             assert capability_versions[("carl", "marketplace", "search_pipeline")] == 1
             assert capability_versions[("carl", "review", "workspace_work")] == 4
             assert capability_versions[("carl", "review", "composed_projection")] == 9
@@ -1396,6 +1401,21 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             )
             assert missing_pipeline_request.is_error
             assert missing_pipeline_status.is_error
+            for tool_name, arguments in (
+                ("list_review_workspace_summaries", {}),
+                ("get_review_batch_page", {"request": {"batch_record_identifier": "missing"}}),
+                (
+                    "get_review_batch_item",
+                    {
+                        "request": {
+                            "batch_record_identifier": "missing",
+                            "listing_identifier": "missing",
+                        }
+                    },
+                ),
+                ("get_tool_response_page", {"cursor": "missing"}),
+            ):
+                await call_json(tool_name, arguments)
             assert called_tools == EXPECTED_TOOLS
 
 
