@@ -145,10 +145,11 @@ workspace edits or creations. Use the exact workspace ID with the activity
 recovery index, or a known track ID with the track-version tool for specifications.
 
 The older `list_review_workspaces` response remains available. Set `compact=true`
-to retain workspace and
-track identities, status, and specification version references while omitting
-full search specifications. Omit `compact` to retrieve complete specifications;
-the ordinary full response remains the default.
+to retain concise track identities, queries, marketplace, enabled state,
+specification version, and latest refresh state. Per-track work/run IDs and
+specification records are available through `get_review_workspace(record_identifier)`.
+Omit `compact` to retrieve complete workspace definitions; the full response
+remains the default.
 
 A workspace can hold several product-guide bindings. Each binding has a
 workspace-local alias and is either pinned to an exact immutable guide record or
@@ -191,8 +192,9 @@ workspace guide.
 
 Set `compact: true` on `acquire_review_batch` to receive the first byte-bounded
 page of frozen listing summaries and the lease for the complete claimed batch.
-Summaries retain exact review revisions and browsing fields, while omitting
-descriptions, seller profiles, field evidence, and prior scalar snapshots.
+Summaries retain only `projection_revision.aggregate_sha256` and browsing fields, while omitting
+descriptions, seller profiles, component revision hashes, field evidence, and prior scalar snapshots.
+Fetch the full frozen revision with `get_review_batch_item` before recording a review.
 Follow `batch.next_cursor` with `get_review_batch_page`, passing
 `batch_record_identifier` and the cursor. The limit defaults to five and is
 capped at ten; byte limits can reduce it further. `total_items`, `returned_items`,
@@ -232,8 +234,9 @@ Check size and continuation metadata on every response. Follow native
 If a response instead has
 `kind="carl_tool_response_page"`, its original tool has already executed.
 `original_is_error` and `critical_metadata` preserve immediate outcome details.
-Parse `content[0].text` as the full page JSON. Its structured content is a small
-manifest that omits `json_fragment`, so each fragment is sent once. Call
+Read `json_fragment` directly from `structuredContent`, which contains the complete page.
+Text contains only a short notice, so the fragment is sent once and remains visible to
+clients that exclusively surface structured content, including Claude Code. Call
 `get_tool_response_page` with each `next_cursor` until `has_more` is false,
 concatenate the `json_fragment` strings in `offset` order, and parse the compact
 JSON. `payload_format=structured_json` contains the original structured payload;

@@ -8,8 +8,9 @@ import anyio
 import pytest
 from mcp import Client
 from mcp.types import Annotations, CallToolResult, ContentBlock, ImageContent, TextContent
+from pydantic import ValidationError
 
-from carl._tests.mcp_response_helpers import tool_response_page
+from carl._tests.mcp_response_helpers import tool_response_page, visible_tool_value
 from carl.core.models import JsonValue, StrictModel
 from carl.core.tool_response_pages import (
     ToolResponseAcknowledgement,
@@ -37,8 +38,10 @@ def _page(result: CallToolResult) -> ToolResponsePage:
     page = tool_response_page(result)
     assert page is not None
     assert isinstance(result.content[0], TextContent)
-    assert page.model_dump(mode="json", exclude={"json_fragment"}) == result.structured_content
-    assert "json_fragment" not in result.structured_content
+    assert page.model_dump(mode="json") == result.structured_content
+    assert page.fragment_location == "structuredContent.json_fragment"
+    assert len(result.content[0].text) < 100
+    assert "json_fragment" not in result.content[0].text
     assert result.meta is not None
     assert result.meta["carl/response"]["response_bytes"] == response_bytes(result)
     assert result.meta["carl/response"]["has_more"] == page.has_more
@@ -193,10 +196,46 @@ def test_sdk_wrapped_sequence_uses_one_compact_structured_representation() -> No
     assert encoded == json.dumps({"result": values}, separators=(",", ":"))
 
 
-@pytest.mark.anyio
-async def test_public_mcp_text_only_client_recovers_payload_and_receives_tiny_ack() -> None:
+def test_normal_structured_result_transmits_payload_only_once() -> None:
+    payload = {"value": "visible-in-structured-content-" + "x" * 18_000}
+    original = CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, indent=2))],
+        structured_content=payload,
+    )
+    assert response_bytes(original) > 24_000
     store = ToolResponseStore()
-    server = BudgetedMCPServer(name="text-only-test", response_store=store)
+    result = store.bound("report", original)
+    assert isinstance(result, CallToolResult)
+    assert result.structured_content == payload
+    assert tool_response_page(result) is None
+    assert response_bytes(result) < 24_000
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == "Tool result is in structuredContent."
+    assert store.retained_bytes == 0
+
+
+@pytest.mark.parametrize("annotated", [False, True])
+def test_normal_result_preserves_genuine_or_annotated_text(annotated: bool) -> None:
+    original = CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text='{"value":"small"}' if annotated else "A genuine explanation.",
+                annotations=Annotations(audience=["assistant"]) if annotated else None,
+            )
+        ],
+        structured_content={"value": "small"},
+    )
+    result = ToolResponseStore().bound("report", original)
+    assert isinstance(result, CallToolResult)
+    assert result.content == original.content
+    assert result.structured_content == original.structured_content
+
+
+@pytest.mark.anyio
+async def test_public_mcp_structured_precedence_recovers_payload_and_receives_tiny_ack() -> None:
+    store = ToolResponseStore()
+    server = BudgetedMCPServer(name="structured-precedence-test", response_store=store)
     original = {"report": "large" * 30_000, "count": 30_000}
 
     async def report() -> _Payload:
@@ -214,10 +253,17 @@ async def test_public_mcp_text_only_client_recovers_payload_and_receives_tiny_ac
         result = await client.call_tool("report", {})
         while True:
             assert not result.is_error and response_bytes(result) <= store.target_bytes
-            # Simulate a client that displays only TextContent, not structuredContent.
-            text_only = result.model_copy(update={"structured_content": None})
-            page = tool_response_page(text_only)
-            assert page is not None
+            # Exactly emulate Claude Code's precedence; never inspect text when
+            # structuredContent is present, including on the initial tool response.
+            visible = (
+                result.structured_content
+                if result.structured_content is not None
+                else json.loads(result.content[0].text)
+                if isinstance(result.content[0], TextContent)
+                else None
+            )
+            page = ToolResponsePage.model_validate(visible)
+            assert page == _page(result)
             assert page.payload_format == "structured_json"
             fragments.append(page.json_fragment)
             if not page.has_more:
@@ -230,9 +276,41 @@ async def test_public_mcp_text_only_client_recovers_payload_and_receives_tiny_ac
         assert not acknowledgement.is_error
         assert response_bytes(acknowledgement) < 1_000
         assert isinstance(acknowledgement.content[0], TextContent)
-        receipt = ToolResponseAcknowledgement.model_validate_json(acknowledgement.content[0].text)
+        visible_ack = (
+            acknowledgement.structured_content
+            if acknowledgement.structured_content is not None
+            else json.loads(acknowledgement.content[0].text)
+        )
+        receipt = ToolResponseAcknowledgement.model_validate(visible_ack)
         assert receipt.acknowledged and receipt.sha256 == page.sha256
         assert "json_fragment" not in response_json(acknowledgement)
+
+
+def test_fragmentless_structured_manifest_cannot_fall_back_to_text() -> None:
+    store = ToolResponseStore()
+    bounded = store.bound(
+        "report", CallToolResult(content=[TextContent(type="text", text="x" * 50_000)])
+    )
+    assert isinstance(bounded, CallToolResult)
+    page = _page(bounded)
+    manifest = page.model_dump(mode="json", exclude={"json_fragment"})
+    old_wire_result = CallToolResult(
+        content=[TextContent(type="text", text=page.model_dump_json())],
+        structured_content=manifest,
+    )
+    assert visible_tool_value(old_wire_result) == manifest
+    with pytest.raises(ValidationError, match="json_fragment"):
+        tool_response_page(old_wire_result)
+    with pytest.raises(ValidationError, match="json_fragment"):
+        ToolResponseReadResult.model_validate(manifest)
+
+    unrelated_structured = old_wire_result.model_copy(update={"structured_content": {}})
+    assert tool_response_page(unrelated_structured) is None
+    # Text parsing is allowed only when structuredContent is absent. The actual
+    # continuation protocol requires structuredContent and sends a notice in text.
+    absent_structured = old_wire_result.model_copy(update={"structured_content": None})
+    assert tool_response_page(absent_structured) == page
+    assert tool_response_page(bounded.model_copy(update={"structured_content": None})) is None
 
 
 def test_unread_results_are_pinned_and_finished_results_can_be_evicted() -> None:
@@ -283,6 +361,7 @@ def test_schema_definitions_are_scoped_when_both_models_define_json_value() -> N
     schema = paging_output_schema(original)
     assert schema["type"] == "object"
     assert len(schema["anyOf"]) == 2
+    assert "json_fragment" in schema["anyOf"][1]["required"]
     assert all(schema["$defs"][key] == value for key, value in original_definitions.items())
     page_keys = set(schema.get("$defs", {})) - set(original_definitions)
     assert all(key.startswith("CarlResponsePage_") for key in page_keys)
@@ -315,6 +394,9 @@ async def test_server_preserves_normal_shape_and_reports_typed_continuation() ->
     result = await server.call_tool("normal", {})
     assert isinstance(result, CallToolResult)
     assert result.structured_content == {"items": ["small"], "has_more": True}
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == "Tool result is in structuredContent."
+    assert visible_tool_value(result) == result.structured_content
     assert result.meta is not None
     assert result.meta["carl/response"] == {
         "response_bytes": response_bytes(result),

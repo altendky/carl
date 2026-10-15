@@ -9,14 +9,20 @@ from mcp.types import CallToolResult, TextContent
 from carl.core.tool_response_pages import ToolResponseAcknowledgement, ToolResponsePage
 
 
-def tool_response_page(result: CallToolResult) -> ToolResponsePage | None:
-    """Read the payload through TextContent, as text-only clients must."""
+def visible_tool_value(result: CallToolResult) -> object:
+    """Match Claude Code: structured content takes precedence without text fallback."""
+    if result.structured_content is not None:
+        return result.structured_content
     if not result.content or not isinstance(result.content[0], TextContent):
         return None
     try:
-        value = json.loads(result.content[0].text)
+        return json.loads(result.content[0].text)
     except ValueError:
         return None
+
+
+def tool_response_page(result: CallToolResult) -> ToolResponsePage | None:
+    value = visible_tool_value(result)
     if not isinstance(value, dict) or value.get("kind") != "carl_tool_response_page":
         return None
     return ToolResponsePage.model_validate(value)
@@ -45,7 +51,7 @@ async def complete_tool_result(client: Client, result: CallToolResult) -> CallTo
     )
     assert not acknowledgement.is_error
     assert acknowledgement.content and isinstance(acknowledgement.content[0], TextContent)
-    receipt = ToolResponseAcknowledgement.model_validate_json(acknowledgement.content[0].text)
+    receipt = ToolResponseAcknowledgement.model_validate(visible_tool_value(acknowledgement))
     assert receipt.sha256 == page.sha256 and receipt.acknowledged
     assert "json_fragment" not in acknowledgement.content[0].text
     if page.payload_format == "structured_json":

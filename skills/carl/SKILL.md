@@ -30,8 +30,9 @@ native pagination and follow returned `next_cursor` or `next_offset` values; ins
 the page or `carl/response` result metadata. An oversized result can instead
 return `kind="carl_tool_response_page"`: the original tool has already run. Check
 `original_is_error` and `critical_metadata`, then call `get_tool_response_page` with each returned
-`next_cursor`. Read each full page by parsing `content[0].text`; structured content is its manifest
-without the fragment. Concatenate `json_fragment` strings in `offset` order and parse the compact
+`next_cursor`. Read each full page, including `json_fragment`, from `structuredContent`.
+Structured response data is entirely there; the text is only a short notice. Concatenate
+`json_fragment` strings in `offset` order and parse the compact
 JSON. `payload_format=structured_json` contains the original structured payload; `mcp_result_json`
 preserves the original MCP result for genuine text/image/mixed output. `total_json_bytes` and `sha256`
 describe that single representation, rather than duplicated text and structured JSON.
@@ -137,7 +138,7 @@ them. Call
 `create_workspace_search` to add another complete search intent/phrase; its returned work ID is also
 the stable track ID. Call `request_workspace_refresh` to advance a track, specifying its track ID
 when more than one completed track exists. To change that same watch's parameters (for example,
-lowering its price cap), read `list_review_workspaces(compact=false)`, then call `revise_workspace_search_track`
+lowering its price cap), read `get_review_workspace` for that workspace, then call `revise_workspace_search_track`
 with the track's `search_specification_version` as `expected_version` and the complete replacement
 search spec. Keep the source unchanged; use a new track only for a genuinely separate watch.
 Revision preserves the stable track ID, first/last-seen history, and prior runs, and performs no
@@ -174,8 +175,8 @@ Retries and refreshes spend provider calls: inspect retained evidence and select
 justified change before queueing; do not make repeated paid probe calls.
 A Facebook transport failure, when Proton is selected, invalidates the shared Proton transport and backs off other
 queued searches on that route before replacement. Use `acquire_review_batch` with a stable caller-generated
-request ID, owner ID, and `compact=true` for routine review. Compact responses retain exact projection
-revisions and browsing fields while omitting seller profiles, descriptions, field evidence, and prior
+request ID, owner ID, and `compact=true` for routine review. Compact responses retain only the
+projection revision's aggregate hash and browsing fields while omitting seller profiles, descriptions, field evidence, and prior
 scalar snapshots. The response contains the first page of its frozen batch, plus the lease for all
 claimed members. Follow `batch.next_cursor` with `get_review_batch_page`, passing the batch record ID;
 this pages the same claim and does not acquire another one. The page limit defaults to five and is
@@ -195,7 +196,8 @@ request ID and replay it unchanged if the response is lost. Release unfinished m
 `release_review_claim`. The MCP surface intentionally does not expose unclaimed
 batches or direct, unclaimed review writes. Acquiring a batch does not mark its listings
 inspected. Resume the exact retained batch with `get_review_batch_page`. Fetch one member's full
-frozen projection with `get_review_batch_item`, passing the batch record ID and listing ID; use that
+frozen projection with `get_review_batch_item`, passing the batch record ID and listing ID; retrieve
+its full component revision before recording a review, and use that
 evidence when inspecting a claimed review. Batch item `evidence_table` contains exact evidence once.
 Look up each typed `evidence_reference` in that table, including fields, status, preview images,
 gallery images, and gallery reference sets. `get_workspace_listing` returns current evidence and may
