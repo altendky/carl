@@ -28,6 +28,7 @@ from carl.core.facebook_work import (
     facebook_search_work_constraint,
     is_transient_search_failure,
     legacy_facebook_network_constraint_identifiers,
+    retryable_search_failure,
 )
 from carl.core.json import encode_json
 from carl.core.work import (
@@ -102,6 +103,26 @@ def test_legacy_unhandled_protocol_error_is_retryable_transport_failure() -> Non
     assert not is_transient_search_failure(
         {"kind": "unhandled_handler_error", "stage": "handler", "type": "ValueError"}
     )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "search_session_bootstrap_response_failure",
+        "search_route_definition_response_failure",
+        "search_route_definition_extraction_failure",
+        "search_price_partition_extraction_failure",
+    ],
+)
+def test_challenge_failure_allows_operator_retry_but_not_automatic_budget_reset(kind: str) -> None:
+    error = {"kind": kind, "response_kind": "bot_challenge"}
+    assert is_transient_search_failure(error)
+    assert retryable_search_failure(error, attempt=1)
+    exhausted = {**error, "decision": "retry_exhausted"}
+    assert is_transient_search_failure(exhausted)
+    assert not retryable_search_failure(exhausted, attempt=1)
+    assert not retryable_search_failure(error, attempt=5)
+    assert not is_transient_search_failure({**error, "response_kind": "unrecognized"})
 
 
 def test_price_partition_traversal_requires_a_finite_upper_bound() -> None:

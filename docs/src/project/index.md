@@ -1236,6 +1236,17 @@ limit. Overlap may create duplicate observations; aggregate counting remains
 strictly by listing ID. Every page retains its derived requested search and
 partition descriptor separately from Facebook's applied configuration.
 
+Recognized Facebook bot challenges during search bootstrap or a partition page
+release the work lease and retry with a fresh HTTP session after 10, 20, 40,
+then 60 minutes. Five challenges on the same partition exhaust its retry budget;
+a successfully acquired partition resets that budget for the next interval.
+Completed partitions and their listing evidence are checkpointed durably, so a
+worker restart resumes the challenged interval without fetching earlier pages
+again. Back-off waits do not consume the elapsed traversal budget.
+Refresh parents sleep until the search child's next eligibility
+time. Missing protocol fields without a recognized challenge remain terminal
+extraction failures rather than successful empty results.
+
 If an interval reports `has_next_page`, Carl marks that interval saturated and
 continues with the next planned interval. A completed plan with saturated
 intervals is incomplete evidence rather than an exhaustive inventory. Dense

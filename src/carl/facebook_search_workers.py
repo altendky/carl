@@ -1,5 +1,7 @@
 """Durable worker handler for bounded Facebook Marketplace searches."""
 
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -42,6 +44,11 @@ from carl.core.facebook_search_requests import (
     search_route_definition_request,
     search_session_bootstrap_plan,
 )
+from carl.core.facebook_search_retry import (
+    FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS,
+    PartitionSearchRetryCheckpoint,
+    facebook_challenge_retry_delay_ns,
+)
 from carl.core.facebook_search_session import (
     SearchSessionMaterialEvidence,
     SearchSessionMaterialIssue,
@@ -59,7 +66,7 @@ from carl.core.facebook_work import (
     facebook_search_network_activity,
 )
 from carl.core.http import stored_content_encodings, stored_response_charset
-from carl.core.models import BytesDraft, Header, JsonValue, NamedOutput, RecordDraft
+from carl.core.models import BytesDraft, Header, JsonValue, NamedInput, NamedOutput, RecordDraft
 from carl.core.work import NetworkActivityAdmission
 from carl.core.worker import (
     AttemptContext,
@@ -78,6 +85,135 @@ SEARCH_RETRY_DELAY_NS = 1_000_000_000
 
 def _search_retry_delay_ns(attempt: int) -> int:
     return min(60, 2 ** (attempt - 1)) * SEARCH_RETRY_DELAY_NS
+
+
+def _partition_checkpoint(
+    *,
+    payload: CollectSearchPayload,
+    context: AttemptContext,
+    state: SearchTraversalState | PricePartitionSearchTraversalState,
+    pages: list[dict[str, JsonValue]],
+    challenge_attempts: int = 0,
+    previous: PartitionSearchRetryCheckpoint | None = None,
+) -> PartitionSearchRetryCheckpoint | None:
+    if (
+        not isinstance(state, PricePartitionSearchTraversalState)
+        or state.stopping_reason is not None
+        or state.partitions_processed == len(state.partitions)
+    ):
+        return None
+    request = {
+        "request": payload.request.model_dump(mode="json"),
+        "traversal": payload.traversal.model_dump(mode="json"),
+        "strategy": payload.traversal_strategy.model_dump(mode="json"),
+    }
+    return PartitionSearchRetryCheckpoint(
+        request_sha256=hashlib.sha256(
+            json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        traversal_state=state,
+        page_references=tuple(pages),
+        challenge_attempts=challenge_attempts,
+        challenge_retry_attempts=0 if previous is None else previous.challenge_retry_attempts,
+        challenge_page_ordinal=state.partitions_processed + 1,
+        retry_budget_start_attempt=max(
+            payload.retry_attempt_offset, context.retry_budget_start_attempt
+        ),
+    )
+
+
+async def _resume_partition_occurrences(
+    *,
+    dependencies: "FacebookSearchWorkerDependencies",
+    context: AttemptContext,
+    checkpoint: PartitionSearchRetryCheckpoint,
+) -> PartitionSearchRetryCheckpoint:
+    """Bind retained evidence to this attempt so completed search views include it."""
+    records: list[RecordDraft] = []
+    inputs: list[NamedInput] = []
+    outputs: list[NamedOutput] = []
+    pages: list[dict[str, JsonValue]] = []
+    for page in checkpoint.page_references:
+        identifiers = page["listing_occurrence_records"]
+        assert isinstance(identifiers, list)
+        copied: list[JsonValue] = []
+        for index, identifier in enumerate(identifiers):
+            assert isinstance(identifier, str)
+            kind, schema_version, value = await dependencies.database.get_record(identifier)
+            if (
+                kind != ("carl", "facebook", "search_listing_occurrence")
+                or not isinstance(value, dict)
+                or value.get("search_run_identifier")
+                != checkpoint.traversal_state.search_run_identifier
+                or value.get("page_ordinal") != page["page_ordinal"]
+            ):
+                raise ValueError("Partition retry references inconsistent listing evidence")
+            copied_identifier = dependencies.new_identifier()
+            name = ("search", "resume", str(page["page_ordinal"]), str(index))
+            records.append(
+                RecordDraft(
+                    identifier=copied_identifier,
+                    kind=kind,
+                    schema_version=schema_version,
+                    value={**value, "resumed_from_occurrence_record_identifier": identifier},
+                )
+            )
+            inputs.append(NamedInput(name=name, object_identifier=identifier))
+            outputs.append(NamedOutput(name=name, object_identifier=copied_identifier))
+            copied.append(copied_identifier)
+        pages.append({**page, "listing_occurrence_records": copied})
+    checkpoint = checkpoint.model_copy(update={"page_references": tuple(pages)})
+    await dependencies.database.publish_leased_operation_checkpoint(
+        work_item_identifier=context.work_item_identifier,
+        lease_token=context.lease_token,
+        worker_identifier=context.worker_identifier,
+        utc_now_ns=dependencies.utc_now_ns,
+        operation_id=context.operation_identifier,
+        records=records,
+        artifacts=(),
+        inputs=inputs,
+        outputs=outputs,
+        checkpoint_result={
+            "state": "collecting",
+            "search_run_identifier": checkpoint.traversal_state.search_run_identifier,
+            "pages_persisted": checkpoint.traversal_state.partitions_processed,
+            "traversal_state": checkpoint.traversal_state.model_dump(mode="json"),
+            "partition_retry_checkpoint": checkpoint.model_dump(mode="json"),
+        },
+    )
+    return checkpoint
+
+
+def _response_failure_work(
+    *,
+    error: dict[str, JsonValue],
+    result: dict[str, JsonValue],
+    checkpoint: PartitionSearchRetryCheckpoint | None,
+    policy_attempt: int,
+) -> RetryWork | TerminalFailureWork:
+    if error.get("response_kind") != "bot_challenge":
+        return TerminalFailureWork(error=error, result=result)
+    attempt = policy_attempt if checkpoint is None else checkpoint.challenge_attempts + 1
+    if checkpoint is not None:
+        checkpoint = checkpoint.model_copy(
+            update={
+                "challenge_attempts": attempt,
+                "challenge_retry_attempts": checkpoint.challenge_retry_attempts + 1,
+            }
+        )
+        result = {**result, "partition_retry_checkpoint": checkpoint.model_dump(mode="json")}
+    diagnostic = {
+        **error,
+        "challenge_attempt": attempt,
+        "maximum_attempts": FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS,
+    }
+    if attempt < FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS:
+        return RetryWork(
+            delay_ns=facebook_challenge_retry_delay_ns(attempt),
+            reason={**diagnostic, "decision": "retry"},
+            result={**result, "state": "challenge_backoff"},
+        )
+    return TerminalFailureWork(error={**diagnostic, "decision": "retry_exhausted"}, result=result)
 
 
 def search_session_failure_work(
@@ -302,6 +438,7 @@ async def _checkpoint_session_bootstrap(
     response_classification: dict[str, JsonValue],
     session_evidence: SearchSessionMaterialEvidence | None,
     session_issues: tuple[SearchSessionMaterialIssue, ...],
+    partition_retry_checkpoint: PartitionSearchRetryCheckpoint | None = None,
 ) -> None:
     decoded_identifier = dependencies.new_identifier()
     extraction_identifier = dependencies.new_identifier()
@@ -431,8 +568,21 @@ async def _checkpoint_session_bootstrap(
             "state": "collecting",
             "search_run_identifier": search_run_identifier,
             "session_bootstrap_persisted": True,
-            "pages_persisted": 0,
-            "traversal_state": None,
+            "pages_persisted": (
+                0
+                if partition_retry_checkpoint is None
+                else partition_retry_checkpoint.traversal_state.partitions_processed
+            ),
+            "traversal_state": (
+                None
+                if partition_retry_checkpoint is None
+                else partition_retry_checkpoint.traversal_state.model_dump(mode="json")
+            ),
+            "partition_retry_checkpoint": (
+                None
+                if partition_retry_checkpoint is None
+                else partition_retry_checkpoint.model_dump(mode="json")
+            ),
         },
     )
 
@@ -460,6 +610,7 @@ async def _checkpoint_page(
     requested_search: FacebookSearchRequest,
     price_partition: SearchPricePartition | None = None,
     price_partition_planner_component: Component | None = None,
+    partition_retry_checkpoint: PartitionSearchRetryCheckpoint | None = None,
 ) -> tuple[str, ...]:
     decoded_identifier = dependencies.new_identifier()
     extraction_identifier = dependencies.new_identifier()
@@ -693,6 +844,34 @@ async def _checkpoint_page(
         )
         for index, body in enumerate(acquisition.bodies)
     )
+    if (
+        partition_retry_checkpoint is not None
+        and page is not None
+        and isinstance(traversal_state, PricePartitionSearchTraversalState)
+        and traversal_state.partitions_processed
+        == len(partition_retry_checkpoint.page_references) + 1
+    ):
+        if traversal_state.stopping_reason is not None:
+            partition_retry_checkpoint = None
+        else:
+            partition_retry_checkpoint = partition_retry_checkpoint.model_copy(
+                update={
+                    "traversal_state": traversal_state,
+                    "page_references": (
+                        *partition_retry_checkpoint.page_references,
+                        {
+                            "page_ordinal": page_ordinal,
+                            "listing_occurrence_records": list(occurrence_identifiers),
+                            "requested_search": requested_search.model_dump(mode="json"),
+                            "price_partition": None
+                            if price_partition is None
+                            else price_partition.model_dump(mode="json"),
+                        },
+                    ),
+                    "challenge_attempts": 0,
+                    "challenge_page_ordinal": traversal_state.partitions_processed + 1,
+                }
+            )
     await dependencies.database.publish_leased_operation_checkpoint(
         work_item_identifier=context.work_item_identifier,
         lease_token=context.lease_token,
@@ -708,6 +887,11 @@ async def _checkpoint_page(
             "pages_persisted": page_ordinal,
             "traversal_state": (
                 None if traversal_state is None else traversal_state.model_dump(mode="json")
+            ),
+            "partition_retry_checkpoint": (
+                None
+                if partition_retry_checkpoint is None
+                else partition_retry_checkpoint.model_dump(mode="json")
             ),
         },
     )
@@ -769,6 +953,73 @@ def build_search_handler(
                 attempt=context.attempt,
                 policy=payload.traversal,
             )
+        page_references: list[dict[str, JsonValue]] = []
+        retry_checkpoint = _partition_checkpoint(
+            payload=payload, context=context, state=traversal_state, pages=page_references
+        )
+        if retry_checkpoint is not None and context.attempt > 1:
+            work = await dependencies.database.work(context.work_item_identifier)
+            result = work.get("result")
+            saved = result.get("partition_retry_checkpoint") if isinstance(result, dict) else None
+            if saved is not None:
+                try:
+                    restored = PartitionSearchRetryCheckpoint.model_validate_json(json.dumps(saved))
+                    if (
+                        restored.request_sha256 != retry_checkpoint.request_sha256
+                        or restored.traversal_state.policy
+                        != retry_checkpoint.traversal_state.policy
+                        or restored.traversal_state.strategy
+                        != retry_checkpoint.traversal_state.strategy
+                        or restored.traversal_state.partitions
+                        != retry_checkpoint.traversal_state.partitions
+                    ):
+                        raise ValueError("Partition retry request changed")
+                    restored = restored.model_copy(
+                        update={
+                            "traversal_state": restored.traversal_state.model_copy(
+                                update={"attempt": context.attempt}
+                            ),
+                            "challenge_attempts": (
+                                restored.challenge_attempts
+                                if restored.retry_budget_start_attempt
+                                == retry_checkpoint.retry_budget_start_attempt
+                                else 0
+                            ),
+                            "challenge_retry_attempts": (
+                                restored.challenge_retry_attempts
+                                if restored.retry_budget_start_attempt
+                                == retry_checkpoint.retry_budget_start_attempt
+                                else 0
+                            ),
+                            "retry_budget_start_attempt": retry_checkpoint.retry_budget_start_attempt,
+                        }
+                    )
+                    retry_checkpoint = await _resume_partition_occurrences(
+                        dependencies=dependencies, context=context, checkpoint=restored
+                    )
+                except ValueError as error:
+                    return TerminalFailureWork(
+                        error={
+                            "kind": "search_partition_retry_checkpoint_invalid",
+                            "message": str(error),
+                        },
+                        result={"state": "failed"},
+                    )
+                traversal_state = retry_checkpoint.traversal_state
+                search_run_identifier = traversal_state.search_run_identifier
+                page_references = list(retry_checkpoint.page_references)
+                current_price_partition = traversal_state.partitions[
+                    traversal_state.partitions_processed
+                ]
+                current_search_request = payload.request.model_copy(
+                    update={
+                        "price": SearchPriceRange(
+                            currency=current_price_partition.currency,
+                            minimum=current_price_partition.minimum,
+                            maximum=current_price_partition.maximum,
+                        )
+                    }
+                )
         bootstrap_plan = search_bootstrap_plan(
             current_search_request,
             routing=payload.routing,
@@ -778,7 +1029,6 @@ def build_search_handler(
             routing=payload.routing,
             navigation_headers=dependencies.navigation_headers,
         )
-        page_references: list[dict[str, JsonValue]] = []
         applied_configuration: AppliedSearchConfiguration | None = None
         completed_session_observation: dict[str, JsonValue] | None = None
         elapsed_accounted_at = dependencies.monotonic_ns()
@@ -857,12 +1107,15 @@ def build_search_handler(
                     ),
                     session_evidence=material_extraction.evidence,
                     session_issues=material_extraction.issues,
+                    partition_retry_checkpoint=retry_checkpoint,
                 )
                 if (
                     session_bootstrap_classification.kind
                     is not SearchSessionBootstrapResponseKind.MARKETPLACE_LANDING
                 ):
-                    return TerminalFailureWork(
+                    return _response_failure_work(
+                        checkpoint=retry_checkpoint,
+                        policy_attempt=policy_attempt,
                         error={
                             "kind": "search_session_bootstrap_response_failure",
                             "response_kind": session_bootstrap_classification.kind.value,
@@ -887,7 +1140,7 @@ def build_search_handler(
                             ],
                         },
                     )
-                page_ordinal = 1
+                page_ordinal = len(page_references) + 1
                 route_definition = search_route_definition_request(
                     bootstrap_plan=bootstrap_plan,
                     navigation_headers=dependencies.navigation_headers,
@@ -963,8 +1216,11 @@ def build_search_handler(
                             if current_price_partition is not None
                             else None
                         ),
+                        partition_retry_checkpoint=retry_checkpoint,
                     )
-                    return TerminalFailureWork(
+                    return _response_failure_work(
+                        checkpoint=retry_checkpoint,
+                        policy_attempt=policy_attempt,
                         error={
                             "kind": (
                                 "search_route_definition_extraction_failure"
@@ -1035,6 +1291,7 @@ def build_search_handler(
                         if current_price_partition is not None
                         else None
                     ),
+                    partition_retry_checkpoint=retry_checkpoint,
                 )
                 page_references.append(
                     {
@@ -1047,6 +1304,13 @@ def build_search_handler(
                             else current_price_partition.model_dump(mode="json")
                         ),
                     }
+                )
+                retry_checkpoint = _partition_checkpoint(
+                    payload=payload,
+                    context=context,
+                    state=traversal_state,
+                    pages=page_references,
+                    previous=retry_checkpoint,
                 )
                 if partition_decision is not None:
                     while partition_decision.action is SearchTraversalAction.CONTINUE:
@@ -1159,8 +1423,11 @@ def build_search_handler(
                                 price_partition_planner_component=(
                                     price_partition_planner_component
                                 ),
+                                partition_retry_checkpoint=retry_checkpoint,
                             )
-                            return TerminalFailureWork(
+                            return _response_failure_work(
+                                checkpoint=retry_checkpoint,
+                                policy_attempt=policy_attempt,
                                 error={
                                     "kind": "search_price_partition_extraction_failure",
                                     "response_kind": response_classification.kind.value,
@@ -1212,6 +1479,7 @@ def build_search_handler(
                             requested_search=current_search_request,
                             price_partition=current_price_partition,
                             price_partition_planner_component=(price_partition_planner_component),
+                            partition_retry_checkpoint=retry_checkpoint,
                         )
                         page_references.append(
                             {
@@ -1220,6 +1488,13 @@ def build_search_handler(
                                 "requested_search": current_search_request.model_dump(mode="json"),
                                 "price_partition": current_price_partition.model_dump(mode="json"),
                             }
+                        )
+                        retry_checkpoint = _partition_checkpoint(
+                            payload=payload,
+                            context=context,
+                            state=traversal_state,
+                            pages=page_references,
+                            previous=retry_checkpoint,
                         )
                 else:
                     if decision is None:
@@ -1377,8 +1652,13 @@ def build_search_handler(
                 raise AssertionError("Search session was not created")
             completed_session_observation = session.completed_observation()
         except AcquisitionFailure as error:
+            transport_attempt = max(
+                1,
+                policy_attempt
+                - (0 if retry_checkpoint is None else retry_checkpoint.challenge_retry_attempts),
+            )
             if error.result.get("stopping_condition") == "transport_failure":
-                delay_ns = _search_retry_delay_ns(policy_attempt)
+                delay_ns = _search_retry_delay_ns(transport_attempt)
                 now_utc_ns = dependencies.utc_now_ns()
                 await dependencies.database.defer_pending_collect_search_work_for_route(
                     routing=payload.routing,
@@ -1391,15 +1671,30 @@ def build_search_handler(
                         "exception_type": error.result.get("exception_type"),
                     },
                 )
-            return search_acquisition_failure_work(
+            outcome = search_acquisition_failure_work(
                 error=error,
                 context=context,
                 search_run_identifier=search_run_identifier,
-                policy_attempt=policy_attempt,
+                policy_attempt=transport_attempt,
             )
+            if isinstance(outcome, RetryWork) and retry_checkpoint is not None:
+                outcome = outcome.model_copy(
+                    update={
+                        "result": {
+                            **(outcome.result if isinstance(outcome.result, dict) else {}),
+                            "partition_retry_checkpoint": retry_checkpoint.model_dump(mode="json"),
+                        }
+                    }
+                )
+            return outcome
         except FacebookSearchSessionFailure as error:
+            transport_attempt = max(
+                1,
+                policy_attempt
+                - (0 if retry_checkpoint is None else retry_checkpoint.challenge_retry_attempts),
+            )
             if error.code in RETRYABLE_SEARCH_SESSION_FAILURE_CODES:
-                delay_ns = _search_retry_delay_ns(policy_attempt)
+                delay_ns = _search_retry_delay_ns(transport_attempt)
                 now_utc_ns = dependencies.utc_now_ns()
                 await dependencies.database.defer_pending_collect_search_work_for_route(
                     routing=payload.routing,
@@ -1412,13 +1707,23 @@ def build_search_handler(
                         "code": error.code,
                     },
                 )
-            return search_session_failure_work(
+            outcome = search_session_failure_work(
                 error=error,
                 context=context,
                 search_run_identifier=search_run_identifier,
                 routing=payload.routing,
-                policy_attempt=policy_attempt,
+                policy_attempt=transport_attempt,
             )
+            if isinstance(outcome, RetryWork) and retry_checkpoint is not None:
+                outcome = outcome.model_copy(
+                    update={
+                        "result": {
+                            **(outcome.result if isinstance(outcome.result, dict) else {}),
+                            "partition_retry_checkpoint": retry_checkpoint.model_dump(mode="json"),
+                        }
+                    }
+                )
+            return outcome
         except ValueError as error:
             return TerminalFailureWork(
                 error={
