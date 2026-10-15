@@ -24,6 +24,7 @@ from carl.core.facebook_images import (
     plan_image_followups,
     verify_image,
 )
+from carl.core.image_failures import image_acquisition_failure_kind
 from carl.core.json import encode_json
 from carl.core.models import ExternalFileDraft, JsonValue, NamedInput, NamedOutput, RecordDraft
 from carl.core.work import WorkCapability
@@ -472,6 +473,24 @@ async def _collect(
             error={"kind": "route_configuration_failure", "code": error.code},
             result={"state": "route_configuration_failed"},
         )
+    except TimeoutError as error:
+        result = {
+            "state": "acquisition_failed",
+            "acquisition": {
+                "stopping_condition": "transport_failure",
+                "exception_type": type(error).__name__,
+            },
+        }
+        if context.retry_attempt() < MAX_IMAGE_TRANSPORT_ATTEMPTS:
+            return RetryWork(
+                delay_ns=1_000_000_000,
+                reason={"kind": "image_transport_failure", "failure_kind": "transport_timeout"},
+                result=result,
+            )
+        return TerminalFailureWork(
+            error={"kind": "image_acquisition_failure", "failure_kind": "transport_timeout"},
+            result=result,
+        )
     except AcquisitionFailure as error:
         result: dict[str, JsonValue] = {
             "state": "acquisition_failed",
@@ -479,6 +498,7 @@ async def _collect(
         }
         if (
             error.result.get("stopping_condition") == "transport_failure"
+            and image_acquisition_failure_kind(error.result) != "proxy_quota_exhausted"
             and context.retry_attempt() < MAX_IMAGE_TRANSPORT_ATTEMPTS
         ):
             return RetryWork(
@@ -487,7 +507,11 @@ async def _collect(
                 result=result,
             )
         return TerminalFailureWork(
-            error={"kind": "image_acquisition_failure", "decision": "terminal"},
+            error={
+                "kind": "image_acquisition_failure",
+                "decision": "terminal",
+                "failure_kind": image_acquisition_failure_kind(error.result),
+            },
             result=result,
         )
 
@@ -526,6 +550,7 @@ async def _collect(
             sha256=verified.sha256,
         )
     except (OSError, KeyError, ValueError) as error:
+        failure_kind = image_acquisition_failure_kind(acquisition.record)
         result_identifier = dependencies.new_identifier()
         failed_acquisition = _image_acquisition_record(
             acquisition.record,
@@ -549,6 +574,7 @@ async def _collect(
                     "kind": "image_validation_or_storage_failure",
                     "type": type(error).__name__,
                     "message": str(error),
+                    "failure_kind": failure_kind,
                 },
                 "operation_identifier": context.operation_identifier,
                 "producer": {
@@ -576,7 +602,11 @@ async def _collect(
                 NamedOutput(name=("acquisition",), object_identifier=acquisition_identifier),
                 NamedOutput(name=("image_result",), object_identifier=result_identifier),
             ),
-            error={"kind": "image_validation_or_storage_failure", "type": type(error).__name__},
+            error={
+                "kind": "image_validation_or_storage_failure",
+                "type": type(error).__name__,
+                "failure_kind": failure_kind,
+            },
             result={
                 "state": "failed",
                 "acquisition_record_identifier": acquisition_identifier,

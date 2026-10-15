@@ -80,8 +80,10 @@ sessions; expiry stops traversal rather than silently changing the exit during
 pagination. Page acquisitions retain the shared safe session record identifier
 and request counters as observed at acquisition time, before session cleanup.
 
-eBay challenges and HTTP 403/429 impose stack-wide cooldowns of two, four, then
-eight minutes after successive failed attempts, including terminal failure.
+eBay challenges and HTTP 403/429 have a five-attempt retry budget. Successive
+failures impose stack-wide cooldowns of 10, 20, 40, then 60 minutes, with the
+60-minute cap also applied after terminal failure. Each retry opens a fresh
+provider session and cookie jar.
 Pending siblings, new work, and same-stack manual retries respect these durable
 deadlines across restarts without consuming attempts while waiting. Other
 response failures retain short bounded backoff. Retrying or refreshing makes
@@ -102,6 +104,10 @@ A refresh with at least half its selected items failing ends in
 `terminal_failure` (`mostly_failed_refresh`); smaller losses remain completed
 with partial failures. `get_work_status.outcome` and `refresh_failure_summary`
 also identify historical mostly-failed refreshes without rewriting their history.
+`get_work_status.search_refresh_progress.image_failure_reason_counts` groups failed
+image work by retained cause, including site HTTP status, transport timeout, and
+explicit proxy quota exhaustion. HTTP 403/429 alone does not establish a quota
+failure. Older acquisitions are consulted when their work errors were generic.
 `retry_item_failures` accepts an exact settled Facebook/eBay refresh work ID
 and a bounded `maximum_items` (default 1,000; maximum 10,000). It atomically
 requeues linked terminal collection jobs with transient transport/session errors,
@@ -158,6 +164,14 @@ Normalized availability evidence still controls the default available-only
 filter. The exact-listing operation applies the same active-track scope and
 workspace guide.
 
+Set `compact: true` on `acquire_review_batch` or `get_workspace_listing` to receive
+scalar values, image counts, analysis presence, and exact review revisions with
+less response data. Compact responses include a shared `sellers` table keyed by
+`seller_reference`; old/new seller changes refer to the same table. Prior scalar
+snapshots and repeated field evidence are omitted from the response. Stored
+batches retain full projections, so recording reviews and replaying claims keep
+their original evidence and revisions. Full responses remain the default.
+
 A newer usable search-card price supersedes an older item-page price, while a
 newer item-page price likewise supersedes an older card price. This applies only
 to listings actually observed by a refresh. A missed listing retains its last
@@ -201,7 +215,11 @@ New reviews retain normalized scalar snapshots. Existing batch-backed reviews us
 projections, while legacy Facebook bulk reviews reconstruct values at the mutation's recorded
 completion boundary and verify the old scalar hash before using that baseline. Historical records
 are not rewritten. Unknown baselines remain conservative rather than suppressing potential changes.
-Recipe changes to scalar normalization do not invalidate unchanged non-scalar components.
+Recipe versions alone do not invalidate reviews. With a verified scalar baseline,
+comparison uses facts populated when the review was recorded: new fields and new
+profile members do not make it stale, while changes or removal of previously
+reviewed values do. Historical nulls represent unavailable facts. Unknown
+baselines retain conservative hash comparison.
 
 Review batches and `get_workspace_listing` report `scalar_field_changes`, with each field's
 `previous_value` and `current_value`, plus `scalar_comparison_available`. An unavailable comparison
@@ -297,8 +315,11 @@ or explicit bounded ID list.
    before requesting a later bulk operation.
 6. Add or refresh search tracks as needed, then wait for workspace work. Every
    completed track must have a completed refresh before workspace-wide analysis.
+   Bounded listing, batch, workset, and snapshot selections require freshness only
+   for enabled tracks containing their listings, including retained ancestry.
+   Freshness errors identify the track, refresh work, and retained failure reason.
 7. Preview and request analysis from the workspace-native selection. The
-   workspace supplies all current search runs, their refresh coordinators, and
+   workspace supplies the relevant current search runs, their refresh coordinators, and
    the exact product guide. Preview and request use a bounded indexed status
    scan rather than full listing composition. They examine 2,500 candidate
    listings by default, report whether that bound was reached, and allow an

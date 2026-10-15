@@ -19,6 +19,7 @@ from carl.core.composed_projection import (
     ProjectionRevision,
     ScalarFieldChange,
     ScalarFieldValues,
+    scalar_field_changes,
     scalar_fields_sha256,
 )
 from carl.core.ebay import EbayListingState
@@ -184,7 +185,7 @@ class ReviewWorkspace(StrictModel):
     staleness_policy: ReviewStalenessPolicy
     created_at_utc: str
     archived: bool = False
-    search_tracks: tuple[WorkspaceSearchTrack, ...] = Field(default=(), max_length=20)
+    search_tracks: tuple[WorkspaceSearchTrack, ...] = ()
     product_guide_bindings: tuple[WorkspaceProductGuideBinding, ...] = Field(
         default=(), max_length=20
     )
@@ -515,6 +516,10 @@ class GetWorkspaceListingRequest(StrictModel):
     maximum_gallery_images: int = Field(default=20, ge=0, le=100)
     maximum_analyses: int = Field(default=10, ge=0, le=20)
     maximum_observations: int = Field(default=100, ge=100, le=100)
+    compact: bool = Field(
+        default=False,
+        description="Return scalar values and deduplicated sellers without repeated evidence or prior snapshots.",
+    )
 
 
 class ListingReviewRecord(StrictModel):
@@ -731,6 +736,10 @@ class AcquireReviewBatchRequest(CreateReviewBatchRequest):
     request_identifier: str = Field(min_length=1, max_length=200)
     owner_identifier: str = Field(min_length=1, max_length=200)
     lease_duration_seconds: int = Field(default=600, ge=30, le=3_600)
+    compact: bool = Field(
+        default=False,
+        description="Return compact listings and a shared seller table; retain full review evidence in the stored batch.",
+    )
 
     @field_validator("request_identifier", "owner_identifier")
     @classmethod
@@ -988,10 +997,14 @@ class WorkspaceWorkWaitResult(StrictModel):
 def review_mutation_request_sha256(action: str, request: StrictModel) -> str:
     """Hash one validated caller intent independently of generated mutation results."""
 
+    request_value = request.model_dump(mode="json", exclude={"request_identifier"})
+    if request_value.get("compact") is False:
+        # Preserve replay identities created before compact responses existed.
+        request_value.pop("compact")
     content: dict[str, JsonValue] = {
         "action": action,
         "request_schema_version": 1,
-        "request": request.model_dump(mode="json", exclude={"request_identifier"}),
+        "request": request_value,
     }
     encoded = json.dumps(
         content,
@@ -1026,6 +1039,7 @@ def classify_review_state(
     previous_review: ListingReviewRecord | None,
     policy: ReviewStalenessPolicy,
     previous_scalar_fields: ScalarFieldValues | None = None,
+    current_scalar_fields: ScalarFieldValues | None = None,
 ) -> tuple[ReviewState, tuple[ProjectionRevisionComponent, ...]]:
     if previous_review is None:
         return ReviewState.UNREVIEWED, ()
@@ -1045,8 +1059,6 @@ def classify_review_state(
                 ),
             }
         )
-    if previous_revision.recipe_version != current_revision.recipe_version:
-        return ReviewState.STALE, tuple(policy.components)
     # A verified snapshot can normalize legacy representation changes within
     # the same recipe too (notably eBay display strings becoming structured money).
     baseline = previous_scalar_fields or previous_review.scalar_fields_snapshot
@@ -1055,5 +1067,20 @@ def classify_review_state(
             update={"scalar_fields_sha256": scalar_fields_sha256(baseline)}
         )
     changed = changed_projection_components(previous_revision, current_revision)
+    if baseline is not None and current_scalar_fields is not None:
+        # Compare the facts actually reviewed, rather than a hash whose field
+        # set or normalization recipe may have expanded since that review.
+        scalar_changed = bool(
+            scalar_field_changes(baseline, current_scalar_fields, reviewed_only=True)
+        )
+        changed = tuple(
+            component
+            for component in ProjectionRevisionComponent
+            if (
+                scalar_changed
+                if component == ProjectionRevisionComponent.SCALAR_FIELDS
+                else component in changed
+            )
+        )
     relevant = tuple(component for component in changed if component in policy.components)
     return (ReviewState.STALE if relevant else ReviewState.CURRENT), relevant

@@ -843,6 +843,26 @@ def test_condition_and_shipping_are_review_scalar_changes() -> None:
     assert scalar_fields_sha256(previous) != scalar_fields_sha256(current)
 
 
+def test_review_comparison_ignores_added_fields_but_keeps_existing_changes() -> None:
+    previous = ScalarFieldValues(title="Textbook", seller={"id": "seller"})
+    expanded = previous.model_copy(
+        update={"seller": {"id": "seller", "profile": {"rating": "99%"}}, "shipping": "Free"}
+    )
+    assert scalar_field_changes(previous, expanded, reviewed_only=True) == ()
+    changed = expanded.model_copy(update={"title": "Updated textbook", "seller": {"id": "other"}})
+    assert [
+        change.field for change in scalar_field_changes(previous, changed, reviewed_only=True)
+    ] == [
+        ScalarFieldName.TITLE,
+        ScalarFieldName.SELLER,
+    ]
+    removed = expanded.model_copy(update={"seller": None})
+    assert (
+        scalar_field_changes(previous, removed, reviewed_only=True)[0].field
+        == ScalarFieldName.SELLER
+    )
+
+
 def test_sale_price_display_does_not_change_structured_sale_revision() -> None:
     first = ScalarFieldValues(
         last_sale={

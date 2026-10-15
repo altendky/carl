@@ -168,7 +168,7 @@ async def expand_search_runs(
     roots: tuple[str, ...],
     *,
     as_of_completion_sequence: int,
-    maximum_runs: int = 100,
+    maximum_runs: int | None = 100,
     maximum_object_rowid: int | None = None,
 ) -> tuple[str, ...]:
     """Expand groups into completed enabled-target runs, without provider access."""
@@ -177,7 +177,7 @@ async def expand_search_runs(
     boundary = await _boundary(database) if maximum_object_rowid is None else maximum_object_rowid
     pending = list(roots)
     visited: set[str] = set()
-    while pending and len(result) < maximum_runs:
+    while pending and (maximum_runs is None or len(result) < maximum_runs):
         root = pending.pop(0)
         if root in visited:
             continue

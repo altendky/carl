@@ -29,6 +29,12 @@ from carl.core.analysis_batch import (
     request_missing_analyses_work,
     select_listing_analysis_batch,
 )
+from carl.core.compact_review import (
+    CompactReviewBatchAcquisition,
+    CompactWorkspaceListingReview,
+    compact_review_acquisition,
+    compact_workspace_listing,
+)
 from carl.core.components import ComponentId
 from carl.core.composed_projection import (
     ComposedGallery,
@@ -347,6 +353,7 @@ from carl.facebook_analysis_workers import (
 )
 from carl.io.claude import ClaudeCli
 from carl.io.configuration import ConfigurationFailure, load_configuration
+from carl.io.image_failures import refresh_image_failure_reason_counts
 from carl.io.paths import user_directories
 from carl.io.processes import database_process_activity
 from carl.io.provenance import (
@@ -1679,7 +1686,7 @@ class ReviewApplication:
 
     async def get_workspace_listing(
         self, request: GetWorkspaceListingRequest
-    ) -> WorkspaceListingReview:
+    ) -> WorkspaceListingReview | CompactWorkspaceListingReview:
         """Compose one exact listing within a workspace's active search-track scope."""
 
         workspace = await self.get_review_workspace(request.workspace_record_identifier)
@@ -1709,8 +1716,9 @@ class ReviewApplication:
             previous_review=prior,
             policy=workspace.staleness_policy,
             previous_scalar_fields=baseline,
+            current_scalar_fields=projection_scalar_fields(projection),
         )
-        return WorkspaceListingReview.model_validate(
+        listing = WorkspaceListingReview.model_validate(
             {
                 **projection.model_dump(mode="python"),
                 "review_state": state,
@@ -1719,11 +1727,14 @@ class ReviewApplication:
                 "scalar_field_changes": (
                     ()
                     if baseline is None
-                    else scalar_field_changes(baseline, projection_scalar_fields(projection))
+                    else scalar_field_changes(
+                        baseline, projection_scalar_fields(projection), reviewed_only=True
+                    )
                 ),
                 "scalar_comparison_available": baseline is not None,
             }
         )
+        return compact_workspace_listing(listing) if request.compact else listing
 
     async def list_search_runs(self, query: str | None = None, limit: int = 50) -> SearchRunPage:
         if query is not None and (not query or query != query.strip()):
@@ -3291,6 +3302,7 @@ class ReviewApplication:
                     previous_review=prior,
                     policy=workspace.staleness_policy,
                     previous_scalar_fields=baseline,
+                    current_scalar_fields=projection_scalar_fields(projection),
                 )
                 if state in request.include_review_states:
                     selected.append(
@@ -3303,7 +3315,9 @@ class ReviewApplication:
                                 ()
                                 if baseline is None
                                 else scalar_field_changes(
-                                    baseline, projection_scalar_fields(projection)
+                                    baseline,
+                                    projection_scalar_fields(projection),
+                                    reviewed_only=True,
                                 )
                             ),
                             scalar_comparison_available=baseline is not None,
@@ -3352,7 +3366,7 @@ class ReviewApplication:
 
     async def acquire_review_batch(
         self, request: AcquireReviewBatchRequest
-    ) -> ReviewBatchAcquisition:
+    ) -> ReviewBatchAcquisition | CompactReviewBatchAcquisition:
         """Atomically issue a batch and claim its listings for one review agent."""
 
         action = "acquire_batch"
@@ -3366,7 +3380,8 @@ class ReviewApplication:
         except ValueError as error:
             raise ReviewInputError(str(error)) from error
         if replay is not None:
-            return ReviewBatchAcquisition.model_validate_json(encode_json(replay))
+            acquisition = ReviewBatchAcquisition.model_validate_json(encode_json(replay))
+            return compact_review_acquisition(acquisition) if request.compact else acquisition
 
         started_utc_ns = self.utc_now_ns()
         started_monotonic_ns = self.monotonic_ns()
@@ -3376,7 +3391,7 @@ class ReviewApplication:
         provenance = await self._code_provenance()
         ended_utc_ns = self.utc_now_ns()
         try:
-            return await self.database.publish_acquired_review_batch(
+            acquisition = await self.database.publish_acquired_review_batch(
                 candidate_batch=candidate,
                 claim_token=self.new_identifier(),
                 owner_identifier=request.owner_identifier,
@@ -3393,6 +3408,7 @@ class ReviewApplication:
                 ended_at_utc=_utc_text(ended_utc_ns),
                 duration_ns=max(0, self.monotonic_ns() - started_monotonic_ns),
             )
+            return compact_review_acquisition(acquisition) if request.compact else acquisition
         except ValueError as error:
             raise ReviewInputError(str(error)) from error
 
@@ -3911,6 +3927,7 @@ class ReviewApplication:
                 previous_review=prior,
                 policy=workspace.staleness_policy,
                 previous_scalar_fields=baseline,
+                current_scalar_fields=projection_scalar_fields(projection),
             )
             if review_state not in request.include_review_states:
                 review_state_excluded_count += 1
@@ -5519,7 +5536,7 @@ class ReviewApplication:
             request.product_guide_binding_identifier,
             request.product_guide_record_identifier,
         )
-        completed_tracks = tuple(
+        completed_tracks: tuple[WorkspaceSearchTrack, ...] = tuple(
             track
             for track in workspace.search_tracks
             if track.enabled and track.current_search_run_record_identifier is not None
@@ -5544,25 +5561,6 @@ class ReviewApplication:
                     ),
                 ),
             )
-        unrefreshed_tracks = tuple(
-            track.track_identifier
-            for track in completed_tracks
-            if track.latest_refresh_work_identifier is None
-            or track.latest_refresh_work_state is not WorkState.COMPLETED
-        )
-        if unrefreshed_tracks:
-            raise ReviewInputError(
-                "Refresh every completed workspace search track before analysis: "
-                + ", ".join(unrefreshed_tracks)
-            )
-        if not completed_tracks:
-            raise ReviewInputError("The workspace has no completed search track")
-        refresh_work_identifier = completed_tracks[0].latest_refresh_work_identifier
-        if refresh_work_identifier is None:
-            raise RuntimeError(
-                "A completed workspace search track lost its refresh work identifier"
-            )
-
         selection = request.selection
         selected_listing_identifiers: tuple[str, ...] | None
         selection_snapshot_record_identifier: str | None = None
@@ -5593,6 +5591,71 @@ class ReviewApplication:
                 raise ReviewInputError("The selection snapshot belongs to a different workspace")
             selection_snapshot_record_identifier = snapshot.record_identifier
             selected_listing_identifiers = tuple(item.listing_identifier for item in snapshot.items)
+
+        if selected_listing_identifiers is not None:
+            selected_ids = frozenset(selected_listing_identifiers)
+            as_of = await self.database.current_completion_boundary()
+            relevant_tracks: list[WorkspaceSearchTrack] = []
+            for track in completed_tracks:
+                assert track.current_search_run_record_identifier is not None
+                ancestry = await expand_search_runs(
+                    self.database,
+                    (track.current_search_run_record_identifier,),
+                    as_of_completion_sequence=as_of,
+                    maximum_runs=None,
+                )
+                for run_identifier in ancestry:
+                    if selected_ids.intersection(
+                        await run_listing_identifiers(self.database, run_identifier)
+                    ):
+                        relevant_tracks.append(track)
+                        break
+            completed_tracks = tuple(relevant_tracks)
+            if not completed_tracks:
+                raise ReviewInputError(
+                    "The selection contains no listings in active workspace tracks"
+                )
+            workspace = workspace.model_copy(update={"search_tracks": completed_tracks})
+
+        unrefreshed_tracks: list[str] = []
+        for track in completed_tracks:
+            if (
+                track.latest_refresh_work_identifier is not None
+                and track.latest_refresh_work_state is WorkState.COMPLETED
+            ):
+                continue
+            detail = f"{track.track_identifier} ({track.query!r}): "
+            if track.latest_refresh_work_identifier is None:
+                detail += "no refresh has been requested"
+            else:
+                refresh = await self.database.work(track.latest_refresh_work_identifier)
+                detail += (
+                    f"refresh {track.latest_refresh_work_identifier}, state={refresh['state']}, "
+                    f"error={encode_json(refresh.get('error'))}"
+                )
+                result = refresh.get("result")
+                if isinstance(result, dict):
+                    if isinstance(result.get("state"), str):
+                        detail += f", result={result['state']}"
+                    if isinstance(result.get("stage"), str):
+                        detail += f", stage={result['stage']}"
+                    search_work = result.get("search_work")
+                    search_identifier = result.get("search_work_identifier")
+                    if not isinstance(search_work, dict) and isinstance(search_identifier, str):
+                        search_work = await self.database.work(search_identifier)
+                    if isinstance(search_work, dict):
+                        detail += (
+                            f", search {search_work.get('identifier', search_identifier)}, "
+                            f"error={encode_json(search_work.get('error'))}"
+                        )
+            unrefreshed_tracks.append(detail)
+        if unrefreshed_tracks:
+            raise ReviewInputError(
+                "Refresh the selected listings' search tracks before analysis: "
+                + "; ".join(unrefreshed_tracks)
+            )
+        refresh_work_identifier = next(iter(completed_tracks)).latest_refresh_work_identifier
+        assert refresh_work_identifier is not None
 
         (
             status_matching_listing_identifiers,
@@ -6914,6 +6977,9 @@ class ReviewApplication:
             image_extractions = work_group_progress(child_states["image_extractions"])
             search_progress = SearchRefreshProgress(
                 checkpoint_stage=checkpoint_stage,
+                image_failure_reason_counts=await refresh_image_failure_reason_counts(
+                    self.database, work_identifier
+                ),
                 active_phase=search_refresh_phase(
                     state=state,
                     checkpoint_stage=checkpoint_stage,

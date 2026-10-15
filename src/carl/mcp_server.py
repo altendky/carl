@@ -26,6 +26,7 @@ from carl.core.analysis_batch import (
     SelectionAnalysesRequest,
     SelectionAnalysesRequestResult,
 )
+from carl.core.compact_review import ReviewBatchAcquisitionResponse, WorkspaceListingResponse
 from carl.core.composed_projection import (
     ComposedListingPage,
     ComposedListingProjection,
@@ -103,7 +104,6 @@ from carl.core.review_workspace import (
     RetryWorkspaceSearchTrackRequest,
     RetryWorkspaceSearchTrackResult,
     ReviewBatch,
-    ReviewBatchAcquisition,
     ReviewClaimLease,
     ReviewWorkset,
     ReviewWorksetConflict,
@@ -117,7 +117,6 @@ from carl.core.review_workspace import (
     UpdateReviewWorksetRequest,
     UpdateWorkspaceProductGuideBindingRequest,
     WorkspaceListingPage,
-    WorkspaceListingReview,
     WorkspaceProductGuideBinding,
     WorkspaceSearchTrack,
     WorkspaceSearchTrackSpecificationRecord,
@@ -445,11 +444,16 @@ Review batches and get_workspace_listing expose scalar_field_changes (field, pre
 current_value) and scalar_comparison_available. An empty change list with comparison unavailable
 is not proof of unchanged values. Older batch/bulk review baselines are recovered from retained
 evidence only when verified against the recorded revision; new reviews retain scalar snapshots.
+Use compact=true on acquire_review_batch or get_workspace_listing to return scalar values, image
+counts, and analysis presence without repeated evidence or prior scalar snapshots. Compact responses
+include a sellers map keyed by seller_reference; seller changes also use these references for their
+previous/current values. Full stored batches and review revisions remain available for drill-down.
 Preview analysis with preview_selection_analyses, then queue the unchanged intent with
 request_selection_analyses. The workspace supplies the exact refreshed search run and product guide;
 the selection may be the whole workspace, a claimed review batch, a workset, a frozen selection
-snapshot, or an explicit bounded ID list. Available status is the default. Refresh every completed,
-enabled workspace search track before requesting analyses; the same workspace follows its refreshes.
+snapshot, or an explicit bounded ID list. Available status is the default. Refresh the enabled tracks
+containing the selected listings before requesting analyses; whole-workspace selection requires every
+completed enabled track. The same workspace follows its refreshes.
 Preview and request scan at most maximum_candidate_listings_examined workspace members (2,500 by
 default) through bounded retained-evidence selection. Check candidate_examination_limit_reached; increase the
 bound deliberately when an exact whole-workspace plan is required.
@@ -676,10 +680,12 @@ def tool_definitions(
 
     async def get_workspace_listing(
         request: GetWorkspaceListingRequest,
-    ) -> WorkspaceListingReview:
+    ) -> WorkspaceListingResponse:
         """Compose a workspace listing with review state and normalized scalar old-to-new changes."""
 
-        return await expected(lambda: application.get_workspace_listing(request))
+        return WorkspaceListingResponse(
+            await expected(lambda: application.get_workspace_listing(request))
+        )
 
     async def list_workspace_search_results(
         request: ListWorkspaceSearchResultsRequest,
@@ -795,10 +801,12 @@ def tool_definitions(
 
     async def acquire_review_batch(
         request: AcquireReviewBatchRequest,
-    ) -> ReviewBatchAcquisition:
+    ) -> ReviewBatchAcquisitionResponse:
         """Idempotently issue a batch and claim its listings for one concurrent agent."""
 
-        return await expected(lambda: application.acquire_review_batch(request))
+        return ReviewBatchAcquisitionResponse(
+            await expected(lambda: application.acquire_review_batch(request))
+        )
 
     async def renew_review_claim(request: RenewReviewClaimRequest) -> ReviewClaimLease:
         """Idempotently extend an active review claim owned by this agent."""

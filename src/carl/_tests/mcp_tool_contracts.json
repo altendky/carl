@@ -82,6 +82,12 @@
               "minimum": 30,
               "title": "Lease Duration Seconds",
               "type": "integer"
+            },
+            "compact": {
+              "default": false,
+              "description": "Return compact listings and a shared seller table; retain full review evidence in the stored batch.",
+              "title": "Compact",
+              "type": "boolean"
             }
           },
           "required": [
@@ -134,6 +140,280 @@
           ],
           "title": "AnalysisApplicability",
           "type": "string"
+        },
+        "CompactReviewBatch": {
+          "additionalProperties": false,
+          "properties": {
+            "record_identifier": {
+              "title": "Record Identifier",
+              "type": "string"
+            },
+            "workspace_record_identifier": {
+              "title": "Workspace Record Identifier",
+              "type": "string"
+            },
+            "created_at_utc": {
+              "title": "Created At Utc",
+              "type": "string"
+            },
+            "items": {
+              "items": {
+                "$ref": "#/$defs/CompactReviewItem"
+              },
+              "maxItems": 100,
+              "title": "Items",
+              "type": "array"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "scanned_page_count": {
+              "title": "Scanned Page Count",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "record_identifier",
+            "workspace_record_identifier",
+            "created_at_utc",
+            "items",
+            "next_cursor",
+            "scanned_page_count"
+          ],
+          "title": "CompactReviewBatch",
+          "type": "object"
+        },
+        "CompactReviewBatchAcquisition": {
+          "additionalProperties": false,
+          "properties": {
+            "batch": {
+              "$ref": "#/$defs/CompactReviewBatch"
+            },
+            "lease": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReviewClaimLease"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sellers": {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "title": "Sellers",
+              "type": "object"
+            }
+          },
+          "required": [
+            "batch",
+            "lease",
+            "sellers"
+          ],
+          "title": "CompactReviewBatchAcquisition",
+          "type": "object"
+        },
+        "CompactReviewItem": {
+          "additionalProperties": false,
+          "properties": {
+            "projection": {
+              "$ref": "#/$defs/CompactReviewProjection"
+            },
+            "review_state": {
+              "$ref": "#/$defs/ReviewState"
+            },
+            "prior_review": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ListingReviewRecord"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "changed_components": {
+              "items": {
+                "$ref": "#/$defs/ProjectionRevisionComponent"
+              },
+              "title": "Changed Components",
+              "type": "array"
+            },
+            "scalar_field_changes": {
+              "items": {
+                "$ref": "#/$defs/ScalarFieldChange"
+              },
+              "title": "Scalar Field Changes",
+              "type": "array"
+            },
+            "scalar_comparison_available": {
+              "title": "Scalar Comparison Available",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "projection",
+            "review_state",
+            "prior_review",
+            "changed_components",
+            "scalar_field_changes",
+            "scalar_comparison_available"
+          ],
+          "title": "CompactReviewItem",
+          "type": "object"
+        },
+        "CompactReviewProjection": {
+          "additionalProperties": false,
+          "properties": {
+            "listing_identifier": {
+              "pattern": "^(?:[0-9]+|ebay:[0-9]{9,15})$",
+              "title": "Listing Identifier",
+              "type": "string"
+            },
+            "canonical_source_url": {
+              "minLength": 1,
+              "title": "Canonical Source Url",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/ListingStatus"
+            },
+            "title": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "price": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "location": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "condition": {
+              "$ref": "#/$defs/JsonValue",
+              "default": null
+            },
+            "shipping": {
+              "$ref": "#/$defs/JsonValue",
+              "default": null
+            },
+            "last_sale": {
+              "$ref": "#/$defs/JsonValue",
+              "default": null
+            },
+            "preview_image_url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Preview Image Url"
+            },
+            "description_available": {
+              "title": "Description Available",
+              "type": "boolean"
+            },
+            "seller_available": {
+              "title": "Seller Available",
+              "type": "boolean"
+            },
+            "referenced_image_count": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Referenced Image Count"
+            },
+            "saved_image_count": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Saved Image Count"
+            },
+            "analysis_available": {
+              "title": "Analysis Available",
+              "type": "boolean"
+            },
+            "projection_revision_sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Projection Revision Sha256",
+              "type": "string"
+            },
+            "warnings": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 20,
+              "title": "Warnings",
+              "type": "array"
+            },
+            "as_of_completion_sequence": {
+              "minimum": 0,
+              "title": "As Of Completion Sequence",
+              "type": "integer"
+            },
+            "projection_revision": {
+              "$ref": "#/$defs/ProjectionRevision"
+            },
+            "description": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "seller_reference": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Seller Reference"
+            }
+          },
+          "required": [
+            "listing_identifier",
+            "canonical_source_url",
+            "status",
+            "title",
+            "price",
+            "location",
+            "preview_image_url",
+            "description_available",
+            "seller_available",
+            "analysis_available",
+            "projection_revision_sha256",
+            "as_of_completion_sequence",
+            "projection_revision",
+            "description",
+            "seller_reference"
+          ],
+          "title": "CompactReviewProjection",
+          "type": "object"
         },
         "ComposedAnalysis": {
           "additionalProperties": false,
@@ -1038,6 +1318,30 @@
           "title": "ReviewBatch",
           "type": "object"
         },
+        "ReviewBatchAcquisition": {
+          "additionalProperties": false,
+          "properties": {
+            "batch": {
+              "$ref": "#/$defs/ReviewBatch"
+            },
+            "lease": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReviewClaimLease"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "batch",
+            "lease"
+          ],
+          "title": "ReviewBatchAcquisition",
+          "type": "object"
+        },
         "ReviewBatchItem": {
           "additionalProperties": false,
           "properties": {
@@ -1367,27 +1671,15 @@
           "type": "object"
         }
       },
-      "additionalProperties": false,
-      "properties": {
-        "batch": {
-          "$ref": "#/$defs/ReviewBatch"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReviewBatchAcquisition"
         },
-        "lease": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ReviewClaimLease"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        {
+          "$ref": "#/$defs/CompactReviewBatchAcquisition"
         }
-      },
-      "required": [
-        "batch",
-        "lease"
       ],
-      "title": "ReviewBatchAcquisition",
+      "title": "ReviewBatchAcquisitionResponse",
       "type": "object"
     },
     "annotations": {
@@ -4135,7 +4427,6 @@
           "items": {
             "$ref": "#/$defs/WorkspaceSearchTrack"
           },
-          "maxItems": 20,
           "title": "Search Tracks",
           "type": "array"
         },
@@ -10558,7 +10849,6 @@
               "items": {
                 "$ref": "#/$defs/WorkspaceSearchTrack"
               },
-              "maxItems": 20,
               "title": "Search Tracks",
               "type": "array"
             },
@@ -13197,6 +13487,14 @@
                 }
               ],
               "default": null
+            },
+            "image_failure_reason_counts": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkFailureReasonCount"
+              },
+              "title": "Image Failure Reason Counts",
+              "type": "array"
             }
           },
           "required": [
@@ -13683,6 +13981,12 @@
               "minimum": 100,
               "title": "Maximum Observations",
               "type": "integer"
+            },
+            "compact": {
+              "default": false,
+              "description": "Return scalar values and deduplicated sellers without repeated evidence or prior snapshots.",
+              "title": "Compact",
+              "type": "boolean"
             }
           },
           "required": [
@@ -13714,6 +14018,219 @@
           ],
           "title": "AnalysisApplicability",
           "type": "string"
+        },
+        "CompactReviewItem": {
+          "additionalProperties": false,
+          "properties": {
+            "projection": {
+              "$ref": "#/$defs/CompactReviewProjection"
+            },
+            "review_state": {
+              "$ref": "#/$defs/ReviewState"
+            },
+            "prior_review": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ListingReviewRecord"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "changed_components": {
+              "items": {
+                "$ref": "#/$defs/ProjectionRevisionComponent"
+              },
+              "title": "Changed Components",
+              "type": "array"
+            },
+            "scalar_field_changes": {
+              "items": {
+                "$ref": "#/$defs/ScalarFieldChange"
+              },
+              "title": "Scalar Field Changes",
+              "type": "array"
+            },
+            "scalar_comparison_available": {
+              "title": "Scalar Comparison Available",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "projection",
+            "review_state",
+            "prior_review",
+            "changed_components",
+            "scalar_field_changes",
+            "scalar_comparison_available"
+          ],
+          "title": "CompactReviewItem",
+          "type": "object"
+        },
+        "CompactReviewProjection": {
+          "additionalProperties": false,
+          "properties": {
+            "listing_identifier": {
+              "pattern": "^(?:[0-9]+|ebay:[0-9]{9,15})$",
+              "title": "Listing Identifier",
+              "type": "string"
+            },
+            "canonical_source_url": {
+              "minLength": 1,
+              "title": "Canonical Source Url",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/ListingStatus"
+            },
+            "title": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "price": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "location": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "condition": {
+              "$ref": "#/$defs/JsonValue",
+              "default": null
+            },
+            "shipping": {
+              "$ref": "#/$defs/JsonValue",
+              "default": null
+            },
+            "last_sale": {
+              "$ref": "#/$defs/JsonValue",
+              "default": null
+            },
+            "preview_image_url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Preview Image Url"
+            },
+            "description_available": {
+              "title": "Description Available",
+              "type": "boolean"
+            },
+            "seller_available": {
+              "title": "Seller Available",
+              "type": "boolean"
+            },
+            "referenced_image_count": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Referenced Image Count"
+            },
+            "saved_image_count": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Saved Image Count"
+            },
+            "analysis_available": {
+              "title": "Analysis Available",
+              "type": "boolean"
+            },
+            "projection_revision_sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Projection Revision Sha256",
+              "type": "string"
+            },
+            "warnings": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 20,
+              "title": "Warnings",
+              "type": "array"
+            },
+            "as_of_completion_sequence": {
+              "minimum": 0,
+              "title": "As Of Completion Sequence",
+              "type": "integer"
+            },
+            "projection_revision": {
+              "$ref": "#/$defs/ProjectionRevision"
+            },
+            "description": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "seller_reference": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Seller Reference"
+            }
+          },
+          "required": [
+            "listing_identifier",
+            "canonical_source_url",
+            "status",
+            "title",
+            "price",
+            "location",
+            "preview_image_url",
+            "description_available",
+            "seller_available",
+            "analysis_available",
+            "projection_revision_sha256",
+            "as_of_completion_sequence",
+            "projection_revision",
+            "description",
+            "seller_reference"
+          ],
+          "title": "CompactReviewProjection",
+          "type": "object"
+        },
+        "CompactWorkspaceListingReview": {
+          "additionalProperties": false,
+          "properties": {
+            "listing": {
+              "$ref": "#/$defs/CompactReviewItem"
+            },
+            "sellers": {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "title": "Sellers",
+              "type": "object"
+            }
+          },
+          "required": [
+            "listing",
+            "sellers"
+          ],
+          "title": "CompactWorkspaceListingReview",
+          "type": "object"
         },
         "ComposedAnalysis": {
           "additionalProperties": false,
@@ -14609,221 +15126,234 @@
           ],
           "title": "SearchMembershipProjection",
           "type": "object"
+        },
+        "WorkspaceListingReview": {
+          "additionalProperties": false,
+          "description": "A listing projection with its workspace-specific review comparison.",
+          "properties": {
+            "listing_identifier": {
+              "pattern": "^(?:[0-9]+|ebay:[0-9]{9,15})$",
+              "title": "Listing Identifier",
+              "type": "string"
+            },
+            "canonical_source_url": {
+              "minLength": 1,
+              "title": "Canonical Source Url",
+              "type": "string"
+            },
+            "as_of_completion_sequence": {
+              "minimum": 0,
+              "title": "As Of Completion Sequence",
+              "type": "integer"
+            },
+            "projection_revision": {
+              "$ref": "#/$defs/ProjectionRevision"
+            },
+            "status": {
+              "$ref": "#/$defs/ComposedStatus"
+            },
+            "title": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedField"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "price": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedField"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "location": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedField"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedField"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "seller": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedField"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "last_sale": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedField"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "condition": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedField"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "shipping": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedField"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "preview_image": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedPreviewImage"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "gallery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ComposedGallery"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "analyses": {
+              "items": {
+                "$ref": "#/$defs/ComposedAnalysis"
+              },
+              "maxItems": 20,
+              "title": "Analyses",
+              "type": "array"
+            },
+            "analyses_truncated": {
+              "title": "Analyses Truncated",
+              "type": "boolean"
+            },
+            "search_membership": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SearchMembershipProjection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "warnings": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 20,
+              "title": "Warnings",
+              "type": "array"
+            },
+            "review_state": {
+              "$ref": "#/$defs/ReviewState",
+              "default": "unreviewed"
+            },
+            "prior_review": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ListingReviewRecord"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "changed_components": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/ProjectionRevisionComponent"
+              },
+              "title": "Changed Components",
+              "type": "array"
+            },
+            "scalar_field_changes": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/ScalarFieldChange"
+              },
+              "title": "Scalar Field Changes",
+              "type": "array"
+            },
+            "scalar_comparison_available": {
+              "default": false,
+              "title": "Scalar Comparison Available",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "listing_identifier",
+            "canonical_source_url",
+            "as_of_completion_sequence",
+            "projection_revision",
+            "status",
+            "title",
+            "price",
+            "location",
+            "description",
+            "seller",
+            "preview_image",
+            "gallery",
+            "analyses",
+            "analyses_truncated",
+            "search_membership"
+          ],
+          "title": "WorkspaceListingReview",
+          "type": "object"
         }
       },
-      "additionalProperties": false,
-      "description": "A listing projection with its workspace-specific review comparison.",
-      "properties": {
-        "listing_identifier": {
-          "pattern": "^(?:[0-9]+|ebay:[0-9]{9,15})$",
-          "title": "Listing Identifier",
-          "type": "string"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkspaceListingReview"
         },
-        "canonical_source_url": {
-          "minLength": 1,
-          "title": "Canonical Source Url",
-          "type": "string"
-        },
-        "as_of_completion_sequence": {
-          "minimum": 0,
-          "title": "As Of Completion Sequence",
-          "type": "integer"
-        },
-        "projection_revision": {
-          "$ref": "#/$defs/ProjectionRevision"
-        },
-        "status": {
-          "$ref": "#/$defs/ComposedStatus"
-        },
-        "title": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedField"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "price": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedField"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "location": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedField"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedField"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "seller": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedField"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "last_sale": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedField"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "condition": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedField"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "shipping": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedField"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "preview_image": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedPreviewImage"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "gallery": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ComposedGallery"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "analyses": {
-          "items": {
-            "$ref": "#/$defs/ComposedAnalysis"
-          },
-          "maxItems": 20,
-          "title": "Analyses",
-          "type": "array"
-        },
-        "analyses_truncated": {
-          "title": "Analyses Truncated",
-          "type": "boolean"
-        },
-        "search_membership": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SearchMembershipProjection"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "warnings": {
-          "default": [],
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 20,
-          "title": "Warnings",
-          "type": "array"
-        },
-        "review_state": {
-          "$ref": "#/$defs/ReviewState",
-          "default": "unreviewed"
-        },
-        "prior_review": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ListingReviewRecord"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "changed_components": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/ProjectionRevisionComponent"
-          },
-          "title": "Changed Components",
-          "type": "array"
-        },
-        "scalar_field_changes": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/ScalarFieldChange"
-          },
-          "title": "Scalar Field Changes",
-          "type": "array"
-        },
-        "scalar_comparison_available": {
-          "default": false,
-          "title": "Scalar Comparison Available",
-          "type": "boolean"
+        {
+          "$ref": "#/$defs/CompactWorkspaceListingReview"
         }
-      },
-      "required": [
-        "listing_identifier",
-        "canonical_source_url",
-        "as_of_completion_sequence",
-        "projection_revision",
-        "status",
-        "title",
-        "price",
-        "location",
-        "description",
-        "seller",
-        "preview_image",
-        "gallery",
-        "analyses",
-        "analyses_truncated",
-        "search_membership"
       ],
-      "title": "WorkspaceListingReview",
+      "description": "Keep both response variants as top-level objects on the MCP wire.",
+      "title": "WorkspaceListingResponse",
       "type": "object"
     },
     "annotations": {
@@ -16746,7 +17276,6 @@
               "items": {
                 "$ref": "#/$defs/WorkspaceSearchTrack"
               },
-              "maxItems": 20,
               "title": "Search Tracks",
               "type": "array"
             },
@@ -21904,7 +22433,6 @@
           "items": {
             "$ref": "#/$defs/WorkspaceSearchTrack"
           },
-          "maxItems": 20,
           "title": "Search Tracks",
           "type": "array"
         },
@@ -27900,7 +28428,6 @@
           "items": {
             "$ref": "#/$defs/WorkspaceSearchTrack"
           },
-          "maxItems": 20,
           "title": "Search Tracks",
           "type": "array"
         },
@@ -29606,7 +30133,6 @@
           "items": {
             "$ref": "#/$defs/WorkspaceSearchTrack"
           },
-          "maxItems": 20,
           "title": "Search Tracks",
           "type": "array"
         },

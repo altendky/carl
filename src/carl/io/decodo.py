@@ -150,14 +150,39 @@ def _session_options(settings: DecodoProxySettings) -> dict[str, JsonValue]:
     }
 
 
-def _provider_result(record: dict[str, JsonValue]) -> dict[str, JsonValue] | None:
+def _provider_result(
+    record: dict[str, JsonValue], error: BaseException | None = None
+) -> dict[str, JsonValue] | None:
     if record.get("stopping_condition") == "transport_failure" and record.get("exception_type") in {
         "ProxyError",
         "ProxyConnectionError",
     }:
+        quota_exhausted = False
+        # Inspect proxy exception diagnostics only inside execution. They can
+        # contain credentials; persist a fixed category, never their text.
+        cause = error
+        while cause is not None:
+            if type(cause).__name__ in {"ProxyError", "ProxyConnectionError"}:
+                diagnostic = str(cause).lower()
+                quota_exhausted = any(
+                    marker in diagnostic
+                    for marker in (
+                        "traffic limit reached",
+                        "traffic limit exceeded",
+                        "bandwidth limit exceeded",
+                        "quota exhausted",
+                        "quota exceeded",
+                        "not enough traffic",
+                    )
+                )
+                if quota_exhausted:
+                    break
+            cause = cause.__cause__
         return {
             "provider": "decodo",
-            "category": "proxy_transport_or_authentication",
+            "category": "proxy_quota_exhausted"
+            if quota_exhausted
+            else "proxy_transport_or_authentication",
             "http_status": None,
             "error_code": None,
         }
@@ -284,7 +309,7 @@ class ManagedDecodoSession:
                     "configured": list(plan.routing),
                     "observed": self.active_observation(),
                 }
-                provider_result = _provider_result(error.result)
+                provider_result = _provider_result(error.result, error)
                 if provider_result is not None:
                     error.result["network_provider_result"] = provider_result
                 raise
@@ -525,7 +550,7 @@ class ManagedDecodoWreqSession:
                     "configured": list(plan.routing),
                     "observed": self.observation(),
                 }
-                provider_result = _provider_result(error.result)
+                provider_result = _provider_result(error.result, error)
                 if provider_result is not None:
                     error.result["network_provider_result"] = provider_result
                 raise
@@ -699,7 +724,7 @@ class ManagedDecodoWreqAcquirer:
                 "configured": list(plan.routing),
                 "observed": observation,
             }
-            provider_result = _provider_result(failure.result)
+            provider_result = _provider_result(failure.result, failure)
             if provider_result is not None:
                 failure.result["network_provider_result"] = provider_result
             raise failure

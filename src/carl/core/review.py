@@ -562,6 +562,11 @@ class SearchRefreshPhase(JsonStringEnumeration):
     FAILED = "failed"
 
 
+class WorkFailureReasonCount(StrictModel):
+    kind: str = Field(min_length=1)
+    count: int = Field(ge=1)
+
+
 class SearchRefreshProgress(StrictModel):
     checkpoint_stage: str | None
     active_phase: SearchRefreshPhase
@@ -570,11 +575,7 @@ class SearchRefreshProgress(StrictModel):
     images: WorkGroupProgress
     image_extractions: WorkGroupProgress
     descriptions: WorkGroupProgress | None = None
-
-
-class WorkFailureReasonCount(StrictModel):
-    kind: str = Field(min_length=1)
-    count: int = Field(ge=1)
+    image_failure_reason_counts: tuple[WorkFailureReasonCount, ...] = ()
 
 
 class WorkFailureSummary(StrictModel):

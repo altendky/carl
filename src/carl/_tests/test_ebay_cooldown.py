@@ -120,7 +120,7 @@ async def test_cooldown_defers_siblings_future_enqueues_and_survives_restart(
         await _enqueue(database, "sibling", now)
         await _enqueue(database, "alternate", now, "other_stack")
         await _fail(database, tmp_path, "blocked", now)
-        deadline = now + 120_000_000_000
+        deadline = now + 600_000_000_000
         assert (await database.work("sibling"))["eligible_at_utc_ns"] == deadline
         await _enqueue(database, "future", now + 1)
         assert (await database.work("future"))["eligible_at_utc_ns"] == deadline
@@ -155,12 +155,12 @@ async def test_terminal_failure_cools_stack_and_operator_retry_keeps_history(
     async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
         await _enqueue(database, "blocked", now)
         await _enqueue(database, "sibling", now)
-        for delay in (0, 120_000_000_000, 240_000_000_000):
+        for delay in (0, 600_000_000_000, 1200_000_000_000, 2400_000_000_000, 3600_000_000_000):
             now += delay
             await _fail(database, tmp_path, "blocked", now)
         failed = await database.work("blocked")
-        assert failed["state"] == "terminal_failure" and failed["attempt"] == 3
-        deadline = now + 480_000_000_000
+        assert failed["state"] == "terminal_failure" and failed["attempt"] == 5
+        deadline = now + 3600_000_000_000
         assert (await database.work("sibling"))["eligible_at_utc_ns"] == deadline
         previous = await database.retry_terminal_ebay_search_work(
             work_item_identifier="blocked",
@@ -170,13 +170,13 @@ async def test_terminal_failure_cools_stack_and_operator_retry_keeps_history(
             payload_schema_version=COLLECT_EBAY_SEARCH_PAYLOAD_SCHEMA_VERSION,
         )
         retried = await database.work("blocked")
-        assert previous == 3 and retried["attempt"] == 3 and len(retried["operations"]) == 3
-        assert retried["payload"]["retry_attempt_offset"] == 3
+        assert previous == 5 and retried["attempt"] == 5 and len(retried["operations"]) == 5
+        assert retried["payload"]["retry_attempt_offset"] == 5
         assert retried["payload"]["request"]["listing_state"] == "active"
         assert retried["eligible_at_utc_ns"] == deadline
         await _fail(database, tmp_path, "blocked", deadline)
         assert (await database.work("blocked"))["error"] is None
-        assert (await database.work("blocked"))["attempt"] == 4
+        assert (await database.work("blocked"))["attempt"] == 6
 
 
 @pytest.mark.anyio
@@ -186,7 +186,7 @@ async def test_alternate_stack_retry_updates_dedup_and_rejects_active_equivalent
     now = 1_000_000_000_000
     async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
         await _enqueue(database, "blocked", now, query="Morpheus")
-        for delay in (0, 120_000_000_000, 240_000_000_000):
+        for delay in (0, 600_000_000_000, 1200_000_000_000, 2400_000_000_000, 3600_000_000_000):
             now += delay
             await _fail(database, tmp_path, "blocked", now)
         await _enqueue(database, "equivalent", now, "other_stack", query="Morpheus")
@@ -270,7 +270,7 @@ async def test_legacy_default_stack_sibling_is_deferred(tmp_path: Path) -> None:
         )
         await _enqueue(database, "blocked", now)
         await _fail(database, tmp_path, "blocked", now)
-        assert (await database.work("legacy"))["eligible_at_utc_ns"] == now + 120_000_000_000
+        assert (await database.work("legacy"))["eligible_at_utc_ns"] == now + 600_000_000_000
         assert (await database.work("legacy"))["attempt"] == 0
 
 
@@ -306,7 +306,7 @@ async def test_public_stack_override_checks_configuration_before_requeueing(
         )
         work_id = group.targets[0].executions[0].work_identifier
         track_id = workspace.search_tracks[0].track_identifier
-        for delay in (0, 120_000_000_000, 240_000_000_000):
+        for delay in (0, 600_000_000_000, 1200_000_000_000, 2400_000_000_000, 3600_000_000_000):
             now += delay
             await _fail(database, tmp_path, work_id, now)
         with pytest.raises(ReviewInputError, match="not configured"):
@@ -325,6 +325,6 @@ async def test_public_stack_override_checks_configuration_before_requeueing(
                 acquisition_stack="ebay_anonymous",
             )
         )
-        assert result.work_identifier == work_id and result.previous_attempt_count == 3
+        assert result.work_identifier == work_id and result.previous_attempt_count == 5
         assert (await database.work(work_id))["payload"]["request"]["listing_state"] == "active"
-        assert (await database.work(work_id))["eligible_at_utc_ns"] == now + 480_000_000_000
+        assert (await database.work(work_id))["eligible_at_utc_ns"] == now + 3600_000_000_000

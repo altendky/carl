@@ -42,6 +42,7 @@ from carl.core.review_workspace import (
     GetWorkspaceListingRequest,
     RequestWorkspaceRefreshRequest,
     RetryWorkspaceSearchTrackRequest,
+    WorkspaceListingReview,
 )
 from carl.core.work import WorkRequester
 from carl.core.worker import AttemptContext, RetryWork, TerminalFailureWork
@@ -241,6 +242,7 @@ async def test_sold_acquisition_ingress_rejects_before_any_write(
                 listing_identifier="ebay:256123456789",
             )
         )
+        assert isinstance(listing, WorkspaceListingReview)
         assert listing.status.value.value == "sold" and listing.last_sale is not None
 
 

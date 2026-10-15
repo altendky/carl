@@ -695,6 +695,22 @@ async def test_workspace_analysis_preview_resolves_claimed_batch(
         assert record_identifier == "refreshed-search-run"
         return "refresh-work"
 
+    async def search_ancestry(
+        _database: Database,
+        roots: tuple[str, ...],
+        *,
+        as_of_completion_sequence: int,
+        maximum_runs: int | None = 100,
+    ) -> tuple[str, ...]:
+        assert roots == ("refreshed-search-run",)
+        assert as_of_completion_sequence >= 0
+        assert maximum_runs is None
+        return roots
+
+    async def search_members(_database: Database, record_identifier: str) -> tuple[str, ...]:
+        assert record_identifier == "refreshed-search-run"
+        return ("123",)
+
     async def workspace_analysis_candidates(
         _application: ReviewApplication,
         _workspace: ReviewWorkspace,
@@ -738,6 +754,8 @@ async def test_workspace_analysis_preview_resolves_claimed_batch(
         refresh_identifier,
     )
     monkeypatch.setattr(ReviewApplication, "_plan_missing_listing_analyses", plan)
+    monkeypatch.setattr("carl.review.expand_search_runs", search_ancestry)
+    monkeypatch.setattr("carl.review.run_listing_identifiers", search_members)
 
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         application = ReviewApplication(database, tmp_path)

@@ -458,8 +458,13 @@ def scalar_fields_sha256(values: ScalarFieldValues, *, normalize: bool = True) -
 
 
 def scalar_field_changes(
-    previous: ScalarFieldValues, current: ScalarFieldValues
+    previous: ScalarFieldValues,
+    current: ScalarFieldValues,
+    *,
+    reviewed_only: bool = False,
 ) -> tuple[ScalarFieldChange, ...]:
+    """Compare scalars, optionally limiting review diffs to previously populated facts."""
+
     previous, current = normalize_scalar_fields(previous), normalize_scalar_fields(current)
     return tuple(
         ScalarFieldChange(
@@ -468,8 +473,27 @@ def scalar_field_changes(
             current_value=getattr(current, name.value),
         )
         for name in ScalarFieldName
-        if getattr(previous, name.value) != getattr(current, name.value)
+        if (
+            _reviewed_value_changed(getattr(previous, name.value), getattr(current, name.value))
+            if reviewed_only
+            else getattr(previous, name.value) != getattr(current, name.value)
+        )
     )
+
+
+def _reviewed_value_changed(previous: JsonValue, current: JsonValue) -> bool:
+    """Compare facts present when reviewed, allowing later extraction additions."""
+
+    if previous is None:
+        return False
+    if isinstance(previous, dict) and isinstance(current, dict):
+        previous_values = cast(dict[str, JsonValue], previous)
+        current_values = cast(dict[str, JsonValue], current)
+        return any(
+            _reviewed_value_changed(value, current_values.get(key))
+            for key, value in previous_values.items()
+        )
+    return previous != current
 
 
 def _semantic_image_descriptor(

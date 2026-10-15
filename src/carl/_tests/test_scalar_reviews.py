@@ -15,7 +15,7 @@ from carl.core.marketplace_search import (
     CreateMarketplaceSearchRequest,
     FacebookSearchTargetSpecification,
 )
-from carl.core.models import CodeProvenance, RecordDraft
+from carl.core.models import CodeProvenance, JsonValue, RecordDraft
 from carl.core.review_workspace import (
     AcquireReviewBatchRequest,
     CreateReviewBatchRequest,
@@ -26,6 +26,7 @@ from carl.core.review_workspace import (
     RecordWorkspaceBulkReviewRequest,
     ReviewDisposition,
     ReviewState,
+    WorkspaceListingReview,
 )
 from carl.io.sqlite import Database
 from carl.review import ReviewApplication
@@ -42,6 +43,7 @@ async def _search(
     currency: str | None = "USD",
     formatted: str | None = None,
     title: str = "Astronomy textbook",
+    seller: JsonValue = None,
 ) -> str:
     run = _search_run_value(name)
     search = CreateSearchRequest.model_validate(
@@ -86,6 +88,7 @@ async def _search(
                         "location_text": "Germantown, MD",
                         "redacted_description": "Good",
                         "is_live": True,
+                        "marketplace_listing_seller": seller,
                     },
                 },
             ),
@@ -175,6 +178,7 @@ async def test_refresh_equivalent_price_stays_current(tmp_path: Path, legacy: bo
                 workspace_record_identifier=workspace, listing_identifier=LISTING
             )
         )
+        assert isinstance(listing, WorkspaceListingReview)
         assert listing.review_state == ReviewState.CURRENT
         assert listing.prior_review is not None
         assert listing.prior_review.record_identifier == identifier
@@ -244,6 +248,7 @@ async def test_real_scalar_change_exposes_old_and_new(
                 workspace_record_identifier=workspace, listing_identifier=LISTING
             )
         )
+        assert isinstance(listing, WorkspaceListingReview)
         assert listing.review_state == ReviewState.STALE
         assert listing.scalar_comparison_available
         assert len(listing.scalar_field_changes) == 1
@@ -279,6 +284,7 @@ async def test_unverifiable_legacy_baseline_is_conservative(
                 workspace_record_identifier=workspace, listing_identifier=LISTING
             )
         )
+        assert isinstance(listing, WorkspaceListingReview)
         assert listing.review_state == ReviewState.STALE
         assert not listing.scalar_comparison_available
         assert listing.scalar_field_changes == ()
@@ -295,6 +301,7 @@ async def test_individual_reviews_save_scalar_snapshot(tmp_path: Path, claimed: 
                 workspace_record_identifier=workspace, listing_identifier=LISTING
             )
         )
+        assert isinstance(listing, WorkspaceListingReview)
         acquired = (
             await app.acquire_review_batch(
                 AcquireReviewBatchRequest(
@@ -389,6 +396,89 @@ async def test_legacy_batch_snapshot_normalizes_without_bulk_boundary(tmp_path: 
                 workspace_record_identifier=workspace, listing_identifier=LISTING
             )
         )
+        assert isinstance(listing, WorkspaceListingReview)
         assert listing.review_state == ReviewState.CURRENT
         assert listing.scalar_comparison_available
         assert listing.scalar_field_changes == ()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_new_seller_facts_preserve_review_until_reviewed_value_changes(
+    tmp_path: Path, legacy: bool
+) -> None:
+    path = tmp_path / "carl.sqlite3"
+    async with Database.managed(path, initialize=True) as database:
+        app, workspace = await _app(database, path)
+        identifier = await _bulk(app, workspace)
+        if legacy:
+            _legacy_review(path, identifier)
+        await _search(app, database, "seller-added", seller={"id": "seller", "name": "Seller"})
+        listing = await app.get_workspace_listing(
+            GetWorkspaceListingRequest(
+                workspace_record_identifier=workspace, listing_identifier=LISTING
+            )
+        )
+        assert isinstance(listing, WorkspaceListingReview)
+        assert listing.seller is not None
+        assert listing.review_state == ReviewState.CURRENT
+        assert listing.changed_components == ()
+        assert listing.scalar_field_changes == ()
+        acquired = await app.acquire_review_batch(
+            AcquireReviewBatchRequest(
+                request_identifier="new-seller-claim",
+                owner_identifier="reviewer",
+                workspace_record_identifier=workspace,
+            )
+        )
+        assert acquired.batch.items == ()
+        await app.record_listing_reviews(
+            RecordListingReviewsRequest(
+                request_identifier="review-seller",
+                workspace_record_identifier=workspace,
+                reviews=(
+                    ListingReviewInput(
+                        listing_identifier=LISTING,
+                        projection_revision=listing.projection_revision,
+                        disposition=ReviewDisposition.REJECTED,
+                    ),
+                ),
+            )
+        )
+        await _search(app, database, "seller-changed", seller={"id": "other", "name": "Seller"})
+        changed = await app.get_workspace_listing(
+            GetWorkspaceListingRequest(
+                workspace_record_identifier=workspace, listing_identifier=LISTING
+            )
+        )
+        assert isinstance(changed, WorkspaceListingReview)
+        assert changed.review_state == ReviewState.STALE
+        assert len(changed.scalar_field_changes) == 1
+        assert changed.scalar_field_changes[0].field == "seller"
+
+
+@pytest.mark.anyio
+async def test_recipe_version_alone_does_not_invalidate_review(tmp_path: Path) -> None:
+    path = tmp_path / "carl.sqlite3"
+    async with Database.managed(path, initialize=True) as database:
+        app, workspace = await _app(database, path)
+        identifier = await _bulk(app, workspace)
+        with sqlite3.connect(path) as connection:
+            value = json.loads(
+                connection.execute(
+                    "SELECT value_json FROM records WHERE object_id = ?", (identifier,)
+                ).fetchone()[0]
+            )
+            value["projection_revision"]["recipe_version"] = 3
+            connection.execute(
+                "UPDATE records SET value_json = ? WHERE object_id = ?",
+                (json.dumps(value), identifier),
+            )
+        listing = await app.get_workspace_listing(
+            GetWorkspaceListingRequest(
+                workspace_record_identifier=workspace, listing_identifier=LISTING
+            )
+        )
+        assert isinstance(listing, WorkspaceListingReview)
+        assert listing.review_state == ReviewState.CURRENT
+        assert listing.changed_components == ()
