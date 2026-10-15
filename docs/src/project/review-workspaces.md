@@ -71,7 +71,10 @@ existing configured Decodo/wreq stack while retaining the track and attempt hist
 Sold/completed acquisitions are disabled and cannot be retried through a stack override;
 their retained targets and results remain readable. The override changes the retried work,
 not the original search-group target specification. Refreshes whose search acquisition
-failed require a new `request_workspace_refresh` with that override. Search and item pages already
+failed require a new `request_workspace_refresh` for the same stable track; an
+acquisition-stack override is optional. `retry_refresh_finalization` requires a
+completed search and downstream checkpoint, so it cannot resume a refresh whose
+search never completed. Search and item pages already
 use the configured Decodo browser stack; a new name for the same route does not
 provide a different acquisition path.
 Each eBay search attempt shares one sticky Decodo session and cookie-preserving
@@ -84,6 +87,11 @@ eBay search challenges and HTTP 403/429 have a five-attempt retry budget. Succes
 failures impose stack-wide cooldowns of 10, 20, 40, then 60 minutes, with the
 60-minute cap also applied after terminal failure. Each retry opens a fresh
 provider session and cookie jar.
+Search-fetch timeouts use the same budget and cooldown. A timeout of Carl's own
+network-activity finalization deadline also retries under this policy, retaining
+any completed HTTP response as evidence and reporting a local finalization
+failure rather than a site error. Cancellation and unrelated database or
+programming errors retain their separate classifications.
 Pending siblings, new work, and same-stack manual retries respect these durable
 deadlines across restarts without consuming attempts while waiting. Other
 response failures retain short bounded backoff. Blocked eBay item pages use

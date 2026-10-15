@@ -17,9 +17,16 @@ from carl.core.work import (
     SchedulingScope,
     SchedulingScopeKind,
 )
-from carl.io.cleanup import shielded_cleanup
+from carl.io.cleanup import report_cleanup_failure, shielded_cleanup
 from carl.io.httpx import Acquisition, AcquisitionFailure
 from carl.io.sqlite import Database
+
+# SQLite permits 30 seconds of busy waiting and 35 seconds of transaction cleanup.
+NETWORK_ACTIVITY_FINALIZATION_TIMEOUT_SECONDS = 40
+
+
+class NetworkActivityFinalizationTimeout(Exception):
+    """The scheduler's own deadline expired while recording a finished request."""
 
 
 def network_activity_definition(
@@ -224,23 +231,33 @@ class NetworkActivityScheduler:
                     )
                 raise
             else:
-                async with shielded_cleanup("network activity completion", primary_error=None):
-                    await self._finish(
-                        definition=definition,
-                        admission=admission,
-                        state=(
-                            NetworkActivityState.COMPLETED
-                            if permit.dispatched
-                            else NetworkActivityState.SKIPPED
-                        ),
-                        result={
-                            "kind": (
-                                "request_attempt_completed"
+                try:
+                    with anyio.move_on_after(
+                        NETWORK_ACTIVITY_FINALIZATION_TIMEOUT_SECONDS, shield=True
+                    ) as deadline:
+                        await self._finish(
+                            definition=definition,
+                            admission=admission,
+                            state=(
+                                NetworkActivityState.COMPLETED
                                 if permit.dispatched
-                                else "not_dispatched"
-                            )
-                        },
-                    )
+                                else NetworkActivityState.SKIPPED
+                            ),
+                            result={
+                                "kind": (
+                                    "request_attempt_completed"
+                                    if permit.dispatched
+                                    else "not_dispatched"
+                                )
+                            },
+                        )
+                    if deadline.cancelled_caught:
+                        raise NetworkActivityFinalizationTimeout(
+                            "Network activity completion exceeded its deadline"
+                        )
+                except Exception as error:
+                    report_cleanup_failure(None, error, "network activity completion")
+                    raise
         except anyio.get_cancelled_exc_class() as error:
             if admission is None:
                 async with shielded_cleanup("cancelled network admission", primary_error=error):

@@ -18,7 +18,7 @@ from carl.core.ebay import (
     extract_ebay_search,
 )
 from carl.core.ebay_search_support import require_supported_ebay_search_acquisition
-from carl.core.http import stored_content_encodings, stored_response_charset
+from carl.core.http import RequestPlan, stored_content_encodings, stored_response_charset
 from carl.core.models import (
     BytesDraft,
     CodeProvenance,
@@ -30,6 +30,7 @@ from carl.io.configuration import decodo_wreq_stack_settings, load_configuration
 from carl.io.decodo import ManagedDecodoWreqAcquirer
 from carl.io.httpx import Acquisition, AcquisitionFailure, HttpAcquirer
 from carl.io.network_activity import (
+    NetworkActivityFinalizationTimeout,
     acquire_for_network_activity,
     network_activity_definition,
     network_activity_scheduler,
@@ -228,6 +229,24 @@ async def collect_ebay_search(
     }
 
 
+async def _acquire_search_request(
+    acquirer: HttpAcquirer, plan: RequestPlan, new_identifier: Callable[[], str]
+) -> Acquisition:
+    try:
+        return await acquirer.acquire(plan, new_identifier)
+    except TimeoutError as error:
+        raise AcquisitionFailure(
+            "eBay search request timed out",
+            result={
+                "hops": [],
+                "stopping_condition": "transport_failure",
+                "exception_type": "TimeoutError",
+                "failure_phase": "request_timeout",
+                "failed_request": {"method": plan.method, "url": plan.url},
+            },
+        ) from error
+
+
 async def _collect_ebay_search_page(
     database: Database,
     *,
@@ -264,6 +283,7 @@ async def _collect_ebay_search_page(
         },
         started_at_utc=started_at_utc,
     )
+    acquisition: Acquisition | None = None
     try:
         activity = network_activity_definition(
             identifier=new_identifier(),
@@ -276,26 +296,71 @@ async def _collect_ebay_search_page(
         async with network_activity_scheduler(database, new_identifier).admit(activity) as permit:
             permit.mark_dispatched()
             acquisition = await acquire_for_network_activity(
-                acquirer.acquire(plan, new_identifier), permit.admission
+                _acquire_search_request(acquirer, plan, new_identifier), permit.admission
             )
-    except AcquisitionFailure as error:
-        artifacts = _body_artifacts(Acquisition(record=error.result, bodies=error.bodies))
+    except (AcquisitionFailure, NetworkActivityFinalizationTimeout) as error:
+        if isinstance(error, NetworkActivityFinalizationTimeout):
+            if acquisition is None:
+                raise AssertionError("Finalized search activity has no acquisition") from error
+            acquisition_identifier = new_identifier()
+            # Retain the completed HTTP response separately from the local
+            # bookkeeping failure, without relabeling it as a site error.
+            records = (
+                RecordDraft(
+                    identifier=acquisition_identifier,
+                    kind=("carl", "http", "acquisition"),
+                    schema_version=1,
+                    value={
+                        **acquisition.record,
+                        "operation_identifier": operation_identifier,
+                        "purpose": "ebay_search_page",
+                        "ebay_search_request": request.model_dump(mode="json"),
+                        "acquisition_stack_identifier": request.stack_identifier,
+                        "page_number": page_number,
+                        "page_ordinal": page_ordinal,
+                        "search_run_record_identifier": search_run_identifier,
+                    },
+                ),
+            )
+            failure = AcquisitionFailure(
+                "eBay search activity finalization timed out",
+                result={
+                    **acquisition.record,
+                    "stopping_condition": "network_activity_failure",
+                    "exception_type": "NetworkActivityFinalizationTimeout",
+                    "failure_phase": "network_activity_finalization_timeout",
+                    "acquisition_record_identifier": acquisition_identifier,
+                },
+                bodies=acquisition.bodies,
+            )
+            retained_outputs = (
+                NamedOutput(name=("acquisition",), object_identifier=acquisition_identifier),
+            )
+        else:
+            failure = error
+            records = ()
+            retained_outputs = ()
+        artifacts = _body_artifacts(Acquisition(record=failure.result, bodies=failure.bodies))
         await database.fail_operation(
             operation_id=operation_identifier,
             error={"type": type(error).__name__, "message": str(error)},
             result={
                 "state": "acquisition_failed",
-                "acquisition": error.result,
+                "acquisition": failure.result,
             },
             ended_at_utc=_utc_now(),
             duration_ns=perf_counter_ns() - started,
             artifacts=artifacts,
-            outputs=tuple(
+            records=records,
+            outputs=retained_outputs
+            + tuple(
                 NamedOutput(name=("body", str(index)), object_identifier=artifact.identifier)
                 for index, artifact in enumerate(artifacts)
             ),
         )
-        raise
+        if failure is error:
+            raise
+        raise failure from error
 
     acquisition_identifier = new_identifier()
     acquisition_value = dict(acquisition.record)
