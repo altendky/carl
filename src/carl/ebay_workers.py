@@ -49,6 +49,15 @@ class EbaySearchWorkerDependencies:
     utc_now_ns: Callable[[], int] = time_ns
 
 
+def _homepage_inputs(value: JsonValue) -> tuple[NamedInput, ...]:
+    if not isinstance(value, dict):
+        return ()
+    identifier = value.get("acquisition_record_identifier")
+    if not isinstance(identifier, str):
+        return ()
+    return (NamedInput(name=("search", "homepage", "acquisition"), object_identifier=identifier),)
+
+
 async def _collect(
     payload: CollectEbaySearchPayload,
     context: AttemptContext,
@@ -121,6 +130,7 @@ async def _collect(
             result={"state": "configuration_failed"},
         )
     except AcquisitionFailure as error:
+        homepage_inputs = _homepage_inputs(error.result.get("homepage_acquisition"))
         timeout = (
             error.result.get("stopping_condition") == "transport_failure"
             and error.result.get("exception_type") == "TimeoutError"
@@ -151,22 +161,25 @@ async def _collect(
                 )
             if policy_attempt < maximum_attempts:
                 return RetryWork(
+                    inputs=homepage_inputs,
                     delay_ns=delay_ns,
                     reason=reason,
                     result={"state": "retryable_failure", "acquisition": error.result},
                 )
             return TerminalFailureWork(
+                inputs=homepage_inputs,
                 error=reason,
                 result={"state": "acquisition_failed", "acquisition": error.result},
             )
         return TerminalFailureWork(
+            inputs=homepage_inputs,
             error={"kind": "ebay_search_acquisition_failure"},
             result={"state": "acquisition_failed", "acquisition": error.result},
         )
 
     # The collector's child operations already own these records. Link their
     # evidence into this work operation without publishing it a second time.
-    inputs: list[NamedInput] = []
+    inputs = list(_homepage_inputs(result.get("homepage_acquisition")))
     for name, key in (
         ("acquisition", "acquisition_record_identifiers"),
         ("extraction", "extraction_record_identifiers"),
