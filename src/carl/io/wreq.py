@@ -115,6 +115,15 @@ class _WreqResponse(Protocol):
 
     def stream(self) -> _WreqStream: ...
 
+    def __enter__(self) -> _WreqResponse: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -444,8 +453,13 @@ def _sync_acquire(
                     result={"stopping_condition": "invalid_redirect"},
                 ) from error
             try:
-                _close_response(response)
+                # close() forbids connection reuse even after a complete read.
+                # Context release returns the fully read connection to the pool.
+                with response:
+                    pass
             except Exception as error:
+                with suppress(Exception):
+                    _close_response(response)
                 raise _SyncAcquisitionFailure(
                     "HTTP transport failed while closing a response",
                     hops=tuple(hops),
