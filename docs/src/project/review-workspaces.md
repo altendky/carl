@@ -78,7 +78,11 @@ search never completed. Search and item pages already
 use the configured Decodo browser stack; a new name for the same route does not
 provide a different acquisition path.
 Each eBay search attempt shares one sticky Decodo session and cookie-preserving
-HTTP client across its pages. Independent searches and retries use fresh
+HTTP client across an initial homepage visit and all search pages. The homepage
+response is retained separately, including HTTP 403 responses, and any cookies
+it sets are available to the first search request. Its status does not decide
+whether the search succeeded, and it does not count toward the search-page limit.
+Independent searches and retries use fresh
 sessions; expiry stops traversal rather than silently changing the exit during
 pagination. Page acquisitions retain the shared safe session record identifier
 and request counters as observed at acquisition time, before session cleanup.

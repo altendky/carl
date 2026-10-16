@@ -688,6 +688,7 @@ async def test_configured_search_shares_session_across_pages_not_attempts(
         proxies.append(str(proxy))
         client = _Client(
             [
+                _response(url="https://www.ebay.com/", status=403),
                 _response(url=ebay_search_url("scope"), chunks=(first,)),
                 _response(url=ebay_search_url("scope", page_number=2), chunks=(second,)),
             ],
@@ -726,8 +727,17 @@ async def test_configured_search_shares_session_across_pages_not_attempts(
         acquisitions = await database.records_by_kind(("carl", "http", "acquisition"))
         observations = [value["routing"]["observed"] for _, value in acquisitions]
         session_ids = [observation["session_record_identifier"] for observation in observations]
-        assert session_ids[0] == session_ids[1] != session_ids[2] == session_ids[3]
-        assert [observation["requests_completed"] for observation in observations] == [1, 2, 1, 2]
+        assert session_ids[0] == session_ids[1] == session_ids[2]
+        assert session_ids[3] == session_ids[4] == session_ids[5]
+        assert session_ids[0] != session_ids[3]
+        assert [observation["requests_completed"] for observation in observations] == [
+            1,
+            2,
+            3,
+            1,
+            2,
+            3,
+        ]
         assert all(observation["state"] == "active" for observation in observations)
         assert all(
             value["transport"]["effective_timeouts"]["pool_seconds"]["reason"]
@@ -736,7 +746,8 @@ async def test_configured_search_shares_session_across_pages_not_attempts(
         )
         assert "FirstProviderSession" not in json.dumps(acquisitions)
         assert "SecondProviderSession" not in json.dumps(acquisitions)
-    assert len(clients) == 2 and all(client.closed and len(client.calls) == 2 for client in clients)
+    assert len(clients) == 2 and all(client.closed and len(client.calls) == 3 for client in clients)
+    assert all(client.calls[0][1] == "https://www.ebay.com/" for client in clients)
     assert "session-FirstProviderSession-" in proxies[0]
     assert "session-SecondProviderSession-" in proxies[1]
 

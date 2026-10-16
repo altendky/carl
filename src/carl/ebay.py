@@ -40,6 +40,7 @@ from carl.io.provenance import collect_code_provenance_async, process_invocation
 from carl.io.sqlite import Database
 
 COLLECT_EBAY_SEARCH = ComponentId(("carl", "ebay", "collect", "search_page"))
+COLLECT_EBAY_SEARCH_HOMEPAGE = ComponentId(("carl", "ebay", "collect", "search_homepage"))
 EXTRACT_EBAY_SEARCH = ComponentId(("carl", "ebay", "extract", "search_page"))
 FINALIZE_EBAY_SEARCH = ComponentId(("carl", "ebay", "finalize", "search"))
 RUN_EBAY_SEARCH_WORK = ComponentId(("carl", "ebay", "run", "search_work"))
@@ -61,9 +62,10 @@ def build_ebay_component_registry() -> Registry:
     return Registry(
         (
             Component(COLLECT_EBAY_SEARCH, 4, _collect_component),
+            Component(COLLECT_EBAY_SEARCH_HOMEPAGE, 1, _collect_component),
             Component(EXTRACT_EBAY_SEARCH, 3, extract_ebay_search),
-            Component(FINALIZE_EBAY_SEARCH, 1, _finalize_component),
-            Component(RUN_EBAY_SEARCH_WORK, 3, _run_work_component),
+            Component(FINALIZE_EBAY_SEARCH, 2, _finalize_component),
+            Component(RUN_EBAY_SEARCH_WORK, 4, _run_work_component),
         )
     )
 
@@ -124,15 +126,34 @@ async def collect_configured_ebay_search(
         credential_source=credential_source,
         transport_settings=transport,
     )
+    search_run_identifier = search_run_identifier or new_identifier()
+    provenance = await collect_code_provenance_async(_repository_root())
     async with acquirer.session(new_identifier) as session:
-        return await collect_ebay_search(
+        homepage = await _collect_ebay_search_document(
             database,
             request=request,
-            network_path=route.route.network_path,
+            plan=RequestPlan(url="https://www.ebay.com/", routing=route.route.network_path),
+            page_number=None,
+            page_ordinal=None,
+            search_run_identifier=search_run_identifier,
             acquirer=session,
             new_identifier=new_identifier,
-            search_run_identifier=search_run_identifier,
+            provenance=provenance,
         )
+        try:
+            return await collect_ebay_search(
+                database,
+                request=request,
+                network_path=route.route.network_path,
+                acquirer=session,
+                new_identifier=new_identifier,
+                search_run_identifier=search_run_identifier,
+                provenance=provenance,
+                homepage_acquisition=homepage,
+            )
+        except AcquisitionFailure as error:
+            error.result["homepage_acquisition"] = homepage
+            raise
 
 
 async def collect_ebay_search(
@@ -144,6 +165,7 @@ async def collect_ebay_search(
     new_identifier: Callable[[], str] = _identifier,
     provenance: CodeProvenance | None = None,
     search_run_identifier: str | None = None,
+    homepage_acquisition: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     resolved_provenance = provenance or await collect_code_provenance_async(_repository_root())
     search_run_identifier = search_run_identifier or new_identifier()
@@ -209,6 +231,7 @@ async def collect_ebay_search(
         stopping_reason=stopping_reason,
         new_identifier=new_identifier,
         provenance=resolved_provenance,
+        homepage_acquisition=homepage_acquisition,
     )
     first_page = pages[0]
     last_page = pages[-1]
@@ -225,6 +248,7 @@ async def collect_ebay_search(
         "extraction_record_identifier": first_page["extraction_record_identifier"],
         "extraction_record_identifiers": [page["extraction_record_identifier"] for page in pages],
         "response_classification": last_page["response_classification"],
+        **({} if homepage_acquisition is None else {"homepage_acquisition": homepage_acquisition}),
         **finalized,
     }
 
@@ -247,25 +271,22 @@ async def _acquire_search_request(
         ) from error
 
 
-async def _collect_ebay_search_page(
+async def _collect_ebay_search_document(
     database: Database,
     *,
     request: EbaySearchRequest,
-    network_path: tuple[str, ...],
-    page_number: int,
-    page_ordinal: int,
+    plan: RequestPlan,
+    page_number: int | None,
+    page_ordinal: int | None,
     search_run_identifier: str,
     acquirer: HttpAcquirer,
     new_identifier: Callable[[], str],
     provenance: CodeProvenance,
 ) -> dict[str, JsonValue]:
-    plan = ebay_search_plan(
-        request,
-        network_path=network_path,
-        page_number=page_number,
-    )
+    homepage = page_number is None
+    purpose = "ebay_search_homepage" if homepage else "ebay_search_page"
     registry = build_ebay_component_registry()
-    component = registry.require(COLLECT_EBAY_SEARCH)
+    component = registry.require(COLLECT_EBAY_SEARCH_HOMEPAGE if homepage else COLLECT_EBAY_SEARCH)
     operation_identifier = new_identifier()
     started_at_utc = _utc_now()
     started = perf_counter_ns()
@@ -276,6 +297,7 @@ async def _collect_ebay_search_page(
         invocation=process_invocation(),
         configuration={
             "request": request.model_dump(mode="json"),
+            "purpose": purpose,
             "page_number": page_number,
             "page_ordinal": page_ordinal,
             "search_run_record_identifier": search_run_identifier,
@@ -287,11 +309,16 @@ async def _collect_ebay_search_page(
     try:
         activity = network_activity_definition(
             identifier=new_identifier(),
-            kind=("carl", "ebay", "network_activity", "search_page"),
+            kind=(
+                "carl",
+                "ebay",
+                "network_activity",
+                "search_homepage" if homepage else "search_page",
+            ),
             operation_identifier=operation_identifier,
             network_session_identifier=search_run_identifier,
-            network_path=network_path,
-            ordinal=page_ordinal,
+            network_path=plan.routing,
+            ordinal=1 if page_ordinal is None else page_ordinal,
         )
         async with network_activity_scheduler(database, new_identifier).admit(activity) as permit:
             permit.mark_dispatched()
@@ -313,7 +340,7 @@ async def _collect_ebay_search_page(
                     value={
                         **acquisition.record,
                         "operation_identifier": operation_identifier,
-                        "purpose": "ebay_search_page",
+                        "purpose": purpose,
                         "ebay_search_request": request.model_dump(mode="json"),
                         "acquisition_stack_identifier": request.stack_identifier,
                         "page_number": page_number,
@@ -333,6 +360,12 @@ async def _collect_ebay_search_page(
                 },
                 bodies=acquisition.bodies,
             )
+            if homepage:
+                failure.result["homepage_acquisition"] = {
+                    "acquisition_operation_identifier": operation_identifier,
+                    "acquisition_record_identifier": acquisition_identifier,
+                    "http_status": _terminal_response(acquisition.record).get("status_code"),
+                }
             retained_outputs = (
                 NamedOutput(name=("acquisition",), object_identifier=acquisition_identifier),
             )
@@ -367,7 +400,7 @@ async def _collect_ebay_search_page(
     acquisition_value.update(
         {
             "operation_identifier": operation_identifier,
-            "purpose": "ebay_search_page",
+            "purpose": purpose,
             "ebay_search_request": request.model_dump(mode="json"),
             "acquisition_stack_identifier": request.stack_identifier,
             "page_number": page_number,
@@ -402,6 +435,38 @@ async def _collect_ebay_search_page(
         ended_at_utc=_utc_now(),
         duration_ns=perf_counter_ns() - started,
     )
+    return {
+        "acquisition_operation_identifier": operation_identifier,
+        "acquisition_record_identifier": acquisition_identifier,
+        "http_status": terminal_response.get("status_code"),
+    }
+
+
+async def _collect_ebay_search_page(
+    database: Database,
+    *,
+    request: EbaySearchRequest,
+    network_path: tuple[str, ...],
+    page_number: int,
+    page_ordinal: int,
+    search_run_identifier: str,
+    acquirer: HttpAcquirer,
+    new_identifier: Callable[[], str],
+    provenance: CodeProvenance,
+) -> dict[str, JsonValue]:
+    acquisition = await _collect_ebay_search_document(
+        database,
+        request=request,
+        plan=ebay_search_plan(request, network_path=network_path, page_number=page_number),
+        page_number=page_number,
+        page_ordinal=page_ordinal,
+        search_run_identifier=search_run_identifier,
+        acquirer=acquirer,
+        new_identifier=new_identifier,
+        provenance=provenance,
+    )
+    acquisition_identifier = acquisition["acquisition_record_identifier"]
+    assert isinstance(acquisition_identifier, str)
     extraction = await extract_ebay_search_acquisition(
         database,
         acquisition_identifier=acquisition_identifier,
@@ -412,8 +477,7 @@ async def _collect_ebay_search_page(
         provenance=provenance,
     )
     return {
-        "acquisition_operation_identifier": operation_identifier,
-        "acquisition_record_identifier": acquisition_identifier,
+        **acquisition,
         **extraction,
     }
 
@@ -613,6 +677,7 @@ async def _finalize_ebay_search(
     stopping_reason: str,
     new_identifier: Callable[[], str],
     provenance: CodeProvenance,
+    homepage_acquisition: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     if not pages:
         raise ValueError("An eBay search run requires at least one retained page")
@@ -622,6 +687,11 @@ async def _finalize_ebay_search(
     started_at_utc = _utc_now()
     started = perf_counter_ns()
     inputs: list[tuple[tuple[str, ...], str]] = []
+    if homepage_acquisition is not None:
+        homepage_identifier = homepage_acquisition.get("acquisition_record_identifier")
+        if not isinstance(homepage_identifier, str):
+            raise ValueError("An eBay homepage has a malformed evidence reference")
+        inputs.append((("homepage", "acquisition"), homepage_identifier))
     occurrence_identifiers: list[str] = []
     unique_listing_identifiers: list[str] = []
     for index, page in enumerate(pages, start=1):
@@ -686,6 +756,7 @@ async def _finalize_ebay_search(
         "listing_occurrence_count": len(occurrence_identifiers),
         "page_count": len(pages),
         "stopping_reason": stopping_reason,
+        **({} if homepage_acquisition is None else {"homepage_acquisition": homepage_acquisition}),
     }
     await database.begin_operation(
         operation_id=operation_identifier,
