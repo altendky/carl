@@ -95,13 +95,32 @@ class _Response:
         self.headers = headers
         self.chunks = chunks
         self.closed = False
+        self.released = False
+        self.aborted = False
+        self.release_error: Exception | None = None
         self.close_error: Exception | None = None
 
     def stream(self) -> _Stream:
         return _Stream(self.chunks)
 
+    def __enter__(self) -> "_Response":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.closed = True
+        self.released = True
+        if self.release_error is not None:
+            raise self.release_error
+
     def close(self) -> None:
         self.closed = True
+        self.aborted = True
         if self.close_error is not None:
             raise self.close_error
 
@@ -236,6 +255,7 @@ async def test_profiled_acquisition_runs_in_thread_and_records_truthful_provenan
     assert factory.proxy is not None
     assert "socks5h://127.0.0.1:31080/" in str(factory.proxy)
     assert response.closed is True
+    assert response.released and not response.aborted
     assert factory.client.closed is True
     assert factory.calls[0][1] == response.url
     request_options = factory.calls[0][2]
@@ -294,6 +314,8 @@ async def test_manual_redirects_reuse_one_client_and_retain_each_body() -> None:
     assert acquisition.record["redirect_count"] == 1
     assert acquisition.record["effective_url"] == final.url
     assert [body.content for body in acquisition.bodies] == [b"redirect", b"results"]
+    assert first.released and final.released
+    assert not first.aborted and not final.aborted
     assert "redirect-secret" not in json.dumps(acquisition.record)
 
 
@@ -324,6 +346,7 @@ async def test_decoded_body_limit_is_a_retained_acquisition_failure(
     }
     assert raised.value.bodies == ()
     assert response.closed is True
+    assert response.aborted and not response.released
     assert factory.client.closed is True
 
 
@@ -363,6 +386,7 @@ async def test_memoryview_body_and_header_maps_preserve_evidence() -> None:
     assert "response-secret" not in retained
     assert "trailer-secret" not in retained
     assert response.closed and factory.client.closed
+    assert response.released and not response.aborted
 
 
 @pytest.mark.anyio
@@ -387,6 +411,7 @@ async def test_memoryview_stream_failure_does_not_retain_partial_body() -> None:
     assert raised.value.bodies == ()
     assert "secret body diagnostic" not in json.dumps(raised.value.result)
     assert response.closed and factory.client.closed
+    assert response.aborted and not response.released
 
 
 @pytest.mark.anyio
@@ -433,9 +458,12 @@ async def test_client_cleanup_failure_retains_completed_response_without_diagnos
 
 
 @pytest.mark.anyio
-async def test_response_cleanup_failure_retains_completed_response() -> None:
+@pytest.mark.parametrize("abort_failure", (False, True))
+async def test_response_cleanup_failure_retains_completed_response(abort_failure: bool) -> None:
     response = _response()
-    response.close_error = RuntimeError("secret response diagnostic")
+    response.release_error = RuntimeError("secret response diagnostic")
+    if abort_failure:
+        response.close_error = OSError("secret abort diagnostic")
     factory = _Factory([response])
 
     with pytest.raises(AcquisitionFailure) as raised:
@@ -445,9 +473,12 @@ async def test_response_cleanup_failure_retains_completed_response() -> None:
         )
 
     assert raised.value.result["failure_phase"] == "response_close"
+    assert raised.value.result["exception_type"] == "RuntimeError"
     assert raised.value.bodies[0].content == b"<html>results</html>"
     assert response.closed and factory.client.closed
+    assert response.released and response.aborted
     assert "secret response diagnostic" not in json.dumps(raised.value.result)
+    assert "secret abort diagnostic" not in json.dumps(raised.value.result)
 
 
 @pytest.mark.anyio
