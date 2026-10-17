@@ -344,6 +344,7 @@ from carl.core.review_workspace import (
     review_mutation_request_sha256,
 )
 from carl.core.work import WorkEventKind, WorkRequester, WorkState
+from carl.core.work_cancellation import WorkCancellationResult, WorkCancellationSummary
 from carl.core.workspace_search_results import (
     ListWorkspaceSearchResultsRequest,
     WorkspaceSearchResult,
@@ -3112,6 +3113,14 @@ class ReviewApplication:
         partial_failures = await self.database.workspace_partial_failure_count(
             workspace_record_identifier
         )
+        (
+            cancelling_count,
+            cancelled_count,
+            cancelled_work,
+        ) = await self.database.workspace_cancellation_status(
+            workspace_record_identifier=workspace_record_identifier,
+            maximum_rows=maximum_failed_work,
+        )
         return WorkspaceWorkStatus(
             workspace_record_identifier=workspace_record_identifier,
             captured_at_utc_ns=self.utc_now_ns(),
@@ -3119,12 +3128,21 @@ class ReviewApplication:
             in_progress_count=in_progress_count,
             terminal_failure_count=terminal_failure_count,
             completed_with_failures_count=partial_failures,
+            cancelling_count=cancelling_count,
+            cancelled_count=cancelled_count,
             active_work=active_work,
             active_work_truncated=queued_count + in_progress_count > len(active_work),
             failed_work=failed_work,
             failed_work_truncated=terminal_failure_count + partial_failures > len(failed_work),
+            cancelled_work=cancelled_work,
+            cancelled_work_truncated=cancelled_count > len(cancelled_work),
             idle=idle,
-            successful=idle and terminal_failure_count == 0 and partial_failures == 0,
+            successful=(
+                idle
+                and terminal_failure_count == 0
+                and partial_failures == 0
+                and cancelled_count == 0
+            ),
         )
 
     async def get_workspace_work_status(
@@ -7185,6 +7203,53 @@ class ReviewApplication:
             gallery_absence_reason=gallery_absence_reason,
         )
 
+    @staticmethod
+    def _cancellation_reason(reason: str) -> str:
+        if not reason.strip() or len(reason) > 2000:
+            raise ReviewInputError("Cancellation reason must contain one to 2000 characters")
+        return reason.strip()
+
+    async def cancel_work(
+        self, work_identifier: str, reason: str, include_descendants: bool = True
+    ) -> WorkCancellationResult:
+        """Cancel an exact work item and its descendants, retaining completed evidence."""
+
+        result = await self.database.cancel_work(
+            work_item_identifier=work_identifier,
+            reason=self._cancellation_reason(reason),
+            caller=f"mcp:cancel_work:{self.server_instance_identifier}",
+            requested_at_utc_ns=self.utc_now_ns(),
+            include_descendants=include_descendants,
+        )
+        return WorkCancellationResult.model_validate_json(encode_json(result))
+
+    async def cancel_workspace_work(
+        self, workspace_record_identifier: str, reason: str
+    ) -> WorkCancellationResult:
+        """Cancel active workspace roots and every descendant without requiring a worker."""
+
+        reason = self._cancellation_reason(reason)
+        await self.get_review_workspace(workspace_record_identifier)
+        result = await self.database.cancel_workspace_work(
+            workspace_record_identifier=workspace_record_identifier,
+            reason=reason,
+            caller=f"mcp:cancel_workspace_work:{self.server_instance_identifier}",
+            requested_at_utc_ns=self.utc_now_ns(),
+        )
+        return WorkCancellationResult.model_validate_json(encode_json(result))
+
+    async def cancel_all_work(self, reason: str, confirm: bool = False) -> WorkCancellationResult:
+        """Stop all pending and leased work only with explicit confirmation."""
+
+        if confirm is not True:
+            raise ReviewInputError("cancel_all_work requires confirm=true")
+        result = await self.database.cancel_all_work(
+            reason=self._cancellation_reason(reason),
+            caller=f"mcp:cancel_all_work:{self.server_instance_identifier}",
+            requested_at_utc_ns=self.utc_now_ns(),
+        )
+        return WorkCancellationResult.model_validate_json(encode_json(result))
+
     async def get_work_status(
         self,
         work_identifier: str,
@@ -7206,6 +7271,10 @@ class ReviewApplication:
         kind = tuple(str(part) for part in work["kind"])
         state = WorkState(str(work["state"]))
         error_kind = work_error_kind(work.get("error"))
+        if state is WorkState.CANCELLED:
+            outcome = "cancelled"
+        if state in {WorkState.CANCELLED, WorkState.CANCELLING}:
+            error_kind = None
         if state is WorkState.TERMINAL_FAILURE and error_kind is None:
             error_kind = "unknown"
         if kind in {("carl", "facebook", "work", "refresh_search"), REFRESH_EBAY_SEARCH_WORK_KIND}:
@@ -7317,7 +7386,8 @@ class ReviewApplication:
             active_identifiers = tuple(
                 str(summary["identifier"])
                 for summary in child_summaries
-                if WorkState(str(summary["state"])) in {WorkState.PENDING, WorkState.LEASED}
+                if WorkState(str(summary["state"]))
+                in {WorkState.PENDING, WorkState.LEASED, WorkState.CANCELLING}
             )
             failed = tuple(
                 summary
@@ -7422,6 +7492,11 @@ class ReviewApplication:
                     ),
                 )
                 if include_details
+                else None
+            ),
+            cancellation=(
+                WorkCancellationSummary.model_validate(work["cancellation"])
+                if isinstance(work.get("cancellation"), dict)
                 else None
             ),
         )

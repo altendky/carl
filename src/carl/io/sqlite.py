@@ -143,6 +143,7 @@ from carl.core.work import (
     SchedulingSubjectKind,
     SlidingWindowRateConstraint,
     UniformHoldoffConstraint,
+    WorkCancellationRequestedError,
     WorkCapability,
     WorkDefinition,
     WorkEventKind,
@@ -179,9 +180,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=12,
+    version=13,
 )
 
+_V12_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 12})
+_V12_SCHEMA_DEFINITION_SHA256 = "93b88a76a1bbc95d29c0cc72876560e5354da0d44250a483f9f5afe177ad2241"
 _V11_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 11})
 _V11_SCHEMA_DEFINITION_SHA256 = "599317d3a36d321c137e2e86034f10d12c8b6dcbcd772b6b8b275e25d9c8bc51"
 _V10_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 10})
@@ -369,7 +372,7 @@ CREATE TABLE IF NOT EXISTS work_items (
     payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
     deduplication_identity_json TEXT NOT NULL CHECK (json_valid(deduplication_identity_json)),
     state TEXT NOT NULL CHECK (
-        state IN ('pending', 'leased', 'completed', 'terminal_failure')
+        state IN ('pending', 'leased', 'completed', 'terminal_failure', 'cancelling', 'cancelled')
     ),
     priority INTEGER NOT NULL,
     eligible_at_utc_ns INTEGER NOT NULL CHECK (eligible_at_utc_ns >= 0),
@@ -383,10 +386,10 @@ CREATE TABLE IF NOT EXISTS work_items (
     result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
     error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json)),
     CHECK (
-        (state = 'leased' AND lease_token IS NOT NULL AND lease_owner IS NOT NULL
+        (state IN ('leased', 'cancelling') AND lease_token IS NOT NULL AND lease_owner IS NOT NULL
          AND lease_expires_at_utc_ns IS NOT NULL)
         OR
-        (state != 'leased' AND lease_token IS NULL AND lease_owner IS NULL
+        (state NOT IN ('leased', 'cancelling') AND lease_token IS NULL AND lease_owner IS NULL
          AND lease_expires_at_utc_ns IS NULL)
     )
 ) STRICT;
@@ -458,7 +461,8 @@ CREATE TABLE IF NOT EXISTS work_events (
     event_kind TEXT NOT NULL CHECK (
         event_kind IN (
             'enqueued', 'requester_attached', 'claimed', 'lease_expired',
-            'lease_renewed', 'released', 'completed', 'terminal_failure'
+            'lease_renewed', 'released', 'completed', 'terminal_failure',
+            'cancel_requested', 'cancelled'
         )
     ),
     recorded_at_utc_ns INTEGER NOT NULL CHECK (recorded_at_utc_ns >= 0),
@@ -468,6 +472,21 @@ CREATE TABLE IF NOT EXISTS work_events (
 
 CREATE INDEX IF NOT EXISTS work_events_work_item
 ON work_events(work_item_id, sequence);
+
+CREATE TABLE IF NOT EXISTS work_cancellation_requests (
+    work_item_id TEXT PRIMARY KEY REFERENCES work_items(id),
+    requested_at_utc_ns INTEGER NOT NULL CHECK (requested_at_utc_ns >= 0),
+    reason TEXT NOT NULL CHECK (length(reason) > 0),
+    caller TEXT NOT NULL CHECK (length(caller) > 0)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS work_dependencies (
+    parent_work_item_id TEXT NOT NULL REFERENCES work_items(id),
+    child_work_item_id TEXT NOT NULL REFERENCES work_items(id),
+    PRIMARY KEY (parent_work_item_id, child_work_item_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS work_dependencies_child ON work_dependencies(child_work_item_id);
 
 CREATE TABLE IF NOT EXISTS scheduling_constraints (
     identifier_parts_json TEXT PRIMARY KEY CHECK (json_valid(identifier_parts_json)),
@@ -892,6 +911,14 @@ class Database:
         }
 
     @staticmethod
+    def _v12_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V12_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "12",
+            "schema_definition_sha256": _V12_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v7_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V7_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -944,6 +971,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v12_metadata())
                 and not await cls._metadata_matches(connection, cls._v11_metadata())
                 and not await cls._metadata_matches(connection, cls._v10_metadata())
                 and not await cls._metadata_matches(connection, cls._v9_metadata())
@@ -1352,6 +1380,12 @@ class Database:
                     )
             if await self._metadata_matches(connection, self._v11_metadata()):
                 await self._migrate_saved_image_lookup(connection)
+                for key, value in self._v12_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v12_metadata()):
+                await self._migrate_work_cancellation(connection)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
@@ -1359,6 +1393,27 @@ class Database:
             if not await self._metadata_matches(connection, self._expected_metadata()):
                 raise RuntimeError("Unsupported database schema metadata")
             await self._validate_schema(connection)
+
+    async def _migrate_work_cancellation(self, connection: AsyncConnection) -> None:
+        """Rebuild mutable scheduling tables, retaining all identifiers and evidence."""
+        await connection.execute("PRAGMA defer_foreign_keys = ON")
+        for name in ("work_items", "work_events"):
+            start = _SCHEMA.index(f"CREATE TABLE IF NOT EXISTS {name} (")
+            end = _SCHEMA.index(") STRICT;", start) + len(") STRICT;")
+            definition = _SCHEMA[start:end].replace(
+                f"CREATE TABLE IF NOT EXISTS {name} (", f"CREATE TABLE {name}_new (", 1
+            )
+            await connection.execute(definition)
+            await connection.execute(f"INSERT INTO {name}_new SELECT * FROM {name}")
+            await connection.execute(f"DROP TABLE {name}")
+            await connection.execute(f"ALTER TABLE {name}_new RENAME TO {name}")
+        # Recreate indexes and the new request table from the authoritative schema.
+        await connection.execute(_SCHEMA)
+        await self._publish_work_request_dependencies(connection)
+        cursor = await connection.execute("PRAGMA foreign_key_check")
+        if await cursor.fetchone() is not None:
+            raise RuntimeError("Cancellation migration violated a foreign key")
+        await connection.execute("PRAGMA defer_foreign_keys = OFF")
 
     async def _migrate_saved_image_lookup(self, connection: AsyncConnection) -> None:
         """Derive indexed reuse keys once, without modifying retained image evidence."""
@@ -2255,10 +2310,13 @@ class Database:
                         connection, requester.identifier, track, version
                     )
             eligible_at = max(definition.not_before_utc_ns, enqueued_at_utc_ns)
+            own_eligible_at = eligible_at
+            shared_cooldown_until = 0
             if definition.kind == COLLECT_EBAY_SEARCH_WORK_KIND:
                 stack = _ebay_search_stack_identifier(definition.payload)
                 cooldowns = await self._ebay_search_stack_cooldowns(connection, enqueued_at_utc_ns)
-                eligible_at = max(eligible_at, cooldowns.get(stack, 0) if stack is not None else 0)
+                shared_cooldown_until = cooldowns.get(stack, 0) if stack is not None else 0
+                eligible_at = max(eligible_at, shared_cooldown_until)
             cursor = await connection.execute(
                 """
                 SELECT id, eligible_at_utc_ns
@@ -2321,6 +2379,7 @@ class Database:
                     if not constraint.minimum_ns <= sampled_delay <= constraint.maximum_ns:
                         raise ValueError("Sampled holdoff is outside the registered range")
                     eligible_at = max(eligible_at, enqueued_at_utc_ns + sampled_delay)
+                    own_eligible_at = max(own_eligible_at, enqueued_at_utc_ns + sampled_delay)
                 await connection.execute(
                     "UPDATE work_items SET eligible_at_utc_ns = ? WHERE id = ?",
                     (eligible_at, work_item_identifier),
@@ -2332,6 +2391,8 @@ class Database:
                         decision.model_dump(mode="json") for decision in holdoff_decisions
                     ],
                     "effective_eligible_at_utc_ns": eligible_at,
+                    "own_eligible_at_utc_ns": own_eligible_at,
+                    "shared_cooldown_until_utc_ns": shared_cooldown_until,
                 }
             else:
                 work_item_identifier = _text(row[0])
@@ -2357,6 +2418,8 @@ class Database:
                     _json(requester.context),
                 ),
             )
+            await self._publish_work_request_dependencies(connection, requester.request_identifier)
+            await self._require_requester_not_cancelled(connection, requester.request_identifier)
             await self._append_work_event(
                 connection,
                 event_identifier=event_identifier,
@@ -2430,6 +2493,8 @@ class Database:
                     _json(requester.context),
                 ),
             )
+            await self._publish_work_request_dependencies(connection, requester.request_identifier)
+            await self._require_requester_not_cancelled(connection, requester.request_identifier)
             await self._append_work_event(
                 connection,
                 event_identifier=event_identifier,
@@ -2463,6 +2528,432 @@ class Database:
                 _json(data),
             ),
         )
+
+    @staticmethod
+    async def _require_requester_not_cancelled(
+        connection: AsyncConnection, request_identifier: str
+    ) -> None:
+        cursor = await connection.execute(
+            """
+            WITH request AS (SELECT * FROM work_requests WHERE id=?), immediate(id) AS (
+                SELECT work.id FROM request JOIN work_items AS work ON work.id=request.requester_identifier
+                UNION
+                SELECT owner.work_item_id FROM request
+                JOIN objects AS object ON object.id=request.requester_identifier
+                JOIN work_operations AS owner ON owner.operation_id=object.created_by_operation_id
+                UNION
+                SELECT owner.work_item_id FROM request,json_tree(request.context_json) AS context
+                JOIN work_operations AS owner ON owner.operation_id=context.value
+                WHERE context.key IN ('operation_identifier','source_operation_identifier')
+            ), parents(id) AS (
+                SELECT id FROM immediate
+                UNION
+                SELECT context.value FROM request,json_tree(request.context_json) AS context
+                WHERE context.type='text' AND NOT EXISTS (SELECT 1 FROM immediate)
+            ) SELECT parent.id FROM parents JOIN work_items AS parent ON parent.id=parents.id
+            WHERE parent.state IN ('cancelled','cancelling') LIMIT 1
+            """,
+            (request_identifier,),
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            raise WorkCancellationRequestedError(_text(row[0]))
+
+    @staticmethod
+    async def _publish_work_request_dependencies(
+        connection: AsyncConnection,
+        request_identifier: str | None = None,
+    ) -> None:
+        predicate = "" if request_identifier is None else "WHERE id=?"
+        await connection.execute(
+            f"""
+            WITH requested AS (
+                SELECT * FROM work_requests {predicate}
+            ), edges(parent, child) AS (
+                SELECT requester_identifier, work_item_id FROM requested
+                UNION
+                SELECT owner.work_item_id, request.work_item_id
+                FROM requested AS request JOIN objects AS object ON object.id=request.requester_identifier
+                JOIN work_operations AS owner ON owner.operation_id=object.created_by_operation_id
+                UNION
+                SELECT context.value, request.work_item_id
+                FROM requested AS request, json_tree(request.context_json) AS context
+                WHERE context.type='text'
+                UNION
+                SELECT owner.work_item_id, request.work_item_id
+                FROM requested AS request, json_tree(request.context_json) AS context
+                JOIN work_operations AS owner ON owner.operation_id=context.value
+                WHERE context.type='text'
+            )
+            INSERT OR IGNORE INTO work_dependencies
+            SELECT parent,child FROM edges JOIN work_items ON work_items.id=edges.parent
+            WHERE parent!=child
+            """,
+            () if request_identifier is None else (request_identifier,),
+        )
+
+    @staticmethod
+    async def _work_descendants(
+        connection: AsyncConnection, identifiers: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Follow durable requests, operation ownership, and retained root contexts."""
+        cursor = await connection.execute(
+            """
+            WITH RECURSIVE selected(id) AS (
+                SELECT value FROM json_each(?)
+                UNION
+                SELECT edges.child_work_item_id FROM work_dependencies AS edges
+                JOIN selected ON edges.parent_work_item_id=selected.id
+            )
+            SELECT work.id FROM selected JOIN work_items AS work ON work.id=selected.id
+            ORDER BY work.created_at_utc_ns, work.id
+            """,
+            (_json(list(identifiers)),),
+        )
+        return tuple(_text(row[0]) for row in await cursor.fetchall())
+
+    @staticmethod
+    async def _workspace_work_identifiers(
+        connection: AsyncConnection, workspace_record_identifier: str
+    ) -> tuple[str, ...]:
+        cursor = await connection.execute(
+            """
+            SELECT DISTINCT work_item_id FROM work_requests WHERE requester_identifier=?
+            UNION
+            SELECT json_extract(execution.value_json, '$.work_identifier')
+            FROM records AS execution JOIN objects AS object ON object.id=execution.object_id
+            WHERE object.kind_parts_json='["carl","marketplace","search_execution"]'
+              AND json_extract(execution.value_json, '$.search_record_identifier') = (
+                  SELECT json_extract(workspace.value_json, '$.search_run_record_identifier')
+                  FROM records AS workspace WHERE workspace.object_id=?
+              )
+            """,
+            (workspace_record_identifier, workspace_record_identifier),
+        )
+        return tuple(_text(row[0]) for row in await cursor.fetchall() if row[0] is not None)
+
+    async def _cancel_work_identifiers(
+        self,
+        connection: AsyncConnection,
+        identifiers: Sequence[str],
+        *,
+        reason: str,
+        caller: str,
+        requested_at_utc_ns: int,
+    ) -> dict[str, JsonValue]:
+        if not reason.strip() or not caller.strip() or requested_at_utc_ns < 0:
+            raise ValueError("Cancellation requires a reason, caller, and nonnegative time")
+        cancelled: list[JsonValue] = []
+        cancelling: list[JsonValue] = []
+        terminal: list[JsonValue] = []
+        changed = False
+        for identifier in identifiers:
+            cursor = await connection.execute(
+                "SELECT state FROM work_items WHERE id=?", (identifier,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(identifier)
+            state = _text(row[0])
+            if state in ("completed", "terminal_failure", "cancelled"):
+                terminal.append(identifier)
+                continue
+            if state == "cancelling":
+                cancelling.append(identifier)
+                continue
+            data: JsonValue = {"reason": reason, "caller": caller}
+            changed = True
+            await connection.execute(
+                "INSERT INTO work_cancellation_requests VALUES (?, ?, ?, ?)",
+                (identifier, requested_at_utc_ns, reason, caller),
+            )
+            await self._append_work_event(
+                connection,
+                event_identifier=str(uuid4()),
+                work_item_identifier=identifier,
+                event_kind=WorkEventKind.CANCEL_REQUESTED,
+                recorded_at_utc_ns=requested_at_utc_ns,
+                data=data,
+            )
+            if state == "pending":
+                await connection.execute(
+                    "UPDATE work_items SET state='cancelled',error_json=NULL WHERE id=?",
+                    (identifier,),
+                )
+                await self._append_work_event(
+                    connection,
+                    event_identifier=str(uuid4()),
+                    work_item_identifier=identifier,
+                    event_kind=WorkEventKind.CANCELLED,
+                    recorded_at_utc_ns=requested_at_utc_ns,
+                    data=data,
+                )
+                cancelled.append(identifier)
+            else:
+                await connection.execute(
+                    "UPDATE work_items SET state='cancelling',error_json=NULL WHERE id=?",
+                    (identifier,),
+                )
+                cancelling.append(identifier)
+        if changed:
+            await self._clear_cancelled_cooldowns(connection, requested_at_utc_ns)
+        return {
+            "cancelled_pending": len(cancelled),
+            "cancelling_leased": len(cancelling),
+            "already_terminal": len(terminal),
+            "cancelled_pending_identifiers": cancelled,
+            "cancelling_leased_identifiers": cancelling,
+            "already_terminal_identifiers": terminal,
+        }
+
+    async def cancel_work(
+        self,
+        work_item_identifier: str,
+        *,
+        reason: str,
+        caller: str,
+        requested_at_utc_ns: int,
+        include_descendants: bool = True,
+    ) -> dict[str, JsonValue]:
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                "SELECT state FROM work_items WHERE id=?", (work_item_identifier,)
+            )
+            root = await cursor.fetchone()
+            if root is None:
+                raise KeyError(work_item_identifier)
+            identifiers = (
+                await self._work_descendants(connection, (work_item_identifier,))
+                if include_descendants and root[0] in ("pending", "leased", "cancelling")
+                else (work_item_identifier,)
+            )
+            return await self._cancel_work_identifiers(
+                connection,
+                identifiers,
+                reason=reason,
+                caller=caller,
+                requested_at_utc_ns=requested_at_utc_ns,
+            )
+
+    async def cancel_workspace_work(
+        self,
+        workspace_record_identifier: str,
+        *,
+        reason: str,
+        caller: str,
+        requested_at_utc_ns: int,
+    ) -> dict[str, JsonValue]:
+        async with self._connections.writer() as connection:
+            roots = await self._workspace_work_identifiers(connection, workspace_record_identifier)
+            cursor = await connection.execute(
+                "SELECT id,state FROM work_items WHERE id IN (SELECT value FROM json_each(?))",
+                (_json(list(roots)),),
+            )
+            rows = await cursor.fetchall()
+            active = tuple(
+                _text(row[0]) for row in rows if row[1] in ("pending", "leased", "cancelling")
+            )
+            terminal = tuple(
+                _text(row[0]) for row in rows if row[1] not in ("pending", "leased", "cancelling")
+            )
+            descendants = await self._work_descendants(connection, active)
+            identifiers = (*descendants, *terminal)
+            return await self._cancel_work_identifiers(
+                connection,
+                identifiers,
+                reason=reason,
+                caller=caller,
+                requested_at_utc_ns=requested_at_utc_ns,
+            )
+
+    async def cancel_all_work(
+        self,
+        *,
+        reason: str,
+        caller: str,
+        requested_at_utc_ns: int,
+    ) -> dict[str, JsonValue]:
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                "SELECT id FROM work_items WHERE state IN ('pending','leased','cancelling') ORDER BY created_at_utc_ns,id"
+            )
+            identifiers = tuple(_text(row[0]) for row in await cursor.fetchall())
+            return await self._cancel_work_identifiers(
+                connection,
+                identifiers,
+                reason=reason,
+                caller=caller,
+                requested_at_utc_ns=requested_at_utc_ns,
+            )
+
+    async def work_cancellation_requested(self, work_item_identifier: str) -> bool:
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT 1 FROM work_cancellation_requests WHERE work_item_id=?",
+                (work_item_identifier,),
+            )
+            return await cursor.fetchone() is not None
+
+    async def finalize_cancelled_work(
+        self,
+        *,
+        work_item_identifier: str,
+        lease_token: str,
+        worker_identifier: str,
+        operation_id: str | None,
+        utc_now_ns: Callable[[], int],
+        event_identifier: str,
+        ended_at_utc: str,
+        duration_ns: int,
+        records: Sequence[RecordDraft] = (),
+        artifacts: Sequence[ArtifactDraft] = (),
+        outputs: Sequence[NamedOutput] = (),
+        inputs: Sequence[NamedInput] = (),
+    ) -> bool:
+        """Acknowledge cancellation, preserving already committed evidence/checkpoints."""
+        async with self._connections.writer() as connection:
+            now = utc_now_ns()
+            cursor = await connection.execute(
+                "SELECT state,lease_token,lease_owner FROM work_items WHERE id=?",
+                (work_item_identifier,),
+            )
+            row = await cursor.fetchone()
+            if row is None or tuple(row) != ("cancelling", lease_token, worker_identifier):
+                return False
+            if operation_id is not None:
+                cursor = await connection.execute(
+                    "SELECT operation.state FROM operations AS operation JOIN work_operations AS owner ON owner.operation_id=operation.id WHERE operation.id=? AND owner.work_item_id=? AND owner.lease_token=? AND owner.worker_identifier=?",
+                    (operation_id, work_item_identifier, lease_token, worker_identifier),
+                )
+                operation = await cursor.fetchone()
+                if operation is not None and operation[0] == "started":
+                    if inputs:
+                        await connection.executemany(
+                            "INSERT OR IGNORE INTO operation_inputs VALUES (?, ?, ?)",
+                            (
+                                (operation_id, _json(list(item.name)), item.object_identifier)
+                                for item in inputs
+                            ),
+                        )
+                    await self._publish_operation_objects(
+                        connection,
+                        operation_id=operation_id,
+                        records=records,
+                        artifacts=artifacts,
+                        outputs=outputs,
+                    )
+                    await connection.execute(
+                        "UPDATE operations SET state='completed', ended_at_utc=?, duration_ns=?, result_json=?,error_json=NULL WHERE id=?",
+                        (ended_at_utc, duration_ns, _json({"state": "cancelled"}), operation_id),
+                    )
+                cursor = await connection.execute(
+                    "SELECT id FROM network_activities WHERE operation_id=? AND state IN ('pending','admitted')",
+                    (operation_id,),
+                )
+                for activity in await cursor.fetchall():
+                    await connection.execute(
+                        "UPDATE network_activities SET state='cancelled',admission_token=NULL,permit_expires_at_utc_ns=NULL,ended_at_utc_ns=?,result_json=? WHERE id=?",
+                        (now, _json({"kind": "work_cancelled"}), activity[0]),
+                    )
+                    await self._append_network_activity_event(
+                        connection,
+                        event_identifier=str(uuid4()),
+                        network_activity_identifier=_text(activity[0]),
+                        event_kind=NetworkActivityEventKind.CANCELLED,
+                        recorded_at_utc_ns=now,
+                        data={"kind": "work_cancelled"},
+                    )
+            await connection.execute(
+                "UPDATE work_items SET state='cancelled',lease_token=NULL,lease_owner=NULL,lease_expires_at_utc_ns=NULL WHERE id=?",
+                (work_item_identifier,),
+            )
+            cursor = await connection.execute(
+                "SELECT reason,caller FROM work_cancellation_requests WHERE work_item_id=?",
+                (work_item_identifier,),
+            )
+            request = await cursor.fetchone()
+            assert request is not None
+            await self._append_work_event(
+                connection,
+                event_identifier=event_identifier,
+                work_item_identifier=work_item_identifier,
+                event_kind=WorkEventKind.CANCELLED,
+                recorded_at_utc_ns=now,
+                data={"reason": _text(request[0]), "caller": _text(request[1])},
+            )
+            return True
+
+    async def has_cancelled_work_dependencies(self, work_item_identifier: str) -> bool:
+        async with self._connections.reader() as connection:
+            return await self._has_cancelled_work_dependencies(connection, work_item_identifier)
+
+    @staticmethod
+    async def _has_cancelled_work_dependencies(
+        connection: AsyncConnection, work_item_identifier: str
+    ) -> bool:
+        cursor = await connection.execute(
+            """
+            WITH RECURSIVE descendants(id) AS (
+                SELECT child_work_item_id FROM work_dependencies WHERE parent_work_item_id=?
+                UNION
+                SELECT dependency.child_work_item_id FROM work_dependencies AS dependency
+                JOIN descendants ON dependency.parent_work_item_id=descendants.id
+            ) SELECT 1 FROM descendants JOIN work_items AS work ON work.id=descendants.id
+              WHERE work.state IN ('cancelled','cancelling') LIMIT 1
+            """,
+            (work_item_identifier,),
+        )
+        return await cursor.fetchone() is not None
+
+    async def _clear_cancelled_cooldowns(
+        self, connection: AsyncConnection, now_utc_ns: int
+    ) -> None:
+        # Restore only deadlines whose current value came from a cancelled source.
+        cursor = await connection.execute(
+            """
+            SELECT work.id, work.payload_json, work.created_at_utc_ns, event.sequence,
+                   NULL
+            FROM work_items AS work JOIN work_events AS event ON event.work_item_id=work.id
+            JOIN work_items AS source ON source.id=json_extract(event.data_json,'$.reason.source_work_identifier')
+            WHERE work.state='pending' AND source.state IN ('cancelled','cancelling')
+              AND json_extract(event.data_json,'$.reason.kind')='ebay_search_shared_cooldown'
+              AND work.eligible_at_utc_ns<=json_extract(event.data_json,'$.eligible_at_utc_ns')
+            UNION
+            SELECT work.id, work.payload_json, work.created_at_utc_ns, event.sequence,
+                   json_extract(event.data_json,'$.own_eligible_at_utc_ns')
+            FROM work_items AS work JOIN work_events AS event ON event.work_item_id=work.id
+            WHERE work.state='pending'
+              AND json_extract(event.data_json,'$.shared_cooldown_until_utc_ns')>0
+              AND work.eligible_at_utc_ns<=json_extract(event.data_json,'$.shared_cooldown_until_utc_ns')
+              AND EXISTS (
+                SELECT 1 FROM work_items AS source JOIN work_events AS failure ON failure.work_item_id=source.id
+                WHERE source.state IN ('cancelled','cancelling')
+                  AND coalesce(json_extract(failure.data_json,'$.reason.cooldown.until_utc_ns'),json_extract(failure.data_json,'$.error.cooldown.until_utc_ns'))=json_extract(event.data_json,'$.shared_cooldown_until_utc_ns')
+                  AND coalesce(json_extract(failure.data_json,'$.reason.cooldown.stack_identifier'),json_extract(failure.data_json,'$.error.cooldown.stack_identifier'))=coalesce(json_extract(work.payload_json,'$.request.stack_identifier'),'ebay_anonymous')
+              )
+            """
+        )
+        cooldowns = await self._ebay_search_stack_cooldowns(connection, now_utc_ns)
+        for row in await cursor.fetchall():
+            previous = await connection.execute(
+                "SELECT max(coalesce(json_extract(data_json,'$.effective_eligible_at_utc_ns'),json_extract(data_json,'$.eligible_at_utc_ns'))) FROM work_events WHERE work_item_id=? AND sequence<? AND coalesce(json_extract(data_json,'$.reason.kind'),'')!='ebay_search_shared_cooldown'",
+                (row[0], row[3]),
+            )
+            prior = await previous.fetchone()
+            baseline = (
+                _integer(row[4])
+                if row[4] is not None
+                else _integer(row[2])
+                if prior is None or prior[0] is None
+                else _integer(prior[0])
+            )
+            stack = _ebay_search_stack_identifier(decode_json(_text(row[1])))
+            eligible = max(
+                now_utc_ns, baseline, cooldowns.get(stack, 0) if stack is not None else 0
+            )
+            await connection.execute(
+                "UPDATE work_items SET eligible_at_utc_ns=? WHERE id=?", (eligible, row[0])
+            )
 
     async def _recover_expired_work_attempt(
         self,
@@ -2573,7 +3064,7 @@ class Database:
                     JOIN work_scopes ON work_scopes.work_item_id = work_items.id
                     WHERE work_scopes.scope_kind = ?
                       AND work_scopes.scope_identity_json = ?
-                      AND work_items.state = 'leased'
+                      AND work_items.state IN ('leased','cancelling')
                       AND work_items.lease_expires_at_utc_ns > ?
                     """,
                     (
@@ -2647,6 +3138,26 @@ class Database:
         )
         async with self._connections.writer() as connection:
             now_utc_ns = utc_now_ns()
+            expired = await connection.execute(
+                "SELECT id,lease_token,lease_owner FROM work_items WHERE state='cancelling' AND lease_expires_at_utc_ns<=?",
+                (now_utc_ns,),
+            )
+            for cancelled in await expired.fetchall():
+                operation_cursor = await connection.execute(
+                    "SELECT operation_id FROM work_operations WHERE work_item_id=? ORDER BY attempt DESC LIMIT 1",
+                    (cancelled[0],),
+                )
+                operation = await operation_cursor.fetchone()
+                await self.finalize_cancelled_work(
+                    work_item_identifier=_text(cancelled[0]),
+                    lease_token=_text(cancelled[1]),
+                    worker_identifier=_text(cancelled[2]),
+                    operation_id=None if operation is None else _text(operation[0]),
+                    utc_now_ns=lambda: now_utc_ns,
+                    event_identifier=str(uuid4()),
+                    ended_at_utc=_utc_text_from_ns(now_utc_ns),
+                    duration_ns=0,
+                )
             ebay_cooldowns = (
                 await self._ebay_search_stack_cooldowns(connection, now_utc_ns)
                 if any(
@@ -2954,12 +3465,24 @@ class Database:
             latest_event = await event_cursor.fetchone()
             if latest_event is None:
                 raise ValueError("Durable work has no event history")
+            cursor = await connection.execute(
+                "SELECT requested_at_utc_ns,reason,caller FROM work_cancellation_requests WHERE work_item_id=?",
+                (work_item_identifier,),
+            )
+            cancellation = await cursor.fetchone()
         return {
             "identifier": work_item_identifier,
             "kind": decode_json(_text(row[0])),
             "payload_schema_version": _integer(row[1]),
             "payload": decode_json(_text(row[2])),
             "state": _text(row[3]),
+            "cancellation": None
+            if cancellation is None
+            else {
+                "requested_at_utc_ns": _integer(cancellation[0]),
+                "reason": _text(cancellation[1]),
+                "caller": _text(cancellation[2]),
+            },
             "attempt": _integer(row[4]),
             "result": None if row[5] is None else decode_json(_text(row[5])),
             "error": None if row[6] is None else decode_json(_text(row[6])),
@@ -3077,7 +3600,7 @@ class Database:
                 FROM work_events AS event
                 JOIN work_items AS work ON work.id = event.work_item_id
                 WHERE event.recorded_at_utc_ns >= ?
-                  AND event.event_kind IN ('completed', 'terminal_failure')
+                  AND event.event_kind IN ('completed', 'terminal_failure', 'cancelled')
                 GROUP BY work.kind_parts_json, event.event_kind
                 ORDER BY work.kind_parts_json, event.event_kind
                 """,
@@ -3090,7 +3613,7 @@ class Database:
                        eligible_at_utc_ns, lease_expires_at_utc_ns, lease_owner,
                        payload_json, result_json, error_json
                 FROM work_items
-                WHERE state IN ('pending', 'leased')
+                WHERE state IN ('pending', 'leased', 'cancelling')
                 ORDER BY state = 'leased' DESC, priority DESC, created_at_utc_ns, id
                 LIMIT ?
                 """,
@@ -3105,7 +3628,7 @@ class Database:
                        event.recorded_at_utc_ns
                 FROM work_events AS event
                 JOIN work_items AS work ON work.id = event.work_item_id
-                WHERE event.event_kind IN ('completed', 'terminal_failure')
+                WHERE event.event_kind IN ('completed', 'terminal_failure', 'cancelled')
                   AND event.recorded_at_utc_ns >= ?
                 ORDER BY event.sequence DESC
                 LIMIT ?
@@ -3191,6 +3714,9 @@ class Database:
                 pending=counts.get(WorkState.PENDING, 0),
                 leased=counts.get(WorkState.LEASED, 0),
                 completed=counts.get(WorkState.COMPLETED, 0),
+                cancelling=counts.get(WorkState.CANCELLING, 0),
+                cancelled=counts.get(WorkState.CANCELLED, 0),
+                recent_cancelled=recent_work_counts.get(kind, {}).get(WorkState.CANCELLED, 0),
                 terminal_failure=counts.get(WorkState.TERMINAL_FAILURE, 0),
                 recent_completed=recent_work_counts.get(kind, {}).get(WorkState.COMPLETED, 0),
                 recent_terminal_failure=recent_work_counts.get(kind, {}).get(
@@ -3408,11 +3934,11 @@ class Database:
                 )
                 SELECT
                     count(*) FILTER (WHERE work.state = 'pending'),
-                    count(*) FILTER (WHERE work.state = 'leased'),
+                    count(*) FILTER (WHERE work.state IN ('leased','cancelling')),
                     count(*) FILTER (WHERE work.state = 'terminal_failure')
                 FROM requested
                 JOIN work_items AS work ON work.id = requested.work_item_id
-                WHERE work.state IN ('pending', 'leased', 'terminal_failure')
+                WHERE work.state IN ('pending', 'leased', 'cancelling', 'terminal_failure')
                 """,
                 (workspace_record_identifier, workspace_record_identifier),
             )
@@ -3438,7 +3964,7 @@ class Database:
                        work.payload_json, work.result_json, work.error_json
                 FROM requested
                 JOIN work_items AS work ON work.id = requested.work_item_id
-                WHERE work.state IN ('pending', 'leased')
+                WHERE work.state IN ('pending', 'leased', 'cancelling')
                 ORDER BY work.state = 'leased' DESC, work.priority DESC,
                          work.created_at_utc_ns, work.id
                 LIMIT ?
@@ -3519,6 +4045,62 @@ class Database:
             terminal_failure_count,
             tuple(activity_from_row(row) for row in rows),
             tuple(activity_from_row(row) for row in failure_rows),
+        )
+
+    async def workspace_cancellation_status(
+        self,
+        *,
+        workspace_record_identifier: str,
+        maximum_rows: int,
+    ) -> tuple[int, int, tuple[WorkActivity, ...]]:
+        if maximum_rows < 1:
+            raise ValueError("Workspace cancellation limit must be positive")
+        async with self._connections.reader() as connection:
+            identifiers = await self._workspace_work_identifiers(
+                connection, workspace_record_identifier
+            )
+            scope = _json(list(identifiers))
+            cursor = await connection.execute(
+                "SELECT count(*) FILTER (WHERE state='cancelling'),count(*) FILTER (WHERE state='cancelled') FROM work_items WHERE id IN (SELECT value FROM json_each(?))",
+                (scope,),
+            )
+            counts = await cursor.fetchone()
+            assert counts is not None
+            cursor = await connection.execute(
+                """
+                SELECT work.id,work.kind_parts_json,work.attempt,work.created_at_utc_ns,
+                       work.eligible_at_utc_ns,work.payload_json,work.result_json,
+                       (SELECT max(recorded_at_utc_ns) FROM work_events WHERE work_item_id=work.id AND event_kind='cancelled')
+                FROM work_items AS work WHERE work.state='cancelled'
+                  AND work.id IN (SELECT value FROM json_each(?))
+                ORDER BY 8 DESC,work.id LIMIT ?
+                """,
+                (scope, maximum_rows),
+            )
+            rows = await cursor.fetchall()
+        return (
+            _integer(counts[0]),
+            _integer(counts[1]),
+            tuple(
+                WorkActivity(
+                    identifier=_text(row[0]),
+                    kind=tuple(str(part) for part in decode_json(_text(row[1]))),
+                    state=WorkState.CANCELLED,
+                    attempt=_integer(row[2]),
+                    created_at_utc_ns=_integer(row[3]),
+                    eligible_at_utc_ns=_integer(row[4]),
+                    lease_expires_at_utc_ns=None,
+                    worker_identifier=None,
+                    subject=work_subject(
+                        tuple(str(part) for part in decode_json(_text(row[1]))),
+                        decode_json(_text(row[5])),
+                    ),
+                    stage=work_stage(None if row[6] is None else decode_json(_text(row[6]))),
+                    error_kind=None,
+                    terminal_at_utc_ns=None if row[7] is None else _integer(row[7]),
+                )
+                for row in rows
+            ),
         )
 
     async def workspace_partial_failure_count(self, workspace_record_identifier: str) -> int:
@@ -3846,6 +4428,7 @@ class Database:
                                 json_extract(event.data_json,'$.error.cooldown.until_utc_ns')) until_ns
                 FROM work_items AS work JOIN work_events AS event ON event.work_item_id=work.id
                 WHERE work.kind_parts_json=? AND event.event_kind IN ('released','terminal_failure')
+                  AND work.state NOT IN ('cancelled','cancelling')
             ) SELECT stack,MAX(until_ns) FROM cooldowns
               WHERE typeof(stack)='text' AND typeof(until_ns)='integer' AND until_ns>?
               GROUP BY stack
@@ -4043,7 +4626,7 @@ class Database:
                            SELECT max(event.sequence)
                            FROM work_events AS event
                            WHERE event.work_item_id = work.id
-                             AND event.event_kind IN ('completed', 'terminal_failure')
+                             AND event.event_kind IN ('completed', 'terminal_failure', 'cancel_requested', 'cancelled')
                        )
                 FROM json_each(?) AS requested
                 JOIN work_items AS work ON work.id = requested.value
@@ -4285,6 +4868,12 @@ class Database:
         worker_identifier: str,
         now_utc_ns: int,
     ) -> tuple[int, int]:
+        cancellation = await connection.execute(
+            "SELECT 1 FROM work_items WHERE id=? AND state='cancelling' AND lease_token=? AND lease_owner=?",
+            (work_item_identifier, lease_token, worker_identifier),
+        )
+        if await cancellation.fetchone() is not None:
+            raise WorkCancellationRequestedError(work_item_identifier)
         cursor = await connection.execute(
             """
             SELECT attempt, lease_expires_at_utc_ns
@@ -4297,6 +4886,8 @@ class Database:
         row = await cursor.fetchone()
         if row is None:
             raise LeaseLostError("The work lease is missing, expired, or owned by another worker")
+        if await self._has_cancelled_work_dependencies(connection, work_item_identifier):
+            raise WorkCancellationRequestedError(work_item_identifier)
         return _integer(row[0]), _integer(row[1])
 
     async def try_admit_facebook_search_route(
@@ -4348,7 +4939,7 @@ class Database:
                     JOIN work_scopes ON work_scopes.work_item_id = work_items.id
                     WHERE work_scopes.scope_kind = 'network_path'
                       AND work_scopes.scope_identity_json = ?
-                      AND work_items.id != ? AND work_items.state = 'leased'
+                      AND work_items.id != ? AND work_items.state IN ('leased','cancelling')
                       AND work_items.lease_expires_at_utc_ns > ?
                     """,
                     (scope_json, work_item_identifier, now_utc_ns),
@@ -4478,6 +5069,10 @@ class Database:
         ended_at_utc: str,
         duration_ns: int,
         possibly_dispatched: bool,
+        inputs: Sequence[NamedInput] = (),
+        records: Sequence[RecordDraft] = (),
+        artifacts: Sequence[ArtifactDraft] = (),
+        outputs: Sequence[NamedOutput] = (),
     ) -> bool:
         """Reconcile interruption atomically; committed outcomes and replacement leases win.
 
@@ -4487,6 +5082,49 @@ class Database:
 
         async with self._connections.writer() as connection:
             now_utc_ns = utc_now_ns()
+            cursor = await connection.execute(
+                "SELECT state,lease_token,lease_owner FROM work_items WHERE id=?",
+                (work_item_identifier,),
+            )
+            current = await cursor.fetchone()
+            owns_lease = current is not None and tuple(current[1:]) == (
+                lease_token,
+                worker_identifier,
+            )
+            if (
+                owns_lease
+                and current is not None
+                and (
+                    current[0] == "cancelling"
+                    or (
+                        current[0] == "leased"
+                        and await self._has_cancelled_work_dependencies(
+                            connection, work_item_identifier
+                        )
+                    )
+                )
+            ):
+                if current[0] == "leased":
+                    await self.cancel_work(
+                        work_item_identifier,
+                        reason="child_cancelled",
+                        caller=f"worker:{worker_identifier}",
+                        requested_at_utc_ns=now_utc_ns,
+                    )
+                return await self.finalize_cancelled_work(
+                    work_item_identifier=work_item_identifier,
+                    lease_token=lease_token,
+                    worker_identifier=worker_identifier,
+                    operation_id=operation_id,
+                    utc_now_ns=lambda: now_utc_ns,
+                    event_identifier=event_identifier,
+                    ended_at_utc=ended_at_utc,
+                    duration_ns=duration_ns,
+                    inputs=inputs,
+                    records=records,
+                    artifacts=artifacts,
+                    outputs=outputs,
+                )
             cursor = await connection.execute(
                 """
                 SELECT operations.state, work_operations.work_item_id,

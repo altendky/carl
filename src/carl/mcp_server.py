@@ -134,6 +134,7 @@ from carl.core.review_workspace import (
     WorkspaceWorkWaitResult,
 )
 from carl.core.tool_response_pages import ToolResponseReadResult
+from carl.core.work_cancellation import WorkCancellationResult
 from carl.core.workspace_search_results import (
     ListWorkspaceSearchResultsRequest,
     WorkspaceSearchResultsPage,
@@ -224,6 +225,13 @@ Diagnose with get_server_info. Discover queued, active, and recent work and ever
 this database open using get_activity_snapshot, then pass an exact full identifier to
 get_work_status for compact progress. Request full details only when raw payload, checkpoint result,
 error, or operation history is needed.
+Use cancel_work with an exact root, cancel_workspace_work for a workspace, or cancel_all_work
+with confirm=true to stop queued and running work. Supply the user's reason. Pending items stop
+immediately without a worker; running items show cancelling until a cooperative stop, then cancelled.
+Cancellation retains evidence/checkpoints and is not a failure. Terminal items are unchanged.
+Descendants are included by default; shared child cancellation can also cancel parents that depend
+on that child. Requeue cancelled refreshes normally with request_workspace_refresh. Large cancellation
+ID lists use get_tool_response_page; retain all fragments before acknowledging the final page.
 On transport failure Carl probes basic Internet reachability directly (DNS/TCP, no paid proxy
 request). An outage pauses marketplace acquisition across worker processes, probes every 30 seconds,
 and defers jobs without spending their retry budgets; offline extraction continues. Inspect
@@ -1136,6 +1144,35 @@ def tool_definitions(
 
         return await expected(lambda: application.retry_image_failures(request))
 
+    async def cancel_work(
+        work_identifier: str,
+        reason: Annotated[str, Field(min_length=1, max_length=2000)],
+        include_descendants: bool = True,
+    ) -> WorkCancellationResult:
+        """Cancel an exact root and, by default, its descendants. Running work stops cooperatively; evidence and checkpoints remain. Large ID results continue with get_tool_response_page."""
+
+        return await expected(
+            lambda: application.cancel_work(work_identifier, reason, include_descendants)
+        )
+
+    async def cancel_workspace_work(
+        workspace_record_identifier: str,
+        reason: Annotated[str, Field(min_length=1, max_length=2000)],
+    ) -> WorkCancellationResult:
+        """Cancel all pending/running workspace roots and their descendants, even without workers. Large ID results continue with get_tool_response_page."""
+
+        return await expected(
+            lambda: application.cancel_workspace_work(workspace_record_identifier, reason)
+        )
+
+    async def cancel_all_work(
+        reason: Annotated[str, Field(min_length=1, max_length=2000)],
+        confirm: bool = False,
+    ) -> WorkCancellationResult:
+        """Stop every pending/running work item. Requires explicit confirm=true. Large ID results continue with get_tool_response_page."""
+
+        return await expected(lambda: application.cancel_all_work(reason, confirm))
+
     async def get_work_status(
         work_identifier: str,
         include_details: bool = False,
@@ -1145,6 +1182,27 @@ def tool_definitions(
         return await expected(lambda: application.get_work_status(work_identifier, include_details))
 
     definitions = (
+        ToolDefinition(
+            "cancel_work",
+            ("carl", "work", "cancel"),
+            cancel_work,
+            cancel_work.__doc__ or "",
+            _IDEMPOTENT_LOCAL_MUTATION,
+        ),
+        ToolDefinition(
+            "cancel_workspace_work",
+            ("carl", "work", "cancel_workspace"),
+            cancel_workspace_work,
+            cancel_workspace_work.__doc__ or "",
+            _IDEMPOTENT_LOCAL_MUTATION,
+        ),
+        ToolDefinition(
+            "cancel_all_work",
+            ("carl", "work", "cancel_all"),
+            cancel_all_work,
+            cancel_all_work.__doc__ or "",
+            _IDEMPOTENT_LOCAL_MUTATION,
+        ),
         ToolDefinition(
             "get_review_batch_item",
             ("carl", "review", "get_batch_item"),

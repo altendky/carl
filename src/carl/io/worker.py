@@ -14,7 +14,7 @@ from carl.core.components import Component
 from carl.core.connectivity import connectivity_failure, network_work_kind
 from carl.core.json import encode_json
 from carl.core.models import CodeProvenance, JsonValue, StrictModel
-from carl.core.work import WorkCapability, WorkLease
+from carl.core.work import WorkCancellationRequestedError, WorkCapability, WorkLease
 from carl.core.worker import (
     AttemptContext,
     CompletedWork,
@@ -151,8 +151,38 @@ async def _finalize_interrupted_lease(
     reason: str,
     possibly_dispatched: bool,
     primary_error: BaseException | None,
+    outcome: WorkOutcome | None = None,
 ) -> None:
     async with shielded_cleanup("interrupted_work", primary_error=primary_error):
+        if not await database.work_cancellation_requested(
+            lease.work_item_identifier
+        ) and await database.has_cancelled_work_dependencies(lease.work_item_identifier):
+            # A descendant may have been cancelled after the runtime's last
+            # read. The atomic lease guard rejects the ensuing write without
+            # mutating its rolled-back transaction; request this parent's
+            # cancellation here before acknowledging its interrupted attempt.
+            await database.cancel_work(
+                lease.work_item_identifier,
+                reason="child_cancelled",
+                caller=f"worker:{lease.worker_identifier}",
+                requested_at_utc_ns=services.utc_now_ns(),
+            )
+        if await database.work_cancellation_requested(lease.work_item_identifier):
+            await database.finalize_cancelled_work(
+                work_item_identifier=lease.work_item_identifier,
+                lease_token=lease.token,
+                worker_identifier=lease.worker_identifier,
+                operation_id=operation_identifier,
+                utc_now_ns=services.utc_now_ns,
+                event_identifier=services.new_identifier(),
+                ended_at_utc=_utc_text(services.utc_now_ns()),
+                duration_ns=max(0, services.monotonic_ns() - started_monotonic_ns),
+                inputs=outcome.inputs if outcome is not None else (),
+                records=outcome.records if outcome is not None else (),
+                artifacts=outcome.artifacts if outcome is not None else (),
+                outputs=outcome.outputs if outcome is not None else (),
+            )
+            return
         await database.finalize_interrupted_work(
             work_item_identifier=lease.work_item_identifier,
             lease_token=lease.token,
@@ -164,6 +194,10 @@ async def _finalize_interrupted_lease(
             ended_at_utc=_utc_text(services.utc_now_ns()),
             duration_ns=max(0, services.monotonic_ns() - started_monotonic_ns),
             possibly_dispatched=possibly_dispatched,
+            inputs=outcome.inputs if outcome is not None else (),
+            records=outcome.records if outcome is not None else (),
+            artifacts=outcome.artifacts if outcome is not None else (),
+            outputs=outcome.outputs if outcome is not None else (),
         )
 
 
@@ -180,6 +214,17 @@ async def execute_lease(
     started_monotonic_ns = services.monotonic_ns()
     stop_renewal = anyio.Event()
     lease_lost = anyio.Event()
+    cancellation_requested = anyio.Event()
+
+    async def check_dependencies() -> None:
+        if await database.has_cancelled_work_dependencies(lease.work_item_identifier):
+            await database.cancel_work(
+                lease.work_item_identifier,
+                reason="child_cancelled",
+                caller=f"worker:{lease.worker_identifier}",
+                requested_at_utc_ns=services.utc_now_ns(),
+            )
+            raise WorkCancellationRequestedError(lease.work_item_identifier)
 
     async def renew(attempt_scope: anyio.CancelScope) -> None:
         while True:
@@ -188,6 +233,7 @@ async def execute_lease(
             if stop_renewal.is_set():
                 return
             try:
+                await check_dependencies()
                 await database.renew_lease(
                     work_item_identifier=lease.work_item_identifier,
                     lease_token=lease.token,
@@ -196,6 +242,10 @@ async def execute_lease(
                     utc_now_ns=services.utc_now_ns,
                     event_identifier=services.new_identifier(),
                 )
+            except WorkCancellationRequestedError:
+                cancellation_requested.set()
+                attempt_scope.cancel("durable work cancellation was requested")
+                return
             except LeaseLostError:
                 lease_lost.set()
                 attempt_scope.cancel("durable work lease was lost")
@@ -204,6 +254,7 @@ async def execute_lease(
     outcome: WorkOutcome | None = None
     possibly_dispatched = False
     try:
+        await check_dependencies()
         handler = registry.require(lease)
         outage_attempts, retry_budget_start_attempt = await work_retry_budget(
             database, lease.work_item_identifier
@@ -274,6 +325,9 @@ async def execute_lease(
                                         "failure": outcome.result,
                                     },
                                 )
+                    except WorkCancellationRequestedError:
+                        cancellation_requested.set()
+                        attempt_scope.cancel("durable work cancellation was requested")
                     except anyio.get_cancelled_exc_class():
                         raise
                     except Exception as error:
@@ -293,6 +347,19 @@ async def execute_lease(
                         )
                 finally:
                     stop_renewal.set()
+        if cancellation_requested.is_set():
+            await _finalize_interrupted_lease(
+                database=database,
+                lease=lease,
+                operation_identifier=operation_identifier,
+                services=services,
+                started_monotonic_ns=started_monotonic_ns,
+                reason="cancelled",
+                possibly_dispatched=possibly_dispatched,
+                primary_error=None,
+                outcome=outcome,
+            )
+            return
         if lease_lost.is_set():
             await _finalize_interrupted_lease(
                 database=database,
@@ -303,10 +370,13 @@ async def execute_lease(
                 reason="lease_lost",
                 possibly_dispatched=possibly_dispatched,
                 primary_error=None,
+                outcome=outcome,
             )
             return
         if outcome is None:
             raise RuntimeError("Work handler exited without an outcome")
+
+        await check_dependencies()
 
         ended_at_utc = _utc_text(services.utc_now_ns())
         duration_ns = max(0, services.monotonic_ns() - started_monotonic_ns)
@@ -362,6 +432,19 @@ async def execute_lease(
                 artifacts=outcome.artifacts,
                 outputs=outcome.outputs,
             )
+    except WorkCancellationRequestedError as error:
+        await _finalize_interrupted_lease(
+            database=database,
+            lease=lease,
+            operation_identifier=operation_identifier,
+            services=services,
+            started_monotonic_ns=started_monotonic_ns,
+            reason="cancelled",
+            possibly_dispatched=possibly_dispatched,
+            primary_error=error,
+            outcome=outcome,
+        )
+        return
     except anyio.get_cancelled_exc_class() as error:
         await _finalize_interrupted_lease(
             database=database,
@@ -372,6 +455,7 @@ async def execute_lease(
             reason="cancelled",
             possibly_dispatched=possibly_dispatched,
             primary_error=error,
+            outcome=outcome,
         )
         raise
     except LeaseLostError as error:
@@ -384,6 +468,7 @@ async def execute_lease(
             reason="lease_lost",
             possibly_dispatched=possibly_dispatched,
             primary_error=error,
+            outcome=outcome,
         )
     except BaseException as error:
         await _finalize_interrupted_lease(
@@ -395,6 +480,7 @@ async def execute_lease(
             reason="worker_runtime_error",
             possibly_dispatched=possibly_dispatched,
             primary_error=error,
+            outcome=outcome,
         )
         raise
     return outcome

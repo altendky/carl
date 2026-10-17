@@ -980,10 +980,14 @@ class WorkspaceWorkStatus(StrictModel):
     in_progress_count: int = Field(ge=0)
     terminal_failure_count: int = Field(ge=0)
     completed_with_failures_count: int = Field(default=0, ge=0)
+    cancelling_count: int = Field(default=0, ge=0)
+    cancelled_count: int = Field(default=0, ge=0)
     active_work: tuple[WorkActivity, ...] = Field(max_length=100)
     active_work_truncated: bool
     failed_work: tuple[WorkActivity, ...] = Field(max_length=100)
     failed_work_truncated: bool
+    cancelled_work: tuple[WorkActivity, ...] = Field(default=(), max_length=100)
+    cancelled_work_truncated: bool = False
     idle: bool
     successful: bool
 
