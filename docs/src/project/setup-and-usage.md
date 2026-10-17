@@ -58,6 +58,12 @@ executable_path = "/opt/carl/bin/wireproxy"
 version = "REPLACE_WITH_WIREPROXY_VERSION"
 binary_sha256 = "REPLACE_WITH_64_CHARACTER_LOWERCASE_SHA256"
 
+[ebay_search]
+maximum_page_attempts = 7
+maximum_homepage_attempts = 2
+minimum_holdoff_seconds = 0.0
+maximum_holdoff_seconds = 0.0
+
 [[http_transports]]
 identifier = "browser_chrome_154"
 implementation = "wreq"
@@ -105,6 +111,14 @@ Use your account-generated HTTP endpoint if it differs; provider examples are no
 that every product or subscription uses the same gateway.
 The pinned `wreq` Python dependency supplies Chrome 154/Linux emulation; this does not
 require installing or automating a Chrome browser.
+Search pages retry challenges and HTTP 403/429 responses in the same session, up to
+seven total attempts per page. A homepage 403 gets one retry before search continues,
+even if the homepage remains blocked. Each attempt retains its acquisition evidence.
+The optional `[ebay_search]` section above shows the defaults: no added waits between
+homepage, search, pagination or retry requests. Set the holdoff bounds to `4.0` and
+`8.0` to restore random 4–8 second waits. Transport failures still use the worker's
+existing retry policy; blocked runs that exhaust page attempts retain the shared
+cooldown and fresh-session retries.
 Existing transports explicitly selecting `chrome_153` retain that profile and its
 default platform. After updating Carl and restarting its workers and MCP clients,
 change their `emulation_profile` to `chrome_154` to select the new profile. The

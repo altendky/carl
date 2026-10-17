@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import cast, final
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import anyio
@@ -15,6 +16,7 @@ import pytest
 from carl._tests.test_ebay import _Acquirer
 from carl._tests.test_ebay_workers import _directories, _provenance
 from carl._tests.test_wreq import _decodo_settings
+from carl.core.configuration import CarlConfiguration, EbaySearchConfiguration
 from carl.core.ebay import (
     EBAY_NAVIGATION_HEADER_ORDER,
     CollectEbaySearchPayload,
@@ -28,6 +30,7 @@ from carl.core.worker import AttemptContext, RetryWork
 from carl.ebay import collect_configured_ebay_search
 from carl.ebay_workers import EbaySearchWorkerDependencies, build_ebay_worker_registry
 from carl.io import network_activity
+from carl.io.configuration import LoadedCarlConfiguration
 from carl.io.decodo import DecodoProxySettings
 from carl.io.httpx import Acquisition, AcquisitionFailure, IdentifierFactory
 from carl.io.sqlite import Database
@@ -50,10 +53,12 @@ class _CookieSession:
         search_status: int,
         homepage_failure: str | None,
         search_timeout: bool,
+        search_statuses: tuple[int, ...] | None,
     ) -> None:
         self.requests: list[tuple[str, str | None]] = []
         self.homepage_failure = homepage_failure
         self.closed = False
+        statuses = iter(search_statuses) if search_statuses is not None else None
 
         def respond(request: httpx.Request) -> httpx.Response:
             self.requests.append((str(request.url), request.headers.get("cookie")))
@@ -70,11 +75,18 @@ class _CookieSession:
                     content=b"Homepage evidence",
                     headers={"set-cookie": f"bm_s=bootstrap-{ordinal}; Path=/; Secure"},
                 )
-            assert request.headers.get("cookie") == f"bm_s=bootstrap-{ordinal}"
+            assert f"bm_s=bootstrap-{ordinal}" in request.headers.get("cookie", "")
             if search_timeout:
                 raise TimeoutError("Search request deadline")
             body = _SECOND if request.url.params.get("_pgn") == "2" else _FIRST
-            return httpx.Response(search_status, content=body)
+            status = next(statuses) if statuses is not None else search_status
+            if status == 0:
+                raise TimeoutError("Search request deadline")
+            return httpx.Response(
+                status,
+                content=body,
+                headers={"set-cookie": "bm_sv=retry; Path=/; Secure"} if status == 403 else {},
+            )
 
         self.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
 
@@ -94,12 +106,14 @@ class _CookieSessions:
         search_status: int = 200,
         homepage_failure: str | None = None,
         search_timeout: bool = False,
+        search_statuses: tuple[int, ...] | None = None,
     ) -> None:
         self.sessions: list[_CookieSession] = []
         self.homepage_status = homepage_status
         self.search_status = search_status
         self.homepage_failure = homepage_failure
         self.search_timeout = search_timeout
+        self.search_statuses = search_statuses
 
     @asynccontextmanager
     async def session(self, _new_identifier: Callable[[], str]) -> AsyncGenerator[_CookieSession]:
@@ -109,6 +123,7 @@ class _CookieSessions:
             search_status=self.search_status,
             homepage_failure=self.homepage_failure,
             search_timeout=self.search_timeout,
+            search_statuses=self.search_statuses,
         )
         self.sessions.append(session)
         try:
@@ -118,9 +133,19 @@ class _CookieSessions:
             session.closed = True
 
 
-def _configure(monkeypatch: pytest.MonkeyPatch, sessions: _CookieSessions) -> None:
-    def load(_path: Path) -> None:
-        return None
+def _configure(
+    monkeypatch: pytest.MonkeyPatch,
+    sessions: _CookieSessions,
+    policy: EbaySearchConfiguration | None = None,
+) -> None:
+    def load(path: Path) -> LoadedCarlConfiguration:
+        return LoadedCarlConfiguration(
+            configuration=CarlConfiguration.model_construct(
+                ebay_search=policy or EbaySearchConfiguration()
+            ),
+            document_sha256="a" * 64,
+            source_path=path,
+        )
 
     def settings(*_arguments: object) -> tuple[DecodoProxySettings, None, WreqTransportSettings]:
         return _decodo_settings(), None, WreqTransportSettings()
@@ -180,6 +205,7 @@ async def test_homepage_cookies_reach_all_search_pages_and_evidence_is_separate(
         assert homepage_id in {item.object_identifier for item in inputs}
     assert sessions.sessions[0].requests == [
         (_HOME, None),
+        *([(_HOME, "bm_s=bootstrap-0")] if homepage_status == 403 else []),
         (ebay_search_url("scope"), "bm_s=bootstrap-0"),
         (ebay_search_url("scope", page_number=2), "bm_s=bootstrap-0"),
     ]
@@ -255,7 +281,7 @@ async def test_bootstrap_and_search_timeout_use_worker_retry_policy_with_retaine
             homepage = cast(dict[str, JsonValue], acquisition["homepage_acquisition"])
             assert homepage["http_status"] == 403
             homepage_id = str(homepage["acquisition_record_identifier"])
-            assert len(sessions.sessions[0].requests) == 2
+            assert len(sessions.sessions[0].requests) == 3
         else:
             assert acquisition["failure_phase"] == "network_activity_finalization_timeout"
             homepage_id = str(acquisition["acquisition_record_identifier"])
@@ -290,8 +316,16 @@ async def test_each_new_attempt_bootstraps_its_own_cookie_jar(
             )
             assert result["page_count"] == 1
     assert [session.requests for session in sessions.sessions] == [
-        [(_HOME, None), (ebay_search_url("scope"), "bm_s=bootstrap-0")],
-        [(_HOME, None), (ebay_search_url("scope"), "bm_s=bootstrap-1")],
+        [
+            (_HOME, None),
+            (_HOME, "bm_s=bootstrap-0"),
+            (ebay_search_url("scope"), "bm_s=bootstrap-0"),
+        ],
+        [
+            (_HOME, None),
+            (_HOME, "bm_s=bootstrap-1"),
+            (ebay_search_url("scope"), "bm_s=bootstrap-1"),
+        ],
     ]
     assert all(session.closed for session in sessions.sessions)
 
@@ -312,7 +346,7 @@ async def test_bootstrap_does_not_mask_a_search_403(
     assert result["stopping_reason"] == "http_error"
     assert result["page_count"] == 1
     assert result["listing_count"] == 0
-    assert len(sessions.sessions[0].requests) == 2
+    assert len(sessions.sessions[0].requests) == 9
 
 
 @pytest.mark.anyio
@@ -336,4 +370,154 @@ async def test_homepage_transport_failure_is_retained_and_never_starts_search(
         assert await database.records_by_kind(("carl", "ebay", "search_run")) == ()
         assert await database.records_by_kind(("carl", "http", "acquisition")) == ()
     assert sessions.sessions[0].requests == [(_HOME, None)]
+    assert sessions.sessions[0].closed
+
+
+@pytest.mark.anyio
+async def test_seventh_attempt_recovers_with_same_cookie_jar_and_page_two_retries_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = _CookieSessions(search_statuses=(*([403] * 6), 200, 429, 200))
+    _configure(monkeypatch, sessions)
+    sleep = AsyncMock()
+    monkeypatch.setattr("carl.ebay.anyio.sleep", sleep)
+    async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
+        result = await collect_configured_ebay_search(
+            database,
+            directories=_directories(tmp_path),
+            request=EbaySearchRequest(query="scope", maximum_pages=2),
+        )
+        assert result["state"] == "completed"
+        assert result["page_count"] == result["listing_count"] == 2
+        _, _, manifest = await database.get_record(str(result["search_run_record_identifier"]))
+        assert isinstance(manifest, dict)
+        pages = cast(list[dict[str, JsonValue]], manifest["pages"])
+        attempts = [cast(list[dict[str, JsonValue]], page["attempts"]) for page in pages]
+        assert [[attempt["attempt"] for attempt in page] for page in attempts] == [
+            list(range(1, 8)),
+            [1, 2],
+        ]
+        _, inputs, _ = await database.object_operation_relations(
+            str(result["search_run_record_identifier"])
+        )
+        linked = {item.object_identifier for item in inputs}
+        for page_attempts in attempts:
+            plans: list[JsonValue] = []
+            for attempt in page_attempts:
+                acquisition_id = str(attempt["acquisition_record_identifier"])
+                assert acquisition_id in linked
+                assert str(attempt["extraction_record_identifier"]) in linked
+                _, _, record = await database.get_record(acquisition_id)
+                assert isinstance(record, dict)
+                assert record["request_attempt"] == attempt["attempt"]
+                plans.append(record["request_plan"])
+                activity = await database.network_activity(
+                    str(record["network_activity_identifier"])
+                )
+                assert activity["attempt"] == attempt["attempt"]
+            assert all(plan == plans[0] for plan in plans)
+        occurrences = await database.records_by_kind(("carl", "ebay", "search_listing_occurrence"))
+        assert len(occurrences) == 2
+    assert len(sessions.sessions) == 1 and sessions.sessions[0].closed
+    requests = sessions.sessions[0].requests
+    assert [url for url, _ in requests] == [
+        _HOME,
+        *([ebay_search_url("scope")] * 7),
+        *([ebay_search_url("scope", page_number=2)] * 2),
+    ]
+    assert all("bm_sv=retry" in (cookie or "") for _, cookie in requests[2:])
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_configured_holdoff_applies_to_homepage_retry_search_retry_and_pagination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = _CookieSessions(homepage_status=403, search_statuses=(403, 200, 200))
+    _configure(
+        monkeypatch,
+        sessions,
+        EbaySearchConfiguration(minimum_holdoff_seconds=4.0, maximum_holdoff_seconds=8.0),
+    )
+    sampled: list[tuple[float, float]] = []
+
+    def sample(minimum: float, maximum: float) -> float:
+        sampled.append((minimum, maximum))
+        return 5.5
+
+    sleep = AsyncMock()
+    monkeypatch.setattr("carl.ebay.uniform", sample)
+    monkeypatch.setattr("carl.ebay.anyio.sleep", sleep)
+    async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
+        result = await collect_configured_ebay_search(
+            database,
+            directories=_directories(tmp_path),
+            request=EbaySearchRequest(query="scope", maximum_pages=2),
+        )
+        assert result["state"] == "completed"
+    assert len(sessions.sessions[0].requests) == 5
+    assert sampled == [(4.0, 8.0)] * 4
+    assert [call.args for call in sleep.await_args_list] == [(5.5,)] * 4
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [200, 500])
+async def test_unrecognized_and_server_errors_do_not_consume_local_block_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    sessions = _CookieSessions(search_status=status)
+    _configure(monkeypatch, sessions)
+    # A generic failure body contains no search cards or challenge markers.
+    monkeypatch.setattr("carl._tests.test_ebay_homepage_bootstrap._FIRST", b"Unexpected response")
+    async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
+        result = await collect_configured_ebay_search(
+            database, directories=_directories(tmp_path), request=EbaySearchRequest(query="scope")
+        )
+        assert result["state"] == "response_failed"
+    assert len(sessions.sessions[0].requests) == 2
+
+
+@pytest.mark.anyio
+async def test_page_two_timeout_after_403_retains_attempts_and_uses_existing_worker_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = _CookieSessions(search_statuses=(200, 403, 0))
+    _configure(monkeypatch, sessions)
+    async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
+
+        async def checkpoint(**_arguments: object) -> None:
+            return None
+
+        monkeypatch.setattr(database, "publish_leased_operation_checkpoint", checkpoint)
+        registry = build_ebay_worker_registry(
+            EbaySearchWorkerDependencies(database, _directories(tmp_path), lambda: str(uuid4()))
+        )
+        outcome = await registry.handlers[0].execute(
+            CollectEbaySearchPayload(
+                request=EbaySearchRequest(query="scope", maximum_pages=2)
+            ).as_json(),
+            AttemptContext(
+                work_item_identifier="search",
+                lease_token="lease",
+                worker_identifier="worker",
+                attempt=1,
+                operation_identifier="operation",
+            ),
+        )
+        assert isinstance(outcome, RetryWork)
+        assert outcome.delay_ns == 600_000_000_000
+        assert isinstance(outcome.reason, dict) and "cooldown" in outcome.reason
+        acquisition = cast(dict[str, JsonValue], outcome.result["acquisition"])
+        assert acquisition["failure_phase"] == "request_timeout"
+        attempts = cast(list[dict[str, JsonValue]], acquisition["search_page_attempts"])
+        assert len(attempts) == 2
+        linked = {item.object_identifier for item in outcome.inputs}
+        for attempt in attempts:
+            assert attempt["acquisition_record_identifier"] in linked
+            assert attempt["extraction_record_identifier"] in linked
+        homepage = cast(dict[str, JsonValue], acquisition["homepage_acquisition"])
+        assert homepage["acquisition_record_identifier"] in linked
+        assert len(await database.records_by_kind(("carl", "http", "acquisition"))) == 3
+        assert await database.records_by_kind(("carl", "ebay", "search_run")) == ()
+    assert len(sessions.sessions[0].requests) == 4
     assert sessions.sessions[0].closed

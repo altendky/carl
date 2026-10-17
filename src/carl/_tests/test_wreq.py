@@ -15,6 +15,7 @@ import wreq.exceptions
 from pydantic import SecretStr
 
 from carl._tests.test_ebay_workers import _directories, _provenance
+from carl.core.configuration import CarlConfiguration, EbaySearchConfiguration
 from carl.core.ebay import EbaySearchRequest, ebay_search_url
 from carl.core.http import RequestPlan
 from carl.core.models import (
@@ -31,6 +32,7 @@ from carl.core.routing import (
     RemoteProxyEndpoint,
 )
 from carl.ebay import collect_configured_ebay_search
+from carl.io.configuration import LoadedCarlConfiguration
 from carl.io.decodo import (
     DecodoCredentials,
     DecodoProxySettings,
@@ -987,7 +989,16 @@ async def test_configured_search_shares_session_across_pages_not_attempts(
         client_factory=cast(WreqClientFactory, cast(object, client_factory)),
         provider_session_factory=lambda: next(provider_sessions),
     )
-    monkeypatch.setattr("carl.ebay.load_configuration", lambda _: None)
+    monkeypatch.setattr(
+        "carl.ebay.load_configuration",
+        lambda path: LoadedCarlConfiguration(
+            configuration=CarlConfiguration.model_construct(
+                ebay_search=EbaySearchConfiguration(maximum_homepage_attempts=1)
+            ),
+            document_sha256="a" * 64,
+            source_path=path,
+        ),
+    )
     monkeypatch.setattr(
         "carl.ebay.decodo_wreq_stack_settings",
         lambda *_: (_decodo_settings(), credentials, transport),

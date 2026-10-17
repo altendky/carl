@@ -483,7 +483,7 @@ async def test_error_page_is_retained_but_collection_does_not_claim_success(tmp_
         assert len(runs) == 1
         assert runs[0][1]["stopping_reason"] == "error_page"
         acquisitions = await database.records_by_kind(("carl", "http", "acquisition"))
-        assert len(acquisitions) == 1
+        assert len(acquisitions) == 7
 
 
 def test_incidental_item_links_do_not_establish_search_results() -> None:

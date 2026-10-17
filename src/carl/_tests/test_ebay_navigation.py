@@ -251,6 +251,9 @@ async def test_fetch_challenge_redirect_is_retained_and_classified_without_follo
         assert result["state"] == "response_failed"
         assert result["stopping_reason"] == "challenge"
         assert result["response_classification"]["kind"] == "challenge"
-        assert len(acquirer.plans) == 2
+        assert len(acquirer.plans) == 8
+        assert all(plan == acquirer.plans[1] for plan in acquirer.plans[1:])
+        assert result["page_count"] == 2
+        assert result["pagination"]["fetch_pages"] == 1
         _, _, retained = await database.get_record(result["acquisition_record_identifiers"][-1])
         assert retained["hops"][-1]["response"]["status_code"] == 307

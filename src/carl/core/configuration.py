@@ -286,9 +286,25 @@ class NetworkRouteOverride(StrictModel):
         return value
 
 
+class EbaySearchConfiguration(StrictModel):
+    """Same-session page recovery and optional pacing between eBay requests."""
+
+    maximum_page_attempts: int = Field(default=7, ge=1, le=20)
+    maximum_homepage_attempts: int = Field(default=2, ge=1, le=20)
+    minimum_holdoff_seconds: float = Field(default=0.0, ge=0, le=60, allow_inf_nan=False)
+    maximum_holdoff_seconds: float = Field(default=0.0, ge=0, le=60, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_holdoff(self) -> "EbaySearchConfiguration":
+        if self.maximum_holdoff_seconds < self.minimum_holdoff_seconds:
+            raise ValueError("Maximum eBay holdoff must be at least the minimum")
+        return self
+
+
 class CarlConfiguration(StrictModel):
     schema_identity: ConfigurationSchemaIdentity = Field(alias="schema")
     wireproxy: WireproxyToolConfiguration
+    ebay_search: EbaySearchConfiguration = Field(default_factory=EbaySearchConfiguration)
     http_transports: Annotated[
         tuple[HttpTransportConfiguration, ...], BeforeValidator(_tuple_from_toml)
     ] = ()
