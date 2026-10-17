@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter_ns, time_ns
+from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
 import anyio
@@ -43,6 +44,7 @@ from carl.core.facebook_work import (
     retryable_search_failure,
 )
 from carl.core.http import RequestPlan
+from carl.core.json import encode_json
 from carl.core.models import (
     CodeProvenance,
     Header,
@@ -82,7 +84,7 @@ def _component_anchor() -> None:
 
 
 def build_refresh_component_registry() -> Registry:
-    return Registry((Component(REFRESH_FACEBOOK_SEARCH, 3, _component_anchor),))
+    return Registry((Component(REFRESH_FACEBOOK_SEARCH, 4, _component_anchor),))
 
 
 def _stable_identifier(*parts: str) -> str:
@@ -134,7 +136,19 @@ async def _work_or_none(database: Database, identifier: str) -> dict[str, JsonVa
 async def _works(
     database: Database, identifiers: tuple[str, ...]
 ) -> tuple[dict[str, JsonValue], ...]:
-    return tuple([await database.work(identifier) for identifier in identifiers])
+    works: list[dict[str, JsonValue]] = []
+    for offset in range(0, len(identifiers), 1000):
+        works.extend(await database.work_progress(identifiers[offset : offset + 1000]))
+    return tuple(works)
+
+
+async def _records(
+    database: Database, identifiers: tuple[str, ...]
+) -> tuple[tuple[str, tuple[str, ...], int, JsonValue], ...]:
+    records: list[tuple[str, tuple[str, ...], int, JsonValue]] = []
+    for offset in range(0, len(identifiers), 1000):
+        records.extend(await database.records_by_identifiers(identifiers[offset : offset + 1000]))
+    return tuple(records)
 
 
 def _unfinished(works: tuple[dict[str, JsonValue], ...]) -> bool:
@@ -359,18 +373,37 @@ async def _item_phase(
     has_image_budget = payload.maximum_images is None or payload.maximum_images > int(
         checkpoint.get("prior_image_collection_count", 0)
     )
+    requested_by_listing: dict[str, tuple[str, ...]] = {}
+    for decision in followup_plan.decisions:
+        requested = await database.requested_work_identifiers(
+            requester_kind=("carl", "facebook", "search_refresh", "item"),
+            requester_identifier=_stable_identifier(
+                context.work_item_identifier, "item_requester", decision.listing_id
+            ),
+        )
+        if len(requested) > 1:
+            raise RuntimeError("Search refresh requested an item page more than once")
+        requested_by_listing[decision.listing_id] = requested
+    expired_galleries: frozenset[str] = (
+        await _expired_galleries_needing_refresh(
+            tuple(
+                decision.latest_successful_result
+                for decision in followup_plan.decisions
+                if decision.latest_successful_result is not None
+                and not requested_by_listing[decision.listing_id]
+            ),
+            dependencies,
+        )
+        if has_image_budget
+        else frozenset()
+    )
     headers: tuple[Header, ...] | None = None
     for decision in followup_plan.decisions:
         listing_identifier = decision.listing_id
         requester_identifier = _stable_identifier(
             context.work_item_identifier, "item_requester", listing_identifier
         )
-        requested = await database.requested_work_identifiers(
-            requester_kind=("carl", "facebook", "search_refresh", "item"),
-            requester_identifier=requester_identifier,
-        )
-        if len(requested) > 1:
-            raise RuntimeError("Search refresh requested an item page more than once")
+        requested = requested_by_listing[listing_identifier]
         if requested:
             collection_identifiers.append(requested[0])
             collection_listings[requested[0]] = listing_identifier
@@ -389,10 +422,7 @@ async def _item_phase(
             continue
         refresh_gallery = False
         if decision.latest_successful_result is not None:
-            if has_image_budget:
-                refresh_gallery = await _expired_gallery_needs_refresh(
-                    decision.latest_successful_result, dependencies
-                )
+            refresh_gallery = listing_identifier in expired_galleries
             if not refresh_gallery:
                 reused_results.append(decision.latest_successful_result)
                 continue
@@ -617,31 +647,60 @@ async def _item_phase(
     )
 
 
-async def _expired_gallery_needs_refresh(
-    result: SuccessfulItemPageResult, dependencies: RefreshWorkerDependencies
-) -> bool:
-    """Renew expired signatures only when validated local images cannot satisfy them."""
-    _, _, observation = await dependencies.database.get_record(result.observation_record_identifier)
-    references = gallery_references(
-        observation_identifier=result.observation_record_identifier, observation=observation
+async def _expired_galleries_needing_refresh(
+    results: tuple[SuccessfulItemPageResult, ...], dependencies: RefreshWorkerDependencies
+) -> frozenset[str]:
+    """Validate shared saved bytes once for all expired galleries in this phase."""
+    if not results:
+        return frozenset()
+    observations = await _records(
+        dependencies.database, tuple(result.observation_record_identifier for result in results)
     )
     now = dependencies.utc_now_ns()
     expired = tuple(
         reference
-        for reference in references
+        for identifier, _, _, observation in observations
+        for reference in gallery_references(
+            observation_identifier=identifier, observation=observation
+        )
         if (expiry := facebook_image_url_expiry_utc_ns(reference.original_url)) is not None
         and expiry <= now
     )
     if not expired:
-        return False
-    saved = await validate_saved_image_results(
-        dependencies.database,
-        await dependencies.database.saved_facebook_image_candidates_for_references(expired),
+        return frozenset()
+    candidates: dict[str, dict[str, JsonValue]] = {}
+    for offset in range(0, len(expired), 1000):
+        candidates.update(
+            await dependencies.database.saved_facebook_image_candidates_for_references(
+                expired[offset : offset + 1000]
+            )
+        )
+    saved = await validate_saved_image_results(dependencies.database, tuple(candidates.items()))
+    plan = plan_image_followups(
+        expired, _saved_image_candidates(saved), len(expired), observed_at_utc_ns=now
     )
-    return bool(
-        plan_image_followups(
-            expired, _saved_image_candidates(saved), len(expired), observed_at_utc_ns=now
-        ).expired_reference_indices
+    return frozenset(expired[index].listing_id for index in plan.expired_reference_indices)
+
+
+def _unavailable_image_plan_reuses(
+    checkpoint: dict[str, JsonValue],
+    plan_identifier: str,
+    reference_identifiers: tuple[str, ...],
+    source_identifiers: tuple[str, ...],
+) -> TerminalFailureWork:
+    return TerminalFailureWork(
+        error={
+            "kind": "refresh_image_reuse_evidence_unavailable",
+            "image_followup_plan_record_identifier": plan_identifier,
+            "reference_record_identifiers": list(reference_identifiers),
+            "source_image_result_record_identifiers": list(source_identifiers),
+        },
+        result={
+            **checkpoint,
+            "stage": "collecting_images",
+            "state": "terminal_failure",
+            "image_followup_plan_record_identifier": plan_identifier,
+        },
     )
 
 
@@ -655,88 +714,222 @@ async def _image_phase(
     refreshed_identifier = checkpoint.get("refreshed_search_run_record_identifier")
     if not isinstance(refreshed_identifier, str):
         raise ValueError("Refresh checkpoint has no search-run record identifier")
-    _, _, base = await database.get_record(payload.base_search_run_record_identifier)
-    _, _, refreshed = await database.get_record(refreshed_identifier)
-    scope_changed = search_scope_changed(
-        "facebook",
-        base.get("request") if isinstance(base, dict) else None,
-        payload.search.request.model_dump(mode="json"),
-    )
-    listing_ids = tuple(
-        dict.fromkeys(
-            (
-                *_search_listing_identifiers(refreshed),
-                *(() if scope_changed else _search_listing_identifiers(base)),
-            )
-        )
-    )[: payload.maximum_items]
-    successful = await database.successful_facebook_item_page_results(listing_ids)
-    latest_by_listing = {}
-    for result in successful:
-        latest_by_listing[result.listing_id] = result
-    references: list[GalleryImageReference] = []
-    for result in latest_by_listing.values():
-        _, _, observation = await database.get_record(result.observation_record_identifier)
-        references.extend(
-            gallery_references(
-                observation_identifier=result.observation_record_identifier,
-                observation=observation,
-            )
-        )
-    existing_references = await database.facebook_gallery_reference_identifiers()
-    reference_identifiers = dict(existing_references)
     generation = checkpoint.get("item_retry_generation_identifier")
     plan_identifier = (
         _stable_identifier(context.work_item_identifier, "image_plan", generation)
         if isinstance(generation, str)
         else _stable_identifier(context.work_item_identifier, "image_plan")
     )
-    plan_exists = True
-    stored_selected_references: list[tuple[str, GalleryImageReference]] = []
+    stored_plan: dict[str, JsonValue] | None = None
+    try:
+        kind, _, value = await database.get_record(plan_identifier)
+    except KeyError:
+        pass
+    else:
+        if kind != ("carl", "facebook", "image_followup_plan") or not isinstance(value, dict):
+            raise ValueError("Stored refresh image plan is malformed")
+        stored_plan = cast(dict[str, JsonValue], value)
+    plan_exists = stored_plan is not None
     stored_reuse_counts: dict[str, int] = {}
     stored_expired_reference_identifiers: set[str] = set()
-    try:
-        plan_kind, _, stored_plan = await database.get_record(plan_identifier)
-        if plan_kind != ("carl", "facebook", "image_followup_plan") or not isinstance(
-            stored_plan, dict
-        ):
-            raise ValueError("Stored refresh image plan is malformed")
-        raw_selected = stored_plan.get("selected_reference_record_identifiers")
-        if not isinstance(raw_selected, list) or not all(
-            isinstance(identifier, str) for identifier in raw_selected
-        ):
-            raise ValueError("Stored refresh image plan has no selected references")
+    exact_reuses = 0
+    source_reuse_count = 0
+    planned_reuses: list[tuple[str, str, ImageReuseMatchKind]] = []
+    if stored_plan is not None:
         raw_references = stored_plan.get("reference_record_identifiers")
+        raw_selected = stored_plan.get("selected_reference_record_identifiers")
         if not isinstance(raw_references, list) or not all(
             isinstance(identifier, str) for identifier in raw_references
         ):
             raise ValueError("Stored refresh image plan has no reference set")
-        references_by_identifier = {
-            identifier: reference for reference, identifier in existing_references.items()
-        }
-        if any(identifier not in references_by_identifier for identifier in raw_references):
-            raise ValueError("Stored refresh image plan references missing evidence")
-        if any(identifier not in raw_references for identifier in raw_selected):
+        if not isinstance(raw_selected, list) or not all(
+            isinstance(identifier, str) for identifier in raw_selected
+        ):
+            raise ValueError("Stored refresh image plan has no selected references")
+        reference_ids = tuple(cast(list[str], raw_references))
+        selected_ids = tuple(cast(list[str], raw_selected))
+        reference_records = await _records(database, reference_ids)
+        references_by_identifier: dict[str, GalleryImageReference] = {}
+        for identifier, kind, _, value in reference_records:
+            if kind != ("carl", "facebook", "gallery_image_reference") or not isinstance(
+                value, dict
+            ):
+                raise ValueError("Stored refresh image plan references malformed evidence")
+            references_by_identifier[identifier] = GalleryImageReference.model_validate_json(
+                encode_json({field: value[field] for field in GalleryImageReference.model_fields})
+            )
+        if any(identifier not in references_by_identifier for identifier in selected_ids):
             raise ValueError(
                 "Stored refresh image plan selects references outside its reference set"
             )
-        references = [references_by_identifier[identifier] for identifier in raw_references]
-        stored_selected_references = [
-            (identifier, references_by_identifier[identifier]) for identifier in raw_selected
-        ]
+        references = [references_by_identifier[identifier] for identifier in reference_ids]
+        reference_identifiers = {
+            reference: identifier for identifier, reference in references_by_identifier.items()
+        }
+        stored_groups: dict[tuple[str, ...], list[tuple[str, GalleryImageReference]]] = {}
+        for identifier in selected_ids:
+            reference = references_by_identifier[identifier]
+            stored_groups.setdefault(reference.rendition_identity, []).append(
+                (identifier, reference)
+            )
+        selected = tuple(tuple(entries) for entries in stored_groups.values())
         stored_expired_reference_identifiers = {
             identifier
             for identifier in stored_plan.get("expired_reference_record_identifiers", [])
             if isinstance(identifier, str)
         }
+        if not stored_expired_reference_identifiers.issubset(references_by_identifier):
+            raise ValueError("Stored refresh image plan has unknown expired references")
+        expired_references = [
+            references_by_identifier[identifier]
+            for identifier in stored_expired_reference_identifiers
+        ]
+        expired_renditions_skipped = {
+            reference.rendition_identity for reference in expired_references
+        }
+        gallery_stale_listings = {reference.listing_id for reference in expired_references}
         for field in ("already_saved_exact_renditions", "reused_source_photo_images"):
             count = stored_plan.get(field)
             if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
                 stored_reuse_counts[field] = count
-    except KeyError:
-        plan_exists = False
-    new_reference_records: list[RecordDraft] = []
-    if not plan_exists:
+        resumed_identifiers = [
+            identifier
+            for identifier in stored_plan.get(
+                "resumed_image_extraction_work_identifiers",
+                checkpoint.get("resumed_image_extraction_work_identifiers", []),
+            )
+            if isinstance(identifier, str)
+        ]
+        resumed_results = await _works(database, tuple(resumed_identifiers))
+        if _unfinished(resumed_results):
+            return RetryWork(
+                delay_ns=_CHILD_WAIT_DELAY_NS,
+                reason={"kind": "waiting_for_resumed_image_extractions"},
+                result={
+                    **checkpoint,
+                    "stage": "extracting_resumed_images",
+                    "resumed_image_extraction_work_identifiers": resumed_identifiers,
+                },
+            )
+        raw_reuses = stored_plan.get("reuse_decisions")
+        if raw_reuses is None:
+            # Older plans did not retain reuse decisions. Recover only the
+            # selected references through the indexed candidate lookup.
+            candidates: dict[str, dict[str, JsonValue]] = {}
+            for offset in range(0, len(references), 1000):
+                candidates.update(
+                    await database.saved_facebook_image_candidates_for_references(
+                        tuple(references[offset : offset + 1000]),
+                        published_before_record_identifier=plan_identifier,
+                    )
+                )
+            saved = await validate_saved_image_results(database, tuple(candidates.items()))
+            plan = plan_image_followups(
+                tuple(references),
+                _saved_image_candidates(saved),
+                len(references),
+                observed_at_utc_ns=dependencies.utc_now_ns(),
+            )
+            planned_reuses = [
+                (
+                    reference_identifiers[references[decision.reference_index]],
+                    decision.candidate.image_result_record_identifier,
+                    decision.match_kind,
+                )
+                for decision in plan.reuse_decisions
+            ]
+            # Legacy plans retain counts but not source IDs. A lost cached
+            # image must not silently become an omitted, successful reuse.
+            selected_id_set = set(selected_ids)
+            retained_reuses = sum(
+                identifier not in selected_id_set for identifier, _, _ in planned_reuses
+            )
+            if retained_reuses < sum(stored_reuse_counts.values()):
+                return _unavailable_image_plan_reuses(checkpoint, plan_identifier, (), ())
+        elif isinstance(raw_reuses, list):
+            for raw in cast(list[JsonValue], raw_reuses):
+                if not isinstance(raw, dict):
+                    raise ValueError("Stored refresh image plan has malformed reuse decisions")
+                reuse = cast(dict[str, JsonValue], raw)
+                reference_identifier = reuse.get("reference_record_identifier")
+                source_identifier = reuse.get("source_image_result_record_identifier")
+                if (
+                    not isinstance(reference_identifier, str)
+                    or reference_identifier not in references_by_identifier
+                    or not isinstance(source_identifier, str)
+                ):
+                    raise ValueError("Stored refresh image plan has malformed reuse evidence")
+                planned_reuses.append(
+                    (
+                        reference_identifier,
+                        source_identifier,
+                        ImageReuseMatchKind(reuse.get("match_kind")),
+                    )
+                )
+            source_identifiers = tuple(dict.fromkeys(source for _, source, _ in planned_reuses))
+            source_results: dict[str, dict[str, JsonValue]] = {}
+            for offset in range(0, len(source_identifiers), 1000):
+                source_results.update(
+                    await database.saved_facebook_image_results_by_identifiers(
+                        source_identifiers[offset : offset + 1000]
+                    )
+                )
+            available = {
+                identifier
+                for identifier, _ in await validate_saved_image_results(
+                    database, tuple(source_results.items())
+                )
+            }
+            missing = tuple(
+                identifier for identifier in source_identifiers if identifier not in available
+            )
+            if missing:
+                return _unavailable_image_plan_reuses(
+                    checkpoint,
+                    plan_identifier,
+                    tuple(
+                        reference
+                        for reference, source, _ in planned_reuses
+                        if source not in available
+                    ),
+                    missing,
+                )
+        else:
+            raise ValueError("Stored refresh image plan has malformed reuse decisions")
+    else:
+        _, _, base = await database.get_record(payload.base_search_run_record_identifier)
+        _, _, refreshed = await database.get_record(refreshed_identifier)
+        scope_changed = search_scope_changed(
+            "facebook",
+            base.get("request") if isinstance(base, dict) else None,
+            payload.search.request.model_dump(mode="json"),
+        )
+        listing_ids = tuple(
+            dict.fromkeys(
+                (
+                    *_search_listing_identifiers(refreshed),
+                    *(() if scope_changed else _search_listing_identifiers(base)),
+                )
+            )
+        )[: payload.maximum_items]
+        successful = await database.successful_facebook_item_page_results(listing_ids)
+        latest_by_listing: dict[str, SuccessfulItemPageResult] = {}
+        for result in successful:
+            latest_by_listing[result.listing_id] = result
+        references: list[GalleryImageReference] = []
+        observations = await _records(
+            database,
+            tuple(result.observation_record_identifier for result in latest_by_listing.values()),
+        )
+        for identifier, _, _, observation in observations:
+            references.extend(
+                gallery_references(observation_identifier=identifier, observation=observation)
+            )
+        existing_references = await database.facebook_gallery_reference_identifiers(
+            tuple(result.observation_record_identifier for result in latest_by_listing.values())
+        )
+        reference_identifiers = dict(existing_references)
+        new_reference_records: list[RecordDraft] = []
         for reference in references:
             if reference in reference_identifiers:
                 continue
@@ -763,134 +956,82 @@ async def _image_phase(
                     },
                 )
             )
-    configured_maximum_images = payload.maximum_images
-    if configured_maximum_images is not None:
-        configured_maximum_images = max(
-            0, configured_maximum_images - int(checkpoint.get("prior_image_collection_count", 0))
-        )
-    if configured_maximum_images is None:
-        configured_maximum_images = len({reference.rendition_identity for reference in references})
-    saved_before_resumption = await database.saved_facebook_image_renditions()
-    pending_extractions = await database.pending_facebook_image_extractions()
-    resumed_keys: set[tuple[str | None, str]] = set()
-    resumed_identifiers: list[str] = []
-    for reference in references:
-        key = (reference.photo_id, reference.original_url)
-        if (
-            key in saved_before_resumption
-            or key in resumed_keys
-            or key not in pending_extractions
-            or len(resumed_keys) >= configured_maximum_images
-        ):
-            continue
-        resumed_keys.add(key)
-        resumed_identifiers.extend(pending_extractions[key])
-    resumed_results = await _works(database, tuple(resumed_identifiers))
-    if _unfinished(resumed_results):
-        return RetryWork(
-            delay_ns=_CHILD_WAIT_DELAY_NS,
-            reason={"kind": "waiting_for_resumed_image_extractions"},
-            result={
-                **checkpoint,
-                "stage": "extracting_resumed_images",
-                "resumed_image_extraction_work_identifiers": resumed_identifiers,
-            },
-        )
-    saved_values: dict[str, dict[str, JsonValue]] = {}
-    for offset in range(0, len(references), 1000):
-        saved_values.update(
-            await database.saved_facebook_image_candidates_for_references(
-                tuple(references[offset : offset + 1000])
+        configured_maximum_images = payload.maximum_images
+        if configured_maximum_images is not None:
+            configured_maximum_images = max(
+                0,
+                configured_maximum_images - int(checkpoint.get("prior_image_collection_count", 0)),
             )
-        )
-    saved_candidates = _saved_image_candidates(
-        await validate_saved_image_results(database, tuple(saved_values.items()))
-    )
-    maximum_images = (
-        len({reference.rendition_identity for reference in references})
-        if plan_exists
-        else max(0, configured_maximum_images - len(resumed_keys))
-    )
-    plan = plan_image_followups(
-        tuple(references),
-        saved_candidates,
-        maximum_images,
-        frozenset(resumed_keys),
-        observed_at_utc_ns=dependencies.utc_now_ns(),
-    )
-    expired_references = [references[index] for index in plan.expired_reference_indices]
-    expired_renditions_skipped = {
-        reference.rendition_identity
-        for reference in expired_references
-        if not plan_exists
-        or reference_identifiers[reference] in stored_expired_reference_identifiers
-    }
-    gallery_stale_listings = {reference.listing_id for reference in expired_references}
-    source_reuses = tuple(
-        decision
-        for decision in plan.reuse_decisions
-        if decision.match_kind is ImageReuseMatchKind.SOURCE_PHOTO_ADEQUATE_DIMENSIONS
-    )
-    exact_reuses = len(plan.reuse_decisions) - len(source_reuses)
-    existing_reuses = {
-        (
-            resolution.gallery_image_reference_record_identifier,
-            resolution.source_image_result_record_identifier,
-            resolution.match_kind,
-        )
-        for resolution in await database.facebook_image_reuse_resolutions()
-    }
-    reuse_records: list[RecordDraft] = []
-    reuse_inputs: list[tuple[tuple[str, ...], str]] = []
-    for decision in plan.reuse_decisions:
-        reference_identifier = reference_identifiers[references[decision.reference_index]]
-        key = (
-            reference_identifier,
-            decision.candidate.image_result_record_identifier,
-            decision.match_kind,
-        )
-        if key in existing_reuses:
-            continue
-        record_identifier = _stable_identifier(
-            context.work_item_identifier,
-            "image_reuse",
-            reference_identifier,
-            decision.candidate.image_result_record_identifier,
-        )
-        reuse_records.append(
-            RecordDraft(
-                identifier=record_identifier,
-                kind=("carl", "facebook", "image_reuse"),
-                schema_version=1,
-                value=image_reuse_record(decision.match_kind).model_dump(mode="json"),
+        if configured_maximum_images is None:
+            configured_maximum_images = len(
+                {reference.rendition_identity for reference in references}
             )
+        saved_before_resumption = await database.saved_facebook_image_renditions()
+        pending_extractions = await database.pending_facebook_image_extractions()
+        resumed_keys: set[tuple[str | None, str]] = set()
+        resumed_identifiers: list[str] = []
+        for reference in references:
+            key = (reference.photo_id, reference.original_url)
+            if (
+                key in saved_before_resumption
+                or key in resumed_keys
+                or key not in pending_extractions
+                or len(resumed_keys) >= configured_maximum_images
+            ):
+                continue
+            resumed_keys.add(key)
+            resumed_identifiers.extend(pending_extractions[key])
+        resumed_results = await _works(database, tuple(resumed_identifiers))
+        if _unfinished(resumed_results):
+            return RetryWork(
+                delay_ns=_CHILD_WAIT_DELAY_NS,
+                reason={"kind": "waiting_for_resumed_image_extractions"},
+                result={
+                    **checkpoint,
+                    "stage": "extracting_resumed_images",
+                    "resumed_image_extraction_work_identifiers": resumed_identifiers,
+                },
+            )
+        saved_values: dict[str, dict[str, JsonValue]] = {}
+        for offset in range(0, len(references), 1000):
+            saved_values.update(
+                await database.saved_facebook_image_candidates_for_references(
+                    tuple(references[offset : offset + 1000])
+                )
+            )
+        saved_candidates = _saved_image_candidates(
+            await validate_saved_image_results(database, tuple(saved_values.items()))
         )
-        index = f"{len(reuse_records) - 1:08d}"
-        reuse_inputs.extend(
+        maximum_images = max(0, configured_maximum_images - len(resumed_keys))
+        plan = plan_image_followups(
+            tuple(references),
+            saved_candidates,
+            maximum_images,
+            frozenset(resumed_keys),
+            observed_at_utc_ns=dependencies.utc_now_ns(),
+        )
+        expired_references = [references[index] for index in plan.expired_reference_indices]
+        expired_renditions_skipped = {
+            reference.rendition_identity for reference in expired_references
+        }
+        gallery_stale_listings = {reference.listing_id for reference in expired_references}
+        source_reuse_count = sum(
+            decision.match_kind is ImageReuseMatchKind.SOURCE_PHOTO_ADEQUATE_DIMENSIONS
+            for decision in plan.reuse_decisions
+        )
+        exact_reuses = len(plan.reuse_decisions) - source_reuse_count
+        planned_reuses = [
             (
-                (("gallery_image_reference", index), reference_identifier),
-                (
-                    ("source_image_result", index),
-                    decision.candidate.image_result_record_identifier,
-                ),
+                reference_identifiers[references[decision.reference_index]],
+                decision.candidate.image_result_record_identifier,
+                decision.match_kind,
             )
+            for decision in plan.reuse_decisions
+        ]
+        selected = tuple(
+            tuple((reference_identifiers[references[index]], references[index]) for index in group)
+            for group in plan.download_groups
         )
-    unresolved = tuple(
-        tuple((reference_identifiers[references[index]], references[index]) for index in group)
-        for group in plan.download_groups
-    )
-    if plan_exists:
-        # Replanning against newly saved images removes completed downloads.  Resume
-        # the original selection instead so its jobs, gallery edges, and totals survive.
-        stored_groups: dict[tuple[str, ...], list[tuple[str, GalleryImageReference]]] = {}
-        for identifier, reference in stored_selected_references:
-            stored_groups.setdefault(reference.rendition_identity, []).append(
-                (identifier, reference)
-            )
-        selected = tuple(tuple(entries) for entries in stored_groups.values())
-    else:
-        selected = unresolved
-    if not plan_exists:
         await database.publish_leased_operation_checkpoint(
             work_item_identifier=context.work_item_identifier,
             lease_token=context.lease_token,
@@ -909,9 +1050,18 @@ async def _image_phase(
                         ],
                         "gallery_references": len(references),
                         "already_saved_exact_renditions": exact_reuses,
-                        "reused_source_photo_images": len(source_reuses),
+                        "reused_source_photo_images": source_reuse_count,
                         "selected_new_renditions": len(selected),
                         "resumed_extractions": len(resumed_results),
+                        "resumed_image_extraction_work_identifiers": resumed_identifiers,
+                        "reuse_decisions": [
+                            {
+                                "reference_record_identifier": reference_identifier,
+                                "source_image_result_record_identifier": source_identifier,
+                                "match_kind": match_kind.value,
+                            }
+                            for reference_identifier, source_identifier, match_kind in planned_reuses
+                        ],
                         "expired_reference_record_identifiers": [
                             reference_identifiers[reference] for reference in expired_references
                         ],
@@ -960,6 +1110,46 @@ async def _image_phase(
                     for index, result in enumerate(latest_by_listing.values())
                 ),
             ),
+        )
+    existing_reuses = {
+        (
+            resolution.gallery_image_reference_record_identifier,
+            resolution.source_image_result_record_identifier,
+            resolution.match_kind,
+        )
+        for resolution in await database.facebook_image_reuse_resolutions(
+            tuple(reference_identifiers.values())
+        )
+    }
+    reuse_records: list[RecordDraft] = []
+    reuse_inputs: list[tuple[tuple[str, ...], str]] = []
+    for reference_identifier, source_identifier, match_kind in planned_reuses:
+        key = (reference_identifier, source_identifier, match_kind)
+        if key in existing_reuses:
+            continue
+        record_identifier = _stable_identifier(
+            context.work_item_identifier,
+            "image_reuse",
+            reference_identifier,
+            source_identifier,
+        )
+        reuse_records.append(
+            RecordDraft(
+                identifier=record_identifier,
+                kind=("carl", "facebook", "image_reuse"),
+                schema_version=1,
+                value=image_reuse_record(match_kind).model_dump(mode="json"),
+            )
+        )
+        index = f"{len(reuse_records) - 1:08d}"
+        reuse_inputs.extend(
+            (
+                (("gallery_image_reference", index), reference_identifier),
+                (
+                    ("source_image_result", index),
+                    source_identifier,
+                ),
+            )
         )
     if reuse_records:
         reuse_operation_identifier = dependencies.new_identifier()
@@ -1184,7 +1374,7 @@ async def _image_phase(
             "already_saved_exact_renditions", exact_reuses
         ),
         "reused_source_photo_images": stored_reuse_counts.get(
-            "reused_source_photo_images", len(source_reuses)
+            "reused_source_photo_images", source_reuse_count
         ),
         "new_image_collections": len(collections),
         "new_images_saved": saved,

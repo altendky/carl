@@ -73,7 +73,10 @@ def _strings(value: JsonValue | None) -> tuple[str, ...]:
 async def _works(
     database: Database, identifiers: tuple[str, ...]
 ) -> tuple[dict[str, JsonValue], ...]:
-    return tuple([await database.work(identifier) for identifier in identifiers])
+    works: list[dict[str, JsonValue]] = []
+    for offset in range(0, len(identifiers), 1000):
+        works.extend(await database.work_progress(identifiers[offset : offset + 1000]))
+    return tuple(works)
 
 
 def _pending(works: tuple[dict[str, JsonValue], ...]) -> bool:
@@ -396,26 +399,35 @@ async def _image_phase(
         outputs: list[NamedOutput] = []
         selected_references: list[str] = []
         reused_reference_inputs: list[NamedInput] = []
-        existing_references = {
-            (
-                _mapping(value).get("observation_record_identifier"),
-                _mapping(value).get("gallery_order"),
-                _mapping(value).get("url"),
-                _mapping(value).get("item_identifier"),
-            ): identifier
-            for identifier, value in await database.records_by_kind(
-                ("carl", "ebay", "gallery_image_reference")
+        observation_identifiers = _strings(checkpoint.get("observation_record_identifiers"))
+        existing_references = {}
+        for offset in range(0, len(observation_identifiers), 1000):
+            existing_references.update(
+                {
+                    (
+                        _mapping(value).get("observation_record_identifier"),
+                        _mapping(value).get("gallery_order"),
+                        _mapping(value).get("url"),
+                        _mapping(value).get("item_identifier"),
+                    ): identifier
+                    for identifier, value in await database.ebay_gallery_references(
+                        observation_identifiers[offset : offset + 1000]
+                    )
+                }
             )
-        }
         remaining = (
             max(0, payload.maximum_images - int(checkpoint.get("prior_image_collection_count", 0)))
             if payload.maximum_images is not None
             else None
         )
         observations: list[tuple[str, dict[str, JsonValue]]] = []
-        for observation_identifier in _strings(checkpoint.get("observation_record_identifiers")):
-            _, _, observation_value = await database.get_record(observation_identifier)
-            observations.append((observation_identifier, _mapping(observation_value)))
+        for offset in range(0, len(observation_identifiers), 1000):
+            observations.extend(
+                (identifier, _mapping(value))
+                for identifier, _, _, value in await database.records_by_identifiers(
+                    observation_identifiers[offset : offset + 1000]
+                )
+            )
         wanted_urls = tuple(
             dict.fromkeys(
                 url
@@ -432,7 +444,7 @@ async def _image_phase(
             saved_candidates.extend(
                 await database.saved_ebay_image_candidates(wanted_urls[start : start + 1000])
             )
-        for _, raw in saved_candidates:
+        for _, raw in reversed(saved_candidates):
             saved = _mapping(raw)
             url, artifact = saved.get("url"), saved.get("image_artifact_identifier")
             if (
@@ -442,7 +454,7 @@ async def _image_phase(
             ):
                 continue
             identity = ebay_image_identity(url)
-            if identity not in wanted:
+            if identity not in wanted or identity in saved_renditions:
                 continue
             if artifact not in validated_artifacts:
                 try:
@@ -552,8 +564,37 @@ async def _image_phase(
         )
     children: list[str] = []
     pending_urls: set[str] = set()
-    for reference_identifier in reference_identifiers:
-        _, _, value = await database.get_record(reference_identifier)
+    references: list[tuple[str, JsonValue]] = []
+    requested_children: dict[str, str] = {}
+    requesters = tuple(
+        _identifier(context.work_item_identifier, "image_requester", identifier)
+        for identifier in reference_identifiers
+    )
+    for offset in range(0, len(reference_identifiers), 1000):
+        references.extend(
+            (identifier, value)
+            for identifier, kind, _, value in await database.records_by_identifiers(
+                reference_identifiers[offset : offset + 1000]
+            )
+            if kind == ("carl", "ebay", "gallery_image_reference")
+        )
+        for requester, child in await database.requested_work_for_requesters(
+            requester_kind=_IMAGE_REQUESTER,
+            requester_identifiers=requesters[offset : offset + 1000],
+        ):
+            if requester in requested_children:
+                raise RuntimeError(
+                    "Refresh stage requested more than one work item for one selection"
+                )
+            requested_children[requester] = child
+    if len(references) != len(reference_identifiers):
+        raise ValueError("Refresh image plan references a non-gallery record")
+    existing_works = {
+        str(work["identifier"]): work
+        for work in await _works(database, tuple(dict.fromkeys(requested_children.values())))
+    }
+    deferred_references = False
+    for (reference_identifier, value), requester in zip(references, requesters, strict=True):
         reference = _mapping(value)
         request = CollectEbayImagePayload.model_validate(
             {
@@ -563,13 +604,11 @@ async def _image_phase(
                 "url": reference.get("url"),
             }
         )
-        requester = _identifier(
-            context.work_item_identifier, "image_requester", reference_identifier
-        )
-        child = await _requested(database, "image", requester)
+        child = requested_children.get(requester)
         # Complete the first exact URL before queuing its other references, so
         # they reuse that download rather than racing redundant acquisitions.
         if child is None and request.url in pending_urls:
+            deferred_references = True
             continue
         if child is None:
             child = await _enqueue(
@@ -584,8 +623,9 @@ async def _image_phase(
                 stage="image",
                 requester_identifier=requester,
             )
+            pending_urls.add(request.url)
         children.append(child)
-        if _pending((await database.work(child),)):
+        if child in existing_works and _pending((existing_works[child],)):
             pending_urls.add(request.url)
     works = await _works(database, tuple(children))
     result: dict[str, JsonValue] = {
@@ -594,9 +634,9 @@ async def _image_phase(
         "image_followup_plan_record_identifier": plan_identifier,
         "image_collection_work_identifiers": children,
     }
-    if _pending(works):
+    if _pending(works) or deferred_references:
         return RetryWork(
-            delay_ns=_pending_delay_ns(works, dependencies.utc_now_ns()),
+            delay_ns=_pending_delay_ns(works, dependencies.utc_now_ns()) if _pending(works) else 0,
             reason={"kind": "waiting_for_image_collections"},
             result=result,
         )
@@ -736,7 +776,7 @@ def build_ebay_refresh_worker_registry(
                 capability=WorkCapability(
                     kind=REFRESH_EBAY_SEARCH_WORK_KIND, payload_schema_version=1
                 ),
-                component=Component(ComponentId(("carl", "ebay", "refresh", "search")), 4, _anchor),
+                component=Component(ComponentId(("carl", "ebay", "refresh", "search")), 5, _anchor),
                 payload_type=RefreshEbaySearchPayload,
                 handler=refresh,
             ),
