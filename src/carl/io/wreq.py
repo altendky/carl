@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import re
+import socket
+import ssl
 from collections.abc import AsyncGenerator, Iterable, Iterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -49,6 +52,192 @@ _WREQ_EXCEPTIONS = (
     wreq.exceptions.WebSocketError,
     wreq.exceptions.TimeoutError,
 )
+_DIAGNOSTIC_EXCEPTION_TYPES = (
+    *_WREQ_EXCEPTIONS,
+    OSError,
+    ConnectionError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    TimeoutError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    socket.gaierror,
+    ssl.SSLError,
+    ssl.SSLCertVerificationError,
+)
+_TYPE_REASON_CODES: dict[type[BaseException], str] = {
+    wreq.exceptions.TlsError: "tls_failure",
+    wreq.exceptions.ConnectionError: "connection_failure",
+    wreq.exceptions.ProxyConnectionError: "proxy_connection_failure",
+    wreq.exceptions.ConnectionResetError: "connection_reset",
+    wreq.exceptions.TimeoutError: "timeout",
+    wreq.exceptions.BodyError: "body_transfer_failure",
+    wreq.exceptions.DecodingError: "content_decoding_failure",
+    ConnectionRefusedError: "connection_refused",
+    ConnectionResetError: "connection_reset",
+    ConnectionAbortedError: "connection_aborted",
+    BrokenPipeError: "broken_pipe",
+    TimeoutError: "timeout",
+    socket.gaierror: "dns_failure",
+    ssl.SSLError: "tls_failure",
+    ssl.SSLCertVerificationError: "tls_failure",
+}
+_ERRNO_REASON_CODES = {
+    errno.ECONNREFUSED: "connection_refused",
+    errno.ECONNRESET: "connection_reset",
+    errno.ECONNABORTED: "connection_aborted",
+    errno.ETIMEDOUT: "timeout",
+    errno.EHOSTUNREACH: "host_unreachable",
+    errno.ENETUNREACH: "network_unreachable",
+    errno.EPIPE: "broken_pipe",
+}
+_MESSAGE_REASON_PATTERNS = (
+    (
+        "dns_failure",
+        re.compile(
+            r"\b(?:dns error|dns resolution failed|failed to lookup address information|name or service not known|temporary failure in name resolution)\b"
+        ),
+    ),
+    ("tcp_connect_failure", re.compile(r"\btcp connect error\b")),
+    (
+        "proxy_connect_failure",
+        re.compile(
+            r"\b(?:proxy connect(?:ion)? (?:error|failed|failure)|unsuccessful tunnel|tunnel error|failed to establish (?:a )?(?:proxy )?tunnel|kind:\s*proxyconnect)\b"
+        ),
+    ),
+    (
+        "proxy_authentication_required",
+        re.compile(r"\b(?:proxyauthrequired|proxy authentication required)\b"),
+    ),
+    (
+        "tls_failure",
+        re.compile(
+            r"\b(?:tls handshake (?:error|failed|failure)|ssl handshake (?:error|failed|failure)|certificate verify failed|certificate verification failed|certificate_verify_failed|invalid peer certificate)\b|\bcode:\s*ssl\s*\("
+        ),
+    ),
+    (
+        "certificate_verification_failure",
+        re.compile(
+            r"\b(?:certificate verify failed|certificate verification failed|certificate_verify_failed|invalid peer certificate)\b"
+        ),
+    ),
+    (
+        "http2_failure",
+        re.compile(
+            r"\b(?:http2 (?:error|connection error|protocol error)|http/2 (?:error|connection error|protocol error)|h2::error|(?:netty|hyper)::error\(http2|goaway received|received goaway|stream error received)\b"
+        ),
+    ),
+    (
+        "http2_stream_reset",
+        re.compile(r"\bkind:\s*reset\(streamid\("),
+    ),
+    ("connection_reset", re.compile(r"\bconnection reset(?: by peer)?\b")),
+    ("connection_refused", re.compile(r"\bconnection refused\b")),
+    ("connection_aborted", re.compile(r"\bconnection aborted\b")),
+    ("broken_pipe", re.compile(r"\b(?:brokenpipe|broken pipe)\b")),
+    ("connection_closed", re.compile(r"\bconnection closed before message completed\b")),
+    ("host_unreachable", re.compile(r"\b(?:host is unreachable|no route to host)\b")),
+    ("network_unreachable", re.compile(r"\bnetwork is unreachable\b")),
+    (
+        "timeout",
+        re.compile(
+            r"\b(?:operation timed out|connection timed out|request timed out|deadline (?:has )?(?:elapsed|exceeded)|timeout error)\b"
+        ),
+    ),
+)
+_MESSAGE_OS_ERROR = re.compile(r"\b(?:os error ([0-9]{1,4})|os \{\s*code:\s*([0-9]{1,4}))\b")
+_MESSAGE_URL = re.compile(r"\b(?:https?|socks5h?)://\S+", re.IGNORECASE)
+
+
+def _exception_label(error: BaseException) -> str:
+    return type(error).__name__ if type(error) in _DIAGNOSTIC_EXCEPTION_TYPES else "OtherError"
+
+
+def _transport_error_diagnostics(error: BaseException) -> dict[str, JsonValue]:
+    """Retain only fixed labels and validated numbers from a bounded error chain.
+
+    The binding offers exception classes and formatted native messages, not a
+    structured Rust source chain. Message matches are therefore evidence hints,
+    never definitive attribution to an endpoint, proxy, or remote server.
+    """
+    chain: list[JsonValue] = []
+    evidence: list[JsonValue] = []
+    reason_codes: set[str] = set()
+    seen: set[int] = set()
+    current: BaseException | None = error
+    inspected_messages = False
+    message_truncated = False
+    binding_omitted_sources = False
+
+    def record(reason: str, source: str, index: int) -> None:
+        reason_codes.add(reason)
+        evidence.append({"reason_code": reason, "source": source, "chain_index": index})
+
+    while current is not None and len(chain) < 8 and id(current) not in seen:
+        seen.add(id(current))
+        index = len(chain)
+        entry: dict[str, JsonValue] = {"exception_type": _exception_label(current)}
+        reason = _TYPE_REASON_CODES.get(type(current))
+        if reason is not None:
+            record(reason, "exception_type", index)
+        if (
+            isinstance(current, OSError)
+            and type(current.errno) is int
+            and current.errno in errno.errorcode
+        ):
+            entry["errno"] = current.errno
+            if (reason := _ERRNO_REASON_CODES.get(current.errno)) is not None:
+                record(reason, "os_errno", index)
+        # Inspect only native binding messages. Arbitrary application exception
+        # text can describe URLs, cookies or cleanup failures rather than I/O.
+        if type(current) in _WREQ_EXCEPTIONS:
+            inspected_messages = True
+            message = str(current)
+            message_truncated = message_truncated or len(message) > 16384
+            binding_omitted_sources = binding_omitted_sources or (
+                re.fullmatch(
+                    r"(?:is_[a-z_]+ error|error): The Python interpreter is not available",
+                    message[:16384],
+                )
+                is not None
+            )
+            message = _MESSAGE_URL.sub("", message[:16384]).lower()
+            for reason, pattern in _MESSAGE_REASON_PATTERNS:
+                if pattern.search(message) is not None:
+                    record(reason, "native_message_pattern", index)
+            numbers: set[int] = set()
+            for match in _MESSAGE_OS_ERROR.finditer(message):
+                number = int(match[1] or match[2])
+                if number in errno.errorcode:
+                    numbers.add(number)
+                if len(numbers) >= 4:
+                    break
+            if numbers:
+                entry["message_os_error_numbers"] = sorted(numbers)
+                for number in sorted(numbers):
+                    if (reason := _ERRNO_REASON_CODES.get(number)) is not None:
+                        record(reason, "native_message_os_error_number", index)
+        chain.append(entry)
+        current = current.__cause__ or (
+            current.__context__ if not current.__suppress_context__ else None
+        )
+    return {
+        "reason_codes": sorted(reason_codes) or ["unknown"],
+        "reason_evidence": evidence,
+        "exception_chain": chain,
+        "chain_truncated": current is not None,
+        "native_messages_inspected": inspected_messages,
+        "native_source_details": "omitted_by_binding"
+        if binding_omitted_sources
+        else "formatted_message_only"
+        if inspected_messages
+        else "not_applicable",
+        "message_scan_truncated": message_truncated,
+        "message_evidence_limit": "fixed_patterns_only; raw_text_not_retained; matches_are_inferences_not_proven_root_causes",
+    }
 
 
 class WreqTransportSettings(StrictModel):
@@ -443,10 +632,12 @@ def _sync_acquire(
             started = perf_counter_ns()
             response: _WreqResponse | None = None
             response_headers: tuple[Header, ...] = ()
+            failure_phase = "request"
             try:
                 response = client.get(current_url, **request_options)
                 response_headers = _headers(response.headers)
                 client_hints.observe(response.url, response_headers)
+                failure_phase = "response_body"
                 body = bytearray()
                 trailer_headers: list[Header] = []
                 with response.stream() as stream:
@@ -520,7 +711,9 @@ def _sync_acquire(
                     hops=tuple(hops),
                     result={
                         "stopping_condition": "transport_failure",
-                        "exception_type": type(error).__name__,
+                        "exception_type": _exception_label(error),
+                        "failure_phase": failure_phase,
+                        "transport_error": _transport_error_diagnostics(error),
                         "failed_request": {"method": plan.method, "url": current_url},
                     },
                 ) from error
@@ -574,8 +767,9 @@ def _sync_acquire(
                     hops=tuple(hops),
                     result={
                         "stopping_condition": "transport_failure",
-                        "exception_type": type(error).__name__,
+                        "exception_type": _exception_label(error),
                         "failure_phase": "response_close",
+                        "transport_error": _transport_error_diagnostics(error),
                         "failed_request": {"method": plan.method, "url": current_url},
                     },
                 ) from error
@@ -605,8 +799,9 @@ def _sync_acquire(
                     hops=tuple(hops),
                     result={
                         "stopping_condition": "transport_failure",
-                        "exception_type": type(error).__name__,
+                        "exception_type": _exception_label(error),
                         "failure_phase": "client_close",
+                        "transport_error": _transport_error_diagnostics(error),
                     },
                 )
     if failure is not None:
@@ -727,6 +922,8 @@ class ProxyWreqAcquirer:
                                         "hops": [],
                                         "stopping_condition": "transport_failure",
                                         "failure_phase": "client_close",
+                                        "exception_type": _exception_label(error),
+                                        "transport_error": _transport_error_diagnostics(error),
                                     },
                                 ) from None
 
@@ -787,8 +984,9 @@ class ProxyWreqAcquirer:
                 result={
                     "hops": [],
                     "stopping_condition": "transport_failure",
-                    "exception_type": type(error).__name__,
+                    "exception_type": _exception_label(error),
                     "failure_phase": "client_open",
+                    "transport_error": _transport_error_diagnostics(error),
                     "transport": self.settings.safe_configuration(
                         plan, shared_client=self._managed_session
                     ),
