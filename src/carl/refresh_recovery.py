@@ -28,7 +28,7 @@ async def retry_refresh_finalization(
     utc_ns: int,
     new_identifier: Callable[[], str],
 ) -> RetryRefreshFinalizationResult:
-    """Explicitly resume a handler failure from retained downstream work, never a new search."""
+    """Resume retained downstream work after a handler or image-reuse evidence failure."""
     async with database._connections.writer() as connection:  # pyright: ignore[reportPrivateUsage]
         cursor = await connection.execute(
             "SELECT kind_parts_json,state,result_json,error_json,attempt FROM work_items WHERE id=?",
@@ -41,13 +41,17 @@ async def retry_refresh_finalization(
             )
         marketplace = _REFRESH_KINDS[tuple(json.loads(str(row[0])))]
         error = json.loads(str(row[3])) if row[3] is not None else None
+        recoverable_errors = {"unhandled_handler_error"}
+        if marketplace == "facebook":
+            recoverable_errors.add("refresh_image_reuse_evidence_unavailable")
         if (
             row[1] != "terminal_failure"
             or not isinstance(error, dict)
-            or error.get("kind") != "unhandled_handler_error"
+            or error.get("kind") not in recoverable_errors
         ):
             raise ReviewInputError(
-                "Finalization recovery requires a settled refresh with an unhandled handler error"
+                "Finalization recovery requires a settled refresh with an unhandled handler error "
+                "or unavailable image-reuse evidence"
             )
         cursor = await connection.execute(
             """SELECT active.id FROM work_items AS active JOIN work_items AS original

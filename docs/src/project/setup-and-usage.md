@@ -271,6 +271,9 @@ unlabeled secrets. Inspect retained evidence before spending on another attempt.
   resume an exact terminal Facebook/eBay refresh from a safe retained checkpoint.
   It does not rerun search or reset terminal/completed child jobs; unsafe recovery
   is rejected. This recovery is MCP-only, not a general automatic retry.
+  A refresh reporting `refresh_image_reuse_evidence_unavailable` can also resume
+  after its missing or corrupt saved image files are restored. The retained image
+  plan is revalidated before reuse is reported.
 
 Wait for each resumed refresh to settle before another recovery call. A refresh
 losing at least half its selected item pages is a failure; smaller losses remain
@@ -284,5 +287,9 @@ MCP clients. If the client caches tool definitions, reload them or start a new a
 session after reconnecting. Compare server capability versions. Worker startup
 updates immutable constraint policy and reconciles unfinished activities whose
 owning operations already ended. Historical evidence and events remain retained.
+The image-reuse schema upgrade builds indexed lookup keys from retained saved-image
+metadata once, inside the migration transaction. All writers must run the upgraded
+code so each new image publication also maintains these derived keys. Saved-image
+records and artifact verification remain authoritative.
 For legacy Proton-to-Decodo overrides, follow the separate audited
 `cutover-route-overrides` procedure before removing those configuration entries.

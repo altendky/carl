@@ -179,9 +179,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=11,
+    version=12,
 )
 
+_V11_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 11})
+_V11_SCHEMA_DEFINITION_SHA256 = "599317d3a36d321c137e2e86034f10d12c8b6dcbcd772b6b8b275e25d9c8bc51"
 _V10_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 10})
 _V10_SCHEMA_DEFINITION_SHA256 = "b2a07eec693b04bc149448ee2ed9c11083f790d235e2a9a9c7e75818a6c9ceda"
 _V9_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 9})
@@ -267,9 +269,22 @@ CREATE TABLE IF NOT EXISTS records (
     FOREIGN KEY (object_id) REFERENCES objects(id)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS saved_image_lookup (
+    marketplace TEXT NOT NULL CHECK (marketplace IN ('facebook', 'ebay')),
+    lookup_kind TEXT NOT NULL CHECK (lookup_kind IN ('url', 'photo_id', 'path')),
+    lookup_value TEXT NOT NULL,
+    result_object_id TEXT NOT NULL,
+    PRIMARY KEY (marketplace, lookup_kind, lookup_value, result_object_id),
+    FOREIGN KEY (result_object_id) REFERENCES objects(id)
+) STRICT, WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS records_gallery_observation
 ON records(json_extract(value_json, '$.listing_observation_record_identifier'), object_id)
 WHERE json_extract(value_json, '$.listing_observation_record_identifier') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_ebay_gallery_observation
+ON records(json_extract(value_json, '$.observation_record_identifier'), object_id)
+WHERE json_extract(value_json, '$.observation_record_identifier') IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS records_saved_image_reference
 ON records(json_extract(value_json, '$.image_reference_record_identifier'), object_id)
@@ -869,6 +884,14 @@ class Database:
         }
 
     @staticmethod
+    def _v11_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V11_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": str(_V11_DATABASE_SCHEMA.version),
+            "schema_definition_sha256": _V11_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v7_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V7_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -921,6 +944,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v11_metadata())
                 and not await cls._metadata_matches(connection, cls._v10_metadata())
                 and not await cls._metadata_matches(connection, cls._v9_metadata())
                 and not await cls._metadata_matches(connection, cls._v8_metadata())
@@ -1322,6 +1346,12 @@ class Database:
                     )
             if await self._metadata_matches(connection, self._v10_metadata()):
                 await self._migrate_code_states(connection)
+                for key, value in self._v11_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v11_metadata()):
+                await self._migrate_saved_image_lookup(connection)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
@@ -1329,6 +1359,98 @@ class Database:
             if not await self._metadata_matches(connection, self._expected_metadata()):
                 raise RuntimeError("Unsupported database schema metadata")
             await self._validate_schema(connection)
+
+    async def _migrate_saved_image_lookup(self, connection: AsyncConnection) -> None:
+        """Derive indexed reuse keys once, without modifying retained image evidence."""
+
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_image_lookup (
+                marketplace TEXT NOT NULL CHECK (marketplace IN ('facebook', 'ebay')),
+                lookup_kind TEXT NOT NULL CHECK (lookup_kind IN ('url', 'photo_id', 'path')),
+                lookup_value TEXT NOT NULL,
+                result_object_id TEXT NOT NULL,
+                PRIMARY KEY (marketplace, lookup_kind, lookup_value, result_object_id),
+                FOREIGN KEY (result_object_id) REFERENCES objects(id)
+            ) STRICT, WITHOUT ROWID
+            """
+        )
+        await connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS records_ebay_gallery_observation
+            ON records(json_extract(value_json, '$.observation_record_identifier'), object_id)
+            WHERE json_extract(value_json, '$.observation_record_identifier') IS NOT NULL
+            """
+        )
+        cursor = await connection.execute(
+            """
+            SELECT object.id, object.kind_parts_json, record.value_json
+            FROM objects AS object
+            JOIN records AS record ON record.object_id = object.id
+            WHERE object.kind_parts_json IN (
+                '["carl","facebook","image_result"]', '["carl","ebay","image_result"]'
+            ) AND json_extract(record.value_json, '$.state') = 'saved'
+            ORDER BY object.rowid
+            """
+        )
+        # Publish keys in bounded batches, rather than retaining all historical
+        # image-result JSON or derived URLs in memory during the migration.
+        rows: list[tuple[str, str, str, str]] = []
+        async for row in cursor:
+            rows.extend(
+                self._saved_image_lookup_rows(
+                    _text(row[0]),
+                    tuple(cast(list[str], decode_json(_text(row[1])))),
+                    decode_json(_text(row[2])),
+                )
+            )
+            if len(rows) >= 1000:
+                await self._publish_saved_image_lookup(connection, rows)
+                rows.clear()
+        await self._publish_saved_image_lookup(connection, rows)
+
+    @staticmethod
+    def _saved_image_lookup_rows(
+        identifier: str, kind: tuple[str, ...], value: JsonValue
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        if (
+            kind not in {("carl", "facebook", "image_result"), ("carl", "ebay", "image_result")}
+            or not isinstance(value, dict)
+            or value.get("state") != "saved"
+        ):
+            return ()
+        marketplace = kind[1]
+        url = value.get("original_url" if marketplace == "facebook" else "url")
+        photo_id = value.get("source_photo_id") if marketplace == "facebook" else None
+        rows: list[tuple[str, str, str, str]] = []
+        if isinstance(photo_id, str):
+            rows.append((marketplace, "photo_id", photo_id, identifier))
+        if isinstance(url, str):
+            rows.append((marketplace, "url", url, identifier))
+            identity = (
+                facebook_image_identity(url, photo_id if isinstance(photo_id, str) else None)
+                if marketplace == "facebook"
+                else ebay_image_identity(url)
+            )
+            if identity[2] == "rendition":
+                rows.append(
+                    (
+                        marketplace,
+                        "path",
+                        identity[4 if marketplace == "facebook" else 3],
+                        identifier,
+                    )
+                )
+        return tuple(rows)
+
+    @staticmethod
+    async def _publish_saved_image_lookup(
+        connection: AsyncConnection, rows: Sequence[tuple[str, str, str, str]]
+    ) -> None:
+        if rows:
+            await connection.executemany(
+                "INSERT OR IGNORE INTO saved_image_lookup VALUES (?, ?, ?, ?)", rows
+            )
 
     async def _migrate_code_states(self, connection: AsyncConnection) -> None:
         """Normalize retained operation provenance without changing output identities."""
@@ -3208,6 +3330,37 @@ class Database:
             ),
         )
 
+    async def requested_work_for_requesters(
+        self,
+        *,
+        requester_kind: tuple[str, ...],
+        requester_identifiers: Sequence[str],
+    ) -> tuple[tuple[str, str], ...]:
+        """Seek bounded requester edges without one database round trip per image."""
+
+        if len(requester_identifiers) > 1000 or any(
+            not identifier for identifier in requester_identifiers
+        ):
+            raise ValueError("Work requester scope is invalid")
+        if not requester_identifiers:
+            return ()
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT requested.value, request.work_item_id
+                FROM json_each(?) AS requested
+                CROSS JOIN work_requests AS request INDEXED BY work_requests_requester
+                  ON request.requester_identifier = requested.value
+                 AND request.requester_kind_parts_json = ?
+                GROUP BY requested.key, request.work_item_id
+                ORDER BY CAST(requested.key AS INTEGER),
+                         MIN(request.requested_at_utc_ns), MIN(request.id)
+                """,
+                (_json(list(requester_identifiers)), _json(list(requester_kind))),
+            )
+            rows = await cursor.fetchall()
+        return tuple((_text(row[0]), _text(row[1])) for row in rows)
+
     async def requested_work_identifiers(
         self, *, requester_kind: tuple[str, ...], requester_identifier: str
     ) -> tuple[str, ...]:
@@ -4588,6 +4741,16 @@ class Database:
                     for record in records
                 ),
             )
+            await self._publish_saved_image_lookup(
+                connection,
+                tuple(
+                    row
+                    for record in records
+                    for row in self._saved_image_lookup_rows(
+                        record.identifier, record.kind, record.value
+                    )
+                ),
+            )
         for artifact in artifacts:
             await connection.execute(
                 "INSERT INTO objects VALUES (?, 'artifact', ?, ?)",
@@ -5128,6 +5291,103 @@ class Database:
         if not isinstance(kind, list) or not all(isinstance(part, str) for part in kind):
             raise ValueError("Invalid stored object kind")
         return tuple(kind), _integer(row[1]), decode_json(_text(row[2]))
+
+    async def records_by_identifiers(
+        self, identifiers: Sequence[str]
+    ) -> tuple[tuple[str, tuple[str, ...], int, JsonValue], ...]:
+        """Read a bounded caller-ordered record scope, retaining duplicate requests."""
+
+        if len(identifiers) > 1000 or any(not identifier for identifier in identifiers):
+            raise ValueError("Record identifier scope is invalid")
+        if not identifiers:
+            return ()
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT record.object_id, object.kind_parts_json,
+                       record.schema_version, record.value_json
+                FROM json_each(?) AS requested
+                CROSS JOIN records AS record ON record.object_id = requested.value
+                CROSS JOIN objects AS object ON object.id = record.object_id
+                ORDER BY CAST(requested.key AS INTEGER)
+                """,
+                (_json(list(identifiers)),),
+            )
+            rows = await cursor.fetchall()
+        if len(rows) != len(identifiers):
+            raise KeyError("One or more requested records do not exist")
+        results: list[tuple[str, tuple[str, ...], int, JsonValue]] = []
+        for row in rows:
+            kind = decode_json(_text(row[1]))
+            if not isinstance(kind, list) or not all(isinstance(part, str) for part in kind):
+                raise ValueError("Invalid stored object kind")
+            results.append(
+                (_text(row[0]), tuple(kind), _integer(row[2]), decode_json(_text(row[3])))
+            )
+        return tuple(results)
+
+    async def work_progress(self, identifiers: Sequence[str]) -> tuple[dict[str, JsonValue], ...]:
+        """Read current work state without loading operations or event histories."""
+
+        if len(identifiers) > 1000 or any(not identifier for identifier in identifiers):
+            raise ValueError("Work progress scope is invalid")
+        if not identifiers:
+            return ()
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT work.id, work.kind_parts_json, work.state, work.attempt,
+                       work.result_json, work.error_json, work.eligible_at_utc_ns
+                FROM json_each(?) AS requested
+                CROSS JOIN work_items AS work ON work.id = requested.value
+                ORDER BY CAST(requested.key AS INTEGER)
+                """,
+                (_json(list(identifiers)),),
+            )
+            rows = await cursor.fetchall()
+        if len(rows) != len(identifiers):
+            raise KeyError("One or more requested work items do not exist")
+        return tuple(
+            {
+                "identifier": _text(row[0]),
+                "kind": decode_json(_text(row[1])),
+                "state": _text(row[2]),
+                "attempt": _integer(row[3]),
+                "result": None if row[4] is None else decode_json(_text(row[4])),
+                "error": None if row[5] is None else decode_json(_text(row[5])),
+                "eligible_at_utc_ns": _integer(row[6]),
+            }
+            for row in rows
+        )
+
+    async def ebay_gallery_references(
+        self, observation_identifiers: Sequence[str]
+    ) -> tuple[tuple[str, JsonValue], ...]:
+        """Seek gallery references attached to selected retained observations."""
+
+        if len(observation_identifiers) > 1000 or any(
+            not identifier for identifier in observation_identifiers
+        ):
+            raise ValueError("Gallery observation scope is invalid")
+        if not observation_identifiers:
+            return ()
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT object.id, record.value_json
+                FROM json_each(?) AS requested
+                CROSS JOIN records AS record INDEXED BY records_ebay_gallery_observation
+                  ON json_extract(record.value_json, '$.observation_record_identifier') =
+                     requested.value
+                CROSS JOIN objects AS object ON object.id = record.object_id
+                WHERE json_extract(record.value_json, '$.observation_record_identifier') IS NOT NULL
+                  AND object.kind_parts_json = '["carl","ebay","gallery_image_reference"]'
+                ORDER BY object.rowid
+                """,
+                (_json(list(dict.fromkeys(observation_identifiers))),),
+            )
+            rows = await cursor.fetchall()
+        return tuple((_text(row[0]), decode_json(_text(row[1]))) for row in rows)
 
     async def ebay_item_observations(
         self, item_identifier: str
@@ -8592,110 +8852,71 @@ class Database:
     async def saved_ebay_image_candidates(
         self, urls: tuple[str, ...]
     ) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
-        """Read possible saved renditions without materializing unrelated image history.
-
-        The path predicate is deliberately broad; callers still check canonical
-        equality and validate the artifact before reusing its bytes.
-        """
+        """Seek possible saved renditions; callers still check canonical equality."""
 
         if len(urls) > 1000:
             raise ValueError("Image candidate URL scope exceeds its bound")
         if not urls:
             return ()
-        requested = []
+        requested: set[tuple[str, str]] = set()
         for url in dict.fromkeys(urls):
             identity = ebay_image_identity(url)
-            requested.append(
-                {"url": url, "path": identity[3] if identity[2] == "rendition" else None}
-            )
-        async with self._connections.reader() as connection:
-            cursor = await connection.execute(
-                """
-                SELECT record.object_id, record.value_json
-                FROM objects AS object
-                JOIN records AS record ON record.object_id = object.id
-                JOIN operations AS operation ON operation.id = object.created_by_operation_id
-                WHERE object.kind_parts_json = '["carl","ebay","image_result"]'
-                  AND operation.state = 'completed'
-                  AND json_extract(record.value_json, '$.state') = 'saved'
-                  AND EXISTS (
-                      SELECT 1 FROM json_each(?) AS requested
-                      WHERE json_extract(record.value_json, '$.url') =
-                                json_extract(requested.value, '$.url')
-                         OR (json_extract(requested.value, '$.path') IS NOT NULL
-                             AND instr(json_extract(record.value_json, '$.url'),
-                                       json_extract(requested.value, '$.path')) > 0)
-                  )
-                ORDER BY object.rowid
-                """,
-                (_json(requested),),
-            )
-            rows = await cursor.fetchall()
-        return tuple(
-            (_text(row[0]), cast(dict[str, JsonValue], decode_json(_text(row[1])))) for row in rows
-        )
+            requested.add(("url", url))
+            if identity[2] == "rendition":
+                requested.add(("path", identity[3]))
+        return await self._saved_image_candidates("ebay", requested)
 
     async def saved_facebook_image_candidates_for_references(
         self, references: tuple[GalleryImageReference, ...]
     ) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
-        """Materialize only possible source photos/URLs for a bounded gallery.
-
-        Canonical equivalence and dimensions are checked by the pure planner;
-        the broad SQL path predicate is intentionally not an equivalence claim.
-        """
+        """Seek photo/URL/path candidates; the planner checks rendition equivalence."""
 
         if len(references) > 1000:
             raise ValueError("Image candidate reference scope exceeds its bound")
         if not references:
             return ()
-        requested = []
+        requested: set[tuple[str, str]] = set()
         for reference in references:
             identity = facebook_image_identity(reference.original_url, reference.photo_id)
-            requested.append(
-                {
-                    "photo_id": reference.photo_id,
-                    "url": reference.original_url,
-                    "path": identity[4] if identity[2] == "rendition" else None,
-                }
-            )
-        # Filter the saved-rendition index once before joining object metadata.
-        # Otherwise SQLite can nest a full forced-index scan under every image
-        # object, monopolizing the reader pool as retained history grows.
+            requested.add(("url", reference.original_url))
+            if reference.photo_id is not None:
+                requested.add(("photo_id", reference.photo_id))
+            if identity[2] == "rendition":
+                requested.add(("path", identity[4]))
+        return await self._saved_image_candidates("facebook", requested)
+
+    async def _saved_image_candidates(
+        self, marketplace: str, requested: set[tuple[str, str]]
+    ) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
                 """
-                WITH requested AS MATERIALIZED (
-                    SELECT json_extract(value, '$.url') AS url,
-                           json_extract(value, '$.photo_id') AS photo_id,
-                           json_extract(value, '$.path') AS path
-                    FROM json_each(?)
-                ), candidates AS MATERIALIZED (
-                    SELECT record.object_id
-                    FROM records AS record INDEXED BY records_saved_image_rendition
-                    WHERE json_extract(record.value_json, '$.state') = 'saved'
-                      AND json_extract(record.value_json, '$.original_url') IS NOT NULL
-                      AND EXISTS (
-                          SELECT 1 FROM requested
-                          WHERE json_extract(record.value_json, '$.original_url') =
-                                    requested.url
-                             OR (requested.photo_id IS NOT NULL
-                                 AND json_extract(record.value_json, '$.source_photo_id') =
-                                     requested.photo_id)
-                             OR (requested.path IS NOT NULL
-                                 AND instr(json_extract(record.value_json, '$.original_url'),
-                                           requested.path) > 0)
-                      )
+                WITH candidates AS MATERIALIZED (
+                    SELECT DISTINCT lookup.result_object_id
+                    FROM json_each(?) AS requested
+                    CROSS JOIN saved_image_lookup AS lookup
+                      ON lookup.marketplace = ?
+                     AND lookup.lookup_kind = json_extract(requested.value, '$[0]')
+                     AND lookup.lookup_value = json_extract(requested.value, '$[1]')
                 )
                 SELECT record.object_id, record.value_json
                 FROM candidates
-                CROSS JOIN records AS record ON record.object_id = candidates.object_id
-                CROSS JOIN objects AS object ON object.id = candidates.object_id
+                CROSS JOIN records AS record ON record.object_id = candidates.result_object_id
+                CROSS JOIN objects AS object ON object.id = candidates.result_object_id
                 CROSS JOIN operations AS operation ON operation.id = object.created_by_operation_id
-                WHERE object.kind_parts_json = '["carl","facebook","image_result"]'
+                WHERE object.kind_parts_json = ?
                   AND operation.state = 'completed'
+                  AND json_extract(record.value_json, '$.state') = 'saved'
+                  AND (? != 'facebook'
+                       OR json_extract(record.value_json, '$.original_url') IS NOT NULL)
                 ORDER BY object.rowid
                 """,
-                (_json(requested),),
+                (
+                    _json([list(key) for key in sorted(requested)]),
+                    marketplace,
+                    _json(["carl", marketplace, "image_result"]),
+                    marketplace,
+                ),
             )
             rows = await cursor.fetchall()
         return tuple(

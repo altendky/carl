@@ -570,12 +570,20 @@ async def test_item_phase_reuses_successful_pages_without_decodo_work(
             assert work_identifier == "current-child"
             return {"state": WorkState.PENDING.value}
 
+        async def current_progress(
+            _database: Database, work_identifiers: tuple[str, ...]
+        ) -> tuple[dict[str, Any], ...]:
+            return tuple(
+                [await current_work(_database, identifier) for identifier in work_identifiers]
+            )
+
         monkeypatch.setattr(
             Database,
             "requested_work_identifiers",
             requested_work_identifiers,
         )
         monkeypatch.setattr(Database, "work", current_work)
+        monkeypatch.setattr(Database, "work_progress", current_progress)
 
         resumed = await facebook_refresh_workers._item_phase(  # pyright: ignore[reportPrivateUsage]
             payload,

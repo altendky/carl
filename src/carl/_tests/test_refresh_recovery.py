@@ -36,7 +36,11 @@ from carl.review import ReviewApplication
 
 
 async def _handler_failed_refresh(
-    database: Database, marketplace: str, *, retained_checkpoint: bool
+    database: Database,
+    marketplace: str,
+    *,
+    retained_checkpoint: bool,
+    error_kind: str = "unhandled_handler_error",
 ) -> dict[str, JsonValue]:
     checkpoint: dict[str, JsonValue] = {
         "stage": "collecting_images",
@@ -77,7 +81,7 @@ async def _handler_failed_refresh(
             "UPDATE work_items SET state='terminal_failure',result_json=?,error_json=? WHERE id='refresh'",
             (
                 encode_json(checkpoint if retained_checkpoint else {"state": "terminal_failure"}),
-                encode_json({"kind": "unhandled_handler_error", "type": "ValidationError"}),
+                encode_json({"kind": error_kind}),
             ),
         )
     for identifier, state in (("saved-image", "completed"), ("failed-image", "terminal_failure")):
@@ -95,14 +99,21 @@ async def _handler_failed_refresh(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("marketplace", ("facebook", "ebay"))
+@pytest.mark.parametrize(
+    ("marketplace", "error_kind"),
+    (
+        ("facebook", "unhandled_handler_error"),
+        ("ebay", "unhandled_handler_error"),
+        ("facebook", "refresh_image_reuse_evidence_unavailable"),
+    ),
+)
 @pytest.mark.parametrize("retained_checkpoint", (False, True))
 async def test_finalization_recovery_preserves_collected_work_and_latest_checkpoint(
-    tmp_path: Path, marketplace: str, retained_checkpoint: bool
+    tmp_path: Path, marketplace: str, error_kind: str, retained_checkpoint: bool
 ) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         checkpoint = await _handler_failed_refresh(
-            database, marketplace, retained_checkpoint=retained_checkpoint
+            database, marketplace, retained_checkpoint=retained_checkpoint, error_kind=error_kind
         )
         before = await database.work("refresh")
         children = [
