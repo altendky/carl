@@ -51,6 +51,11 @@ class RequestPlan(StrictModel):
     url: str
     method: str = "GET"
     headers: tuple[Header, ...] = ()
+    profile_default_headers: bool = Field(
+        default=True,
+        exclude_if=lambda value: value,
+        description="Include the profiled transport's default request headers.",
+    )
     header_order: tuple[str, ...] = Field(
         default=(),
         exclude_if=lambda value: not value,
@@ -98,6 +103,7 @@ class RequestPlan(StrictModel):
         *,
         protected_header_names: frozenset[bytes] = frozenset(),
     ) -> dict[str, JsonValue]:
+        protected_header_names = protected_header_names | {b"x-pl-config"}
         result = self.model_dump(mode="json", by_alias=True)
         result["headers"] = [
             (

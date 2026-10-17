@@ -648,6 +648,7 @@ def extract_ebay_search(
     *,
     status_code: int | None = None,
     listing_state: EbayListingState = "active",
+    redirect_target: str | None = None,
 ) -> EbaySearchExtraction:
     parser = _EbaySearchParser()
     parser.feed(html)
@@ -655,6 +656,20 @@ def extract_ebay_search(
     occurrences = _occurrences(parser, listing_state)
     document_text = " ".join(parser.document_text).lower()
     challenge_evidence = tuple(marker for marker in _CHALLENGE_MARKERS if marker in document_text)
+    if redirect_target is not None and status_code in {301, 302, 303, 307, 308}:
+        try:
+            target = urlsplit(redirect_target)
+            if (
+                target.scheme == "https"
+                and target.hostname == "www.ebay.com"
+                and target.port in (None, 443)
+                and target.username is None
+                and target.password is None
+                and target.path.rstrip("/") == "/splashui/challenge"
+            ):
+                challenge_evidence += ("ebay_challenge_redirect",)
+        except ValueError:
+            pass
     empty_evidence = tuple(marker for marker in _EMPTY_MARKERS if marker in document_text)
     error_evidence = tuple(marker for marker in _ERROR_MARKERS if marker in document_text)
     http_evidence = (f"http_status_{status_code}",) if status_code is not None else ()
