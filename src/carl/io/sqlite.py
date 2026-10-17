@@ -6310,7 +6310,7 @@ class Database:
             cursor = await connection.execute(
                 """
                 SELECT work.id, work.payload_json, work.result_json
-                FROM work_items AS work
+                FROM work_items AS work INDEXED BY work_items_analysis_lookup
                 WHERE work.kind_parts_json = ? AND work.state = 'completed'
                   AND work.id != ? AND json_extract(work.payload_json, ?) = ?
                   AND EXISTS (
