@@ -244,6 +244,7 @@ def ebay_search_url(
 def ebay_homepage_plan(*, network_path: tuple[str, ...]) -> RequestPlan:
     return RequestPlan(
         url="https://www.ebay.com/",
+        reconnect_on_broken_pipe=True,
         header_order=EBAY_NAVIGATION_HEADER_ORDER,
         routing=network_path,
     )
@@ -256,6 +257,7 @@ def ebay_search_plan(
     page_number: int = 1,
 ) -> RequestPlan:
     return RequestPlan(
+        reconnect_on_broken_pipe=True,
         url=ebay_search_url(
             request.query, page_number=page_number, listing_state=request.listing_state
         ),

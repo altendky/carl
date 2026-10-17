@@ -6,7 +6,12 @@ from uuid import uuid4
 import pytest
 
 from carl._tests.test_ebay import _Acquirer, _PagingAcquirer, _provenance
-from carl.core.ebay import EbaySearchRequest, extract_ebay_search
+from carl.core.ebay import (
+    EbaySearchRequest,
+    ebay_homepage_plan,
+    ebay_search_plan,
+    extract_ebay_search,
+)
 from carl.core.ebay_navigation import ebay_fetch_plan, ebay_pagination_token
 from carl.core.http import RequestPlan
 from carl.ebay import collect_ebay_search
@@ -100,6 +105,20 @@ def test_fetch_plan_has_complete_profile_and_no_document_only_headers() -> None:
     assert "cookie" not in headers
     assert not plan.follow_redirects
     assert "local-token" not in str(plan.as_json())
+
+
+def test_search_plans_opt_into_bounded_reconnect_without_changing_default_plan_identity() -> None:
+    request = EbaySearchRequest(query="scope")
+    home = ebay_homepage_plan(network_path=("test",))
+    search = ebay_search_plan(request, network_path=home.routing)
+    fetch = ebay_fetch_plan(
+        request, network_path=home.routing, page_number=2, token="local", referer=search.url
+    )
+    assert all(plan.reconnect_on_broken_pipe for plan in (home, search, fetch))
+    ordinary = RequestPlan(url="https://example.invalid/")
+    assert not ordinary.reconnect_on_broken_pipe
+    assert "reconnect_on_broken_pipe" not in ordinary.as_json()
+    assert "reconnect_on_broken_pipe" not in ordinary.model_dump_json()
 
 
 @pytest.mark.parametrize(
