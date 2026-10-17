@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import httpcore
@@ -65,11 +66,35 @@ def test_request_plan_has_typed_json_serialization() -> None:
         {"url": "https://user:secret@example.com/"},
         {"headers": (Header(name=b"Cookie", value=b"secret"),)},
         {"routing": ()},
+        {"header_order": ("accept", "Accept")},
+        {"header_order": (":method",)},
+        {"header_order": ("accept\r\nx-test",)},
+        {"header_order": ("é",)},
+        {"header_order": ("",)},
+        {"header_order": ("accept language",)},
     ],
 )
 def test_request_plan_rejects_unsafe_or_invalid_settings(change: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         RequestPlan.model_validate({"url": "https://example.com/", **change})
+
+
+def test_header_order_round_trips_without_supplying_cookie_values() -> None:
+    plan = RequestPlan(url="https://example.com/", header_order=("accept", "cookie", "priority"))
+    assert plan.headers == ()
+    assert plan.as_json()["header_order"] == ["accept", "cookie", "priority"]
+    assert RequestPlan.model_validate_json(plan.model_dump_json(by_alias=True)) == plan
+    assert RequestPlan(url=plan.url).header_order == ()
+    assert "header_order" not in RequestPlan(url=plan.url).as_json()
+
+
+def test_default_request_plan_preserves_existing_deduplication_digest() -> None:
+    # Facebook item work hashes serialized plans; adding an unused hint must not
+    # change the pre-existing digest and admit duplicate collection work.
+    plan = RequestPlan(url="https://www.facebook.com/marketplace/item/123/")
+    assert hashlib.sha256(plan.model_dump_json(by_alias=True).encode()).hexdigest() == (
+        "1de0e5c3be3ae5a07c1247e1db544191bf5ccf9914e085fbd576caf51d94bf51"
+    )
 
 
 def test_timeout_plan_rejects_nonpositive_values() -> None:

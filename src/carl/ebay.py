@@ -14,6 +14,7 @@ from carl.core.content_encoding import decoded_stored_body
 from carl.core.ebay import (
     EBAY_SEARCH_FAILURE_KINDS,
     EbaySearchRequest,
+    ebay_homepage_plan,
     ebay_search_plan,
     extract_ebay_search,
 )
@@ -132,7 +133,7 @@ async def collect_configured_ebay_search(
         homepage = await _collect_ebay_search_document(
             database,
             request=request,
-            plan=RequestPlan(url="https://www.ebay.com/", routing=route.route.network_path),
+            plan=ebay_homepage_plan(network_path=route.route.network_path),
             page_number=None,
             page_ordinal=None,
             search_run_identifier=search_run_identifier,

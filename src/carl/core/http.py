@@ -1,5 +1,6 @@
 """Pure HTTP acquisition plans and redirect decisions."""
 
+import re
 from email.message import Message
 from urllib.parse import urljoin, urlsplit
 
@@ -50,12 +51,26 @@ class RequestPlan(StrictModel):
     url: str
     method: str = "GET"
     headers: tuple[Header, ...] = ()
+    header_order: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+        description="Preferred regular-header order for profiled transports; names supply no values.",
+    )
     timeout: TimeoutPlan = Field(default_factory=TimeoutPlan)
     follow_redirects: bool = True
     max_redirects: int = Field(default=5, ge=0, le=10)
     max_body_bytes: int = Field(default=20_000_000, gt=0, le=100_000_000)
     routing: tuple[str, ...] = ("direct",)
     compression: tuple[str, ...] = ("gzip", "deflate", "br", "zstd")
+
+    @field_validator("header_order")
+    @classmethod
+    def validate_header_order(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) is None for name in value):
+            raise ValueError("Header order requires regular ASCII HTTP header names")
+        if len({name.lower() for name in value}) != len(value):
+            raise ValueError("Header order cannot repeat a header name")
+        return value
 
     @model_validator(mode="after")
     def validate_request(self) -> "RequestPlan":

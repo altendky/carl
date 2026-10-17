@@ -236,6 +236,7 @@ def _request_evidence(plan: RequestPlan, url: str, started_at_utc: str) -> dict[
         "url": url,
         "headers": _header_evidence(plan.headers, _PROTECTED_REQUEST_HEADERS),
         "header_evidence_scope": "caller_supplied_only",
+        **({"requested_header_order": list(plan.header_order)} if plan.header_order else {}),
         "profile_generated_headers": {
             "state": "not_observed",
             "generator": {
@@ -338,7 +339,9 @@ def _sync_acquire(
             request_options: dict[str, object] = {"default_headers": True}
             if header_map is not None:
                 request_options["headers"] = header_map
-                request_options["orig_headers"] = list(ordered_header_names)
+            effective_order = plan.header_order or ordered_header_names
+            if effective_order:
+                request_options["orig_headers"] = list(effective_order)
             started_at_utc = datetime.now(UTC).isoformat()
             started = perf_counter_ns()
             response: _WreqResponse | None = None

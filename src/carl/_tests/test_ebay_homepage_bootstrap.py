@@ -15,7 +15,12 @@ import pytest
 from carl._tests.test_ebay import _Acquirer
 from carl._tests.test_ebay_workers import _directories, _provenance
 from carl._tests.test_wreq import _decodo_settings
-from carl.core.ebay import CollectEbaySearchPayload, EbaySearchRequest, ebay_search_url
+from carl.core.ebay import (
+    EBAY_NAVIGATION_HEADER_ORDER,
+    CollectEbaySearchPayload,
+    EbaySearchRequest,
+    ebay_search_url,
+)
 from carl.core.http import RequestPlan
 from carl.core.models import CodeProvenance, JsonValue
 from carl.core.work import NetworkActivityState
@@ -155,6 +160,8 @@ async def test_homepage_cookies_reach_all_search_pages_and_evidence_is_separate(
         _, _, homepage_record = await database.get_record(homepage_id)
         assert isinstance(homepage_record, dict)
         assert homepage_record["effective_url"] == _HOME
+        plan = cast(dict[str, JsonValue], homepage_record["request_plan"])
+        assert plan["header_order"] == list(EBAY_NAVIGATION_HEADER_ORDER)
         assert homepage_id not in cast(list[JsonValue], result["acquisition_record_identifiers"])
         operation = await database.operation(str(homepage["acquisition_operation_identifier"]))
         assert operation["state"] == "completed"

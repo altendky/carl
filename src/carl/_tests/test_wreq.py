@@ -286,6 +286,40 @@ async def test_profiled_acquisition_runs_in_thread_and_records_truthful_provenan
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "supplied_headers", [(), (Header(name=b"Referer", value=b"https://www.ebay.com/"),)]
+)
+async def test_explicit_header_order_applies_to_profile_defaults_without_adding_values(
+    supplied_headers: tuple[Header, ...],
+) -> None:
+    response = _response()
+    factory = _Factory([response])
+    order = ("accept-language", "user-agent", "accept", "referer", "cookie", "priority")
+    plan = RequestPlan(
+        url=response.url,
+        headers=supplied_headers,
+        header_order=order,
+        routing=("proton", "personal", "carl"),
+    )
+
+    acquisition = await _acquirer(factory).acquire(plan, lambda: "body-1")
+
+    options = factory.calls[0][2]
+    assert options["default_headers"] is True
+    assert options["orig_headers"] == list(order)
+    if supplied_headers:
+        assert list(cast(wreq.HeaderMap, options["headers"])) == [
+            (b"referer", b"https://www.ebay.com/")
+        ]
+    else:
+        assert "headers" not in options
+    assert acquisition.record["hops"][0]["request"]["requested_header_order"] == list(order)
+    assert acquisition.record["hops"][0]["request"]["profile_generated_headers"]["state"] == (
+        "not_observed"
+    )
+
+
+@pytest.mark.anyio
 async def test_manual_redirects_reuse_one_client_and_retain_each_body() -> None:
     first = _response(
         url="https://www.ebay.com/start",
