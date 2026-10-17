@@ -107,14 +107,14 @@ def test_fetch_plan_has_complete_profile_and_no_document_only_headers() -> None:
     assert "local-token" not in str(plan.as_json())
 
 
-def test_search_plans_do_not_hide_extra_attempts_in_transport_reconnects() -> None:
+def test_search_plans_opt_into_bounded_reconnect_without_changing_default_plan_identity() -> None:
     request = EbaySearchRequest(query="scope")
     home = ebay_homepage_plan(network_path=("test",))
     search = ebay_search_plan(request, network_path=home.routing)
     fetch = ebay_fetch_plan(
         request, network_path=home.routing, page_number=2, token="local", referer=search.url
     )
-    assert all(not plan.reconnect_on_broken_pipe for plan in (home, search, fetch))
+    assert all(plan.reconnect_on_broken_pipe for plan in (home, search, fetch))
     ordinary = RequestPlan(url="https://example.invalid/")
     assert not ordinary.reconnect_on_broken_pipe
     assert "reconnect_on_broken_pipe" not in ordinary.as_json()

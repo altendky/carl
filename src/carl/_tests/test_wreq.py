@@ -1032,7 +1032,7 @@ async def test_configured_search_shares_session_across_pages_not_attempts(
         assert all(observation["state"] == "active" for observation in observations)
         assert all(
             value["transport"]["effective_timeouts"]["pool_seconds"]["reason"]
-            == "one_client_per_managed_session"
+            == "one_active_client_per_managed_session"
             for _, value in acquisitions
         )
         assert "FirstProviderSession" not in json.dumps(acquisitions)
