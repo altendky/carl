@@ -151,7 +151,7 @@ from carl.core.work import (
     WorkState,
 )
 from carl.core.worker import FollowOnWork
-from carl.io.db import DatabaseConnections
+from carl.io.db import DEFAULT_BUSY_TIMEOUT_MS, DatabaseConnections
 from carl.route_cutover import rebuild_work_definition
 
 if TYPE_CHECKING:
@@ -902,6 +902,8 @@ class Database:
             flags=apsw.SQLITE_OPEN_READONLY,
         )
         try:
+            # Startup queries can overlap another connection's WAL cleanup.
+            await connection.set_busy_timeout(DEFAULT_BUSY_TIMEOUT_MS)
             cursor = await connection.execute(
                 """
                 SELECT name

@@ -29,6 +29,7 @@ class ReaderPoolClosedError(DatabaseWrapperError):
     pass
 
 
+DEFAULT_BUSY_TIMEOUT_MS = 30_000
 _CLEANUP_TIMEOUT_SECONDS = 35
 
 
@@ -108,7 +109,7 @@ class DatabaseConnections:
         *,
         create: bool = True,
         reader_count: int = 4,
-        busy_timeout_ms: int = 30_000,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         synchronous: str = "FULL",
     ) -> AsyncGenerator[DatabaseConnections]:
         if reader_count < 1:
