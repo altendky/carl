@@ -63,11 +63,11 @@ def _finalize_component() -> None:
 def build_ebay_component_registry() -> Registry:
     return Registry(
         (
-            Component(COLLECT_EBAY_SEARCH, 5, _collect_component),
-            Component(COLLECT_EBAY_SEARCH_HOMEPAGE, 1, _collect_component),
+            Component(COLLECT_EBAY_SEARCH, 6, _collect_component),
+            Component(COLLECT_EBAY_SEARCH_HOMEPAGE, 2, _collect_component),
             Component(EXTRACT_EBAY_SEARCH, 4, extract_ebay_search),
             Component(FINALIZE_EBAY_SEARCH, 3, _finalize_component),
-            Component(RUN_EBAY_SEARCH_WORK, 5, _run_work_component),
+            Component(RUN_EBAY_SEARCH_WORK, 6, _run_work_component),
         )
     )
 

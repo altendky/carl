@@ -271,7 +271,9 @@ class WreqTransportSettings(StrictModel):
             },
             "pool_seconds": {
                 "state": "not_applicable",
-                "reason": "one_client_per_managed_session"
+                "reason": "one_active_client_per_managed_session"
+                if shared_client and plan.reconnect_on_broken_pipe
+                else "one_client_per_managed_session"
                 if shared_client
                 else "one_client_per_acquisition",
             },
@@ -538,6 +540,7 @@ class _SyncHop:
 class _SyncResult:
     hops: tuple[_SyncHop, ...]
     stopping_condition: str
+    connection_recovery: _ConnectionRecovery | None = None
 
 
 @final
@@ -548,10 +551,22 @@ class _SyncAcquisitionFailure(Exception):
         *,
         hops: tuple[_SyncHop, ...],
         result: dict[str, JsonValue],
+        completed_hops_before_request: int | None = None,
+        connection_recovery: _ConnectionRecovery | None = None,
     ):
         super().__init__(message)
         self.hops = hops
         self.result = result
+        self.completed_hops_before_request = completed_hops_before_request
+        self.connection_recovery = connection_recovery
+
+
+@dataclass(frozen=True, slots=True)
+class _ConnectionRecovery:
+    attempted: bool
+    recovered: bool
+    reason: str
+    first_failure: _SyncAcquisitionFailure
 
 
 def _response_metadata(
@@ -592,6 +607,8 @@ def _sync_acquire(
     client_factory: WreqClientFactory,
     client: _WreqClient | None = None,
     client_hints: _ClientHints | None = None,
+    cookie_provider: wreq.Jar | None = None,
+    visited_urls: frozenset[str] = frozenset(),
 ) -> _SyncResult:
     client_hints = client_hints if client_hints is not None else _ClientHints()
     owns_client = client is None
@@ -599,7 +616,7 @@ def _sync_acquire(
         client = client_factory(proxy=proxy_factory(), settings=settings, plan=plan)
     hops: list[_SyncHop] = []
     current_url = plan.url
-    seen_urls: set[str] = set()
+    seen_urls = set(visited_urls)
     failure: _SyncAcquisitionFailure | None = None
     result: _SyncResult | None = None
     try:
@@ -611,6 +628,7 @@ def _sync_acquire(
                     result={"stopping_condition": "redirect_loop"},
                 )
             seen_urls.add(current_url)
+            completed_hops_before_request = len(hops)
             header_map, ordered_header_names = _supplied_headers(plan)
             supplied_names = {header.name.lower() for header in plan.headers}
             negotiated_headers = tuple(
@@ -623,6 +641,8 @@ def _sync_acquire(
                 for header in negotiated_headers:
                     header_map.append(header.name.decode("ascii"), header.value.decode("ascii"))
             request_options: dict[str, object] = {"default_headers": plan.profile_default_headers}
+            if cookie_provider is not None:
+                request_options["cookie_provider"] = cookie_provider
             if header_map is not None:
                 request_options["headers"] = header_map
             effective_order = plan.header_order or ordered_header_names
@@ -716,6 +736,7 @@ def _sync_acquire(
                         "transport_error": _transport_error_diagnostics(error),
                         "failed_request": {"method": plan.method, "url": current_url},
                     },
+                    completed_hops_before_request=completed_hops_before_request,
                 ) from error
             duration_ns = perf_counter_ns() - started
             metadata = _response_metadata(
@@ -859,6 +880,26 @@ def _materialize_hops(
     return evidence, tuple(bodies)
 
 
+def _materialize_recovery(
+    recovery: _ConnectionRecovery,
+    new_identifier: IdentifierFactory,
+    settings: WreqTransportSettings,
+) -> tuple[dict[str, JsonValue], tuple[AcquiredBody, ...]]:
+    first = recovery.first_failure
+    prefix_count = first.completed_hops_before_request or 0
+    failed_hops, bodies = _materialize_hops(first.hops[prefix_count:], new_identifier, settings)
+    return {
+        "attempted": recovery.attempted,
+        "recovered": recovery.recovered,
+        "reason": recovery.reason,
+        "first_failure": {
+            **first.result,
+            "redirect_prefix_hop_indexes": list(range(prefix_count)),
+            "hops": failed_hops,
+        },
+    }, bodies
+
+
 @final
 class ProxyWreqAcquirer:
     """Acquire bounded GET documents through an explicitly constructed proxy."""
@@ -881,11 +922,30 @@ class ProxyWreqAcquirer:
         self.client_factory = client_factory
         self._managed_session = False
         self._client: _WreqClient | None = None
+        self._client_proxy: wreq.Proxy | None = None
+        self._cookie_jar: wreq.Jar | None = None
         self._client_plan: RequestPlan | None = None
         self._client_hints = _ClientHints()
         self._closed = False
         self._failed = False
         self._lock = anyio.Lock()
+
+    @property
+    def cookie_jar(self) -> wreq.Jar | None:
+        """Canonical native cookie provider, without reading cookie values."""
+        return self._cookie_jar
+
+    def _sync_open_session_client(self, plan: RequestPlan) -> None:
+        if self._client_proxy is None:
+            self._client_proxy = self.proxy_factory()
+        self._client = self.client_factory(
+            proxy=self._client_proxy, settings=self.settings, plan=plan
+        )
+        if self._cookie_jar is None:
+            jar = getattr(self._client, "cookie_jar", None)
+            if isinstance(jar, wreq.Jar):
+                self._cookie_jar = jar
+        self._client_plan = plan
 
     @asynccontextmanager
     async def session(self) -> AsyncGenerator[ProxyWreqAcquirer]:
@@ -929,17 +989,108 @@ class ProxyWreqAcquirer:
 
     def _sync_session_acquire(self, plan: RequestPlan) -> _SyncResult:
         if self._managed_session and self._client is None:
-            self._client = self.client_factory(
-                proxy=self.proxy_factory(), settings=self.settings, plan=plan
+            self._sync_open_session_client(plan)
+        try:
+            return _sync_acquire(
+                plan=plan,
+                proxy_factory=self.proxy_factory,
+                settings=self.settings,
+                client_factory=self.client_factory,
+                client=self._client,
+                client_hints=self._client_hints if self._managed_session else None,
+                cookie_provider=self._cookie_jar,
             )
-            self._client_plan = plan
-        return _sync_acquire(
-            plan=plan,
-            proxy_factory=self.proxy_factory,
-            settings=self.settings,
-            client_factory=self.client_factory,
-            client=self._client,
-            client_hints=self._client_hints if self._managed_session else None,
+        except _SyncAcquisitionFailure as first:
+            diagnostics = first.result.get("transport_error")
+            eligible = (
+                self._managed_session
+                and plan.reconnect_on_broken_pipe
+                and plan.method == "GET"
+                and first.result.get("stopping_condition") == "transport_failure"
+                and first.result.get("failure_phase") in {"request", "response_body"}
+                and isinstance(diagnostics, dict)
+                and "broken_pipe" in diagnostics.get("reason_codes", [])
+                and first.completed_hops_before_request is not None
+            )
+            if not eligible:
+                raise
+            prefix_count = first.completed_hops_before_request
+            assert prefix_count is not None
+            if any(hop.response.get("status_code") == 403 for hop in first.hops[prefix_count:]):
+                raise
+            if self._cookie_jar is None:
+                first.connection_recovery = _ConnectionRecovery(
+                    False, False, "native_cookie_jar_unavailable", first
+                )
+                raise
+            return self._sync_reconnect(plan, first, prefix_count)
+
+    def _sync_reconnect(
+        self, plan: RequestPlan, first: _SyncAcquisitionFailure, prefix_count: int
+    ) -> _SyncResult:
+        failed_request = first.result["failed_request"]
+        assert isinstance(failed_request, dict) and isinstance(failed_request.get("url"), str)
+        prefix = first.hops[:prefix_count]
+        resume_plan = plan.model_copy(
+            update={
+                "url": failed_request["url"],
+                "max_redirects": plan.max_redirects - prefix_count,
+            }
+        )
+        recovery = _ConnectionRecovery(True, False, "reconnect_failed", first)
+        phase = "client_close"
+        try:
+            assert self._client is not None
+            self._client.close()
+            self._client = None
+            phase = "client_open"
+            self._sync_open_session_client(resume_plan)
+        except Exception as error:
+            raise _SyncAcquisitionFailure(
+                "HTTP transport failed while replacing a broken-pipe connection",
+                hops=prefix,
+                result={
+                    "stopping_condition": "transport_failure",
+                    "failure_phase": phase,
+                    "exception_type": _exception_label(error),
+                    "transport_error": _transport_error_diagnostics(error),
+                },
+                connection_recovery=recovery,
+            ) from error
+        try:
+            resumed = _sync_acquire(
+                plan=resume_plan,
+                proxy_factory=self.proxy_factory,
+                settings=self.settings,
+                client_factory=self.client_factory,
+                client=self._client,
+                client_hints=self._client_hints,
+                cookie_provider=self._cookie_jar,
+                visited_urls=frozenset(cast(str, hop.request["url"]) for hop in prefix),
+            )
+        except _SyncAcquisitionFailure as final:
+            raise _SyncAcquisitionFailure(
+                str(final),
+                hops=(*prefix, *final.hops),
+                result=final.result,
+                connection_recovery=recovery,
+            ) from final
+        except _WREQ_EXCEPTIONS as error:
+            raise _SyncAcquisitionFailure(
+                "HTTP transport failed while preparing the reconnect request",
+                hops=prefix,
+                result={
+                    "stopping_condition": "transport_failure",
+                    "failure_phase": "request_preparation",
+                    "exception_type": _exception_label(error),
+                    "transport_error": _transport_error_diagnostics(error),
+                },
+                connection_recovery=recovery,
+            ) from error
+        return _SyncResult(
+            hops=(*prefix, *resumed.hops),
+            stopping_condition=resumed.stopping_condition,
+            connection_recovery=_ConnectionRecovery(True, True, "broken_pipe", first),
         )
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
@@ -970,6 +1121,12 @@ class ProxyWreqAcquirer:
         except _SyncAcquisitionFailure as error:
             hops, bodies = _materialize_hops(error.hops, new_identifier, self.settings)
             result = {"hops": hops, **error.result}
+            if error.connection_recovery is not None:
+                recovery, recovery_bodies = _materialize_recovery(
+                    error.connection_recovery, new_identifier, self.settings
+                )
+                result["connection_recovery"] = recovery
+                bodies = (*bodies, *recovery_bodies)
             result["transport"] = self.settings.safe_configuration(
                 plan, shared_client=self._managed_session
             )
@@ -998,11 +1155,19 @@ class ProxyWreqAcquirer:
             ) from error
 
         hops, bodies = _materialize_hops(sync_result.hops, new_identifier, self.settings)
+        recovery_record: dict[str, JsonValue] = {}
+        if sync_result.connection_recovery is not None:
+            recovery, recovery_bodies = _materialize_recovery(
+                sync_result.connection_recovery, new_identifier, self.settings
+            )
+            recovery_record["connection_recovery"] = recovery
+            bodies = (*bodies, *recovery_bodies)
         final_response = hops[-1]["response"]
         if not isinstance(final_response, dict):
             raise AssertionError("Response metadata must be an object")
         return Acquisition(
             record={
+                **recovery_record,
                 "request_plan": plan.as_json(protected_header_names=_PROTECTED_REQUEST_HEADERS),
                 "authentication": self.authentication,
                 "transport": self.settings.safe_configuration(

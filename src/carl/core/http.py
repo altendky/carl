@@ -51,6 +51,11 @@ class RequestPlan(StrictModel):
     url: str
     method: str = "GET"
     headers: tuple[Header, ...] = ()
+    reconnect_on_broken_pipe: bool = Field(
+        default=False,
+        exclude_if=lambda value: not value,
+        description="Allow one connection replacement for a managed GET that fails with broken-pipe evidence.",
+    )
     profile_default_headers: bool = Field(
         default=True,
         exclude_if=lambda value: value,
