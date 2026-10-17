@@ -1933,11 +1933,13 @@ class Database:
         available = True
         for constraint in constraints:
             if isinstance(constraint, ConcurrencyConstraint):
+                # Common scopes retain all historical owners. Drive this join
+                # from admitted activities so history cannot grow admission cost.
                 cursor = await connection.execute(
                     """
                     SELECT count(*), min(network_activities.permit_expires_at_utc_ns)
-                    FROM network_activities
-                    JOIN network_activity_scopes
+                    FROM network_activities INDEXED BY network_activities_state
+                    CROSS JOIN network_activity_scopes
                       ON network_activity_scopes.network_activity_id = network_activities.id
                     WHERE network_activity_scopes.scope_kind = ?
                       AND network_activity_scopes.scope_identity_json = ?
@@ -3057,11 +3059,13 @@ class Database:
         available = True
         for constraint in constraints:
             if isinstance(constraint, ConcurrencyConstraint):
+                # Count live leases first, then seek their scope memberships;
+                # the opposite order walks every retained job in common scopes.
                 cursor = await connection.execute(
                     """
                     SELECT count(*), min(work_items.lease_expires_at_utc_ns)
-                    FROM work_items
-                    JOIN work_scopes ON work_scopes.work_item_id = work_items.id
+                    FROM work_items INDEXED BY work_items_claim
+                    CROSS JOIN work_scopes ON work_scopes.work_item_id = work_items.id
                     WHERE work_scopes.scope_kind = ?
                       AND work_scopes.scope_identity_json = ?
                       AND work_items.state IN ('leased','cancelling')
@@ -4935,8 +4939,8 @@ class Database:
                 )
                 cursor = await connection.execute(
                     """
-                    SELECT count(*) FROM work_items
-                    JOIN work_scopes ON work_scopes.work_item_id = work_items.id
+                    SELECT count(*) FROM work_items INDEXED BY work_items_claim
+                    CROSS JOIN work_scopes ON work_scopes.work_item_id = work_items.id
                     WHERE work_scopes.scope_kind = 'network_path'
                       AND work_scopes.scope_identity_json = ?
                       AND work_items.id != ? AND work_items.state IN ('leased','cancelling')
