@@ -819,7 +819,8 @@ async def _image_phase(
             for offset in range(0, len(references), 1000):
                 candidates.update(
                     await database.saved_facebook_image_candidates_for_references(
-                        tuple(references[offset : offset + 1000])
+                        tuple(references[offset : offset + 1000]),
+                        published_before_record_identifier=plan_identifier,
                     )
                 )
             saved = await validate_saved_image_results(database, tuple(candidates.items()))

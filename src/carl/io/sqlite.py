@@ -8867,7 +8867,10 @@ class Database:
         return await self._saved_image_candidates("ebay", requested)
 
     async def saved_facebook_image_candidates_for_references(
-        self, references: tuple[GalleryImageReference, ...]
+        self,
+        references: tuple[GalleryImageReference, ...],
+        *,
+        published_before_record_identifier: str | None = None,
     ) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
         """Seek photo/URL/path candidates; the planner checks rendition equivalence."""
 
@@ -8883,12 +8886,30 @@ class Database:
                 requested.add(("photo_id", reference.photo_id))
             if identity[2] == "rendition":
                 requested.add(("path", identity[4]))
-        return await self._saved_image_candidates("facebook", requested)
+        return await self._saved_image_candidates(
+            "facebook",
+            requested,
+            published_before_record_identifier=published_before_record_identifier,
+        )
 
     async def _saved_image_candidates(
-        self, marketplace: str, requested: set[tuple[str, str]]
+        self,
+        marketplace: str,
+        requested: set[tuple[str, str]],
+        *,
+        published_before_record_identifier: str | None = None,
     ) -> tuple[tuple[str, dict[str, JsonValue]], ...]:
         async with self._connections.reader() as connection:
+            boundary_rowid: int | None = None
+            if published_before_record_identifier is not None:
+                cursor = await connection.execute(
+                    "SELECT rowid FROM objects WHERE id = ?",
+                    (published_before_record_identifier,),
+                )
+                boundary = await cursor.fetchone()
+                if boundary is None:
+                    raise KeyError(published_before_record_identifier)
+                boundary_rowid = _integer(boundary[0])
             cursor = await connection.execute(
                 """
                 WITH candidates AS MATERIALIZED (
@@ -8909,6 +8930,7 @@ class Database:
                   AND json_extract(record.value_json, '$.state') = 'saved'
                   AND (? != 'facebook'
                        OR json_extract(record.value_json, '$.original_url') IS NOT NULL)
+                  AND (? IS NULL OR object.rowid < ?)
                 ORDER BY object.rowid
                 """,
                 (
@@ -8916,6 +8938,8 @@ class Database:
                     marketplace,
                     _json(["carl", marketplace, "image_result"]),
                     marketplace,
+                    boundary_rowid,
+                    boundary_rowid,
                 ),
             )
             rows = await cursor.fetchall()

@@ -137,6 +137,16 @@ class _Database:
     async def requested_work_identifiers(self, **_kwargs: object) -> tuple[str, ...]:
         return ()
 
+    async def records_by_identifiers(
+        self, identifiers: tuple[str, ...]
+    ) -> tuple[tuple[str, tuple[str, ...], int, JsonValue], ...]:
+        return tuple(
+            [(identifier, *(await self.get_record(identifier))) for identifier in identifiers]
+        )
+
+    async def work_progress(self, identifiers: tuple[str, ...]) -> tuple[dict[str, JsonValue], ...]:
+        return tuple([await self.work(identifier) for identifier in identifiers])
+
     async def work(self, identifier: str) -> dict[str, JsonValue]:
         self.selected += (identifier,)
         return {

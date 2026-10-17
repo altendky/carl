@@ -43,9 +43,15 @@ def _payload() -> RefreshSearchPayload:
     )
 
 
-async def _retain_shared_image(database: Database) -> None:
+async def _retain_shared_image(
+    database: Database,
+    *,
+    suffix: str = "",
+    url: str = EXPIRED,
+    photo_id: str = "photo-123",
+) -> None:
     await database.begin_operation(
-        operation_id="saved-image-operation",
+        operation_id=f"saved-image-operation{suffix}",
         component=Component(ComponentId(("test", "saved_image")), 1, _payload),
         provenance=_provenance(),
         invocation={},
@@ -53,25 +59,25 @@ async def _retain_shared_image(database: Database) -> None:
         started_at_utc="2026-10-17T00:00:00+00:00",
     )
     await database.complete_operation(
-        operation_id="saved-image-operation",
+        operation_id=f"saved-image-operation{suffix}",
         records=(
             RecordDraft(
-                identifier="saved-image",
+                identifier=f"saved-image{suffix}",
                 kind=("carl", "facebook", "image_result"),
                 schema_version=1,
                 value={
                     "state": "saved",
-                    "source_photo_id": "photo-123",
-                    "original_url": EXPIRED,
+                    "source_photo_id": photo_id,
+                    "original_url": url,
                     "width": 720,
                     "height": 960,
-                    "image_artifact_identifier": "shared-image-bytes",
+                    "image_artifact_identifier": f"shared-image-bytes{suffix}",
                 },
             ),
         ),
         artifacts=(
             BytesDraft(
-                identifier="shared-image-bytes",
+                identifier=f"shared-image-bytes{suffix}",
                 kind=("test", "image"),
                 media_type="image/png",
                 representation={},
@@ -79,8 +85,8 @@ async def _retain_shared_image(database: Database) -> None:
             ),
         ),
         outputs=(
-            NamedOutput(name=("image",), object_identifier="saved-image"),
-            NamedOutput(name=("body",), object_identifier="shared-image-bytes"),
+            NamedOutput(name=("image",), object_identifier=f"saved-image{suffix}"),
+            NamedOutput(name=("body",), object_identifier=f"shared-image-bytes{suffix}"),
         ),
         result={},
         ended_at_utc="2026-10-17T00:00:01+00:00",
@@ -251,6 +257,94 @@ async def test_stored_image_plan_resumes_without_global_history_and_replays_reus
             assert outcome.result["new_image_collections"] == 0
             assert len(await database.facebook_image_reuse_resolutions(("reference",))) == 1
         assert artifact_reads == ["shared-image-bytes", "shared-image-bytes"]
+
+
+@pytest.mark.anyio
+async def test_later_saved_budget_exclusion_cannot_mask_lost_legacy_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identifiers = _identifiers()
+    original = _reference().model_copy(update={"original_url": EXPIRED})
+    selected = _reference(listing_id="456", observation="selected-observation").model_copy(
+        update={
+            "original_url": EXPIRED.replace("photo.jpg", "selected.jpg"),
+            "photo_id": "selected",
+        }
+    )
+    excluded = _reference(listing_id="789", observation="excluded-observation").model_copy(
+        update={"original_url": EXPIRED.replace("photo.jpg", "later.jpg"), "photo_id": "later"}
+    )
+    plan_identifier = workers._stable_identifier("refresh", "image_plan")
+    monkeypatch.setattr("carl._tests.test_pipeline_search_occurrences.time_ns", lambda: NOW)
+    async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
+        await _retain_shared_image(database)
+        await _retain_records(
+            database,
+            (
+                *(
+                    RecordDraft(
+                        identifier=identifier,
+                        kind=("carl", "facebook", "gallery_image_reference"),
+                        schema_version=1,
+                        value=reference.model_dump(mode="json"),
+                    )
+                    for identifier, reference in (
+                        ("original-reference", original),
+                        ("selected-reference", selected),
+                        ("excluded-reference", excluded),
+                    )
+                ),
+                RecordDraft(
+                    identifier=plan_identifier,
+                    kind=("carl", "facebook", "image_followup_plan"),
+                    schema_version=1,
+                    value={
+                        "reference_record_identifiers": [
+                            "original-reference",
+                            "selected-reference",
+                            "excluded-reference",
+                        ],
+                        "selected_reference_record_identifiers": ["selected-reference"],
+                        "expired_reference_record_identifiers": [],
+                        "already_saved_exact_renditions": 1,
+                        "reused_source_photo_images": 0,
+                    },
+                ),
+            ),
+            identifiers,
+        )
+        # This later cache entry was outside the original plan's image budget.
+        await _retain_shared_image(
+            database, suffix="-later", url=excluded.original_url, photo_id="later"
+        )
+        original_artifact = database.get_artifact
+
+        async def artifact(identifier: str) -> tuple[dict[str, JsonValue], bytes]:
+            if identifier == "shared-image-bytes":
+                raise FileNotFoundError("The originally reused image disappeared")
+            return await original_artifact(identifier)
+
+        monkeypatch.setattr(database, "get_artifact", artifact)
+        context = await _attempt(
+            database, "refresh", "facebook", work_kind=REFRESH_SEARCH_WORK_KIND
+        )
+
+        async def provenance():
+            return _provenance()
+
+        outcome = await workers._image_phase(
+            _payload().model_copy(update={"maximum_images": 1}),
+            {"refreshed_search_run_record_identifier": "fresh"},
+            context,
+            workers.RefreshWorkerDependencies(
+                database, identifiers, utc_now_ns=lambda: NOW, code_provenance=provenance
+            ),
+        )
+        assert isinstance(outcome, TerminalFailureWork)
+        assert outcome.error["kind"] == "refresh_image_reuse_evidence_unavailable"
+        assert not await database.facebook_image_reuse_resolutions(
+            ("original-reference", "excluded-reference")
+        )
 
 
 @pytest.mark.anyio

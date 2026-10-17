@@ -70,9 +70,11 @@ async def _vm_steps[Result](
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("marketplace", ["facebook", "ebay"])
+@pytest.mark.parametrize(
+    "marketplace,bounded", [("facebook", False), ("facebook", True), ("ebay", False)]
+)
 async def test_image_candidate_cost_tracks_requested_keys_not_retained_history(
-    tmp_path: Path, marketplace: str
+    tmp_path: Path, marketplace: str, bounded: bool
 ) -> None:
     identifiers = _identifiers()
     async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
@@ -87,7 +89,8 @@ async def test_image_candidate_cost_tracks_requested_keys_not_retained_history(
                             for index in range(64)
                         ),
                         _reference(URL),
-                    )
+                    ),
+                    published_before_record_identifier="plan" if bounded else None,
                 )
             return await database.saved_ebay_image_candidates(
                 (
@@ -98,7 +101,10 @@ async def test_image_candidate_cost_tracks_requested_keys_not_retained_history(
 
         await _retain_records(
             database,
-            (_saved("matching", marketplace=marketplace, url=url, photo_id="photo-1"),),
+            (
+                _saved("matching", marketplace=marketplace, url=url, photo_id="photo-1"),
+                RecordDraft(identifier="plan", kind=("test", "plan"), schema_version=1, value={}),
+            ),
             identifiers,
         )
         before, before_steps = await _vm_steps(database, query)
@@ -139,6 +145,39 @@ async def test_image_candidate_cost_tracks_requested_keys_not_retained_history(
             )
             plan = " ".join(str(row[3]) for row in await cursor.fetchall())
         assert "SEARCH lookup USING PRIMARY KEY" in plan
+
+
+@pytest.mark.anyio
+async def test_image_candidate_publication_boundary_excludes_post_plan_cache(
+    tmp_path: Path,
+) -> None:
+    identifiers = _identifiers()
+    async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
+        await _retain_records(
+            database,
+            (
+                _saved("before", marketplace="facebook", url=OTHER, photo_id="photo-1"),
+                RecordDraft(identifier="plan", kind=("test", "plan"), schema_version=1, value={}),
+                _saved("after", marketplace="facebook", url=URL, photo_id="photo-1"),
+            ),
+            identifiers,
+        )
+        assert [
+            identifier
+            for identifier, _ in await database.saved_facebook_image_candidates_for_references(
+                (_reference(URL),), published_before_record_identifier="plan"
+            )
+        ] == ["before"]
+        assert [
+            identifier
+            for identifier, _ in await database.saved_facebook_image_candidates_for_references(
+                (_reference(URL),)
+            )
+        ] == ["before", "after"]
+        with pytest.raises(KeyError, match="missing-plan"):
+            await database.saved_facebook_image_candidates_for_references(
+                (_reference(URL),), published_before_record_identifier="missing-plan"
+            )
 
 
 @pytest.mark.anyio
