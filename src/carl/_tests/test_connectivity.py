@@ -1,6 +1,7 @@
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from time import perf_counter_ns
 from uuid import uuid4
 
 import anyio
@@ -58,15 +59,29 @@ async def test_outage_defers_work_without_spending_budget_and_allows_offline_wor
     tmp_path: Path,
 ) -> None:
     now = 1_000_000_000
+    clock_started = perf_counter_ns()
     online = False
     probes = 0
     observed_budgets: list[int] = []
     network_kind = ("carl", "ebay", "collect", "item")
     offline_kind = ("carl", "ebay", "extract", "item")
 
+    def utc_now_ns() -> int:
+        # Manual outage jumps and real lease-renewal timers share an advancing clock.
+        return now + perf_counter_ns() - clock_started
+
     async def probe() -> dict[str, JsonValue]:
         nonlocal probes
         probes += 1
+        if probes == 1:
+            # Keep the outage check open until a background renewal is durably
+            # recorded, rather than depending on the machine finishing in 100 ms.
+            previous_activity = (await database.work("network"))["last_lease_activity_at_utc_ns"]
+            with anyio.fail_after(5):
+                while (await database.work("network"))[
+                    "last_lease_activity_at_utc_ns"
+                ] == previous_activity:
+                    await anyio.sleep(0.01)
         return {"reachable": online}
 
     async def handle(payload: Payload, context: AttemptContext) -> WorkOutcome:
@@ -89,11 +104,11 @@ async def test_outage_defers_work_without_spending_budget_and_allows_offline_wor
         )
     )
     async with Database.managed(tmp_path / "database.sqlite3", initialize=True) as database:
-        monitor = ConnectivityMonitor(database, lambda: str(uuid4()), lambda: now, probe)
+        monitor = ConnectivityMonitor(database, lambda: str(uuid4()), utc_now_ns, probe)
         services = WorkerRuntimeServices(
             new_identifier=lambda: str(uuid4()),
-            utc_now_ns=lambda: now,
-            monotonic_ns=lambda: now,
+            utc_now_ns=utc_now_ns,
+            monotonic_ns=perf_counter_ns,
             code_provenance=_async_provenance,
             invocation=lambda: {},
             connectivity_monitor=monitor,
@@ -112,7 +127,7 @@ async def test_outage_defers_work_without_spending_budget_and_allows_offline_wor
                 worker_identifier="worker",
                 lease_token=str(uuid4()),
                 lease_duration_ns=_settings().lease_duration_ns,
-                utc_now_ns=lambda: now,
+                utc_now_ns=utc_now_ns,
                 event_identifier=str(uuid4()),
             )
 
@@ -135,7 +150,7 @@ async def test_outage_defers_work_without_spending_budget_and_allows_offline_wor
         assert not await monitor.available()
         assert probes == 2
         # Reopening the monitor retains the outage across process lifetimes.
-        replacement = ConnectivityMonitor(database, lambda: str(uuid4()), lambda: now, probe)
+        replacement = ConnectivityMonitor(database, lambda: str(uuid4()), utc_now_ns, probe)
         assert not await replacement.available()
         assert probes == 2
         online = True

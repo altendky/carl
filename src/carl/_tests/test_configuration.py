@@ -8,7 +8,11 @@ from zipfile import ZipFile
 import pytest
 from pydantic import ValidationError
 
-from carl.core.configuration import CarlConfiguration, EbaySearchConfiguration
+from carl.core.configuration import (
+    CarlConfiguration,
+    EbayItemConfiguration,
+    EbaySearchConfiguration,
+)
 from carl.core.routing import (
     BrightDataProduct,
     DecodoProduct,
@@ -164,6 +168,41 @@ def test_ebay_search_defaults_and_explicit_zero_holdoff(tmp_path: Path) -> None:
 def test_ebay_search_policy_rejects_invalid_bounds(values: dict[str, int | float]) -> None:
     with pytest.raises(ValidationError):
         EbaySearchConfiguration.model_validate(values)
+
+
+def test_ebay_item_defaults_and_configured_holdoff(tmp_path: Path) -> None:
+    directories, path = _write_configuration(tmp_path)
+    policy = load_configuration(directories.configuration_file).configuration.ebay_item
+    assert policy.maximum_page_attempts == 7
+    assert policy.minimum_holdoff_seconds == policy.maximum_holdoff_seconds == 0
+    with path.open("ab") as stream:
+        stream.write(
+            b"\n[ebay_item]\nmaximum_page_attempts = 3\nminimum_holdoff_seconds = 4.0\nmaximum_holdoff_seconds = 8.0\n"
+        )
+    changed = load_configuration(path).configuration
+    assert changed.ebay_item.maximum_page_attempts == 3
+    assert (
+        changed.ebay_item.minimum_holdoff_seconds,
+        changed.ebay_item.maximum_holdoff_seconds,
+    ) == (4, 8)
+    assert changed.ebay_search == EbaySearchConfiguration()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"maximum_page_attempts": 0},
+        {"maximum_page_attempts": 21},
+        {"minimum_holdoff_seconds": -1.0},
+        {"maximum_holdoff_seconds": 61.0},
+        {"minimum_holdoff_seconds": float("nan")},
+        {"maximum_holdoff_seconds": float("inf")},
+        {"minimum_holdoff_seconds": 8.0, "maximum_holdoff_seconds": 4.0},
+    ],
+)
+def test_ebay_item_policy_rejects_invalid_bounds(values: dict[str, int | float]) -> None:
+    with pytest.raises(ValidationError):
+        EbayItemConfiguration.model_validate(values)
 
 
 def test_explicit_network_route_cutover(tmp_path: Path) -> None:

@@ -862,6 +862,7 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
         assert result.matched_terminal_failures == image_count
         assert result.retried == image_count
         assert result.remaining_terminal_failures == 0
+        now = time_ns()
         old_worker = await database.claim_work(
             supported_capabilities=(
                 WorkCapability(kind=COLLECT_IMAGE_WORK_KIND, payload_schema_version=1),
@@ -869,7 +870,7 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
             worker_identifier="pre-fix-worker",
             lease_token="pre-fix-lease",
             lease_duration_ns=1_000,
-            utc_now_ns=lambda: time_ns(),
+            utc_now_ns=lambda: now,
             event_identifier="pre-fix-claim",
         )
         assert old_worker.lease is None
@@ -885,7 +886,7 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
                 worker_identifier=f"current-worker-{index}",
                 lease_token=f"current-lease-{index}",
                 lease_duration_ns=1_000_000_000,
-                utc_now_ns=time_ns,
+                utc_now_ns=lambda: now,
                 event_identifier=f"current-claim-{index}",
             )
             assert current_worker.lease is not None
@@ -910,7 +911,7 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
                 worker_identifier="another-current-worker",
                 lease_token="another-current-lease",
                 lease_duration_ns=1_000_000_000,
-                utc_now_ns=time_ns,
+                utc_now_ns=lambda: now,
                 event_identifier="another-current-claim",
             )
 

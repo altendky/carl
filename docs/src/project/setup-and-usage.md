@@ -64,6 +64,11 @@ maximum_homepage_attempts = 2
 minimum_holdoff_seconds = 0.0
 maximum_holdoff_seconds = 0.0
 
+[ebay_item]
+maximum_page_attempts = 7
+minimum_holdoff_seconds = 0.0
+maximum_holdoff_seconds = 0.0
+
 [[http_transports]]
 identifier = "browser_chrome_154"
 implementation = "wreq"
@@ -119,6 +124,13 @@ homepage, search, pagination or retry requests. Set the holdoff bounds to `4.0` 
 `8.0` to restore random 4–8 second waits. Transport failures still use the worker's
 existing retry policy; blocked runs that exhaust page attempts retain the shared
 cooldown and fresh-session retries.
+Item pages use the separate optional `[ebay_item]` settings. Blocked responses retry
+in the same session with no added wait by default, up to seven total HTTP responses
+per item work item, including responses retained by earlier attempts. Exhausting
+that budget stops the item job instead of scheduling another 40-minute recovery.
+Each response retains its acquisition evidence. Set the item holdoff bounds above
+zero to add waits between blocked-response retries. Workers reload these settings
+between jobs; installing the new retry implementation requires restarting workers.
 Existing transports explicitly selecting `chrome_153` retain that profile and its
 default platform. After updating Carl and restarting its workers and MCP clients,
 change their `emulation_profile` to `chrome_154` to select the new profile. The
