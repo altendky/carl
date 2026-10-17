@@ -265,7 +265,8 @@ async def test_planning_checks_only_newest_valid_artifact_for_each_saved_renditi
 
         monkeypatch.setattr(database, "get_artifact", verify_selected_artifact)
         planned = await _run_next(database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND)
-        assert planned["state"] == "pending"
+        assert planned["state"] == "completed"
+        assert _mapping(planned["result"])["new_images_reused"] == 1
         assert checked == (
             ["artifact-newest", "artifact-middle"] if newest_corrupt else ["artifact-newest"]
         )

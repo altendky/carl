@@ -41,6 +41,7 @@ from carl.marketplace_listing import ebay_observations
 _WAIT_NS = 5_000_000_000
 _ITEM_REQUESTER = ("carl", "ebay", "search_refresh", "item")
 _IMAGE_REQUESTER = ("carl", "ebay", "search_refresh", "image")
+_IMAGE_REUSE_BATCH_SIZE = 100
 
 
 def _identifier(*parts: str) -> str:
@@ -376,6 +377,48 @@ async def _item_phase(
     )
 
 
+async def _image_artifact_available(
+    database: Database,
+    saved: dict[str, JsonValue],
+    validated_artifacts: dict[str, bool],
+) -> bool:
+    artifact = saved.get("image_artifact_identifier")
+    if not isinstance(artifact, str):
+        return False
+    if artifact not in validated_artifacts:
+        try:
+            _ = await database.get_artifact(artifact)
+        except (KeyError, ValueError, OSError):
+            validated_artifacts[artifact] = False
+        else:
+            validated_artifacts[artifact] = True
+    return validated_artifacts[artifact]
+
+
+async def _reusable_ebay_images(
+    database: Database,
+    urls: tuple[str, ...],
+    validated_artifacts: dict[str, bool],
+) -> dict[tuple[str, ...], tuple[str, dict[str, JsonValue]]]:
+    wanted = {ebay_image_identity(url) for url in urls}
+    candidates: list[tuple[str, dict[str, JsonValue]]] = []
+    for offset in range(0, len(urls), 1000):
+        candidates.extend(await database.saved_ebay_image_candidates(urls[offset : offset + 1000]))
+    reusable: dict[tuple[str, ...], tuple[str, dict[str, JsonValue]]] = {}
+    for identifier, saved in reversed(candidates):
+        url = saved.get("url")
+        if saved.get("state") != "saved" or not isinstance(url, str):
+            continue
+        identity = ebay_image_identity(url)
+        if (
+            identity in wanted
+            and identity not in reusable
+            and await _image_artifact_available(database, saved, validated_artifacts)
+        ):
+            reusable[identity] = (identifier, saved)
+    return reusable
+
+
 async def _image_phase(
     payload: RefreshEbaySearchPayload,
     checkpoint: dict[str, JsonValue],
@@ -383,6 +426,8 @@ async def _image_phase(
     dependencies: EbayRefreshWorkerDependencies,
 ) -> WorkOutcome:
     database = dependencies.database
+    validated_artifacts: dict[str, bool] = {}
+    reusable_images: dict[tuple[str, ...], tuple[str, dict[str, JsonValue]]] | None = None
     generation = checkpoint.get("item_retry_generation_identifier")
     plan_identifier = (
         _identifier(context.work_item_identifier, "image_plan", generation)
@@ -394,6 +439,7 @@ async def _image_phase(
         if kind != ("carl", "ebay", "image_followup_plan"):
             raise ValueError("Refresh image plan is malformed")
         reference_identifiers = _strings(_mapping(value).get("reference_record_identifiers"))
+        batch_cached_reuse = _mapping(value).get("batch_cached_reuse") is True
     except KeyError:
         records: list[RecordDraft] = []
         outputs: list[NamedOutput] = []
@@ -435,36 +481,9 @@ async def _image_phase(
                 for url in _strings(observation.get("gallery_urls"))
             )
         )
-        wanted = {ebay_image_identity(url) for url in wanted_urls}
         selected_renditions: set[tuple[str, ...]] = set()
-        saved_renditions: set[tuple[str, ...]] = set()
-        validated_artifacts: dict[str, bool] = {}
-        saved_candidates = []
-        for start in range(0, len(wanted_urls), 1000):
-            saved_candidates.extend(
-                await database.saved_ebay_image_candidates(wanted_urls[start : start + 1000])
-            )
-        for _, raw in reversed(saved_candidates):
-            saved = _mapping(raw)
-            url, artifact = saved.get("url"), saved.get("image_artifact_identifier")
-            if (
-                saved.get("state") != "saved"
-                or not isinstance(url, str)
-                or not isinstance(artifact, str)
-            ):
-                continue
-            identity = ebay_image_identity(url)
-            if identity not in wanted or identity in saved_renditions:
-                continue
-            if artifact not in validated_artifacts:
-                try:
-                    await database.get_artifact(artifact)
-                except (KeyError, ValueError, OSError):
-                    validated_artifacts[artifact] = False
-                else:
-                    validated_artifacts[artifact] = True
-            if validated_artifacts[artifact]:
-                saved_renditions.add(identity)
+        reusable_images = await _reusable_ebay_images(database, wanted_urls, validated_artifacts)
+        saved_renditions = reusable_images.keys()
         for observation_identifier, observation in observations:
             item = observation.get("item_identifier")
             if not isinstance(item, str):
@@ -511,7 +530,11 @@ async def _image_phase(
                                 ),
                                 "url": url,
                                 "gallery_order": order,
-                                "work_identifier": work_identifier,
+                                "work_identifier": (
+                                    context.work_item_identifier
+                                    if identity in saved_renditions
+                                    else work_identifier
+                                ),
                             },
                         )
                     )
@@ -530,7 +553,10 @@ async def _image_phase(
                 identifier=plan_identifier,
                 kind=("carl", "ebay", "image_followup_plan"),
                 schema_version=1,
-                value={"reference_record_identifiers": list(reference_identifiers)},
+                value={
+                    "reference_record_identifiers": list(reference_identifiers),
+                    "batch_cached_reuse": True,
+                },
             )
         )
         outputs.append(
@@ -562,6 +588,7 @@ async def _image_phase(
                 ),
             ),
         )
+        batch_cached_reuse = True
     children: list[str] = []
     pending_urls: set[str] = set()
     references: list[tuple[str, JsonValue]] = []
@@ -593,6 +620,140 @@ async def _image_phase(
         str(work["identifier"]): work
         for work in await _works(database, tuple(dict.fromkeys(requested_children.values())))
     }
+    reference_values = {identifier: _mapping(value) for identifier, value in references}
+    reuse_results = {
+        reference: identifier
+        for reference, identifier in _mapping(
+            checkpoint.get("image_reuse_result_identifiers")
+        ).items()
+        if reference in reference_values
+    }
+    reused_references: set[str] = set()
+    if batch_cached_reuse:
+        stored_results = tuple(
+            identifier for identifier in reuse_results.values() if isinstance(identifier, str)
+        )
+        if len(set(stored_results)) != len(reuse_results):
+            raise ValueError("Stored image reuse bindings are malformed")
+        result_references = {
+            identifier: reference for reference, identifier in reuse_results.items()
+        }
+        for offset in range(0, len(stored_results), 1000):
+            for result_identifier, kind, _, value in await database.records_by_identifiers(
+                stored_results[offset : offset + 1000]
+            ):
+                saved = _mapping(value)
+                reference = saved.get("reference_record_identifier")
+                if (
+                    kind != ("carl", "ebay", "image_result")
+                    or saved.get("state") != "saved"
+                    or not isinstance(reference, str)
+                    or reference != result_references[result_identifier]
+                    or any(
+                        saved.get(field) != reference_values[reference].get(field)
+                        for field in ("item_identifier", "observation_record_identifier", "url")
+                    )
+                ):
+                    raise ValueError("Stored image reuse binding is malformed")
+                if await _image_artifact_available(database, saved, validated_artifacts):
+                    reused_references.add(reference)
+        reused_references.difference_update(
+            identifier
+            for (identifier, _), requester in zip(references, requesters, strict=True)
+            if requester in requested_children
+        )
+        unbound_urls = tuple(
+            dict.fromkeys(
+                str(_mapping(value)["url"])
+                for (identifier, value), requester in zip(references, requesters, strict=True)
+                if requester not in requested_children and identifier not in reuse_results
+            )
+        )
+        if reusable_images is None:
+            reusable_images = await _reusable_ebay_images(
+                database, unbound_urls, validated_artifacts
+            )
+        reuse_records: list[RecordDraft] = []
+        reuse_inputs: list[NamedInput] = []
+        reuse_outputs: list[NamedOutput] = []
+
+        async def publish_reuses() -> None:
+            if not reuse_records:
+                return
+            await database.publish_leased_operation_checkpoint(
+                work_item_identifier=context.work_item_identifier,
+                lease_token=context.lease_token,
+                worker_identifier=context.worker_identifier,
+                utc_now_ns=dependencies.utc_now_ns,
+                operation_id=context.operation_identifier,
+                records=tuple(reuse_records),
+                artifacts=(),
+                inputs=tuple(reuse_inputs),
+                outputs=tuple(reuse_outputs),
+                checkpoint_result={
+                    **checkpoint,
+                    "stage": "collecting_images",
+                    "image_followup_plan_record_identifier": plan_identifier,
+                    "image_reuse_result_identifiers": dict(reuse_results),
+                    "new_images_reused": len(reused_references),
+                },
+            )
+            reuse_records.clear()
+            reuse_inputs.clear()
+            reuse_outputs.clear()
+
+        for (reference_identifier, value), requester in zip(references, requesters, strict=True):
+            if requester in requested_children or reference_identifier in reuse_results:
+                continue
+            reference = _mapping(value)
+            url = reference.get("url")
+            if not isinstance(url, str):
+                raise ValueError("Refresh image reference has no URL")
+            source = reusable_images.get(ebay_image_identity(url))
+            if source is None:
+                continue
+            source_identifier, saved = source
+            identifier = _identifier(
+                context.work_item_identifier, "image_reuse", plan_identifier, reference_identifier
+            )
+            reuse_records.append(
+                RecordDraft(
+                    identifier=identifier,
+                    kind=("carl", "ebay", "image_result"),
+                    schema_version=1,
+                    value={
+                        **saved,
+                        "item_identifier": reference.get("item_identifier"),
+                        "observation_record_identifier": reference.get(
+                            "observation_record_identifier"
+                        ),
+                        "reference_record_identifier": reference_identifier,
+                        "url": url,
+                        "reused_from_result_record_identifier": source_identifier,
+                        "operation_identifier": context.operation_identifier,
+                    },
+                )
+            )
+            reuse_inputs.extend(
+                (
+                    NamedInput(
+                        name=("gallery_reference", identifier),
+                        object_identifier=reference_identifier,
+                    ),
+                    NamedInput(
+                        name=("reused_image_result", identifier),
+                        object_identifier=source_identifier,
+                    ),
+                )
+            )
+            reuse_outputs.append(
+                NamedOutput(name=("image_result", identifier), object_identifier=identifier)
+            )
+            reuse_results[reference_identifier] = identifier
+            reused_references.add(reference_identifier)
+            if len(reuse_records) >= _IMAGE_REUSE_BATCH_SIZE:
+                await publish_reuses()
+        await publish_reuses()
     deferred_references = False
     for (reference_identifier, value), requester in zip(references, requesters, strict=True):
         reference = _mapping(value)
@@ -605,6 +766,8 @@ async def _image_phase(
             }
         )
         child = requested_children.get(requester)
+        if child is None and reference_identifier in reused_references:
+            continue
         # Complete the first exact URL before queuing its other references, so
         # they reuse that download rather than racing redundant acquisitions.
         if child is None and request.url in pending_urls:
@@ -633,6 +796,8 @@ async def _image_phase(
         "stage": "collecting_images",
         "image_followup_plan_record_identifier": plan_identifier,
         "image_collection_work_identifiers": children,
+        "image_reuse_result_identifiers": reuse_results,
+        "new_images_reused": len(reused_references),
     }
     if _pending(works) or deferred_references:
         return RetryWork(
@@ -640,11 +805,11 @@ async def _image_phase(
             reason={"kind": "waiting_for_image_collections"},
             result=result,
         )
-    saved = sum(
+    saved = len(reused_references) + sum(
         work.get("state") == "completed" and _mapping(work.get("result")).get("state") == "saved"
         for work in works
     )
-    failures = len(works) - saved
+    failures = len(works) + len(reused_references) - saved
     total_failures = (
         failures
         + int(str(checkpoint.get("item_failures", 0)))
@@ -746,7 +911,10 @@ async def ebay_refresh_child_work_states(
         "item_extractions": tuple(
             WorkState(str(item["state"])) for item in (*extractions, *reused)
         ),
-        "images": tuple(WorkState(str(image["state"])) for image in images),
+        "images": (
+            *tuple(WorkState(str(image["state"])) for image in images),
+            *((WorkState.COMPLETED,) * int(str(checkpoint.get("new_images_reused", 0)))),
+        ),
         "image_extractions": (),
         "descriptions": tuple(WorkState(str(work["state"])) for work in descriptions),
     }
@@ -776,7 +944,7 @@ def build_ebay_refresh_worker_registry(
                 capability=WorkCapability(
                     kind=REFRESH_EBAY_SEARCH_WORK_KIND, payload_schema_version=1
                 ),
-                component=Component(ComponentId(("carl", "ebay", "refresh", "search")), 5, _anchor),
+                component=Component(ComponentId(("carl", "ebay", "refresh", "search")), 6, _anchor),
                 payload_type=RefreshEbaySearchPayload,
                 handler=refresh,
             ),

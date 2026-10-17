@@ -297,7 +297,7 @@ async def test_refresh_waits_for_details_descriptions_and_globally_bounded_image
         _ = await _run_next(database, registry(), identifiers, COLLECT_EBAY_IMAGE_WORK_KIND)
         # Rebuilding the registry simulates restart; fixed plan survives and the
         # duplicate URL is subsequently reused for the other item relationship.
-        if shared_image:
+        if shared_image == "cdn":
             _ = await _run_next(database, registry(), identifiers, REFRESH_EBAY_SEARCH_WORK_KIND)
             _ = await _run_next(database, registry(), identifiers, COLLECT_EBAY_IMAGE_WORK_KIND)
         completed = await _run_next(
@@ -663,10 +663,13 @@ async def test_two_completed_refreshes_have_distinct_observations_and_valid_anal
             _ = await _run_next(database, registry, identifiers, COLLECT_EBAY_DESCRIPTION_WORK_KIND)
             _ = await _run_next(database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND)
             _ = await _run_next(database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND)
-            _ = await _run_next(database, registry, identifiers, COLLECT_EBAY_IMAGE_WORK_KIND)
-            completed = await _run_next(
-                database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND
-            )
+            if round_number == 1:
+                _ = await _run_next(database, registry, identifiers, COLLECT_EBAY_IMAGE_WORK_KIND)
+                completed = await _run_next(
+                    database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND
+                )
+            else:
+                completed = await database.work(f"refresh-{round_number}")
             assert completed["state"] == "completed"
             result = _mapping(completed["result"])
             assert result["state"] == "completed"
@@ -755,10 +758,13 @@ async def test_image_phase_reuses_reference_when_coordinators_share_one_observat
             )
             _ = await _run_next(database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND)
             _ = await _run_next(database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND)
-            _ = await _run_next(database, registry, identifiers, COLLECT_EBAY_IMAGE_WORK_KIND)
-            completed = await _run_next(
-                database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND
-            )
+            if round_number == 1:
+                _ = await _run_next(database, registry, identifiers, COLLECT_EBAY_IMAGE_WORK_KIND)
+                completed = await _run_next(
+                    database, registry, identifiers, REFRESH_EBAY_SEARCH_WORK_KIND
+                )
+            else:
+                completed = await database.work(f"refresh-{round_number}")
             assert completed["state"] == "completed"
             assert (
                 len((await select_ebay_analysis_evidence(database, "shared-observation")).included)
