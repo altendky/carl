@@ -27,6 +27,29 @@ COLLECT_EBAY_SEARCH_WORK_KIND = ("carl", "ebay", "collect", "search")
 LEGACY_COLLECT_EBAY_SEARCH_PAYLOAD_SCHEMA_VERSION = 1
 COLLECT_EBAY_SEARCH_PAYLOAD_SCHEMA_VERSION = 2
 
+# Observed Chrome document-navigation order. Optional names do not add values;
+# the transport profile and cookie jar still generate their own headers.
+EBAY_NAVIGATION_HEADER_ORDER = (
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-full-version",
+    "sec-ch-ua-platform",
+    "sec-ch-ua-platform-version",
+    "sec-ch-ua-model",
+    "accept-language",
+    "upgrade-insecure-requests",
+    "user-agent",
+    "accept",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-user",
+    "sec-fetch-dest",
+    "referer",
+    "accept-encoding",
+    "cookie",
+    "priority",
+)
+
 type EbayListingState = Literal["active", "sold", "completed"]
 
 _ITEM_IDENTIFIER = re.compile(r"^[0-9]{9,15}$")
@@ -218,6 +241,14 @@ def ebay_search_url(
     return "https://www.ebay.com/sch/i.html?" + urlencode(parameters)
 
 
+def ebay_homepage_plan(*, network_path: tuple[str, ...]) -> RequestPlan:
+    return RequestPlan(
+        url="https://www.ebay.com/",
+        header_order=EBAY_NAVIGATION_HEADER_ORDER,
+        routing=network_path,
+    )
+
+
 def ebay_search_plan(
     request: EbaySearchRequest,
     *,
@@ -229,19 +260,21 @@ def ebay_search_plan(
             request.query, page_number=page_number, listing_state=request.listing_state
         ),
         headers=(
-            (
-                Header(
-                    name=b"Referer",
-                    value=ebay_search_url(
+            Header(
+                name=b"Referer",
+                value=(
+                    ebay_search_url(
                         request.query,
                         page_number=page_number - 1,
                         listing_state=request.listing_state,
-                    ).encode("ascii"),
-                ),
-            )
-            if page_number > 1
-            else ()
+                    )
+                    if page_number > 1
+                    else "https://www.ebay.com/"
+                ).encode("ascii"),
+            ),
+            Header(name=b"Sec-Fetch-Site", value=b"same-origin"),
         ),
+        header_order=EBAY_NAVIGATION_HEADER_ORDER,
         routing=network_path,
     )
 

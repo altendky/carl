@@ -59,13 +59,13 @@ version = "REPLACE_WITH_WIREPROXY_VERSION"
 binary_sha256 = "REPLACE_WITH_64_CHARACTER_LOWERCASE_SHA256"
 
 [[http_transports]]
-identifier = "browser_chrome_153"
+identifier = "browser_chrome_154"
 implementation = "wreq"
-emulation_profile = "chrome_153"
+emulation_profile = "chrome_154"
 
 [[acquisition_stacks]]
 identifier = "ebay_anonymous"
-http_transport = "browser_chrome_153"
+http_transport = "browser_chrome_154"
 network_path = ["decodo", "personal", "carl"]
 
 [[routes]]
@@ -103,8 +103,12 @@ provider configuration; see [the provider configuration notes](index.md#local-co
 The mobile gateway above follows [Decodo's mobile quick start](https://help.decodo.com/docs/mobile-proxy-quick-start).
 Use your account-generated HTTP endpoint if it differs; provider examples are not a promise
 that every product or subscription uses the same gateway.
-The pinned `wreq` Python dependency supplies Chrome 153 emulation; this does not
+The pinned `wreq` Python dependency supplies Chrome 154/Linux emulation; this does not
 require installing or automating a Chrome browser.
+Existing transports explicitly selecting `chrome_153` retain that profile and its
+default platform. After updating Carl and restarting its workers and MCP clients,
+change their `emulation_profile` to `chrome_154` to select the new profile. The
+transport identifier and acquisition-stack references can stay unchanged.
 
 Store each product's separate password through a non-echoing prompt:
 

@@ -7,11 +7,13 @@ import pytest
 
 from carl.core.ebay import (
     COLLECT_EBAY_SEARCH_WORK_KIND,
+    EBAY_NAVIGATION_HEADER_ORDER,
     CollectEbaySearchPayload,
     EbayListingState,
     EbaySearchRequest,
     EbaySearchResponseKind,
     collect_ebay_search_work,
+    ebay_homepage_plan,
     ebay_item_identifier,
     ebay_search_plan,
     ebay_search_url,
@@ -60,7 +62,7 @@ class _Acquirer:
                 "transport": {
                     "implementation": "wreq",
                     "implementation_version": "test",
-                    "emulation_profile": "Chrome153",
+                    "emulation_profile": "Chrome154",
                 },
                 "routing": {
                     "configured": list(plan.routing),
@@ -137,6 +139,16 @@ def test_ebay_search_request_and_url_are_explicit() -> None:
     )
 
 
+def test_homepage_and_search_share_document_header_order() -> None:
+    home = ebay_homepage_plan(network_path=("test",))
+    search = ebay_search_plan(EbaySearchRequest(query="scope"), network_path=home.routing)
+    assert home.url == "https://www.ebay.com/"
+    assert home.headers == ()
+    assert home.header_order == search.header_order == EBAY_NAVIGATION_HEADER_ORDER
+    assert home.header_order.index("accept-language") < home.header_order.index("user-agent")
+    assert home.header_order[-2:] == ("cookie", "priority")
+
+
 @pytest.mark.parametrize("listing_state", ("active", "sold", "completed"))
 @pytest.mark.parametrize("page_number", (1, 2, 3))
 def test_pagination_referer_names_preceding_page(
@@ -145,16 +157,17 @@ def test_pagination_referer_names_preceding_page(
     request = EbaySearchRequest(query="32 mm Plössl & eyepiece", listing_state=listing_state)
     plan = ebay_search_plan(request, network_path=("test",), page_number=page_number)
     assert plan.headers == (
-        (
-            Header(
-                name=b"Referer",
-                value=ebay_search_url(
+        Header(
+            name=b"Referer",
+            value=(
+                ebay_search_url(
                     request.query, page_number=page_number - 1, listing_state=listing_state
-                ).encode("ascii"),
-            ),
-        )
-        if page_number > 1
-        else ()
+                )
+                if page_number > 1
+                else "https://www.ebay.com/"
+            ).encode("ascii"),
+        ),
+        Header(name=b"Sec-Fetch-Site", value=b"same-origin"),
     )
 
 
@@ -644,9 +657,13 @@ async def test_search_follows_next_page_until_explicit_maximum(tmp_path: Path) -
         "https://www.ebay.com/sch/i.html?_nkw=scope",
         "https://www.ebay.com/sch/i.html?_nkw=scope&_pgn=2",
     ]
-    assert acquirer.plans[0].headers == ()
+    assert acquirer.plans[0].headers == (
+        Header(name=b"Referer", value=b"https://www.ebay.com/"),
+        Header(name=b"Sec-Fetch-Site", value=b"same-origin"),
+    )
     assert acquirer.plans[1].headers == (
         Header(name=b"Referer", value=acquirer.plans[0].url.encode("ascii")),
+        Header(name=b"Sec-Fetch-Site", value=b"same-origin"),
     )
     assert len(acquisitions) == len(extractions) == 2
     assert len(occurrences) == 3
@@ -699,8 +716,13 @@ async def test_three_page_search_retains_each_preceding_page_referer(tmp_path: P
     assert result["page_count"] == 3
     assert result["stopping_reason"] == "no_next_page"
     retained = sorted((value for _, value in acquisitions), key=lambda value: value["page_number"])
-    assert retained[0]["request_plan"]["headers"] == []
-    for index in (1, 2):
-        expected = Header(name=b"Referer", value=acquirer.plans[index - 1].url.encode("ascii"))
-        assert acquirer.plans[index].headers == (expected,)
-        assert retained[index]["request_plan"]["headers"] == [expected.as_json()]
+    for index in (0, 1, 2):
+        referer = acquirer.plans[index - 1].url if index else "https://www.ebay.com/"
+        expected = (
+            Header(name=b"Referer", value=referer.encode("ascii")),
+            Header(name=b"Sec-Fetch-Site", value=b"same-origin"),
+        )
+        assert acquirer.plans[index].headers == expected
+        assert retained[index]["request_plan"]["headers"] == [
+            header.as_json() for header in expected
+        ]
