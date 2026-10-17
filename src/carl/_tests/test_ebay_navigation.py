@@ -107,14 +107,14 @@ def test_fetch_plan_has_complete_profile_and_no_document_only_headers() -> None:
     assert "local-token" not in str(plan.as_json())
 
 
-def test_search_plans_opt_into_bounded_reconnect_without_changing_default_plan_identity() -> None:
+def test_search_plans_do_not_hide_extra_attempts_in_transport_reconnects() -> None:
     request = EbaySearchRequest(query="scope")
     home = ebay_homepage_plan(network_path=("test",))
     search = ebay_search_plan(request, network_path=home.routing)
     fetch = ebay_fetch_plan(
         request, network_path=home.routing, page_number=2, token="local", referer=search.url
     )
-    assert all(plan.reconnect_on_broken_pipe for plan in (home, search, fetch))
+    assert all(not plan.reconnect_on_broken_pipe for plan in (home, search, fetch))
     ordinary = RequestPlan(url="https://example.invalid/")
     assert not ordinary.reconnect_on_broken_pipe
     assert "reconnect_on_broken_pipe" not in ordinary.as_json()
@@ -251,6 +251,9 @@ async def test_fetch_challenge_redirect_is_retained_and_classified_without_follo
         assert result["state"] == "response_failed"
         assert result["stopping_reason"] == "challenge"
         assert result["response_classification"]["kind"] == "challenge"
-        assert len(acquirer.plans) == 2
+        assert len(acquirer.plans) == 8
+        assert all(plan == acquirer.plans[1] for plan in acquirer.plans[1:])
+        assert result["page_count"] == 2
+        assert result["pagination"]["fetch_pages"] == 1
         _, _, retained = await database.get_record(result["acquisition_record_identifiers"][-1])
         assert retained["hops"][-1]["response"]["status_code"] == 307

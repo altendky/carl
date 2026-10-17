@@ -140,7 +140,6 @@ def ebay_fetch_plan(
         "priority": "u=1, i",
     }
     return RequestPlan(
-        reconnect_on_broken_pipe=True,
         url=ebay_search_url(
             request.query, page_number=page_number, listing_state=request.listing_state
         ),

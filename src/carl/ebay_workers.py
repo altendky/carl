@@ -55,7 +55,22 @@ def _homepage_inputs(value: JsonValue) -> tuple[NamedInput, ...]:
     identifier = value.get("acquisition_record_identifier")
     if not isinstance(identifier, str):
         return ()
-    return (NamedInput(name=("search", "homepage", "acquisition"), object_identifier=identifier),)
+    return (
+        NamedInput(name=("search", "homepage", "acquisition"), object_identifier=identifier),
+        *_attempt_inputs(value.get("attempts"), ("search", "homepage", "attempt")),
+    )
+
+
+def _attempt_inputs(value: JsonValue, prefix: tuple[str, ...]) -> tuple[NamedInput, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        NamedInput(name=(*prefix, str(index), kind), object_identifier=identifier)
+        for index, attempt in enumerate(value, start=1)
+        if isinstance(attempt, dict)
+        for kind in ("acquisition", "extraction")
+        if isinstance(identifier := attempt.get(f"{kind}_record_identifier"), str)
+    )
 
 
 async def _collect(
@@ -130,7 +145,15 @@ async def _collect(
             result={"state": "configuration_failed"},
         )
     except AcquisitionFailure as error:
-        homepage_inputs = _homepage_inputs(error.result.get("homepage_acquisition"))
+        homepage_inputs = (
+            *_homepage_inputs(error.result.get("homepage_acquisition")),
+            *_attempt_inputs(
+                error.result.get("homepage_attempts"), ("search", "homepage", "attempt")
+            ),
+            *_attempt_inputs(
+                error.result.get("search_page_attempts"), ("search", "page", "attempt")
+            ),
+        )
         timeout = (
             error.result.get("stopping_condition") == "transport_failure"
             and error.result.get("exception_type") == "TimeoutError"

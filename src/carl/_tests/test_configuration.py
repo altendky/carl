@@ -8,7 +8,7 @@ from zipfile import ZipFile
 import pytest
 from pydantic import ValidationError
 
-from carl.core.configuration import CarlConfiguration
+from carl.core.configuration import CarlConfiguration, EbaySearchConfiguration
 from carl.core.routing import (
     BrightDataProduct,
     DecodoProduct,
@@ -133,6 +133,37 @@ def _write_configuration(tmp_path: Path) -> tuple[CarlDirectories, Path]:
     path.write_bytes(_configuration_document(tmp_path / "wireproxy"))
     path.chmod(0o600)
     return directories, path
+
+
+def test_ebay_search_defaults_and_explicit_zero_holdoff(tmp_path: Path) -> None:
+    directories, path = _write_configuration(tmp_path)
+    policy = load_configuration(directories.configuration_file).configuration.ebay_search
+    assert policy.maximum_page_attempts == 7
+    assert policy.maximum_homepage_attempts == 2
+    assert policy.minimum_holdoff_seconds == policy.maximum_holdoff_seconds == 0
+    with path.open("ab") as stream:
+        stream.write(
+            b"\n[ebay_search]\nmaximum_page_attempts = 3\nminimum_holdoff_seconds = 4.0\nmaximum_holdoff_seconds = 8.0\n"
+        )
+    changed = load_configuration(path).configuration.ebay_search
+    assert changed.maximum_page_attempts == 3
+    assert (changed.minimum_holdoff_seconds, changed.maximum_holdoff_seconds) == (4, 8)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"maximum_page_attempts": 0},
+        {"maximum_page_attempts": 21},
+        {"maximum_homepage_attempts": 0},
+        {"minimum_holdoff_seconds": -1.0},
+        {"maximum_holdoff_seconds": float("inf")},
+        {"minimum_holdoff_seconds": 8.0, "maximum_holdoff_seconds": 4.0},
+    ],
+)
+def test_ebay_search_policy_rejects_invalid_bounds(values: dict[str, int | float]) -> None:
+    with pytest.raises(ValidationError):
+        EbaySearchConfiguration.model_validate(values)
 
 
 def test_explicit_network_route_cutover(tmp_path: Path) -> None:
