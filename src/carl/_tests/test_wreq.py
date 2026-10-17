@@ -37,7 +37,7 @@ from carl.io.decodo import (
     ManagedDecodoWreqAcquirer,
     StaticDecodoCredentialSource,
 )
-from carl.io.httpx import AcquisitionFailure, RouteConfigurationFailure
+from carl.io.httpx import Acquisition, AcquisitionFailure, RouteConfigurationFailure
 from carl.io.proton import (
     ManagedProtonWreqAcquirer,
     ProtonSessionManager,
@@ -336,6 +336,195 @@ async def test_explicit_header_order_applies_to_profile_defaults_without_adding_
     assert acquisition.record["hops"][0]["request"]["profile_generated_headers"]["state"] == (
         "not_observed"
     )
+
+
+@pytest.mark.anyio
+async def test_profile_defaults_can_be_disabled_without_disclosing_page_configuration() -> None:
+    response = _response()
+    factory = _Factory([response])
+    plan = RequestPlan(
+        url=response.url,
+        headers=(Header(name=b"X-Pl-Config", value=b"current-session-config"),),
+        profile_default_headers=False,
+        routing=("proton", "personal", "carl"),
+    )
+    assert "profile_default_headers" not in RequestPlan(url=response.url).as_json()
+    assert plan.as_json()["profile_default_headers"] is False
+    assert "current-session-config" not in json.dumps(plan.as_json())
+
+    acquisition = await _acquirer(factory).acquire(plan, lambda: "body")
+
+    options = factory.calls[0][2]
+    assert options["default_headers"] is False
+    assert list(cast(wreq.HeaderMap, options["headers"])) == [
+        (b"x-pl-config", b"current-session-config")
+    ]
+    request = acquisition.record["hops"][0]["request"]
+    assert request["profile_generated_headers"]["state"] == "disabled"
+    assert request["profile_generated_headers"]["generator"]["default_headers"] is False
+    assert acquisition.record["transport"]["profile_default_headers"] is False
+    assert acquisition.record["transport"]["compression"]["header_source"] == "caller_supplied"
+    assert "current-session-config" not in json.dumps(acquisition.record)
+
+
+def _sent_headers(call: tuple[int, str, dict[str, object]]) -> dict[bytes, bytes]:
+    headers = call[2].get("headers")
+    return (
+        {bytes(name): bytes(value) for name, value in cast(wreq.HeaderMap, headers)}
+        if headers is not None
+        else {}
+    )
+
+
+@pytest.mark.anyio
+async def test_client_hints_replace_clear_ignore_malformed_and_persist_without_header() -> None:
+    url = "https://www.ebay.com/"
+    response_headers = (
+        ((b"Accept-CH", b"Sec-CH-UA-Model, sec-ch-ua-platform-version, sec-ch-ua-full-version"),),
+        (),
+        ((b"Accept-CH", b"sec-ch-ua-model"),),
+        ((b"Accept-CH", b"sec-ch-ua-platform-version;invalid"),),
+        ((b"Accept-CH", b""),),
+        (),
+    )
+    factory = _Factory(
+        [
+            _response(url=url, status=403 if index == 0 else 200, headers=headers)
+            for index, headers in enumerate(response_headers)
+        ]
+    )
+    acquisitions: list[Acquisition] = []
+    async with _acquirer(factory).acquirer.session() as session:
+        for _ in response_headers:
+            acquisitions.append(
+                await session.acquire(
+                    RequestPlan(url=url, routing=("proton", "personal", "carl")),
+                    lambda: "body",
+                )
+            )
+
+    model = {b"sec-ch-ua-model": b'""'}
+    both = {**model, b"sec-ch-ua-platform-version": b'""'}
+    assert [_sent_headers(call) for call in factory.calls] == [{}, both, both, model, model, {}]
+    assert all(b"sec-ch-ua-full-version" not in _sent_headers(call) for call in factory.calls)
+    request = acquisitions[1].record["hops"][0]["request"]
+    assert request["header_evidence_scope"] == "caller_supplied_and_negotiated_client_hints"
+    assert request["negotiated_client_hint_names"] == [
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform-version",
+    ]
+    assert {header["name_latin1"]: header["value_latin1"] for header in request["headers"]} == {
+        "sec-ch-ua-model": '""',
+        "sec-ch-ua-platform-version": '""',
+    }
+
+
+@pytest.mark.anyio
+async def test_redirect_hints_are_learned_and_sent_only_to_their_response_origin() -> None:
+    first = "https://www.ebay.com/start"
+    foreign = "https://example.com/middle"
+    final = "https://www.ebay.com/final"
+    factory = _Factory(
+        [
+            _response(
+                url=first,
+                status=302,
+                headers=((b"location", foreign.encode()), (b"accept-ch", b"sec-ch-ua-model")),
+            ),
+            _response(
+                url=foreign,
+                status=302,
+                headers=(
+                    (b"location", final.encode()),
+                    (b"accept-ch", b"sec-ch-ua-platform-version"),
+                ),
+            ),
+            _response(url=final, headers=()),
+        ]
+    )
+    acquisition = await _acquirer(factory).acquire(
+        RequestPlan(url=first, routing=("proton", "personal", "carl")), lambda: "body"
+    )
+    assert [_sent_headers(call) for call in factory.calls] == [
+        {},
+        {},
+        {b"sec-ch-ua-model": b'""'},
+    ]
+    assert "negotiated_client_hint_names" not in acquisition.record["hops"][1]["request"]
+    assert acquisition.record["hops"][2]["request"]["negotiated_client_hint_names"] == [
+        "sec-ch-ua-model"
+    ]
+
+
+@pytest.mark.anyio
+async def test_client_hints_do_not_escape_managed_session_lifetime() -> None:
+    url = "https://www.ebay.com/"
+    advertised = _response(url=url, headers=((b"accept-ch", b"sec-ch-ua-model"),))
+    factory = _Factory([advertised, _response(url=url, headers=())])
+    acquirer = _acquirer(factory).acquirer
+    plan = RequestPlan(url=url, routing=("proton", "personal", "carl"))
+    async with acquirer.session() as first_session:
+        await first_session.acquire(plan, lambda: "body")
+        await first_session.acquire(plan, lambda: "body")
+    assert factory.client.closed
+    factory.client = _Client([_response(url=url, headers=())], calls=factory.calls)
+    async with acquirer.session() as second_session:
+        await second_session.acquire(plan, lambda: "body")
+    assert [_sent_headers(call) for call in factory.calls] == [
+        {},
+        {b"sec-ch-ua-model": b'""'},
+        {},
+    ]
+
+
+@pytest.mark.anyio
+async def test_standalone_requests_do_not_share_client_hints() -> None:
+    url = "https://www.ebay.com/"
+    factory = _Factory(
+        [
+            _response(url=url, headers=((b"accept-ch", b"sec-ch-ua-model"),)),
+            _response(url=url, headers=()),
+        ]
+    )
+    acquirer = _acquirer(factory)
+    plan = RequestPlan(url=url, routing=("proton", "personal", "carl"))
+    await acquirer.acquire(plan, lambda: "body")
+    await acquirer.acquire(plan, lambda: "body")
+    assert [_sent_headers(call) for call in factory.calls] == [{}, {}]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("platform", ("Linux", "profile_default"))
+async def test_explicit_client_hints_override_negotiation_without_assuming_other_platforms(
+    platform: str,
+) -> None:
+    url = "https://www.ebay.com/"
+    factory = _Factory(
+        [
+            _response(
+                url=url, headers=((b"accept-ch", b"sec-ch-ua-model, sec-ch-ua-platform-version"),)
+            ),
+            _response(url=url, headers=()),
+        ]
+    )
+    settings = WreqTransportSettings.model_validate({"emulation_platform": platform})
+    async with _acquirer(factory, settings).acquirer.session() as session:
+        await session.acquire(
+            RequestPlan(url=url, routing=("proton", "personal", "carl")), lambda: "body"
+        )
+        await session.acquire(
+            RequestPlan(
+                url=url,
+                headers=(Header(name=b"Sec-CH-UA-Model", value=b'"caller-value"'),),
+                routing=("proton", "personal", "carl"),
+                profile_default_headers=False,
+            ),
+            lambda: "body",
+        )
+    expected = {b"sec-ch-ua-model": b'"caller-value"'}
+    if platform == "Linux":
+        expected[b"sec-ch-ua-platform-version"] = b'""'
+    assert _sent_headers(factory.calls[1]) == expected
 
 
 @pytest.mark.anyio
@@ -757,10 +946,17 @@ def test_wreq_transport_settings_are_secret_free_and_explicit() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "transport",
+    (
+        WreqTransportSettings(),
+        WreqTransportSettings(emulation_profile="Chrome153", emulation_platform="profile_default"),
+    ),
+)
 async def test_configured_search_shares_session_across_pages_not_attempts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport: WreqTransportSettings
 ) -> None:
-    first = b'<li class="s-card"><a href="/itm/256123456789">Scope</a></li><a class="pagination__next" href="/sch/i.html?_pgn=2">Next</a>'
+    first = b'<li class="s-card"><a href="/itm/256123456789">Scope</a></li><a class="pagination__next" href="/sch/i.html?_pgn=2">Next</a><script>{"plConfigToken":"current-test-page-config"}</script>'
     second = b'<li class="s-card"><a href="/itm/256987654321">Another scope</a></li>'
     clients: list[_Client] = []
     proxies: list[str] = []
@@ -794,7 +990,7 @@ async def test_configured_search_shares_session_across_pages_not_attempts(
     monkeypatch.setattr("carl.ebay.load_configuration", lambda _: None)
     monkeypatch.setattr(
         "carl.ebay.decodo_wreq_stack_settings",
-        lambda *_: (_decodo_settings(), credentials, WreqTransportSettings()),
+        lambda *_: (_decodo_settings(), credentials, transport),
     )
     monkeypatch.setattr("carl.ebay.ManagedDecodoWreqAcquirer", lambda **_: acquirer)
     monkeypatch.setattr("carl.ebay.collect_code_provenance_async", lambda _: _provenance())
@@ -830,8 +1026,22 @@ async def test_configured_search_shares_session_across_pages_not_attempts(
         )
         assert "FirstProviderSession" not in json.dumps(acquisitions)
         assert "SecondProviderSession" not in json.dumps(acquisitions)
+        assert "current-test-page-config" not in json.dumps(acquisitions)
     assert len(clients) == 2 and all(client.closed and len(client.calls) == 3 for client in clients)
     assert all(client.calls[0][1] == "https://www.ebay.com/" for client in clients)
+    for client in clients:
+        options = client.calls[2][2]
+        headers = _sent_headers(client.calls[2])
+        if transport.emulation_profile == "Chrome154":
+            assert options["default_headers"] is False
+            assert headers[b"x-pl-config"] == b"current-test-page-config"
+            assert headers[b"x-wire-request"] == b"true"
+            assert headers[b"sec-fetch-mode"] == b"cors"
+            assert b"sec-fetch-user" not in headers
+            assert b"upgrade-insecure-requests" not in headers
+        else:
+            assert options["default_headers"] is True
+            assert b"x-pl-config" not in headers
     assert "session-FirstProviderSession-" in proxies[0]
     assert "session-SecondProviderSession-" in proxies[1]
 

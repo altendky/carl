@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncGenerator, Iterable, Iterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from http import HTTPStatus
 from importlib.metadata import version
 from time import perf_counter_ns
 from typing import Literal, Protocol, cast, final
+from urllib.parse import urlsplit
 
 import anyio
 import wreq
@@ -29,7 +31,7 @@ from carl.io.httpx import (
 )
 
 _DEFAULT_COMPRESSION = ("gzip", "deflate", "br", "zstd")
-_PROTECTED_REQUEST_HEADERS = frozenset({b"cookie", b"proxy-authorization"})
+_PROTECTED_REQUEST_HEADERS = frozenset({b"cookie", b"proxy-authorization", b"x-pl-config"})
 _PROTECTED_RESPONSE_HEADERS = frozenset({b"set-cookie", b"proxy-authenticate", b"proxy-status"})
 _WREQ_EXCEPTIONS = (
     wreq.exceptions.RustPanic,
@@ -69,6 +71,7 @@ class WreqTransportSettings(StrictModel):
         self, plan: RequestPlan, *, shared_client: bool = False
     ) -> dict[str, JsonValue]:
         result = self.model_dump(mode="json")
+        result["profile_default_headers"] = plan.profile_default_headers
         result["effective_timeouts"] = {
             "total_seconds": plan.timeout.connect_seconds + plan.timeout.read_seconds,
             "connect_seconds": plan.timeout.connect_seconds,
@@ -86,7 +89,9 @@ class WreqTransportSettings(StrictModel):
         }
         result["compression"] = {
             "accepted": list(plan.compression),
-            "header_source": "emulation_profile",
+            "header_source": "emulation_profile"
+            if plan.profile_default_headers
+            else "caller_supplied",
             "decoded_before_python_body_exposure": True,
         }
         return result
@@ -238,22 +243,91 @@ def _supplied_headers(plan: RequestPlan) -> tuple[wreq.HeaderMap | None, tuple[s
     return header_map, tuple(ordered_names)
 
 
+_CLIENT_HINT_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9a-z-]{1,128}$")
+_LINUX_CLIENT_HINTS = frozenset({"sec-ch-ua-model", "sec-ch-ua-platform-version"})
+type _Origin = tuple[str, str, int]
+
+
+def _origin(url: str) -> _Origin | None:
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return None
+        return parsed.scheme, parsed.hostname.lower(), parsed.port or 443
+    except ValueError:
+        return None
+
+
+class _ClientHints:
+    """Response-negotiated hints for one client lifetime, isolated by origin.
+
+    wreq exposes reduced user-agent versions rather than an actual full browser
+    version. Only the observed Linux empty model/platform-version values are
+    supported; a full-version hint is deliberately not fabricated.
+    """
+
+    def __init__(self) -> None:
+        self.requested: dict[_Origin, frozenset[str]] = {}
+
+    def observe(self, url: str, headers: tuple[Header, ...]) -> None:
+        origin = _origin(url)
+        values = header_values(headers, b"accept-ch")
+        if origin is None or not values:
+            return
+        combined = b",".join(values).decode("latin-1").strip()
+        if not combined:
+            self.requested[origin] = frozenset()
+            return
+        names = tuple(name.strip().lower() for name in combined.split(","))
+        if len(combined) > 16384 or any(
+            _CLIENT_HINT_TOKEN.fullmatch(name) is None for name in names
+        ):
+            return
+        self.requested[origin] = frozenset(names) & _LINUX_CLIENT_HINTS
+
+    def headers(self, url: str, settings: WreqTransportSettings) -> tuple[Header, ...]:
+        origin = _origin(url)
+        if settings.emulation_platform != "Linux" or origin is None:
+            return ()
+        return tuple(
+            Header(name=name.encode("ascii"), value=b'""')
+            for name in sorted(self.requested.get(origin, ()))
+        )
+
+
 def _request_evidence(
-    plan: RequestPlan, url: str, started_at_utc: str, settings: WreqTransportSettings
+    plan: RequestPlan,
+    url: str,
+    started_at_utc: str,
+    settings: WreqTransportSettings,
+    negotiated_headers: tuple[Header, ...] = (),
 ) -> dict[str, JsonValue]:
     return {
         "method": plan.method,
         "url": url,
-        "headers": _header_evidence(plan.headers, _PROTECTED_REQUEST_HEADERS),
-        "header_evidence_scope": "caller_supplied_only",
+        "headers": _header_evidence(
+            (*plan.headers, *negotiated_headers), _PROTECTED_REQUEST_HEADERS
+        ),
+        "header_evidence_scope": "caller_supplied_and_negotiated_client_hints"
+        if negotiated_headers
+        else "caller_supplied_only",
+        **(
+            {
+                "negotiated_client_hint_names": [
+                    header.name.decode("ascii") for header in negotiated_headers
+                ]
+            }
+            if negotiated_headers
+            else {}
+        ),
         **({"requested_header_order": list(plan.header_order)} if plan.header_order else {}),
         "profile_generated_headers": {
-            "state": "not_observed",
+            "state": "not_observed" if plan.profile_default_headers else "disabled",
             "generator": {
                 "implementation": "wreq",
                 "profile": settings.emulation_profile,
                 "platform": settings.emulation_platform,
-                "default_headers": True,
+                "default_headers": plan.profile_default_headers,
             },
         },
         "started_at_utc": started_at_utc,
@@ -328,7 +402,9 @@ def _sync_acquire(
     settings: WreqTransportSettings,
     client_factory: WreqClientFactory,
     client: _WreqClient | None = None,
+    client_hints: _ClientHints | None = None,
 ) -> _SyncResult:
+    client_hints = client_hints if client_hints is not None else _ClientHints()
     owns_client = client is None
     if client is None:
         client = client_factory(proxy=proxy_factory(), settings=settings, plan=plan)
@@ -347,7 +423,17 @@ def _sync_acquire(
                 )
             seen_urls.add(current_url)
             header_map, ordered_header_names = _supplied_headers(plan)
-            request_options: dict[str, object] = {"default_headers": True}
+            supplied_names = {header.name.lower() for header in plan.headers}
+            negotiated_headers = tuple(
+                header
+                for header in client_hints.headers(current_url, settings)
+                if header.name.lower() not in supplied_names
+            )
+            if negotiated_headers:
+                header_map = header_map if header_map is not None else wreq.HeaderMap()
+                for header in negotiated_headers:
+                    header_map.append(header.name.decode("ascii"), header.value.decode("ascii"))
+            request_options: dict[str, object] = {"default_headers": plan.profile_default_headers}
             if header_map is not None:
                 request_options["headers"] = header_map
             effective_order = plan.header_order or ordered_header_names
@@ -360,6 +446,7 @@ def _sync_acquire(
             try:
                 response = client.get(current_url, **request_options)
                 response_headers = _headers(response.headers)
+                client_hints.observe(response.url, response_headers)
                 body = bytearray()
                 trailer_headers: list[Header] = []
                 with response.stream() as stream:
@@ -379,7 +466,11 @@ def _sync_acquire(
                                 hops.append(
                                     _SyncHop(
                                         request=_request_evidence(
-                                            plan, current_url, started_at_utc, settings
+                                            plan,
+                                            current_url,
+                                            started_at_utc,
+                                            settings,
+                                            negotiated_headers,
                                         ),
                                         response=metadata,
                                     )
@@ -416,7 +507,9 @@ def _sync_acquire(
                     }
                     hops.append(
                         _SyncHop(
-                            request=_request_evidence(plan, current_url, started_at_utc, settings),
+                            request=_request_evidence(
+                                plan, current_url, started_at_utc, settings, negotiated_headers
+                            ),
                             response=metadata,
                         )
                     )
@@ -444,7 +537,9 @@ def _sync_acquire(
             )
             hops.append(
                 _SyncHop(
-                    request=_request_evidence(plan, current_url, started_at_utc, settings),
+                    request=_request_evidence(
+                        plan, current_url, started_at_utc, settings, negotiated_headers
+                    ),
                     response=metadata,
                     content=bytes(body),
                     media_type=_content_type(response_headers),
@@ -592,6 +687,7 @@ class ProxyWreqAcquirer:
         self._managed_session = False
         self._client: _WreqClient | None = None
         self._client_plan: RequestPlan | None = None
+        self._client_hints = _ClientHints()
         self._closed = False
         self._failed = False
         self._lock = anyio.Lock()
@@ -646,6 +742,7 @@ class ProxyWreqAcquirer:
             settings=self.settings,
             client_factory=self.client_factory,
             client=self._client,
+            client_hints=self._client_hints if self._managed_session else None,
         )
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:

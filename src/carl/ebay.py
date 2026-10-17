@@ -18,6 +18,7 @@ from carl.core.ebay import (
     ebay_search_plan,
     extract_ebay_search,
 )
+from carl.core.ebay_navigation import ebay_fetch_plan, ebay_pagination_token, is_ebay_search_url
 from carl.core.ebay_search_support import require_supported_ebay_search_acquisition
 from carl.core.http import RequestPlan, stored_content_encodings, stored_response_charset
 from carl.core.models import (
@@ -62,11 +63,11 @@ def _finalize_component() -> None:
 def build_ebay_component_registry() -> Registry:
     return Registry(
         (
-            Component(COLLECT_EBAY_SEARCH, 4, _collect_component),
+            Component(COLLECT_EBAY_SEARCH, 5, _collect_component),
             Component(COLLECT_EBAY_SEARCH_HOMEPAGE, 1, _collect_component),
-            Component(EXTRACT_EBAY_SEARCH, 3, extract_ebay_search),
-            Component(FINALIZE_EBAY_SEARCH, 2, _finalize_component),
-            Component(RUN_EBAY_SEARCH_WORK, 4, _run_work_component),
+            Component(EXTRACT_EBAY_SEARCH, 4, extract_ebay_search),
+            Component(FINALIZE_EBAY_SEARCH, 3, _finalize_component),
+            Component(RUN_EBAY_SEARCH_WORK, 5, _run_work_component),
         )
     )
 
@@ -151,6 +152,10 @@ async def collect_configured_ebay_search(
                 search_run_identifier=search_run_identifier,
                 provenance=provenance,
                 homepage_acquisition=homepage,
+                fetch_pagination=(
+                    transport.emulation_profile == "Chrome154"
+                    and transport.emulation_platform == "Linux"
+                ),
             )
         except AcquisitionFailure as error:
             error.result["homepage_acquisition"] = homepage
@@ -167,6 +172,7 @@ async def collect_ebay_search(
     provenance: CodeProvenance | None = None,
     search_run_identifier: str | None = None,
     homepage_acquisition: dict[str, JsonValue] | None = None,
+    fetch_pagination: bool = False,
 ) -> dict[str, JsonValue]:
     resolved_provenance = provenance or await collect_code_provenance_async(_repository_root())
     search_run_identifier = search_run_identifier or new_identifier()
@@ -174,13 +180,30 @@ async def collect_ebay_search(
     page_number = 1
     seen_page_numbers: set[int] = set()
     stopping_reason = "maximum_pages"
+    pagination_token: str | None = None
+    previous_url: str | None = None
+    pagination: dict[str, JsonValue] | None = (
+        {"mode": "document", "fetch_pages": 0} if fetch_pagination else None
+    )
     while True:
         page_ordinal = len(pages) + 1
         seen_page_numbers.add(page_number)
+        plan = ebay_search_plan(request, network_path=network_path, page_number=page_number)
+        if page_number > 1 and pagination_token is not None and previous_url is not None:
+            plan = ebay_fetch_plan(
+                request,
+                network_path=network_path,
+                page_number=page_number,
+                token=pagination_token,
+                referer=previous_url,
+            )
+            assert pagination is not None
+            pagination["mode"] = "fetch"
+            pagination["fetch_pages"] = int(pagination["fetch_pages"]) + 1
         page = await _collect_ebay_search_page(
             database,
             request=request,
-            network_path=network_path,
+            plan=plan,
             page_number=page_number,
             page_ordinal=page_ordinal,
             search_run_identifier=search_run_identifier,
@@ -222,6 +245,32 @@ async def collect_ebay_search(
         ):
             stopping_reason = "invalid_next_page"
             break
+        if fetch_pagination and (page_ordinal == 1 or pagination_token is not None):
+            _, _, acquisition = await database.get_record(
+                str(page["acquisition_record_identifier"])
+            )
+            assert isinstance(acquisition, dict)
+            effective_url = acquisition.get("effective_url")
+            if isinstance(effective_url, str) and is_ebay_search_url(effective_url):
+                previous_url = effective_url
+                if page_ordinal == 1:
+                    _, _, extraction = await database.get_record(
+                        str(page["extraction_record_identifier"])
+                    )
+                    assert isinstance(extraction, dict)
+                    _, decoded_body = await database.get_artifact(
+                        str(extraction["decoded_body_artifact_identifier"])
+                    )
+                    try:
+                        pagination_token = ebay_pagination_token(decoded_body.decode("utf-8"))
+                    except ValueError as error:
+                        assert pagination is not None
+                        pagination["fallback_reason"] = str(error)
+            else:
+                previous_url = None
+                pagination_token = None
+                assert pagination is not None
+                pagination["fallback_reason"] = "previous_page_not_ebay_search"
         page_number = next_page_number
 
     finalized = await _finalize_ebay_search(
@@ -233,6 +282,7 @@ async def collect_ebay_search(
         new_identifier=new_identifier,
         provenance=resolved_provenance,
         homepage_acquisition=homepage_acquisition,
+        pagination=pagination,
     )
     first_page = pages[0]
     last_page = pages[-1]
@@ -447,7 +497,7 @@ async def _collect_ebay_search_page(
     database: Database,
     *,
     request: EbaySearchRequest,
-    network_path: tuple[str, ...],
+    plan: RequestPlan,
     page_number: int,
     page_ordinal: int,
     search_run_identifier: str,
@@ -458,7 +508,7 @@ async def _collect_ebay_search_page(
     acquisition = await _collect_ebay_search_document(
         database,
         request=request,
-        plan=ebay_search_plan(request, network_path=network_path, page_number=page_number),
+        plan=plan,
         page_number=page_number,
         page_ordinal=page_ordinal,
         search_run_identifier=search_run_identifier,
@@ -554,7 +604,14 @@ async def extract_ebay_search_acquisition(
         if not isinstance(status_code, int) or isinstance(status_code, bool):
             raise ValueError("eBay acquisition terminal response has no HTTP status")
         extraction = extract_ebay_search(
-            html, status_code=status_code, listing_state=request.listing_state
+            html,
+            status_code=status_code,
+            listing_state=request.listing_state,
+            redirect_target=(
+                terminal_response["redirect_target"]
+                if isinstance(terminal_response.get("redirect_target"), str)
+                else None
+            ),
         )
     except Exception as error:
         await database.fail_operation(
@@ -679,6 +736,7 @@ async def _finalize_ebay_search(
     new_identifier: Callable[[], str],
     provenance: CodeProvenance,
     homepage_acquisition: dict[str, JsonValue] | None = None,
+    pagination: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     if not pages:
         raise ValueError("An eBay search run requires at least one retained page")
@@ -758,6 +816,7 @@ async def _finalize_ebay_search(
         "page_count": len(pages),
         "stopping_reason": stopping_reason,
         **({} if homepage_acquisition is None else {"homepage_acquisition": homepage_acquisition}),
+        **({} if pagination is None else {"pagination": pagination}),
     }
     await database.begin_operation(
         operation_id=operation_identifier,
@@ -803,4 +862,5 @@ async def _finalize_ebay_search(
         "listing_occurrence_count": len(occurrence_identifiers),
         "stopping_reason": stopping_reason,
         "listing_occurrence_record_identifiers": occurrence_identifiers,
+        **({} if pagination is None else {"pagination": pagination}),
     }
