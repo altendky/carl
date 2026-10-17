@@ -156,13 +156,13 @@ version = "1.1.3"
 binary_sha256 = "<verified 64-character lowercase SHA-256>"
 
 [[http_transports]]
-identifier = "browser_chrome_153"
+identifier = "browser_chrome_154"
 implementation = "wreq"
-emulation_profile = "chrome_153"
+emulation_profile = "chrome_154"
 
 [[acquisition_stacks]]
 identifier = "ebay_anonymous"
-http_transport = "browser_chrome_153"
+http_transport = "browser_chrome_154"
 network_path = ["decodo", "personal", "carl"]
 
 [[routes]]
@@ -273,7 +273,7 @@ The ordinary document contains credential identities, never proxy passwords.
 HTTP transports and network routes are independently named configuration
 components. An acquisition stack composes one of each without adding the HTTP
 implementation to `network_path`. The `ebay_anonymous` example therefore means
-wreq with its Chrome 153 profile over the configured Decodo route. The stack
+wreq with its Chrome 154/Linux profile over the configured Decodo route. The stack
 model can represent other route providers, but the initial eBay command
 deliberately resolves Decodo only and has no implicit fallback.
 Carl requires `config.toml` to be a regular file owned by the current user without
@@ -571,7 +571,7 @@ stream, and cleanup failures are transport failures.
 
 `carl ebay-search QUERY` performs a bounded anonymous eBay search traversal
 through the configured `ebay_anonymous` stack. The initial stack composes the
-wreq Chrome 153 transport with Decodo. Each page is a separately retained HTTP
+wreq Chrome 154/Linux transport with Decodo. Each page is a separately retained HTTP
 acquisition; the traversal follows only a validated, sequential eBay next-page
 link and defaults to at most five pages, with a hard request-model limit of
 twenty. Follow-up pages send the preceding search page's URL as `Referer`, without
@@ -641,7 +641,7 @@ alternative at one layer of a path. For example, Marketplace search and image
 downloads default directly to Decodo datacenter, while item details use their separate Decodo
 route. A later flow may
 choose among Decodo, Mullvad, Bright Data, or other explicitly configured paths.
-Anonymous eBay acquisition currently selects the named wreq/Chrome 153
+Anonymous eBay acquisition currently selects the named wreq/Chrome 154/Linux
 transport composed with the Decodo route.
 
 The policy must resolve a concrete path before each request attempt. A fallback

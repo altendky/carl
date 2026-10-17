@@ -62,7 +62,7 @@ class _Acquirer:
                 "transport": {
                     "implementation": "wreq",
                     "implementation_version": "test",
-                    "emulation_profile": "Chrome153",
+                    "emulation_profile": "Chrome154",
                 },
                 "routing": {
                     "configured": list(plan.routing),

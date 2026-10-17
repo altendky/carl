@@ -54,8 +54,8 @@ class WreqTransportSettings(StrictModel):
 
     implementation: Literal["wreq"] = "wreq"
     implementation_version: str = version("wreq")
-    emulation_profile: Literal["Chrome153"] = "Chrome153"
-    emulation_platform: Literal["profile_default"] = "profile_default"
+    emulation_profile: Literal["Chrome153", "Chrome154"] = "Chrome154"
+    emulation_platform: Literal["profile_default", "Linux"] = "Linux"
     profile_default_headers: Literal[True] = True
     execution_mode: Literal["blocking_worker_thread"] = "blocking_worker_thread"
     redirect_handling: Literal["carl_manual"] = "carl_manual"
@@ -154,7 +154,15 @@ def _default_client_factory(
     plan: RequestPlan,
 ) -> _WreqClient:
     total_seconds = plan.timeout.connect_seconds + plan.timeout.read_seconds
-    emulation = {"Chrome153": wreq.Emulation.Chrome153}[settings.emulation_profile]
+    profile = {
+        "Chrome153": wreq.emulation.Profile.Chrome153,
+        "Chrome154": wreq.emulation.Profile.Chrome154,
+    }[settings.emulation_profile]
+    emulation = (
+        wreq.Emulation(profile=profile, platform=wreq.emulation.Platform.Linux)
+        if settings.emulation_platform == "Linux"
+        else wreq.Emulation(profile=profile)
+    )
     client = wreq.blocking.Client(
         emulation=emulation,
         redirect=wreq.Policy.none(),
@@ -230,7 +238,9 @@ def _supplied_headers(plan: RequestPlan) -> tuple[wreq.HeaderMap | None, tuple[s
     return header_map, tuple(ordered_names)
 
 
-def _request_evidence(plan: RequestPlan, url: str, started_at_utc: str) -> dict[str, JsonValue]:
+def _request_evidence(
+    plan: RequestPlan, url: str, started_at_utc: str, settings: WreqTransportSettings
+) -> dict[str, JsonValue]:
     return {
         "method": plan.method,
         "url": url,
@@ -241,7 +251,8 @@ def _request_evidence(plan: RequestPlan, url: str, started_at_utc: str) -> dict[
             "state": "not_observed",
             "generator": {
                 "implementation": "wreq",
-                "profile": "Chrome153",
+                "profile": settings.emulation_profile,
+                "platform": settings.emulation_platform,
                 "default_headers": True,
             },
         },
@@ -368,7 +379,7 @@ def _sync_acquire(
                                 hops.append(
                                     _SyncHop(
                                         request=_request_evidence(
-                                            plan, current_url, started_at_utc
+                                            plan, current_url, started_at_utc, settings
                                         ),
                                         response=metadata,
                                     )
@@ -405,7 +416,7 @@ def _sync_acquire(
                     }
                     hops.append(
                         _SyncHop(
-                            request=_request_evidence(plan, current_url, started_at_utc),
+                            request=_request_evidence(plan, current_url, started_at_utc, settings),
                             response=metadata,
                         )
                     )
@@ -433,7 +444,7 @@ def _sync_acquire(
             )
             hops.append(
                 _SyncHop(
-                    request=_request_evidence(plan, current_url, started_at_utc),
+                    request=_request_evidence(plan, current_url, started_at_utc, settings),
                     response=metadata,
                     content=bytes(body),
                     media_type=_content_type(response_headers),

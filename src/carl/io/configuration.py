@@ -555,7 +555,13 @@ def decodo_wreq_stack_settings(
     return (
         route_settings,
         credential_source,
-        WreqTransportSettings(emulation_profile="Chrome153"),
+        (
+            WreqTransportSettings()
+            if transport.emulation_profile == "chrome_154"
+            else WreqTransportSettings(
+                emulation_profile="Chrome153", emulation_platform="profile_default"
+            )
+        ),
     )
 
 

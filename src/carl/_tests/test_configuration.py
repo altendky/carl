@@ -277,8 +277,28 @@ def test_configures_and_loads_private_decodo_credential(tmp_path: Path) -> None:
         )
 
 
-def test_resolves_configured_ebay_wreq_decodo_stack(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("configured_profile", "profile", "platform"),
+    [
+        ("chrome_153", "Chrome153", "profile_default"),
+        ("chrome_154", "Chrome154", "Linux"),
+        (None, "Chrome154", "Linux"),
+    ],
+)
+def test_resolves_configured_ebay_wreq_decodo_stack(
+    tmp_path: Path, configured_profile: str | None, profile: str, platform: str
+) -> None:
     directories, path = _write_configuration(tmp_path)
+    path.write_bytes(
+        path.read_bytes().replace(
+            b'emulation_profile = "chrome_153"\n',
+            (
+                f'emulation_profile = "{configured_profile}"\n'.encode()
+                if configured_profile is not None
+                else b""
+            ),
+        )
+    )
     _ = configure_decodo_credential(
         "proxy-password-secret",
         directories=directories,
@@ -294,7 +314,8 @@ def test_resolves_configured_ebay_wreq_decodo_stack(tmp_path: Path) -> None:
         "proxy-password-secret"
     )
     assert transport.implementation == "wreq"
-    assert transport.emulation_profile == "Chrome153"
+    assert transport.emulation_profile == profile
+    assert transport.emulation_platform == platform
 
 
 @pytest.mark.parametrize(

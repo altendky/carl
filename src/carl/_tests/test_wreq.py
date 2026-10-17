@@ -177,12 +177,15 @@ class _Factory:
         return self.client
 
 
-def _acquirer(factory: _Factory) -> LocalSocks5WreqAcquirer:
+def _acquirer(
+    factory: _Factory, settings: WreqTransportSettings | None = None
+) -> LocalSocks5WreqAcquirer:
     return LocalSocks5WreqAcquirer(
         endpoint=LocalSocks5Endpoint(port=31080),
         expected_routing=("proton", "personal", "carl"),
         routing_observation={"state": "test", "observed_exit_ip": "203.0.113.7"},
         client_factory=cast(WreqClientFactory, cast(object, factory)),
+        settings=settings,
     )
 
 
@@ -238,7 +241,16 @@ def test_real_wreq_accepts_list_header_order_without_network() -> None:
 
 
 @pytest.mark.anyio
-async def test_profiled_acquisition_runs_in_thread_and_records_truthful_provenance() -> None:
+@pytest.mark.parametrize(
+    "settings",
+    [
+        WreqTransportSettings(),
+        WreqTransportSettings(emulation_profile="Chrome153", emulation_platform="profile_default"),
+    ],
+)
+async def test_profiled_acquisition_runs_in_thread_and_records_truthful_provenance(
+    settings: WreqTransportSettings,
+) -> None:
     response = _response()
     factory = _Factory([response])
     main_thread = get_ident()
@@ -248,7 +260,7 @@ async def test_profiled_acquisition_runs_in_thread_and_records_truthful_provenan
         routing=("proton", "personal", "carl"),
     )
 
-    acquisition = await _acquirer(factory).acquire(plan, lambda: "body-1")
+    acquisition = await _acquirer(factory, settings).acquire(plan, lambda: "body-1")
 
     assert factory.thread is not None and factory.thread != main_thread
     assert factory.thread == factory.calls[0][0] == factory.client.close_thread
@@ -266,12 +278,19 @@ async def test_profiled_acquisition_runs_in_thread_and_records_truthful_provenan
     transport = acquisition.record["transport"]
     assert transport["implementation"] == "wreq"
     assert transport["implementation_version"] == "0.13.0"
-    assert transport["emulation_profile"] == "Chrome153"
+    assert transport["emulation_profile"] == settings.emulation_profile
+    assert transport["emulation_platform"] == settings.emulation_platform
     assert transport["execution_mode"] == "blocking_worker_thread"
     assert transport["effective_timeouts"]["total_seconds"] == 40.0
     request = acquisition.record["hops"][0]["request"]
     assert request["header_evidence_scope"] == "caller_supplied_only"
     assert request["profile_generated_headers"]["state"] == "not_observed"
+    assert request["profile_generated_headers"]["generator"] == {
+        "implementation": "wreq",
+        "profile": settings.emulation_profile,
+        "platform": settings.emulation_platform,
+        "default_headers": True,
+    }
     assert "secret-session" not in json.dumps(acquisition.record)
     assert acquisition.record["hops"][0]["response"]["headers"][-1]["value"]["state"] == (
         "redacted"
@@ -729,8 +748,8 @@ def test_wreq_transport_settings_are_secret_free_and_explicit() -> None:
     safe = settings.safe_configuration(RequestPlan(url="https://www.ebay.com/"))
 
     assert safe["implementation_version"] == "0.13.0"
-    assert safe["emulation_profile"] == "Chrome153"
-    assert safe["emulation_platform"] == "profile_default"
+    assert safe["emulation_profile"] == "Chrome154"
+    assert safe["emulation_platform"] == "Linux"
     assert safe["profile_default_headers"] is True
     assert safe["tls_certificate_verification"] == "enabled"
     assert safe["tls_trust_store"] == "wreq_default"

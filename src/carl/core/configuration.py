@@ -250,7 +250,7 @@ class HttpxTransportConfiguration(StrictModel):
 class WreqTransportConfiguration(StrictModel):
     identifier: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
     implementation: Literal["wreq"]
-    emulation_profile: Literal["chrome_153"] = "chrome_153"
+    emulation_profile: Literal["chrome_153", "chrome_154"] = "chrome_154"
 
 
 type HttpTransportConfiguration = Annotated[
