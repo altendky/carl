@@ -480,11 +480,6 @@ async def test_blocked_item_retries_then_terminal_failure_is_counted_once(
 ) -> None:
     monkeypatch.setattr("carl.ebay_refresh_workers._WAIT_NS", 0)
 
-    def no_delay(_attempt: int, *, blocked: bool) -> int:
-        assert blocked
-        return 0
-
-    monkeypatch.setattr("carl.ebay_item_workers.ebay_response_retry_delay_ns", no_delay)
     identifiers = _identifiers()
     pages = _Acquirer(
         {
@@ -523,10 +518,6 @@ async def test_blocked_item_retries_then_terminal_failure_is_counted_once(
             REFRESH_EBAY_SEARCH_WORK_KIND,
             REFRESH_EBAY_SEARCH_WORK_KIND,
             COLLECT_EBAY_ITEM_WORK_KIND,
-            COLLECT_EBAY_ITEM_WORK_KIND,
-            COLLECT_EBAY_ITEM_WORK_KIND,
-            COLLECT_EBAY_ITEM_WORK_KIND,
-            COLLECT_EBAY_ITEM_WORK_KIND,
             REFRESH_EBAY_SEARCH_WORK_KIND,
         ):
             _ = await _run_next(database, registry, identifiers, kind)
@@ -537,7 +528,7 @@ async def test_blocked_item_retries_then_terminal_failure_is_counted_once(
         assert _mapping(completed["error"])["kind"] == "mostly_failed_refresh"
         assert result["item_failures"] == 1
         assert result["new_images_saved"] == 0
-        assert len(pages.plans) == 5
+        assert len(pages.plans) == 7
         child_states = await ebay_refresh_child_work_states(database, "refresh")
         assert child_states["item_pages"] == (WorkState.TERMINAL_FAILURE,)
         assert child_states["item_extractions"] == ()

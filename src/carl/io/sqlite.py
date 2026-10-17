@@ -5250,6 +5250,128 @@ class Database:
         assert row is not None
         return bool(row[0])
 
+    async def retained_ebay_item_acquisitions(
+        self,
+        work_item_identifier: str,
+        *,
+        before_attempt: int,
+        retry_budget_start_attempt: int = 0,
+    ) -> tuple[str, ...]:
+        """Read committed item responses, including failed attempts and checkpoints."""
+
+        if (
+            not work_item_identifier
+            or before_attempt < 1
+            or retry_budget_start_attempt < 0
+            or retry_budget_start_attempt >= before_attempt
+        ):
+            raise ValueError("Item acquisition retry budget bounds are invalid")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT acquisition.id
+                FROM work_operations AS owner
+                JOIN work_items AS work ON work.id = owner.work_item_id
+                JOIN objects AS acquisition
+                  ON acquisition.created_by_operation_id = owner.operation_id
+                JOIN records AS record ON record.object_id = acquisition.id
+                WHERE owner.work_item_id = ?
+                  AND work.kind_parts_json = '["carl","ebay","collect","item"]'
+                  AND owner.attempt > ? AND owner.attempt < ?
+                  AND acquisition.kind_parts_json = '["carl","http","acquisition"]'
+                  AND json_extract(record.value_json, '$.purpose') = 'ebay_item'
+                ORDER BY owner.attempt, acquisition.rowid
+                """,
+                (work_item_identifier, retry_budget_start_attempt, before_attempt),
+            )
+            return tuple(_text(row[0]) for row in await cursor.fetchall())
+
+    async def expedite_pending_ebay_item_retries(
+        self,
+        *,
+        at_utc_ns: int,
+        event_batch_identifier: str,
+        stack_identifier: str | None = "ebay_anonymous",
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Audit an immediate-retry policy cutover without resetting work history."""
+
+        if at_utc_ns < 0 or not event_batch_identifier or stack_identifier == "":
+            raise ValueError("Item retry policy cutover arguments are invalid")
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT work.id, work.attempt, work.eligible_at_utc_ns
+                FROM work_items AS work
+                JOIN work_events AS released ON released.sequence = (
+                    SELECT MAX(event.sequence) FROM work_events AS event
+                    WHERE event.work_item_id = work.id AND event.event_kind = 'released'
+                )
+                WHERE work.kind_parts_json = '["carl","ebay","collect","item"]'
+                  AND work.state = 'pending' AND work.eligible_at_utc_ns > ?
+                  AND (? IS NULL OR COALESCE(
+                      json_extract(work.payload_json, '$.request.stack_identifier'),
+                      'ebay_anonymous') = ?)
+                  AND json_extract(released.data_json, '$.reason.kind') =
+                      'ebay_item_response_failure'
+                  AND json_extract(released.data_json, '$.reason.classification') = 'challenge'
+                ORDER BY work.created_at_utc_ns, work.id
+                """,
+                (at_utc_ns, stack_identifier, stack_identifier),
+            )
+            items = await cursor.fetchall()
+            identifiers = tuple(_text(row[0]) for row in items)
+            if not identifiers:
+                return (), ()
+            cursor = await connection.execute(
+                """
+                SELECT work.id, work.attempt, work.eligible_at_utc_ns
+                FROM work_items AS work
+                WHERE work.kind_parts_json = '["carl","ebay","work","refresh_search"]'
+                  AND work.state = 'pending' AND work.eligible_at_utc_ns > ?
+                  AND json_extract(work.result_json, '$.stage') = 'collecting_items'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(
+                          work.result_json, '$.item_collection_work_identifiers'
+                      ) AS child
+                      JOIN json_each(?) AS selected ON selected.value = child.value
+                  )
+                ORDER BY work.created_at_utc_ns, work.id
+                """,
+                (at_utc_ns, _json(list(identifiers))),
+            )
+            parents = await cursor.fetchall()
+            for index, row in enumerate((*items, *parents)):
+                identifier, attempt, previous_eligible_at = (
+                    _text(row[0]),
+                    _integer(row[1]),
+                    _integer(row[2]),
+                )
+                await connection.execute(
+                    """UPDATE work_items SET eligible_at_utc_ns = ?
+                       WHERE id = ? AND state = 'pending' AND eligible_at_utc_ns = ?""",
+                    (at_utc_ns, identifier, previous_eligible_at),
+                )
+                if await connection.changes() != 1:
+                    raise RuntimeError("Pending item retry work changed during policy cutover")
+                await self._append_work_event(
+                    connection,
+                    event_identifier=f"{event_batch_identifier}-{index}",
+                    work_item_identifier=identifier,
+                    event_kind=WorkEventKind.ENQUEUED,
+                    recorded_at_utc_ns=at_utc_ns,
+                    data={
+                        "reason": {
+                            "kind": "ebay_item_retry_policy_change",
+                            "stack_identifier": stack_identifier,
+                            "role": "item" if index < len(items) else "refresh_parent",
+                        },
+                        "previous_attempt": attempt,
+                        "previous_eligible_at_utc_ns": previous_eligible_at,
+                        "eligible_at_utc_ns": at_utc_ns,
+                    },
+                )
+        return identifiers, tuple(_text(row[0]) for row in parents)
+
     async def completed_acquisition_candidates(
         self,
         kind: tuple[str, ...],

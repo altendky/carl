@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from random import uniform
+from time import time_ns
 
 import anyio
+from anyio import sleep as item_retry_sleep
 
 from carl.core.acquisition_identity import acquisition_resource_identity, ebay_image_identity
 from carl.core.components import Component, ComponentId
+from carl.core.configuration import EbayItemConfiguration
 from carl.core.content_encoding import decoded_stored_body
 from carl.core.ebay_items import (
     COLLECT_EBAY_DESCRIPTION_WORK_KIND,
@@ -18,6 +23,7 @@ from carl.core.ebay_items import (
     CollectEbayDescriptionPayload,
     CollectEbayImagePayload,
     CollectEbayItemPayload,
+    EbayItemExtraction,
     EbayItemRequest,
     EbayItemResponseKind,
     ExtractEbayItemPayload,
@@ -30,7 +36,7 @@ from carl.core.ebay_items import (
     extract_ebay_item,
     extract_ebay_item_work,
 )
-from carl.core.ebay_retry import EBAY_BLOCKED_MAXIMUM_ATTEMPTS, ebay_response_retry_delay_ns
+from carl.core.ebay_retry import ebay_response_retry_delay_ns
 from carl.core.facebook_images import verify_image
 from carl.core.http import stored_content_encodings, stored_header_values, stored_response_charset
 from carl.core.image_failures import image_acquisition_failure_kind
@@ -95,6 +101,7 @@ class EbayItemWorkerDependencies:
     item_acquirer: HttpAcquirer | None = None
     image_acquirer: HttpAcquirer | None = None
     item_network_path: tuple[str, ...] = ("decodo", "personal", "carl")
+    item_policy: EbayItemConfiguration | None = None
 
 
 def _follow(
@@ -213,6 +220,45 @@ def _item_acquirer(
     ), route.route.network_path
 
 
+@asynccontextmanager
+async def _item_session(
+    acquirer: HttpAcquirer, new_identifier: Callable[[], str]
+) -> AsyncGenerator[HttpAcquirer]:
+    if isinstance(acquirer, ManagedDecodoWreqAcquirer):
+        async with acquirer.session(new_identifier) as session:
+            yield session
+    else:
+        yield acquirer
+
+
+def _item_response(acquisition: Acquisition, request: EbayItemRequest) -> EbayItemExtraction | None:
+    response = _terminal_response(acquisition.record)
+    terminal_body = response.get("body")
+    body_identifier = terminal_body.get("artifact_id") if isinstance(terminal_body, dict) else None
+    body = next((body for body in acquisition.bodies if body.identifier == body_identifier), None)
+    try:
+        html = (
+            _decode_html(body.content, body.representation, response.get("headers"))[0]
+            if body is not None
+            else ""
+        )
+        return extract_ebay_item(
+            html,
+            item_identifier=request.item_identifier,
+            effective_url=acquisition.record.get("effective_url", ""),
+            status_code=response.get("status_code", 0),
+        )
+    except ValueError:
+        return None
+
+
+async def _item_holdoff(policy: EbayItemConfiguration) -> None:
+    if policy.maximum_holdoff_seconds:
+        await item_retry_sleep(
+            uniform(policy.minimum_holdoff_seconds, policy.maximum_holdoff_seconds)
+        )
+
+
 async def _acquisition_candidates(
     dependencies: EbayItemWorkerDependencies,
     context: AttemptContext,
@@ -309,103 +355,215 @@ async def _collect_item(
                 "reused": True,
             },
         )
-    try:
-        acquirer, network_path = _item_acquirer(payload.request, dependencies)
-        activity = network_activity_definition(
-            identifier=dependencies.new_identifier(),
-            kind=("carl", "ebay", "network_activity", "item_page"),
-            operation_identifier=context.operation_identifier,
-            network_session_identifier=dependencies.new_identifier(),
-            network_path=network_path,
-            attempt=context.attempt,
+    identifiers = list(
+        await dependencies.database.retained_ebay_item_acquisitions(
+            work_item_identifier=context.work_item_identifier,
+            before_attempt=context.attempt,
+            retry_budget_start_attempt=context.retry_budget_start_attempt,
         )
-        async with network_activity_scheduler(
-            dependencies.database, dependencies.new_identifier
-        ).admit(activity) as permit:
-            permit.mark_dispatched()
-            acquisition = await acquire_for_network_activity(
-                acquirer.acquire(
-                    ebay_item_plan(payload.request, network_path=network_path),
-                    dependencies.new_identifier,
-                ),
-                permit.admission,
+    )
+    inputs = tuple(
+        NamedInput(name=("previous_acquisition", str(i)), object_identifier=identifier)
+        for i, identifier in enumerate(identifiers)
+    )
+    # A response may have committed before cancellation or session cleanup failed.
+    # Recover that success before deciding whether its request budget is exhausted.
+    if identifiers:
+        _, _, retained = await dependencies.database.get_record(identifiers[-1])
+        if isinstance(retained, dict):
+            try:
+                html, _, _ = await _html(
+                    dependencies.database, retained, dependencies.new_identifier
+                )
+                prior = extract_ebay_item(
+                    html,
+                    item_identifier=payload.request.item_identifier,
+                    effective_url=retained.get("effective_url", ""),
+                    status_code=_terminal_response(retained).get("status_code", 0),
+                )
+            except ValueError:
+                prior = None
+            if prior is not None and prior.classification in {
+                EbayItemResponseKind.DETAIL,
+                EbayItemResponseKind.UNAVAILABLE,
+            }:
+                follow = _follow(
+                    extract_ebay_item_work(
+                        identifier=dependencies.new_identifier(),
+                        payload=ExtractEbayItemPayload(
+                            request=payload.request, acquisition_record_identifier=identifiers[-1]
+                        ),
+                    ),
+                    context,
+                    dependencies,
+                )
+                return CompletedWork(
+                    inputs=inputs,
+                    follow_on_work=(follow,),
+                    result={
+                        "state": "acquired",
+                        "acquisition_record_identifier": identifiers[-1],
+                        "acquisition_record_identifiers": identifiers,
+                        "request_attempts": len(identifiers),
+                        "extraction_work_identifier": follow.definition.identifier,
+                        "reused": True,
+                    },
+                )
+    extracted: EbayItemExtraction | None = None
+    blocked = False
+    identifier: str | None = None
+    try:
+        policy = dependencies.item_policy or (
+            EbayItemConfiguration()
+            if dependencies.item_acquirer is not None
+            else load_configuration(
+                dependencies.directories.configuration_file
+            ).configuration.ebay_item
+        )
+        if len(identifiers) >= policy.maximum_page_attempts:
+            return TerminalFailureWork(
+                inputs=inputs,
+                error={
+                    "kind": "ebay_item_attempts_exhausted",
+                    "maximum_attempts": policy.maximum_page_attempts,
+                },
+                result={
+                    "state": "terminal_failure",
+                    "acquisition_record_identifiers": identifiers,
+                    "request_attempts": len(identifiers),
+                },
             )
-    except (ConfigurationFailure, RouteConfigurationFailure, AcquisitionFailure) as error:
-        return _failure(error, context)
-    identifier = dependencies.new_identifier()
-    artifacts = _body_artifacts(acquisition)
-    records = (
-        RecordDraft(
-            identifier=identifier,
-            kind=("carl", "http", "acquisition"),
-            schema_version=1,
-            value={
-                **acquisition.record,
-                "purpose": "ebay_item",
-                "ebay_item_request": payload.request.model_dump(mode="json"),
-            },
-        ),
-    )
-    outputs = (
-        NamedOutput(name=("acquisition",), object_identifier=identifier),
-        *(
-            NamedOutput(name=("body", str(i)), object_identifier=a.identifier)
-            for i, a in enumerate(artifacts)
-        ),
-    )
-    response = _terminal_response(acquisition.record)
-    terminal_body = response.get("body")
-    body_identifier = terminal_body.get("artifact_id") if isinstance(terminal_body, dict) else None
-    body = next((body for body in acquisition.bodies if body.identifier == body_identifier), None)
-    try:
-        html = (
-            _decode_html(body.content, body.representation, response.get("headers"))[0]
-            if body is not None
-            else ""
+        acquirer, network_path = _item_acquirer(payload.request, dependencies)
+        session_identifier = dependencies.new_identifier()
+        plan = ebay_item_plan(payload.request, network_path=network_path)
+        async with _item_session(acquirer, dependencies.new_identifier) as session:
+            for local_attempt in range(policy.maximum_page_attempts - len(identifiers)):
+                if local_attempt:
+                    await _item_holdoff(policy)
+                activity = network_activity_definition(
+                    identifier=dependencies.new_identifier(),
+                    kind=("carl", "ebay", "network_activity", "item_page"),
+                    operation_identifier=context.operation_identifier,
+                    network_session_identifier=session_identifier,
+                    network_path=network_path,
+                    attempt=context.attempt,
+                    ordinal=len(identifiers) + 1,
+                )
+                async with network_activity_scheduler(
+                    dependencies.database, dependencies.new_identifier
+                ).admit(activity) as permit:
+                    permit.mark_dispatched()
+                    acquisition = await acquire_for_network_activity(
+                        session.acquire(plan, dependencies.new_identifier), permit.admission
+                    )
+                identifier = dependencies.new_identifier()
+                identifiers.append(identifier)
+                extracted = _item_response(acquisition, payload.request)
+                blocked = (
+                    extracted is not None
+                    and extracted.classification == EbayItemResponseKind.CHALLENGE
+                )
+                artifacts = _body_artifacts(acquisition)
+                prefix = ("request_attempt", str(len(identifiers)))
+                await dependencies.database.publish_leased_operation_checkpoint(
+                    work_item_identifier=context.work_item_identifier,
+                    lease_token=context.lease_token,
+                    worker_identifier=context.worker_identifier,
+                    utc_now_ns=time_ns,
+                    operation_id=context.operation_identifier,
+                    records=(
+                        RecordDraft(
+                            identifier=identifier,
+                            kind=("carl", "http", "acquisition"),
+                            schema_version=1,
+                            value={
+                                **acquisition.record,
+                                "purpose": "ebay_item",
+                                "ebay_item_request": payload.request.model_dump(mode="json"),
+                                "request_attempt": len(identifiers),
+                                "collection_policy": policy.model_dump(mode="json"),
+                            },
+                        ),
+                    ),
+                    artifacts=artifacts,
+                    outputs=(
+                        NamedOutput(name=(*prefix, "acquisition"), object_identifier=identifier),
+                        *(
+                            NamedOutput(
+                                name=(*prefix, "body", str(i)), object_identifier=a.identifier
+                            )
+                            for i, a in enumerate(artifacts)
+                        ),
+                    ),
+                    checkpoint_result={
+                        "state": "collecting",
+                        "acquisition_record_identifier": identifier,
+                        "acquisition_record_identifiers": identifiers,
+                        "request_attempts": len(identifiers),
+                    },
+                )
+                if not blocked or len(identifiers) >= policy.maximum_page_attempts:
+                    break
+    except (
+        ConfigurationFailure,
+        RouteConfigurationFailure,
+        AcquisitionFailure,
+        TimeoutError,
+    ) as error:
+        if isinstance(error, TimeoutError):
+            error = AcquisitionFailure(
+                "Item transport timed out",
+                result={
+                    "stopping_condition": "transport_failure",
+                    "exception_type": "TimeoutError",
+                },
+            )
+        outcome = _failure(error, context, inputs=inputs)
+        result = outcome.result
+        assert isinstance(result, dict)
+        return outcome.model_copy(
+            update={
+                "result": {
+                    **result,
+                    "acquisition_record_identifiers": identifiers,
+                    "request_attempts": len(identifiers),
+                }
+            }
         )
-        extracted = extract_ebay_item(
-            html,
-            item_identifier=payload.request.item_identifier,
-            effective_url=acquisition.record.get("effective_url", ""),
-            status_code=response.get("status_code", 0),
-        )
-    except ValueError:
-        extracted = None
+    assert identifier is not None
     if extracted is None or extracted.classification not in {
         EbayItemResponseKind.DETAIL,
         EbayItemResponseKind.UNAVAILABLE,
     }:
-        blocked = (
-            extracted is not None and extracted.classification == EbayItemResponseKind.CHALLENGE
+        retry = (
+            not blocked
+            and context.retry_attempt() < 3
+            and len(identifiers) < policy.maximum_page_attempts
         )
-        attempt = context.retry_attempt()
-        maximum_attempts = EBAY_BLOCKED_MAXIMUM_ATTEMPTS if blocked else 3
         reason = {
             "kind": "ebay_item_response_failure",
             "classification": None if extracted is None else extracted.classification,
             "issues": [] if extracted is None else list(extracted.issues),
             "attempt": context.attempt,
-            "policy_attempt": attempt,
-            "maximum_attempts": maximum_attempts,
+            "policy_attempt": len(identifiers),
+            "maximum_attempts": policy.maximum_page_attempts,
         }
         result = {
-            "state": "retryable_failure" if attempt < maximum_attempts else "terminal_failure",
+            "state": "retryable_failure" if retry else "terminal_failure",
             "acquisition_record_identifier": identifier,
+            "acquisition_record_identifiers": identifiers,
+            "request_attempts": len(identifiers),
             "classification": reason["classification"],
             "issues": reason["issues"],
         }
-        if attempt < maximum_attempts:
+        if retry:
             return RetryWork(
-                records=records,
-                artifacts=artifacts,
-                outputs=outputs,
-                delay_ns=ebay_response_retry_delay_ns(attempt, blocked=blocked),
+                inputs=inputs,
+                delay_ns=ebay_response_retry_delay_ns(context.retry_attempt(), blocked=False),
                 reason=reason,
                 result=result,
             )
-        return TerminalFailureWork(
-            records=records, artifacts=artifacts, outputs=outputs, error=reason, result=result
-        )
+        return TerminalFailureWork(inputs=inputs, error=reason, result=result)
     extraction = ExtractEbayItemPayload(
         request=payload.request, acquisition_record_identifier=identifier
     )
@@ -415,15 +573,15 @@ async def _collect_item(
         dependencies,
     )
     return CompletedWork(
-        records=records,
-        artifacts=artifacts,
-        outputs=outputs,
+        inputs=inputs,
         follow_on_work=(follow,),
         result={
             "state": "acquired",
             "acquisition_record_identifier": identifier,
             "extraction_work_identifier": follow.definition.identifier,
             "reused": False,
+            "acquisition_record_identifiers": identifiers,
+            "request_attempts": len(identifiers),
         },
     )
 
@@ -1190,7 +1348,7 @@ def build_ebay_item_worker_registry(
                 capability=WorkCapability(
                     kind=COLLECT_EBAY_ITEM_WORK_KIND, payload_schema_version=1
                 ),
-                component=Component(COLLECT_ITEM, 3, collect),
+                component=Component(COLLECT_ITEM, 4, collect),
                 payload_type=CollectEbayItemPayload,
                 handler=collect,
             ),

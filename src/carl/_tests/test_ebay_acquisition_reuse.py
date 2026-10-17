@@ -133,14 +133,14 @@ async def test_challenge_acquisition_is_not_shared_with_another_queued_item(
         acquisitions: set[str] = set()
         for _ in range(2):
             work = await _run_next(database, registry, identifiers, COLLECT_EBAY_ITEM_WORK_KIND)
-            assert work["state"] == WorkState.PENDING.value
+            assert work["state"] == WorkState.TERMINAL_FAILURE.value
             result = _mapping(work["result"])
-            assert result["state"] == "retryable_failure"
+            assert result["state"] == "terminal_failure"
             assert result["classification"] == "challenge"
             assert "extraction_work_identifier" not in result
             acquisitions.add(_string(result["acquisition_record_identifier"]))
         assert len(acquisitions) == 2
-        assert len(pages.plans) == 2
+        assert len(pages.plans) == 14
 
 
 @pytest.mark.anyio

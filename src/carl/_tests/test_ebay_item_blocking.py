@@ -1,9 +1,11 @@
-"""Blocked item evidence retries acquisition without completing unusable work."""
+"""Blocked item responses recover within one leased work item and session."""
 
 # pyright: reportPrivateUsage=false
 
-from datetime import UTC, datetime
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import override
 
 import pytest
 
@@ -13,8 +15,8 @@ from carl._tests.test_ebay_item_workers import (
     _Acquirer,
     _enqueue,
     _identifiers,
+    _item_html,
     _mapping,
-    _provenance,
     _registry,
     _Response,
     _run_next,
@@ -31,8 +33,9 @@ from carl.core.ebay_items import (
     extract_ebay_item,
     extract_ebay_item_work,
 )
-from carl.core.models import BytesDraft
-from carl.core.worker import AttemptContext, RetryWork, TerminalFailureWork
+from carl.core.http import RequestPlan
+from carl.core.work import WorkState
+from carl.io.httpx import Acquisition, IdentifierFactory
 from carl.io.sqlite import Database
 
 AKAMAI = (
@@ -53,57 +56,98 @@ def test_http_blocks_and_akamai_pages_are_item_challenges(status: int, body: byt
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("attempt", range(1, 6))
+@pytest.mark.parametrize("recover", (False, True))
 @pytest.mark.parametrize("status,body", [(403, b"Forbidden"), (200, AKAMAI)])
-async def test_blocked_item_uses_full_search_retry_window_and_preserves_evidence(
-    tmp_path: Path, attempt: int, status: int, body: bytes
+async def test_seven_item_attempts_share_session_and_checkpoint_each_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recover: bool, status: int, body: bytes
 ) -> None:
     identifiers = _identifiers()
-    pages = _Acquirer({ITEM_URL: _Response(body, status_code=status)})
+    session_events: list[str] = []
+    session_open = False
+
+    async def unexpected_sleep(_seconds: float) -> None:
+        pytest.fail("The default item policy must not sleep between blocked responses")
+
+    monkeypatch.setattr("carl.ebay_item_workers.item_retry_sleep", unexpected_sleep)
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+
+        class CheckpointAcquirer(_Acquirer):
+            @override
+            async def acquire(
+                self, plan: RequestPlan, new_identifier: IdentifierFactory
+            ) -> Acquisition:
+                assert session_open
+                # Earlier responses must survive even if this lease is interrupted
+                # before the next request finishes.
+                retained = await database.records_by_kind(("carl", "http", "acquisition"))
+                assert len(retained) == len(self.plans)
+                for identifier in self.body_identifiers:
+                    assert (await database.get_artifact(identifier))[1] == body
+                if recover and len(self.plans) == 6:
+                    self.responses[ITEM_URL] = _Response(_item_html())
+                return await super().acquire(plan, new_identifier)
+
+        pages = CheckpointAcquirer({ITEM_URL: _Response(body, status_code=status)})
+
+        @asynccontextmanager
+        async def session(
+            acquirer: _Acquirer, _new_identifier: Callable[[], str]
+        ) -> AsyncGenerator[_Acquirer]:
+            nonlocal session_open
+            assert acquirer is pages
+            assert not session_open
+            session_events.append("opened")
+            session_open = True
+            try:
+                yield pages
+            finally:
+                session_open = False
+                session_events.append("closed")
+
+        monkeypatch.setattr("carl.ebay_item_workers._item_session", session)
         registry = _registry(database, tmp_path, identifiers, item_acquirer=pages)
-        handler = next(
-            h for h in registry.handlers if h.capability.kind == COLLECT_EBAY_ITEM_WORK_KIND
-        )
-        await database.begin_operation(
-            operation_id="operation",
-            component=handler.component,
-            provenance=_provenance(),
-            invocation={},
-            configuration={},
-            started_at_utc=datetime.now(UTC).isoformat(),
-        )
-        outcome = await handler.execute(
-            CollectEbayItemPayload(request=EbayItemRequest(item_identifier=ITEM)).as_json(),
-            AttemptContext(
-                work_item_identifier="item-work",
-                lease_token="lease",
-                worker_identifier="worker",
-                attempt=attempt,
-                operation_identifier="operation",
+        _ = await _enqueue(
+            database,
+            collect_ebay_item_work(
+                identifier="item-work",
+                payload=CollectEbayItemPayload(request=EbayItemRequest(item_identifier=ITEM)),
             ),
+            identifiers,
         )
-        assert isinstance(outcome, RetryWork if attempt < 5 else TerminalFailureWork)
-        reason = _mapping(outcome.reason if isinstance(outcome, RetryWork) else outcome.error)
-        assert reason["classification"] == "challenge"
-        assert reason["maximum_attempts"] == 5
-        assert reason["policy_attempt"] == attempt
-        if isinstance(outcome, RetryWork):
-            assert outcome.delay_ns == min(3600, 600 * 2 ** (attempt - 1)) * 1_000_000_000
-        assert _mapping(outcome.result)["state"] == (
-            "retryable_failure" if attempt < 5 else "terminal_failure"
-        )
-        assert "extraction_work_identifier" not in _mapping(outcome.result)
-        assert len(outcome.records) == 1
-        assert len(outcome.artifacts) == 1
-        assert isinstance(outcome.artifacts[0], BytesDraft)
-        assert outcome.artifacts[0].content == body
+        collected = await _run_next(database, registry, identifiers, COLLECT_EBAY_ITEM_WORK_KIND)
+        assert collected["attempt"] == 1
+        assert session_events == ["opened", "closed"]
+        assert not session_open
+        assert len(pages.plans) == 7
+        assert len(await database.records_by_kind(("carl", "http", "acquisition"))) == 7
+        for index, identifier in enumerate(pages.body_identifiers):
+            assert (await database.get_artifact(identifier))[1] == (
+                _item_html() if recover and index == 6 else body
+            )
+        result = _mapping(collected["result"])
+        if recover:
+            assert collected["state"] == "completed"
+            assert result["state"] == "acquired"
+            assert await database.work_state(_string(result["extraction_work_identifier"])) == (
+                WorkState.PENDING
+            )
+            extracted = await _run_next(
+                database, registry, identifiers, EXTRACT_EBAY_ITEM_WORK_KIND
+            )
+            assert extracted["state"] == "completed"
+            assert _mapping(extracted["result"])["classification"] == "detail"
+        else:
+            assert collected["state"] == "terminal_failure"
+            assert result["state"] == "terminal_failure"
+            assert "extraction_work_identifier" not in result
+            error = _mapping(collected["error"])
+            assert error["classification"] == "challenge"
+            assert error["maximum_attempts"] == 7
+            assert not await database.records_by_kind(("carl", "ebay", "listing_observation"))
 
 
 @pytest.mark.anyio
-async def test_queued_block_is_pending_and_legacy_extraction_cannot_complete(
-    tmp_path: Path,
-) -> None:
+async def test_legacy_blocked_acquisition_cannot_complete_extraction(tmp_path: Path) -> None:
     identifiers = _identifiers()
     pages = _Acquirer({ITEM_URL: _Response(AKAMAI, status_code=403)})
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
@@ -117,14 +161,10 @@ async def test_queued_block_is_pending_and_legacy_extraction_cannot_complete(
             identifiers,
         )
         collected = await _run_next(database, registry, identifiers, COLLECT_EBAY_ITEM_WORK_KIND)
-        assert collected["state"] == "pending"
-        assert _mapping(collected["result"])["state"] == "retryable_failure"
-        assert not await database.records_by_kind(("carl", "ebay", "listing_observation"))
+        assert collected["state"] == "terminal_failure"
         acquisition = _string(_mapping(collected["result"])["acquisition_record_identifier"])
-        _, retained = await database.get_artifact(pages.body_identifiers[0])
-        assert retained == AKAMAI
-        # A retained pre-fix acquisition can still be explicitly extracted, but
-        # its offline error page must not be recorded as successfully extracted.
+        # Retained pre-fix acquisitions can still be explicitly extracted, but
+        # offline error pages must not be recorded as successfully extracted.
         _ = await _enqueue(
             database,
             extract_ebay_item_work(
