@@ -37,6 +37,10 @@ def _identifier(value: str) -> str:
 
 
 def _work_status(work: WorkActivity, now_utc_ns: int) -> Text:
+    if work.state is WorkState.CANCELLING:
+        return Text("cancelling", style="yellow")
+    if work.state is WorkState.CANCELLED:
+        return Text("cancelled", style="yellow")
     if work.state is WorkState.LEASED:
         if work.lease_expires_at_utc_ns is None:
             return Text("leased", style="yellow")
@@ -77,8 +81,10 @@ def _work_summary(snapshot: ActivitySnapshot) -> Table:
     failed = sum(item.terminal_failure for item in snapshot.work_kinds)
     recent_completed = sum(item.recent_completed for item in snapshot.work_kinds)
     recent_failed = sum(item.recent_terminal_failure for item in snapshot.work_kinds)
+    cancelling = sum(item.cancelling for item in snapshot.work_kinds)
+    cancelled = sum(item.cancelled for item in snapshot.work_kinds)
     table = Table.grid(expand=True, padding=(0, 1))
-    for _ in range(6):
+    for _ in range(8):
         table.add_column(justify="center")
     table.add_row(
         f"[bold]{pending}[/]\npending",
@@ -87,6 +93,8 @@ def _work_summary(snapshot: ActivitySnapshot) -> Table:
         f"[bold red]{recent_failed}[/]\nrecently failed",
         f"[bold]{completed}[/]\nall completed",
         f"[bold]{failed}[/]\nall failed",
+        f"[bold yellow]{cancelling}[/]\ncancelling",
+        f"[bold yellow]{cancelled}[/]\nall cancelled",
     )
     return table
 
@@ -100,9 +108,17 @@ def _work_kinds(snapshot: ActivitySnapshot) -> Table:
     table.add_column("Recent failed", justify="right")
     table.add_column("All done", justify="right")
     table.add_column("All failed", justify="right")
+    table.add_column("Cancelling", justify="right")
+    table.add_column("Recent cancelled", justify="right")
+    table.add_column("All cancelled", justify="right")
     for item in snapshot.work_kinds:
         if not (
-            item.pending or item.leased or item.recent_completed or item.recent_terminal_failure
+            item.pending
+            or item.leased
+            or item.cancelling
+            or item.recent_completed
+            or item.recent_terminal_failure
+            or item.recent_cancelled
         ):
             continue
         table.add_row(
@@ -113,6 +129,9 @@ def _work_kinds(snapshot: ActivitySnapshot) -> Table:
             str(item.recent_terminal_failure),
             str(item.completed),
             str(item.terminal_failure),
+            str(item.cancelling),
+            str(item.recent_cancelled),
+            str(item.cancelled),
         )
     return table
 
@@ -152,30 +171,34 @@ def _network_paths(snapshot: ActivitySnapshot) -> Table:
     table.add_column("Recent failed", justify="right")
     table.add_column("All done", justify="right")
     table.add_column("All failed", justify="right")
+    table.add_column("Recent cancelled", justify="right")
+    table.add_column("All cancelled", justify="right")
     network = snapshot.network
     table.add_row(
         Text("All recorded paths", style="bold"),
         str(network.pending),
         str(network.admitted),
         str(network.recent_completed),
-        str(network.recent_failed + network.recent_cancelled),
+        str(network.recent_failed),
         str(network.completed),
-        str(network.failed + network.cancelled),
+        str(network.failed),
+        str(network.recent_cancelled),
+        str(network.cancelled),
     )
     for item in snapshot.network_paths:
-        recent_failed = item.recent_failed + item.recent_cancelled
-        all_failed = item.failed + item.cancelled
         table.add_row(
             _kind(item.path),
             str(item.pending),
             str(item.admitted),
             str(item.recent_completed),
-            str(recent_failed),
+            str(item.recent_failed),
             str(item.completed),
-            str(all_failed),
+            str(item.failed),
+            str(item.recent_cancelled),
+            str(item.cancelled),
         )
     if not snapshot.network_paths:
-        table.add_row("none recorded", "0", "0", "0", "0", "0", "0")
+        table.add_row("none recorded", "0", "0", "0", "0", "0", "0", "0", "0")
     return table
 
 
@@ -240,11 +263,12 @@ def _recent_work(snapshot: ActivitySnapshot) -> Table:
     table.add_column("Result", overflow="fold")
     for work in snapshot.recent_terminal_work:
         terminal_at = work.terminal_at_utc_ns or snapshot.captured_at_utc_ns
-        state = (
-            Text("completed", style="green")
-            if work.state is WorkState.COMPLETED
-            else Text("failed", style="red")
-        )
+        if work.state is WorkState.COMPLETED:
+            state = Text("completed", style="green")
+        elif work.state is WorkState.CANCELLED:
+            state = Text("cancelled", style="yellow")
+        else:
+            state = Text("failed", style="red")
         table.add_row(
             _duration(snapshot.captured_at_utc_ns - terminal_at),
             state,

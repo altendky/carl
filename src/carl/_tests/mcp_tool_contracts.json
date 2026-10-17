@@ -3231,7 +3231,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -3522,6 +3524,614 @@
         "carl",
         "review",
         "add_workspace_product_guide"
+      ]
+    }
+  },
+  {
+    "name": "cancel_all_work",
+    "description": "Stop every pending/running work item. Requires explicit confirm=true. Large ID results continue with get_tool_response_page.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "confirm": {
+          "default": false,
+          "title": "Confirm",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "cancel_all_workArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "description": "Large ID lists continue through the standard get_tool_response_page tool.",
+          "properties": {
+            "cancelled_pending": {
+              "minimum": 0,
+              "title": "Cancelled Pending",
+              "type": "integer"
+            },
+            "cancelling_leased": {
+              "minimum": 0,
+              "title": "Cancelling Leased",
+              "type": "integer"
+            },
+            "already_terminal": {
+              "minimum": 0,
+              "title": "Already Terminal",
+              "type": "integer"
+            },
+            "cancelled_pending_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Cancelled Pending Identifiers",
+              "type": "array"
+            },
+            "cancelling_leased_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Cancelling Leased Identifiers",
+              "type": "array"
+            },
+            "already_terminal_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Already Terminal Identifiers",
+              "type": "array"
+            }
+          },
+          "required": [
+            "cancelled_pending",
+            "cancelling_leased",
+            "already_terminal",
+            "cancelled_pending_identifiers",
+            "cancelling_leased_identifiers",
+            "already_terminal_identifiers"
+          ],
+          "title": "WorkCancellationResult",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "work",
+        "cancel_all"
+      ]
+    }
+  },
+  {
+    "name": "cancel_work",
+    "description": "Cancel an exact root and, by default, its descendants. Running work stops cooperatively; evidence and checkpoints remain. Large ID results continue with get_tool_response_page.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "work_identifier": {
+          "title": "Work Identifier",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "include_descendants": {
+          "default": true,
+          "title": "Include Descendants",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "work_identifier",
+        "reason"
+      ],
+      "title": "cancel_workArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "description": "Large ID lists continue through the standard get_tool_response_page tool.",
+          "properties": {
+            "cancelled_pending": {
+              "minimum": 0,
+              "title": "Cancelled Pending",
+              "type": "integer"
+            },
+            "cancelling_leased": {
+              "minimum": 0,
+              "title": "Cancelling Leased",
+              "type": "integer"
+            },
+            "already_terminal": {
+              "minimum": 0,
+              "title": "Already Terminal",
+              "type": "integer"
+            },
+            "cancelled_pending_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Cancelled Pending Identifiers",
+              "type": "array"
+            },
+            "cancelling_leased_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Cancelling Leased Identifiers",
+              "type": "array"
+            },
+            "already_terminal_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Already Terminal Identifiers",
+              "type": "array"
+            }
+          },
+          "required": [
+            "cancelled_pending",
+            "cancelling_leased",
+            "already_terminal",
+            "cancelled_pending_identifiers",
+            "cancelling_leased_identifiers",
+            "already_terminal_identifiers"
+          ],
+          "title": "WorkCancellationResult",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "work",
+        "cancel"
+      ]
+    }
+  },
+  {
+    "name": "cancel_workspace_work",
+    "description": "Cancel all pending/running workspace roots and their descendants, even without workers. Large ID results continue with get_tool_response_page.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_record_identifier": {
+          "title": "Workspace Record Identifier",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_record_identifier",
+        "reason"
+      ],
+      "title": "cancel_workspace_workArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "description": "Large ID lists continue through the standard get_tool_response_page tool.",
+          "properties": {
+            "cancelled_pending": {
+              "minimum": 0,
+              "title": "Cancelled Pending",
+              "type": "integer"
+            },
+            "cancelling_leased": {
+              "minimum": 0,
+              "title": "Cancelling Leased",
+              "type": "integer"
+            },
+            "already_terminal": {
+              "minimum": 0,
+              "title": "Already Terminal",
+              "type": "integer"
+            },
+            "cancelled_pending_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Cancelled Pending Identifiers",
+              "type": "array"
+            },
+            "cancelling_leased_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Cancelling Leased Identifiers",
+              "type": "array"
+            },
+            "already_terminal_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Already Terminal Identifiers",
+              "type": "array"
+            }
+          },
+          "required": [
+            "cancelled_pending",
+            "cancelling_leased",
+            "already_terminal",
+            "cancelled_pending_identifiers",
+            "cancelling_leased_identifiers",
+            "already_terminal_identifiers"
+          ],
+          "title": "WorkCancellationResult",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "work",
+        "cancel_workspace"
       ]
     }
   },
@@ -4950,7 +5560,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -6563,7 +7175,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -7733,7 +8347,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -8443,6 +9059,21 @@
             "recent_terminal_failure": {
               "title": "Recent Terminal Failure",
               "type": "integer"
+            },
+            "cancelling": {
+              "default": 0,
+              "title": "Cancelling",
+              "type": "integer"
+            },
+            "cancelled": {
+              "default": 0,
+              "title": "Cancelled",
+              "type": "integer"
+            },
+            "recent_cancelled": {
+              "default": 0,
+              "title": "Recent Cancelled",
+              "type": "integer"
             }
           },
           "required": [
@@ -8462,7 +9093,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -14718,7 +15351,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -16168,7 +16803,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -17257,7 +17894,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -17793,7 +18432,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -18959,7 +19600,8 @@
                   "enum": [
                     "success",
                     "partial_failure",
-                    "failed"
+                    "failed",
+                    "cancelled"
                   ],
                   "type": "string"
                 },
@@ -19007,6 +19649,17 @@
               "anyOf": [
                 {
                   "$ref": "#/$defs/WorkStatusDetails"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "cancellation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkCancellationSummary"
                 },
                 {
                   "type": "null"
@@ -19293,7 +19946,9 @@
             "collecting_images",
             "extracting_images",
             "completed",
-            "failed"
+            "failed",
+            "cancelling",
+            "cancelled"
           ],
           "title": "SearchRefreshPhase",
           "type": "string"
@@ -19409,6 +20064,31 @@
           "title": "SearchRefreshProgress",
           "type": "object"
         },
+        "WorkCancellationSummary": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "title": "Reason",
+              "type": "string"
+            },
+            "caller": {
+              "title": "Caller",
+              "type": "string"
+            },
+            "requested_at_utc_ns": {
+              "minimum": 0,
+              "title": "Requested At Utc Ns",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "reason",
+            "caller",
+            "requested_at_utc_ns"
+          ],
+          "title": "WorkCancellationSummary",
+          "type": "object"
+        },
         "WorkEventKind": {
           "enum": [
             "enqueued",
@@ -19418,7 +20098,9 @@
             "lease_renewed",
             "released",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancel_requested",
+            "cancelled"
           ],
           "title": "WorkEventKind",
           "type": "string"
@@ -19491,6 +20173,18 @@
             "terminal_failure": {
               "minimum": 0,
               "title": "Terminal Failure",
+              "type": "integer"
+            },
+            "cancelling": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelling",
+              "type": "integer"
+            },
+            "cancelled": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelled",
               "type": "integer"
             }
           },
@@ -19641,7 +20335,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -21318,6 +22014,18 @@
               "title": "Completed With Failures Count",
               "type": "integer"
             },
+            "cancelling_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelling Count",
+              "type": "integer"
+            },
+            "cancelled_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelled Count",
+              "type": "integer"
+            },
             "active_work": {
               "items": {
                 "$ref": "#/$defs/WorkActivity"
@@ -21340,6 +22048,20 @@
             },
             "failed_work_truncated": {
               "title": "Failed Work Truncated",
+              "type": "boolean"
+            },
+            "cancelled_work": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkActivity"
+              },
+              "maxItems": 100,
+              "title": "Cancelled Work",
+              "type": "array"
+            },
+            "cancelled_work_truncated": {
+              "default": false,
+              "title": "Cancelled Work Truncated",
               "type": "boolean"
             },
             "idle": {
@@ -21591,7 +22313,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -24540,7 +25264,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -25526,7 +26252,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -30400,7 +31128,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -33700,7 +34430,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -34571,7 +35303,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -36250,7 +36984,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -37106,7 +37842,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -38112,7 +38850,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -39228,7 +39968,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -40037,7 +40779,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -41142,7 +41886,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -42042,7 +42788,9 @@
             "pending",
             "leased",
             "completed",
-            "terminal_failure"
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
           ],
           "title": "WorkState",
           "type": "string"
@@ -42081,6 +42829,18 @@
               "title": "Completed With Failures Count",
               "type": "integer"
             },
+            "cancelling_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelling Count",
+              "type": "integer"
+            },
+            "cancelled_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelled Count",
+              "type": "integer"
+            },
             "active_work": {
               "items": {
                 "$ref": "#/$defs/WorkActivity"
@@ -42103,6 +42863,20 @@
             },
             "failed_work_truncated": {
               "title": "Failed Work Truncated",
+              "type": "boolean"
+            },
+            "cancelled_work": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkActivity"
+              },
+              "maxItems": 100,
+              "title": "Cancelled Work",
+              "type": "array"
+            },
+            "cancelled_work_truncated": {
+              "default": false,
+              "title": "Cancelled Work Truncated",
               "type": "boolean"
             },
             "idle": {

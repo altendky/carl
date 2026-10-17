@@ -12,6 +12,12 @@ class WorkState(JsonStringEnumeration):
     LEASED = "leased"
     COMPLETED = "completed"
     TERMINAL_FAILURE = "terminal_failure"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+
+
+class WorkCancellationRequestedError(RuntimeError):
+    """The owner must stop its attempt and acknowledge durable cancellation."""
 
 
 class WorkEventKind(JsonStringEnumeration):
@@ -23,6 +29,8 @@ class WorkEventKind(JsonStringEnumeration):
     RELEASED = "released"
     COMPLETED = "completed"
     TERMINAL_FAILURE = "terminal_failure"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCELLED = "cancelled"
 
 
 class SchedulingScopeKind(JsonStringEnumeration):

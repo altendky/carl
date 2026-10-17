@@ -52,6 +52,9 @@ from carl.mcp_server import build_server, managed_mcp_runtime, tool_definitions
 from carl.review import ReviewApplication
 
 EXPECTED_TOOLS = {
+    "cancel_work",
+    "cancel_workspace_work",
+    "cancel_all_work",
     "acquire_review_batch",
     "add_search_target",
     "add_workspace_product_guide",
@@ -1403,6 +1406,12 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert missing_pipeline_request.is_error
             assert missing_pipeline_status.is_error
             for tool_name, arguments in (
+                ("cancel_work", {"work_identifier": "missing-work", "reason": "Stop"}),
+                (
+                    "cancel_workspace_work",
+                    {"workspace_record_identifier": "missing", "reason": "Stop"},
+                ),
+                ("cancel_all_work", {"reason": "Stop"}),
                 ("get_review_workspace", {"record_identifier": "missing-workspace"}),
                 ("list_review_workspace_summaries", {}),
                 ("get_review_batch_page", {"request": {"batch_record_identifier": "missing"}}),

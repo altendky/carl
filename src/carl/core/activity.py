@@ -16,6 +16,9 @@ class WorkKindActivity(StrictModel):
     terminal_failure: int
     recent_completed: int
     recent_terminal_failure: int
+    cancelling: int = 0
+    cancelled: int = 0
+    recent_cancelled: int = 0
 
 
 class WorkActivity(StrictModel):

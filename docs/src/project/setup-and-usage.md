@@ -279,6 +279,29 @@ Wait for each resumed refresh to settle before another recovery call. A refresh
 losing at least half its selected item pages is a failure; smaller losses remain
 partial completion. Check outcomes and failure summaries rather than state alone.
 
+## Cancel queued or running work
+
+Use the MCP tool `cancel_work(work_identifier, reason)` for one exact root and
+its descendants, or `cancel_workspace_work(workspace_record_identifier, reason)`
+for all active roots in a workspace and their descendants. For a global stop,
+call `cancel_all_work(reason, confirm=true)`. An exact terminal root is a no-op.
+Set `include_descendants=false` on `cancel_work` to cancel only that item.
+
+Queued work becomes `cancelled` immediately, even with no worker running.
+Running work shows `cancelling` until its next operation or lease renewal stops
+the attempt cooperatively. Completed evidence and checkpoints remain available.
+Cancellation is separate from failure in work, activity and workspace status;
+cancelled jobs do not appear in the workspace's failed list. A parent depending
+on a cancelled child also cancels; this can include another parent sharing that
+child. New children cannot escape a cancellation racing their parent.
+
+Results report `cancelled_pending`, `cancelling_leased`, and `already_terminal`,
+with their work IDs. Large results use the standard bounded response pages:
+follow `get_tool_response_page` until complete and acknowledge the final page.
+Each cancellation event retains the reason and calling MCP tool/server identity.
+Use `request_workspace_refresh` normally to create fresh work after cancellation;
+cancelled work does not occupy the active deduplication identity.
+
 ## Upgrade together
 
 Stop old workers and MCP servers, update the checkout, run
@@ -291,5 +314,9 @@ The image-reuse schema upgrade builds indexed lookup keys from retained saved-im
 metadata once, inside the migration transaction. All writers must run the upgraded
 code so each new image publication also maintains these derived keys. Saved-image
 records and artifact verification remain authoritative.
+The cancellation schema upgrade preserves scheduling history while adding terminal
+cancellation states and indexed dependency links. Stop all old workers and MCP
+servers before migration so every process understands cancellation and records
+new dependency links.
 For legacy Proton-to-Decodo overrides, follow the separate audited
 `cutover-route-overrides` procedure before removing those configuration entries.

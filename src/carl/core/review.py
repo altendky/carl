@@ -18,6 +18,7 @@ from carl.core.models import (
 )
 from carl.core.refresh_recovery import RefreshFailureSummary
 from carl.core.work import WorkEventKind, WorkState
+from carl.core.work_cancellation import WorkCancellationSummary
 
 
 class CandidateAvailability(JsonStringEnumeration):
@@ -548,6 +549,8 @@ class WorkGroupProgress(StrictModel):
     leased: int = Field(ge=0)
     completed: int = Field(ge=0)
     terminal_failure: int = Field(ge=0)
+    cancelling: int = Field(default=0, ge=0)
+    cancelled: int = Field(default=0, ge=0)
 
 
 class SearchRefreshPhase(JsonStringEnumeration):
@@ -560,6 +563,8 @@ class SearchRefreshPhase(JsonStringEnumeration):
     EXTRACTING_IMAGES = "extracting_images"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
 
 
 class WorkFailureReasonCount(StrictModel):
@@ -638,11 +643,12 @@ class WorkStatus(StrictModel):
     error_kind: str | None
     operation_count: int = Field(ge=0)
     runtime: WorkRuntimeStatus
-    outcome: Literal["success", "partial_failure", "failed"] | None = None
+    outcome: Literal["success", "partial_failure", "failed", "cancelled"] | None = None
     refresh_failure_summary: RefreshFailureSummary | None = None
     search_refresh_progress: SearchRefreshProgress | None = None
     analysis_batch_progress: AnalysisBatchProgress | None = None
     details: WorkStatusDetails | None = None
+    cancellation: WorkCancellationSummary | None = None
 
 
 class ServerCapability(StrictModel):
@@ -671,6 +677,8 @@ def work_group_progress(states: tuple[WorkState, ...]) -> WorkGroupProgress:
         leased=counts[WorkState.LEASED],
         completed=counts[WorkState.COMPLETED],
         terminal_failure=counts[WorkState.TERMINAL_FAILURE],
+        cancelling=counts[WorkState.CANCELLING],
+        cancelled=counts[WorkState.CANCELLED],
     )
 
 
@@ -689,6 +697,10 @@ def search_refresh_phase(
         return SearchRefreshPhase.COMPLETED
     if state is WorkState.TERMINAL_FAILURE:
         return SearchRefreshPhase.FAILED
+    if state is WorkState.CANCELLING:
+        return SearchRefreshPhase.CANCELLING
+    if state is WorkState.CANCELLED:
+        return SearchRefreshPhase.CANCELLED
     if checkpoint_stage in {None, "collecting_search"}:
         return SearchRefreshPhase.SEARCH
     if checkpoint_stage in {"search_complete", "collecting_items", "extracting_items"}:
