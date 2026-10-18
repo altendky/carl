@@ -33,11 +33,14 @@ from carl.core.composed_projection import (
 )
 from carl.core.facebook_refresh import RefreshSearchPayload
 from carl.core.facebook_search import (
+    CursorSearchTraversalStrategy,
     OverlappingPricePartitionSearchTraversalStrategy,
     SearchPricePartitionOrder,
     SearchTraversalPolicy,
 )
 from carl.core.facebook_work import (
+    COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
+    COLLECT_SEARCH_WORK_KIND,
     CollectSearchPayload,
     CreateSearchRequest,
     FacebookSearchRequest,
@@ -55,7 +58,7 @@ from carl.core.marketplace_search import (
     ListMarketplaceSearchResultsRequest,
 )
 from carl.core.models import Header, JsonValue
-from carl.core.work import WorkState
+from carl.core.work import WorkCapability, WorkState
 from carl.core.worker import (
     AttemptContext,
     CompletedWork,
@@ -116,6 +119,8 @@ class _Clock:
 class _PartitionSessionFactory:
     challenges: int
     malformed: bool = False
+    bootstrap_login_wall: bool = False
+    clock: _Clock | None = None
     challenge_location: str = "90"
     challenges_by_partition: dict[str, int] = field(default_factory=dict)
     transport_failures_by_partition: dict[str, int] = field(default_factory=dict)
@@ -140,17 +145,24 @@ class _PartitionSessionFactory:
         self.sessions.append(identifier)
 
         def respond(request: httpx.Request) -> httpx.Response:
+            if self.clock is not None:
+                # Let a full resumed traversal cross the short request-rate window.
+                self.clock.now += 1_000_000_000
             if request.url.path == "/marketplace/":
                 self.requests.append((identifier, "bootstrap"))
+                if self.bootstrap_login_wall:
+                    return httpx.Response(302, headers={"Location": "/login/"}, stream=_Stream(b""))
                 body = (
                     b'<html><form id="checkpointSubmitButton"></form></html>'
                     if self.challenge("bootstrap")
                     else _session_bootstrap()
                 )
+            elif request.url.path == "/login/":
+                body = b'<html><form id="login_form"></form></html>'
             else:
                 assert request.url.path == "/ajax/route-definition/"
                 form = parse_qs(request.content.decode("ascii"), strict_parsing=True)
-                minimum = parse_qs(urlsplit(form["route_url"][0]).query)["minPrice"][0]
+                minimum = parse_qs(urlsplit(form["route_url"][0]).query).get("minPrice", ["0"])[0]
                 self.requests.append((identifier, minimum))
                 if self.login_walls_by_partition.get(minimum, 0) > 0:
                     self.login_walls_by_partition[minimum] -= 1
@@ -225,23 +237,29 @@ class _Harness:
             code_provenance=_async_provenance,
         )
 
-    async def create(self, database: Database) -> tuple[str, str]:
+    async def create(
+        self, database: Database, *, query: str = "telescope", partitioned: bool = True
+    ) -> tuple[str, str]:
         search = await self.app(database).create_marketplace_search(
             CreateMarketplaceSearchRequest(
                 targets=(
                     FacebookSearchTargetSpecification(
                         search=CreateSearchRequest(
                             request=FacebookSearchRequest(
-                                query="telescope",
+                                query=query,
                                 location=SearchFacebookLocation(identifier="456"),
                                 radius=SearchRadius(value=60, unit=SearchDistanceUnit.MILES),
                                 price=SearchPriceRange(currency="USD", maximum=Decimal("250")),
                             ),
                             traversal=SearchTraversalPolicy(maximum_pages=10),
-                            traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(
-                                width=Decimal("100"),
-                                overlap=Decimal("10"),
-                                order=SearchPricePartitionOrder.ASCENDING,
+                            traversal_strategy=(
+                                OverlappingPricePartitionSearchTraversalStrategy(
+                                    width=Decimal("100"),
+                                    overlap=Decimal("10"),
+                                    order=SearchPricePartitionOrder.ASCENDING,
+                                )
+                                if partitioned
+                                else CursorSearchTraversalStrategy()
                             ),
                             network_path=("proton", "personal", "carl"),
                         ),
@@ -276,6 +294,7 @@ class _Harness:
         )
         claim = await database.claim_work(
             supported_capabilities=registry.capabilities,
+            eligible_identifiers=(work_identifier,),
             worker_identifier="challenge-worker",
             lease_token=self.new_identifier(),
             lease_duration_ns=SETTINGS.lease_duration_ns,
@@ -455,8 +474,45 @@ async def test_interrupted_guest_login_resumes_same_partition_with_fresh_session
 
 
 @pytest.mark.anyio
-async def test_initial_guest_auth_wall_is_terminal_without_retry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("partitioned", (True, False))
+async def test_first_route_login_wall_retries_with_fresh_session_after_restart(
+    tmp_path: Path, partitioned: bool
+) -> None:
     factory = _PartitionSessionFactory(challenges=0, login_walls_by_partition={"0": 1})
+    harness = _Harness(tmp_path / "carl.sqlite3", factory)
+    factory.clock = harness.clock
+    async with Database.managed(harness.path, initialize=True) as database:
+        _, work_identifier = await harness.create(database, partitioned=partitioned)
+        outcome = await harness.run(database, work_identifier)
+        assert isinstance(outcome, RetryWork)
+        reason = cast(dict[str, JsonValue], outcome.reason)
+        assert reason["kind"] == "search_route_definition_response_failure"
+        assert reason["response_kind"] == "login_page"
+        assert reason["guest_access_interrupted"] is True
+        assert outcome.delay_ns == 10 * MINUTE_NS
+        parent = await harness.parent(database, work_identifier)
+        assert isinstance(parent, RetryWork)
+        assert parent.delay_ns == outcome.delay_ns
+        harness.clock.now += outcome.delay_ns
+    async with Database.managed(harness.path) as database:
+        outcome = await harness.run(database, work_identifier)
+        assert isinstance(outcome, CompletedWork)
+        assert (await database.work(work_identifier))["state"] == WorkState.COMPLETED
+    assert len(set(factory.sessions)) == 2
+    assert [request for _, request in factory.requests] == [
+        "bootstrap",
+        "0",
+        "bootstrap",
+        "0",
+        *(["90", "180"] if partitioned else []),
+    ]
+
+
+@pytest.mark.anyio
+async def test_bootstrap_login_wall_without_established_guest_session_remains_terminal(
+    tmp_path: Path,
+) -> None:
+    factory = _PartitionSessionFactory(challenges=0, bootstrap_login_wall=True)
     harness = _Harness(tmp_path / "carl.sqlite3", factory)
     async with Database.managed(harness.path, initialize=True) as database:
         _, work_identifier = await harness.create(database)
@@ -464,24 +520,63 @@ async def test_initial_guest_auth_wall_is_terminal_without_retry(tmp_path: Path)
         assert isinstance(outcome, TerminalFailureWork)
         error = cast(dict[str, JsonValue], outcome.error)
         assert error == {
-            "kind": "search_route_definition_response_failure",
+            "kind": "search_session_bootstrap_response_failure",
             "response_kind": "login_page",
         }
     assert len(factory.sessions) == 1
-    assert [request for _, request in factory.requests] == ["bootstrap", "0"]
+    assert [request for _, request in factory.requests] == ["bootstrap"]
+
+
+@pytest.mark.anyio
+async def test_route_login_wall_pauses_next_sibling_search_across_restart(tmp_path: Path) -> None:
+    factory = _PartitionSessionFactory(challenges=0, login_walls_by_partition={"0": 1})
+    harness = _Harness(tmp_path / "carl.sqlite3", factory)
+    async with Database.managed(harness.path, initialize=True) as database:
+        _, source = await harness.create(database)
+        _, sibling = await harness.create(database, query="sibling")
+        outcome = await harness.run(database, source)
+        assert isinstance(outcome, RetryWork)
+        eligible = harness.clock.now + outcome.delay_ns
+    async with Database.managed(harness.path) as database:
+        for now in (harness.clock.now, eligible - 1, eligible):
+            harness.clock.now = now
+            claim = await database.claim_work(
+                supported_capabilities=(
+                    WorkCapability(
+                        kind=COLLECT_SEARCH_WORK_KIND,
+                        payload_schema_version=COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
+                    ),
+                ),
+                eligible_identifiers=(sibling,),
+                worker_identifier="sibling-worker",
+                lease_token=harness.new_identifier(),
+                lease_duration_ns=SETTINGS.lease_duration_ns,
+                utc_now_ns=harness.clock,
+                event_identifier=harness.new_identifier(),
+            )
+            if now < eligible:
+                assert claim.lease is None
+                assert claim.next_eligible_at_utc_ns == eligible
+            else:
+                assert claim.lease is not None
+                assert claim.lease.work_item_identifier == sibling
+    assert len(factory.sessions) == 1
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(("challenges", "login_walls"), ((2, 3), (0, 5)))
+@pytest.mark.parametrize(("partitioned", "minimum"), ((True, "0"), (True, "90"), (False, "0")))
 async def test_guest_login_and_challenge_share_one_bounded_partition_budget(
-    tmp_path: Path, challenges: int, login_walls: int
+    tmp_path: Path, challenges: int, login_walls: int, partitioned: bool, minimum: str
 ) -> None:
     factory = _PartitionSessionFactory(
-        challenges=challenges, login_walls_by_partition={"90": login_walls}
+        challenges=challenges,
+        challenge_location=minimum,
+        login_walls_by_partition={minimum: login_walls},
     )
     harness = _Harness(tmp_path / "carl.sqlite3", factory)
     async with Database.managed(harness.path, initialize=True) as database:
-        _, work_identifier = await harness.create(database)
+        _, work_identifier = await harness.create(database, partitioned=partitioned)
         for attempt in range(1, 6):
             outcome = await harness.run(database, work_identifier)
             if attempt < 5:
@@ -500,8 +595,8 @@ async def test_guest_login_and_challenge_share_one_bounded_partition_budget(
                 parent = await harness.parent(database, work_identifier)
                 assert isinstance(parent, TerminalFailureWork)
     assert len(set(factory.sessions)) == 5
-    assert [request for _, request in factory.requests].count("0") == 1
-    assert [request for _, request in factory.requests].count("90") == 5
+    assert [request for _, request in factory.requests].count("0") == (1 if minimum == "90" else 5)
+    assert [request for _, request in factory.requests].count(minimum) == 5
 
 
 def test_login_retry_requires_proven_guest_progress_and_preserves_exhaustion() -> None:
