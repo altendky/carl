@@ -264,6 +264,80 @@ def test_datacenter_configuration(tmp_path: Path) -> None:
     assert settings.route.endpoint.port == 10001
 
 
+@pytest.mark.parametrize("product", tuple(DecodoProduct))
+def test_decodo_configuration_loads_endpoint_pool(tmp_path: Path, product: DecodoProduct) -> None:
+    directories, path = _write_configuration(tmp_path)
+    _ = path.write_bytes(
+        path.read_bytes()
+        .replace(b'product = "residential_proxy"', f'product = "{product.value}"'.encode())
+        .replace(b"port = 7000", b"port = 10001\nports = [10001, 10002, 10100]")
+    )
+    _ = configure_decodo_credential("password", credential_id="carl", directories=directories)
+    settings, _ = decodo_settings(
+        load_configuration(path), directories, ("decodo", "personal", "carl")
+    )
+    assert settings.endpoint_ports == (10001, 10002, 10100)
+    assert settings.route.endpoint.port == 10001
+
+
+@pytest.mark.parametrize("ports", ([], [10001, 10001], [0], [65536], [9999], [63001]))
+def test_decodo_configuration_rejects_invalid_endpoint_pool(
+    tmp_path: Path, ports: list[int]
+) -> None:
+    directories, path = _write_configuration(tmp_path)
+    _ = path.write_bytes(
+        path.read_bytes()
+        .replace(b'product = "residential_proxy"', b'product = "datacenter_proxy"')
+        .replace(b"port = 7000", f"port = 10001\nports = {json.dumps(ports)}".encode())
+    )
+    with pytest.raises(ConfigurationLoadFailure):
+        _ = load_configuration(directories.configuration_file)
+
+
+@pytest.mark.parametrize("product", tuple(DecodoProduct))
+@pytest.mark.parametrize("port_end", (11000, 19000))
+def test_decodo_configuration_loads_compact_inclusive_range(
+    tmp_path: Path, product: DecodoProduct, port_end: int
+) -> None:
+    directories, path = _write_configuration(tmp_path)
+    _ = path.write_bytes(
+        path.read_bytes()
+        .replace(b'product = "residential_proxy"', f'product = "{product.value}"'.encode())
+        .replace(b"port = 7000", f"port = 11000\nport_end = {port_end}".encode())
+    )
+    _ = configure_decodo_credential("password", credential_id="carl", directories=directories)
+    settings, _ = decodo_settings(
+        load_configuration(path), directories, ("decodo", "personal", "carl")
+    )
+    assert settings.route.endpoint.port == 11000
+    assert settings.endpoint_port_end == port_end
+    assert settings.endpoint_ports == ()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    (
+        "port = 11000\nport_end = 0",
+        "port = 11000\nport_end = 65536",
+        "port = 11000\nport_end = 10999",
+        "port = 9999\nport_end = 19000",
+        "port = 11000\nport_end = 63001",
+        "port = 11000\nport_end = 19000\nports = [11000, 19000]",
+    ),
+)
+def test_decodo_configuration_rejects_invalid_or_ambiguous_range(
+    tmp_path: Path, endpoint: str
+) -> None:
+    directories, path = _write_configuration(tmp_path)
+    _ = path.write_bytes(
+        path.read_bytes()
+        .replace(b'product = "residential_proxy"', b'product = "datacenter_proxy"')
+        .replace(b"port = 7000", endpoint.encode())
+    )
+    with pytest.raises(ConfigurationLoadFailure):
+        _ = load_configuration(directories.configuration_file)
+
+
 def test_user_directories_follow_platform_conventions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

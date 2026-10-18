@@ -1,13 +1,15 @@
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import asynccontextmanager
 from typing import cast
 
 import anyio
 import httpx
 import pytest
-from pydantic import SecretStr
+import wreq
+from pydantic import SecretStr, ValidationError
 
 from carl._tests.test_wreq import _Factory, _response
+from carl._tests.test_wreq_reconnect import _broken_pipe, _CookieClient, _ReplacingFactory
 from carl.core.http import FormField, RequestPlan
 from carl.core.models import (
     ConfigurationDocumentIdentity,
@@ -26,6 +28,7 @@ from carl.io.decodo import (
     StaticDecodoCredentialSource,
     _provider_result,
     _sticky_proxy_credentials,
+    select_decodo_session_settings,
 )
 from carl.io.httpx import AcquisitionFailure, RouteConfigurationFailure
 from carl.io.wreq import WreqClientFactory
@@ -82,6 +85,239 @@ def _settings() -> DecodoProxySettings:
 def _identifiers() -> Callable[[], str]:
     values = iter(f"identifier-{index}" for index in range(20))
     return lambda: next(values)
+
+
+def _pool_settings(product: DecodoProduct, *, range_pool: bool = False) -> DecodoProxySettings:
+    settings = _settings()
+    if range_pool:
+        return settings.model_copy(
+            update={
+                "route": settings.route.model_copy(
+                    update={
+                        "product": product,
+                        "endpoint": settings.route.endpoint.model_copy(update={"port": 11000}),
+                    }
+                ),
+                "endpoint_port_end": 19000,
+            }
+        )
+    return settings.model_copy(
+        update={
+            "route": settings.route.model_copy(update={"product": product}),
+            "endpoint_ports": (10001, 10002, 10100),
+        }
+    )
+
+
+def test_preselected_endpoint_is_frozen_and_original_pool_is_unchanged() -> None:
+    settings = _pool_settings(DecodoProduct.RESIDENTIAL_PROXY)
+    selected = select_decodo_session_settings(settings, lambda ports: ports[-1])
+    assert selected.route.endpoint.port == 10100
+    assert selected.endpoint_ports == ()
+    assert settings.endpoint_ports == (10001, 10002, 10100)
+    assert settings.route.endpoint.port == 7000
+
+    def unexpected_choice(_ports: Sequence[int]) -> int:
+        raise AssertionError("A preselected session must not rotate its endpoint")
+
+    assert select_decodo_session_settings(selected, unexpected_choice) is selected
+    with pytest.raises(RouteConfigurationFailure, match="invalid_decodo_selected_port"):
+        _ = select_decodo_session_settings(settings, lambda _ports: 10004)
+
+
+@pytest.mark.parametrize("product", tuple(DecodoProduct))
+@pytest.mark.parametrize("take_last", (False, True))
+def test_range_endpoints_are_inclusive_compact_and_frozen(
+    product: DecodoProduct, take_last: bool
+) -> None:
+    settings = _pool_settings(product, range_pool=True)
+
+    def choose(ports: Sequence[int]) -> int:
+        assert isinstance(ports, range)
+        assert len(ports) == 8001
+        assert ports[0] == 11000
+        assert ports[-1] == 19000
+        return ports[-1] if take_last else ports[0]
+
+    selected = select_decodo_session_settings(settings, choose)
+    assert selected.route.endpoint.port == (19000 if take_last else 11000)
+    assert selected.endpoint_ports == ()
+    assert selected.endpoint_port_end is None
+    assert select_decodo_session_settings(selected, choose) is selected
+    assert settings.route.endpoint.port == 11000
+    assert settings.endpoint_port_end == 19000
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "ports"),
+    (
+        (11000, 0, ()),
+        (11000, 65536, ()),
+        (11000, 10999, ()),
+        (9999, 19000, ()),
+        (11000, 63001, ()),
+        (11000, 19000, (11000, 19000)),
+    ),
+)
+def test_settings_reject_invalid_or_ambiguous_ranges(
+    start: int, end: int, ports: tuple[int, ...]
+) -> None:
+    settings = _pool_settings(DecodoProduct.DATACENTER_PROXY)
+    value = settings.model_dump(mode="python")
+    value["route"] = settings.route.model_copy(
+        update={"endpoint": settings.route.endpoint.model_copy(update={"port": start})}
+    )
+    value["endpoint_ports"] = ports
+    value["endpoint_port_end"] = end
+    with pytest.raises(ValidationError):
+        _ = DecodoProxySettings.model_validate(value)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("product", tuple(DecodoProduct))
+@pytest.mark.parametrize("range_pool", (False, True))
+async def test_httpx_pool_selects_once_per_session_and_records_actual_endpoint(
+    product: DecodoProduct, range_pool: bool
+) -> None:
+    settings = _pool_settings(product, range_pool=range_pool)
+    expected_ports = (11000, 19000) if range_pool else (10002, 10100)
+    selected_ports = iter(expected_ports)
+    choices: list[Sequence[int]] = []
+    proxies: list[str] = []
+
+    def choose(ports: Sequence[int]) -> int:
+        choices.append(ports)
+        return next(selected_ports)
+
+    def client_factory(*, proxy: httpx.Proxy, verify: bool) -> httpx.AsyncClient:
+        assert verify
+        proxies.append(str(proxy.url))
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, stream=_Stream(b"page"))
+            )
+        )
+
+    manager = DecodoSessionManager(client_factory=client_factory, port_choice=choose)
+    identifiers = _identifiers()
+    source = StaticDecodoCredentialSource(DecodoCredentials(proxy_password=SecretStr("secret")))
+    plan = RequestPlan(url="https://example.com/", routing=settings.route.network_path)
+    for port in expected_ports:
+        async with manager.open(
+            settings=settings, credential_source=source, new_identifier=identifiers
+        ) as session:
+            for _ in range(2):
+                acquisition = await session.acquire(plan, identifiers)
+                assert (
+                    acquisition.record["routing"]["observed"]["route"]["endpoint"]["port"] == port
+                )
+        assert session.completed_observation().route.endpoint.port == port
+    assert choices == [range(11000, 19001) if range_pool else (10001, 10002, 10100)] * 2
+    assert proxies == [f"http://gate.decodo.com:{port}" for port in expected_ports]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("product", tuple(DecodoProduct))
+@pytest.mark.parametrize("shared", (False, True))
+@pytest.mark.parametrize("range_pool", (False, True))
+async def test_wreq_pool_selects_once_and_records_actual_endpoint(
+    product: DecodoProduct, shared: bool, range_pool: bool
+) -> None:
+    settings = _pool_settings(product, range_pool=range_pool)
+    expected_port = 19000 if range_pool else 10100
+    choices: list[Sequence[int]] = []
+
+    def choose(ports: Sequence[int]) -> int:
+        choices.append(ports)
+        return ports[-1]
+
+    factory = _Factory([_response(), _response()])
+    acquirer = ManagedDecodoWreqAcquirer(
+        settings=settings,
+        credential_source=StaticDecodoCredentialSource(
+            DecodoCredentials(proxy_password=SecretStr("secret"))
+        ),
+        client_factory=cast(WreqClientFactory, cast(object, factory)),
+        port_choice=choose,
+    )
+    identifiers = _identifiers()
+    plan = RequestPlan(url="https://www.ebay.com/", routing=settings.route.network_path)
+    if shared:
+        async with acquirer.session(identifiers) as session:
+            for _ in range(2):
+                acquisition = await session.acquire(plan, identifiers)
+                assert (
+                    acquisition.record["routing"]["observed"]["route"]["endpoint"]["port"]
+                    == expected_port
+                )
+        assert session.observation()["route"]["endpoint"]["port"] == expected_port
+    else:
+        acquisition = await acquirer.acquire(plan, identifiers)
+        assert (
+            acquisition.record["routing"]["observed"]["route"]["endpoint"]["port"] == expected_port
+        )
+    assert choices == [range(11000, 19001) if range_pool else (10001, 10002, 10100)]
+    assert f"gate.decodo.com:{expected_port}" in str(factory.proxy)
+    assert settings.endpoint_ports == (() if range_pool else (10001, 10002, 10100))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("product", tuple(DecodoProduct))
+async def test_range_session_reconnect_preserves_selected_port_provider_and_cookies(
+    product: DecodoProduct,
+) -> None:
+    events: list[str] = []
+    jar = wreq.Jar()
+    first = _CookieClient([_response(), _broken_pipe()], jar=jar, events=events, label="first")
+    second = _CookieClient(
+        [_response(), _response()], jar=wreq.Jar(), events=events, label="second"
+    )
+    factory = _ReplacingFactory([first, second], events)
+    choices: list[Sequence[int]] = []
+    provider_sessions: list[str] = []
+
+    def choose(ports: Sequence[int]) -> int:
+        choices.append(ports)
+        return ports[-1]
+
+    def provider_session() -> str:
+        provider_sessions.append("StableProviderSession")
+        return provider_sessions[-1]
+
+    settings = _pool_settings(product, range_pool=True)
+    acquirer = ManagedDecodoWreqAcquirer(
+        settings=settings,
+        credential_source=StaticDecodoCredentialSource(
+            DecodoCredentials(proxy_password=SecretStr("proxy-secret"))
+        ),
+        client_factory=cast(WreqClientFactory, cast(object, factory)),
+        port_choice=choose,
+        provider_session_factory=provider_session,
+    )
+    plan = RequestPlan(
+        url="https://www.ebay.com/",
+        routing=settings.route.network_path,
+        reconnect_on_broken_pipe=True,
+    )
+    identifiers = _identifiers()
+    async with acquirer.session(identifiers) as session:
+        acquisitions = [await session.acquire(plan, identifiers) for _ in range(3)]
+    assert choices == [range(11000, 19001)]
+    assert provider_sessions == ["StableProviderSession"]
+    assert len(factory.proxies) == 2 and factory.proxies[0] is factory.proxies[1]
+    assert "gate.decodo.com:19000" in str(factory.proxies[0])
+    if product is not DecodoProduct.DATACENTER_PROXY:
+        assert "-session-StableProviderSession-" in str(factory.proxies[0])
+    assert events == ["open:1", "close:first", "open:2", "close:second"]
+    assert all(
+        call[2]["cookie_provider"] is jar for call in (*first.inner.calls, *second.inner.calls)
+    )
+    assert acquisitions[1].record["connection_recovery"]["recovered"] is True
+    assert all(
+        acquisition.record["routing"]["observed"]["route"]["endpoint"]["port"] == 19000
+        for acquisition in acquisitions
+    )
+    assert session.observation()["route"]["endpoint"]["port"] == 19000
 
 
 @pytest.mark.anyio
