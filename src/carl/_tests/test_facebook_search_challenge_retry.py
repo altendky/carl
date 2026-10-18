@@ -45,6 +45,8 @@ from carl.core.facebook_work import (
     SearchFacebookLocation,
     SearchPriceRange,
     SearchRadius,
+    is_transient_search_failure,
+    retryable_search_failure,
 )
 from carl.core.json import encode_json
 from carl.core.marketplace_search import (
@@ -117,6 +119,7 @@ class _PartitionSessionFactory:
     challenge_location: str = "90"
     challenges_by_partition: dict[str, int] = field(default_factory=dict)
     transport_failures_by_partition: dict[str, int] = field(default_factory=dict)
+    login_walls_by_partition: dict[str, int] = field(default_factory=dict)
     sessions: list[str] = field(default_factory=list)
     requests: list[tuple[str, str]] = field(default_factory=list)
 
@@ -149,7 +152,13 @@ class _PartitionSessionFactory:
                 form = parse_qs(request.content.decode("ascii"), strict_parsing=True)
                 minimum = parse_qs(urlsplit(form["route_url"][0]).query)["minPrice"][0]
                 self.requests.append((identifier, minimum))
-                if self.challenge(minimum) or (minimum == "90" and self.malformed):
+                if self.login_walls_by_partition.get(minimum, 0) > 0:
+                    self.login_walls_by_partition[minimum] -= 1
+                    body = (
+                        b'for (;;);{"jsmods":{"require":[["ServerRedirect","redirectPageTo",[], '
+                        b'["/login/?next=marketplace",true,false]]]}}'
+                    )
+                elif self.challenge(minimum) or (minimum == "90" and self.malformed):
                     if self.malformed:
                         body = b'for (;;);{"__type":"last_response"}'
                     else:
@@ -411,6 +420,100 @@ async def test_partition_challenge_exhausts_five_attempts_with_long_backoff(tmp_
     assert len(set(factory.sessions)) == 5
     assert [request for _, request in factory.requests].count("0") == 1
     assert [request for _, request in factory.requests].count("90") == 5
+
+
+@pytest.mark.anyio
+async def test_interrupted_guest_login_resumes_same_partition_with_fresh_session(
+    tmp_path: Path,
+) -> None:
+    factory = _PartitionSessionFactory(challenges=0, login_walls_by_partition={"90": 1})
+    harness = _Harness(tmp_path / "carl.sqlite3", factory)
+    async with Database.managed(harness.path, initialize=True) as database:
+        _, work_identifier = await harness.create(database)
+        first = await harness.run(database, work_identifier)
+        assert isinstance(first, RetryWork)
+        reason = cast(dict[str, JsonValue], first.reason)
+        assert reason["response_kind"] == "login_page"
+        assert reason["guest_access_interrupted"] is True
+        assert first.delay_ns == 10 * MINUTE_NS
+        assert cast(dict[str, JsonValue], first.result)["partition_retry_checkpoint"] is not None
+        harness.clock.now += first.delay_ns
+    async with Database.managed(harness.path) as database:
+        final = await harness.run(database, work_identifier)
+        assert isinstance(final, CompletedWork)
+        assert cast(dict[str, JsonValue], final.result)["pages_processed"] == 3
+        assert cast(dict[str, JsonValue], final.result)["unique_listings"] == 3
+    assert len(set(factory.sessions)) == 2
+    assert [request for _, request in factory.requests] == [
+        "bootstrap",
+        "0",
+        "90",
+        "bootstrap",
+        "90",
+        "180",
+    ]
+
+
+@pytest.mark.anyio
+async def test_initial_guest_auth_wall_is_terminal_without_retry(tmp_path: Path) -> None:
+    factory = _PartitionSessionFactory(challenges=0, login_walls_by_partition={"0": 1})
+    harness = _Harness(tmp_path / "carl.sqlite3", factory)
+    async with Database.managed(harness.path, initialize=True) as database:
+        _, work_identifier = await harness.create(database)
+        outcome = await harness.run(database, work_identifier)
+        assert isinstance(outcome, TerminalFailureWork)
+        error = cast(dict[str, JsonValue], outcome.error)
+        assert error == {
+            "kind": "search_route_definition_response_failure",
+            "response_kind": "login_page",
+        }
+    assert len(factory.sessions) == 1
+    assert [request for _, request in factory.requests] == ["bootstrap", "0"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("challenges", "login_walls"), ((2, 3), (0, 5)))
+async def test_guest_login_and_challenge_share_one_bounded_partition_budget(
+    tmp_path: Path, challenges: int, login_walls: int
+) -> None:
+    factory = _PartitionSessionFactory(
+        challenges=challenges, login_walls_by_partition={"90": login_walls}
+    )
+    harness = _Harness(tmp_path / "carl.sqlite3", factory)
+    async with Database.managed(harness.path, initialize=True) as database:
+        _, work_identifier = await harness.create(database)
+        for attempt in range(1, 6):
+            outcome = await harness.run(database, work_identifier)
+            if attempt < 5:
+                assert isinstance(outcome, RetryWork)
+                assert outcome.delay_ns == (10, 20, 40, 60)[attempt - 1] * MINUTE_NS
+                assert cast(dict[str, JsonValue], outcome.reason)["response_kind"] == (
+                    "login_page" if attempt <= login_walls else "bot_challenge"
+                )
+                harness.clock.now += outcome.delay_ns
+            else:
+                assert isinstance(outcome, TerminalFailureWork)
+                assert cast(dict[str, JsonValue], outcome.error)["decision"] == "retry_exhausted"
+                assert cast(dict[str, JsonValue], outcome.error)["response_kind"] == (
+                    "login_page" if login_walls == 5 else "bot_challenge"
+                )
+                parent = await harness.parent(database, work_identifier)
+                assert isinstance(parent, TerminalFailureWork)
+    assert len(set(factory.sessions)) == 5
+    assert [request for _, request in factory.requests].count("0") == 1
+    assert [request for _, request in factory.requests].count("90") == 5
+
+
+def test_login_retry_requires_proven_guest_progress_and_preserves_exhaustion() -> None:
+    initial = {"kind": "search_price_partition_extraction_failure", "response_kind": "login_page"}
+    assert not is_transient_search_failure(initial)
+    assert not retryable_search_failure(initial, attempt=1)
+    interrupted = {**initial, "guest_access_interrupted": True, "challenge_attempt": 2}
+    assert is_transient_search_failure(interrupted)
+    # Successful intervening partitions can make the physical attempt exceed
+    # five while this partition still has a bounded independent retry budget.
+    assert retryable_search_failure(interrupted, attempt=11)
+    assert not retryable_search_failure({**interrupted, "decision": "retry_exhausted"}, attempt=1)
 
 
 @pytest.mark.anyio

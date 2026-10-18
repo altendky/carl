@@ -1,4 +1,4 @@
-"""Bounded bot-challenge retries and resumable completed price partitions."""
+"""Bounded guest-access retries and resumable completed price partitions."""
 
 from typing import Literal
 
@@ -8,6 +8,15 @@ from carl.core.facebook_search import PricePartitionSearchTraversalState
 from carl.core.models import JsonValue, StrictModel
 
 FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS = 5
+FACEBOOK_SEARCH_NETWORK_ACTIVITY_KINDS = frozenset(
+    ("carl", "facebook", "network_activity", stage)
+    for stage in (
+        "search_session_open",
+        "search_session_bootstrap",
+        "search_route_definition",
+        "search_pagination",
+    )
+)
 
 
 def facebook_challenge_retry_delay_ns(attempt: int) -> int:

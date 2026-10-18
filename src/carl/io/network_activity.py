@@ -8,6 +8,7 @@ from time import time_ns
 
 import anyio
 
+from carl.core.facebook_search_retry import FACEBOOK_SEARCH_NETWORK_ACTIVITY_KINDS
 from carl.core.marketplace_images import MARKETPLACE_IMAGE_SCOPE
 from carl.core.models import JsonValue
 from carl.core.work import (
@@ -204,9 +205,14 @@ class NetworkActivityScheduler:
                 if result.next_eligible_at_utc_ns is None:
                     raise RuntimeError("Blocked network activity has no eligibility time")
                 delay_seconds = max(0, result.next_eligible_at_utc_ns - now_utc_ns) / 1_000_000_000
-                if MARKETPLACE_IMAGE_SCOPE in definition.scopes:
+                if (
+                    MARKETPLACE_IMAGE_SCOPE in definition.scopes
+                    or definition.kind in FACEBOOK_SEARCH_NETWORK_ACTIVITY_KINDS
+                ):
                     # A completed image releases its slot before the lease expiry;
                     # waiting downloads must notice it without sleeping ten minutes.
+                    # Search route cooldowns can disappear when their source is
+                    # cancelled; active sessions must notice that promptly too.
                     delay_seconds = min(delay_seconds, 1.0)
                 await anyio.sleep(delay_seconds)
             permit = NetworkActivityPermit(admission=admission)
