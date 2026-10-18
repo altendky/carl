@@ -192,11 +192,12 @@ def _response_failure_work(
     policy_attempt: int,
     routing: tuple[str, ...],
     now_utc_ns: int,
+    guest_session_established: bool = False,
 ) -> RetryWork | TerminalFailureWork:
-    interrupted_guest_access = (
-        error.get("response_kind") == "login_page"
-        and checkpoint is not None
-        and checkpoint.traversal_state.partitions_processed > 0
+    """Recover login walls after a valid guest bootstrap or completed partition."""
+    interrupted_guest_access = error.get("response_kind") == "login_page" and (
+        guest_session_established
+        or (checkpoint is not None and checkpoint.traversal_state.partitions_processed > 0)
     )
     if error.get("response_kind") != "bot_challenge" and not interrupted_guest_access:
         return TerminalFailureWork(error=error, result=result)
@@ -1257,6 +1258,7 @@ def build_search_handler(
                             ],
                             "session_material_issues": [],
                         },
+                        guest_session_established=True,
                     )
                 page_completed_at = dependencies.monotonic_ns()
                 page_facts = traversal_page_facts(
