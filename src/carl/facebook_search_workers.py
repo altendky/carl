@@ -190,8 +190,15 @@ def _response_failure_work(
     result: dict[str, JsonValue],
     checkpoint: PartitionSearchRetryCheckpoint | None,
     policy_attempt: int,
+    routing: tuple[str, ...],
+    now_utc_ns: int,
 ) -> RetryWork | TerminalFailureWork:
-    if error.get("response_kind") != "bot_challenge":
+    interrupted_guest_access = (
+        error.get("response_kind") == "login_page"
+        and checkpoint is not None
+        and checkpoint.traversal_state.partitions_processed > 0
+    )
+    if error.get("response_kind") != "bot_challenge" and not interrupted_guest_access:
         return TerminalFailureWork(error=error, result=result)
     attempt = policy_attempt if checkpoint is None else checkpoint.challenge_attempts + 1
     if checkpoint is not None:
@@ -206,6 +213,11 @@ def _response_failure_work(
         **error,
         "challenge_attempt": attempt,
         "maximum_attempts": FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS,
+        "guest_access_interrupted": interrupted_guest_access,
+        "facebook_search_cooldown": {
+            "network_path": list(routing),
+            "until_utc_ns": now_utc_ns + facebook_challenge_retry_delay_ns(attempt),
+        },
     }
     if attempt < FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS:
         return RetryWork(
@@ -1116,6 +1128,8 @@ def build_search_handler(
                     return _response_failure_work(
                         checkpoint=retry_checkpoint,
                         policy_attempt=policy_attempt,
+                        routing=payload.routing,
+                        now_utc_ns=dependencies.utc_now_ns(),
                         error={
                             "kind": "search_session_bootstrap_response_failure",
                             "response_kind": session_bootstrap_classification.kind.value,
@@ -1221,6 +1235,8 @@ def build_search_handler(
                     return _response_failure_work(
                         checkpoint=retry_checkpoint,
                         policy_attempt=policy_attempt,
+                        routing=payload.routing,
+                        now_utc_ns=dependencies.utc_now_ns(),
                         error={
                             "kind": (
                                 "search_route_definition_extraction_failure"
@@ -1428,6 +1444,8 @@ def build_search_handler(
                             return _response_failure_work(
                                 checkpoint=retry_checkpoint,
                                 policy_attempt=policy_attempt,
+                                routing=payload.routing,
+                                now_utc_ns=dependencies.utc_now_ns(),
                                 error={
                                     "kind": "search_price_partition_extraction_failure",
                                     "response_kind": response_classification.kind.value,

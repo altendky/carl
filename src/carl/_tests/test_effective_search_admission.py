@@ -69,6 +69,7 @@ async def _claim(
         lease_duration_ns=duration,
         utc_now_ns=lambda: now,
         event_identifier=f"claim-{identifier}",
+        eligible_identifiers=(identifier,),
     )
     assert result.lease is not None
     assert result.lease.work_item_identifier == identifier
@@ -143,7 +144,7 @@ async def test_legacy_alias_and_direct_route_share_admission(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("second_route", (("proton", "personal", "alias"), DATACENTER))
-async def test_decodo_alias_and_direct_route_admit_concurrent_searches(
+async def test_decodo_alias_and_direct_route_share_one_admission(
     tmp_path: Path, second_route: tuple[str, ...]
 ) -> None:
     path = tmp_path / "carl.sqlite3"
@@ -154,17 +155,20 @@ async def test_decodo_alias_and_direct_route_admit_concurrent_searches(
         history = await _rows(database, "SELECT * FROM work_events ORDER BY sequence")
         assert await _admit(database, first, DATACENTER)
         async with Database.managed(path) as other_database:
-            assert await _admit(other_database, second, DATACENTER)
+            assert not await _admit(other_database, second, DATACENTER)
         assert await _admit(database, first, DATACENTER)
         assert await _rows(database, "SELECT id,payload_json FROM work_items ORDER BY id") == before
         assert await _rows(database, "SELECT * FROM work_events ORDER BY sequence") == history
         assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *DATACENTER) in await _scopes(
             database, "first"
         )
-        assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *DATACENTER) in await _scopes(
+        assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *DATACENTER) not in await _scopes(
             database, "second"
         )
-        assert await _rows(database, "SELECT count(*) FROM scheduling_constraints") == [(0,)]
+        assert await _rows(
+            database,
+            "SELECT count(*) FROM scheduling_constraints WHERE identifier_parts_json LIKE '%effective_route_concurrency%'",
+        ) == [(1,)]
 
 
 @pytest.mark.anyio
@@ -174,7 +178,7 @@ async def test_decodo_admission_validates_lease_and_rebinding_preserves_proton_e
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         first = await _claim(database, "first", TARGET)
         second = await _claim(database, "second", DATACENTER)
-        expired = await _claim(database, "expired", DATACENTER, duration=100)
+        expired = await _claim(database, "expired", ("decodo", "personal", "expired"), duration=100)
         assert await _admit(database, first, TARGET)
         assert await _admit(database, second, DATACENTER)
         scopes = await _scopes(database, "second")
@@ -188,12 +192,13 @@ async def test_decodo_admission_validates_lease_and_rebinding_preserves_proton_e
             database, "second"
         )
         assert await _admit(database, second, DATACENTER)
-        assert await _admit(database, first, DATACENTER)
+        assert not await _admit(database, first, DATACENTER)
         assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *TARGET) not in await _scopes(
             database, "first"
         )
         assert await _admit(database, second, TARGET)
         assert not await _admit(database, first, TARGET)
+        assert await _admit(database, first, DATACENTER)
 
 
 @pytest.mark.anyio
@@ -215,9 +220,9 @@ async def test_simultaneous_processes_admit_only_one_before_policy_registration(
 ) -> None:
     path = tmp_path / "carl.sqlite3"
     async with Database.managed(path, initialize=True) as database:
-        # Same original route, with both leases claimed before any route constraint exists.
-        first = await _claim(database, "first", TARGET)
-        second = await _claim(database, "second", TARGET)
+        # Distinct requested aliases resolve to one effective acquisition route.
+        first = await _claim(database, "first", ("proton", "personal", "first"))
+        second = await _claim(database, "second", ("proton", "personal", "second"))
     code = """
 import sys
 from pathlib import Path
@@ -329,7 +334,9 @@ async def test_cancelled_routed_wait_does_not_access_provider_or_consume_attempt
     monkeypatch.setattr(routed, "proton_settings", unexpected)
     monkeypatch.setattr(routed, "brave_navigation_headers", unexpected)
     async with Database.managed(path, initialize=True) as database:
-        first = await _claim(database, "first", routes.PROTON, now=now, duration=60_000_000_000)
+        first = await _claim(
+            database, "first", ("proton", "personal", "owner"), now=now, duration=60_000_000_000
+        )
         second = await _claim(database, "second", routes.PROTON, now=now, duration=60_000_000_000)
         assert await _admit(database, first, TARGET, now=now)
         registry = routed.build_routed_facebook_worker_registry(

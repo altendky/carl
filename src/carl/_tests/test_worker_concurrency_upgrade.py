@@ -102,14 +102,24 @@ async def test_upgrade_retires_old_caps_and_is_idempotent(tmp_path: Path) -> Non
 
 
 @pytest.mark.anyio
-async def test_search_upgrade_retires_alias_and_decodo_caps_before_queued_work_claims(
+async def test_search_upgrade_replaces_retired_v1_caps_before_queued_work_claims(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "carl.sqlite3"
     requested_proton = ("proton", "personal", "legacy")
     decodo = ("decodo", "personal", "datacenter")
-    proton_constraint = facebook_effective_search_work_constraint(requested_proton)
-    assert proton_constraint is not None
+    proton_constraint = facebook_effective_search_work_constraint(requested_proton).model_copy(
+        update={
+            "identifier": (
+                "carl",
+                "facebook",
+                "search",
+                "effective_route_concurrency",
+                "v1",
+                *requested_proton,
+            )
+        }
+    )
     old_effective_decodo = proton_constraint.model_copy(
         update={
             "identifier": (
@@ -126,13 +136,31 @@ async def test_search_upgrade_retires_alias_and_decodo_caps_before_queued_work_c
         }
     )
     old_constraints = (
-        facebook_search_work_constraint(requested_proton),
-        facebook_search_work_constraint(decodo),
+        facebook_search_work_constraint(requested_proton).model_copy(
+            update={
+                "identifier": (
+                    "carl",
+                    "facebook",
+                    "search",
+                    "route_concurrency",
+                    "v1",
+                    *requested_proton,
+                )
+            }
+        ),
+        facebook_search_work_constraint(decodo).model_copy(
+            update={
+                "identifier": ("carl", "facebook", "search", "route_concurrency", "v1", *decodo)
+            }
+        ),
         old_effective_decodo,
+        proton_constraint,
     )
     async with Database.managed(path, initialize=True) as database:
-        for constraint in (*old_constraints, proton_constraint):
+        for constraint in old_constraints:
             await database.register_constraint(constraint, registered_at_utc_ns=1)
+        # The previous policy already retired v1. The upgrade must use fresh IDs.
+        await prepare_worker_constraints(database, tmp_path)
         for index, routing in enumerate((requested_proton, requested_proton, decodo, decodo)):
             payload = _payload().model_copy(
                 update={
@@ -156,7 +184,11 @@ async def test_search_upgrade_retires_alias_and_decodo_caps_before_queued_work_c
                 event_identifier=f"enqueue-{index}",
                 enqueued_at_utc_ns=index + 1,
             )
-        await prepare_worker_constraints(database, tmp_path)
+        # Reproduce work queued by the older runtime, which did not register v2.
+        async with database._connections.writer() as connection:
+            await connection.execute(
+                "DELETE FROM scheduling_constraints WHERE json_extract(identifier_parts_json,'$[2]')='search' AND json_extract(identifier_parts_json,'$[4]')='v2'"
+            )
         await prepare_worker_constraints(database, tmp_path)
         capability = WorkCapability(
             kind=COLLECT_SEARCH_WORK_KIND,
@@ -170,9 +202,28 @@ async def test_search_upgrade_retires_alias_and_decodo_caps_before_queued_work_c
                 lease_duration_ns=100,
                 utc_now_ns=lambda: 10,
                 event_identifier=f"claim-{index}",
+                eligible_identifiers=(f"search-{index}",),
             )
             assert claimed.lease is not None
             assert claimed.lease.work_item_identifier == f"search-{index}"
+            blocked = await database.claim_work(
+                supported_capabilities=(capability,),
+                worker_identifier=f"blocked-{index}",
+                lease_token=f"blocked-{index}",
+                lease_duration_ns=100,
+                utc_now_ns=lambda: 10,
+                event_identifier=f"blocked-{index}",
+            )
+            assert blocked.lease is None
+            await database.release_lease(
+                work_item_identifier=claimed.lease.work_item_identifier,
+                lease_token=claimed.lease.token,
+                worker_identifier=claimed.lease.worker_identifier,
+                utc_now_ns=lambda: 10,
+                eligible_at_utc_ns=1000,
+                reason={"kind": "test"},
+                event_identifier=f"release-{index}",
+            )
         with apsw.Connection(str(path), flags=apsw.SQLITE_OPEN_READONLY) as connection:
             retired = {
                 tuple(json.loads(identity))
@@ -181,14 +232,29 @@ async def test_search_upgrade_retires_alias_and_decodo_caps_before_queued_work_c
                 )
             }
             assert retired == {constraint.identifier for constraint in old_constraints}
-            assert proton_constraint.identifier not in retired
+            assert (
+                facebook_effective_search_work_constraint(requested_proton).identifier
+                not in retired
+            )
+            for route in (requested_proton, decodo):
+                for replacement in (
+                    facebook_search_work_constraint(route),
+                    facebook_effective_search_work_constraint(route),
+                ):
+                    row = connection.execute(
+                        "SELECT definition_json FROM scheduling_constraints WHERE identifier_parts_json=?",
+                        (json.dumps(replacement.identifier, separators=(",", ":")),),
+                    ).fetchone()
+                    assert row is not None and json.loads(row[0]) == replacement.model_dump(
+                        mode="json"
+                    )
             assert connection.execute(
                 """
                 SELECT count(*) FROM scheduling_constraint_retirements AS r
                 JOIN operations AS o ON o.id=r.operation_id
                 WHERE json_extract(o.result_json,'$.state')='prepared'
                 """
-            ).fetchone() == (3,)
+            ).fetchone() == (4,)
             assert connection.execute(
                 "SELECT count(*) FROM operations WHERE json_extract(result_json,'$.state')='prepared'"
             ).fetchone() == (2,)

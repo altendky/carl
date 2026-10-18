@@ -119,10 +119,10 @@ def _search_route_scope(routing: tuple[str, ...]) -> SchedulingScope:
 
 
 def facebook_search_work_constraint(routing: tuple[str, ...]) -> ConcurrencyConstraint:
-    """Historical requested-route limit, retained only to identify old policy."""
+    """Claim one search child per requested route across worker processes."""
 
     return ConcurrencyConstraint(
-        identifier=("carl", "facebook", "search", "route_concurrency", "v1", *routing),
+        identifier=("carl", "facebook", "search", "route_concurrency", "v2", *routing),
         subject_kind=SchedulingSubjectKind.WORK_ITEM,
         scope=_search_route_scope(routing),
         maximum_active=FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE,
@@ -140,14 +140,11 @@ def facebook_effective_search_scope(routing: tuple[str, ...]) -> SchedulingScope
 
 def facebook_effective_search_work_constraint(
     routing: tuple[str, ...],
-) -> ConcurrencyConstraint | None:
-    """Serialize shared Proton transports, not independent Decodo sessions."""
-
-    if routing[0] == "decodo":
-        return None
+) -> ConcurrencyConstraint:
+    """Serialize searches sharing the route selected after configuration remapping."""
 
     return ConcurrencyConstraint(
-        identifier=("carl", "facebook", "search", "effective_route_concurrency", "v1", *routing),
+        identifier=("carl", "facebook", "search", "effective_route_concurrency", "v2", *routing),
         subject_kind=SchedulingSubjectKind.WORK_ITEM,
         scope=facebook_effective_search_scope(routing),
         maximum_active=FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE,
@@ -515,7 +512,10 @@ def is_transient_search_failure(error: JsonValue) -> bool:
         "search_route_definition_extraction_failure",
         "search_price_partition_extraction_failure",
     }:
-        return error.get("response_kind") == "bot_challenge"
+        return error.get("response_kind") == "bot_challenge" or (
+            error.get("response_kind") == "login_page"
+            and error.get("guest_access_interrupted") is True
+        )
     if error.get("kind") == "search_acquisition_failure":
         return error.get("stopping_condition") == "transport_failure"
     if error.get("kind") == "unhandled_handler_error":
@@ -529,10 +529,13 @@ def is_transient_search_failure(error: JsonValue) -> bool:
 def retryable_search_failure(error: JsonValue, *, attempt: int) -> bool:
     """Return whether a terminal search failure can resume under the current policy."""
 
-    if isinstance(error, dict) and error.get("response_kind") == "bot_challenge":
+    if isinstance(error, dict) and error.get("response_kind") in {"bot_challenge", "login_page"}:
+        response_attempt = error.get("challenge_attempt", attempt)
         return (
             error.get("decision") != "retry_exhausted"
-            and attempt < FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS
+            and isinstance(response_attempt, int)
+            and not isinstance(response_attempt, bool)
+            and response_attempt < FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS
             and is_transient_search_failure(error)
         )
     return attempt < SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS and is_transient_search_failure(error)

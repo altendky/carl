@@ -65,12 +65,14 @@ from carl.core.facebook_images import (
 )
 from carl.core.facebook_refresh import SearchRunOrigin
 from carl.core.facebook_search import SearchStoppingReason
+from carl.core.facebook_search_retry import FACEBOOK_SEARCH_NETWORK_ACTIVITY_KINDS
 from carl.core.facebook_work import (
     COLLECT_SEARCH_WORK_KIND,
     FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY,
     SuccessfulItemPageResult,
     facebook_effective_search_scope,
     facebook_effective_search_work_constraint,
+    facebook_search_work_constraint,
 )
 from carl.core.item_analysis import (
     ANALYZE_ITEM_WORK_SCHEMA_VERSION,
@@ -1663,7 +1665,7 @@ class Database:
         )
 
     async def legacy_facebook_search_constraint_identifiers(self) -> tuple[tuple[str, ...], ...]:
-        """Find persisted requested-route and Decodo-only effective search limits.
+        """Find persisted superseded requested and effective search limits.
 
         Route names can outlive their configuration, so discover old definitions
         rather than guessing names from the current route configuration.
@@ -1677,18 +1679,34 @@ class Database:
                   AND json_extract(identifier_parts_json, '$[1]') = 'facebook'
                   AND json_extract(identifier_parts_json, '$[2]') = 'search'
                   AND json_extract(identifier_parts_json, '$[4]') = 'v1'
-                  AND (
-                    json_extract(identifier_parts_json, '$[3]') = 'route_concurrency'
-                    OR (
-                      json_extract(identifier_parts_json, '$[3]') = 'effective_route_concurrency'
-                      AND json_extract(identifier_parts_json, '$[5]') = 'decodo'
-                    )
-                  )
+                  AND json_extract(identifier_parts_json, '$[3]') IN
+                      ('route_concurrency', 'effective_route_concurrency')
                 ORDER BY identifier_parts_json
                 """
             )
             rows = await cursor.fetchall()
         return tuple(CONSTRAINT_ADAPTER.validate_json(_text(row[0])).identifier for row in rows)
+
+    async def facebook_search_work_routes(self) -> tuple[tuple[str, ...], ...]:
+        """Discover still-active requested/effective routes, including retired aliases."""
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT DISTINCT scope.scope_identity_json
+                FROM work_items AS work JOIN work_scopes AS scope ON scope.work_item_id=work.id
+                WHERE work.kind_parts_json=? AND work.state IN ('pending','leased','cancelling')
+                  AND scope.scope_kind='network_path'
+                  AND json_extract(scope.scope_identity_json,'$[0]') IN
+                      ('search_acquisition','effective_search_acquisition')
+                ORDER BY scope.scope_identity_json
+                """,
+                (_json(list(COLLECT_SEARCH_WORK_KIND)),),
+            )
+            routes = {
+                tuple(str(part) for part in cast(list[JsonValue], decode_json(_text(row[0])))[1:])
+                for row in await cursor.fetchall()
+            }
+        return tuple(sorted(routes))
 
     async def supersede_constraints(
         self,
@@ -2002,7 +2020,8 @@ class Database:
         async with self._connections.writer() as connection:
             cursor = await connection.execute(
                 """
-                SELECT activity.state, activity.eligible_at_utc_ns, operation.state
+                SELECT activity.state, activity.eligible_at_utc_ns, operation.state,
+                       activity.kind_parts_json
                 FROM network_activities AS activity
                 JOIN operations AS operation ON operation.id = activity.operation_id
                 WHERE activity.id = ?
@@ -2017,6 +2036,17 @@ class Database:
             if _text(row[0]) != NetworkActivityState.PENDING.value:
                 raise RuntimeError("Only a pending network activity can be admitted")
             eligible_at = _integer(row[1])
+            if (
+                tuple(cast(list[str], decode_json(_text(row[3]))))
+                in FACEBOOK_SEARCH_NETWORK_ACTIVITY_KINDS
+            ):
+                path_cursor = await connection.execute(
+                    "SELECT scope_identity_json FROM network_activity_scopes WHERE network_activity_id=? AND scope_kind='network_path'",
+                    (network_activity_identifier,),
+                )
+                cooldowns = await self._facebook_search_route_cooldowns(connection, now_utc_ns)
+                for path_row in await path_cursor.fetchall():
+                    eligible_at = max(eligible_at, cooldowns.get(_text(path_row[0]), 0))
             if eligible_at > now_utc_ns:
                 return NetworkActivityAdmissionResult(
                     admission=None,
@@ -2297,6 +2327,22 @@ class Database:
         kind_json = _json(list(definition.kind))
         deduplication_json = _json(list(definition.deduplication_identity))
         async with self._connections.writer() as connection:
+            if definition.kind == COLLECT_SEARCH_WORK_KIND:
+                routing = (
+                    definition.payload.get("routing")
+                    if isinstance(definition.payload, dict)
+                    else None
+                )
+                if (
+                    isinstance(routing, list)
+                    and routing
+                    and all(isinstance(part, str) and part for part in routing)
+                ):
+                    await self._register_constraint(
+                        connection,
+                        constraint=facebook_search_work_constraint(tuple(cast(list[str], routing))),
+                        registered_at_utc_ns=enqueued_at_utc_ns,
+                    )
             if requester.kind in (
                 ("carl", "mcp", "request_workspace_refresh"),
                 ("carl", "mcp", "create_workspace_search_revision"),
@@ -3170,6 +3216,14 @@ class Database:
                 )
                 else {}
             )
+            facebook_cooldowns = (
+                await self._facebook_search_route_cooldowns(connection, now_utc_ns)
+                if any(
+                    capability.kind == COLLECT_SEARCH_WORK_KIND
+                    for capability in supported_capabilities
+                )
+                else {}
+            )
             cursor = await connection.execute(
                 f"""
                 WITH eligible AS (
@@ -3252,6 +3306,13 @@ class Database:
                 if _text(row[1]) == _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)):
                     stack = _ebay_search_stack_identifier(decode_json(_text(row[3])))
                     cooldown_until = ebay_cooldowns.get(stack, 0) if stack is not None else 0
+                    if cooldown_until > now_utc_ns:
+                        next_checks.append(cooldown_until)
+                        continue
+                if _text(row[1]) == _json(list(COLLECT_SEARCH_WORK_KIND)):
+                    payload = decode_json(_text(row[3]))
+                    routing = payload.get("routing") if isinstance(payload, dict) else None
+                    cooldown_until = facebook_cooldowns.get(_json(routing), 0)
                     if cooldown_until > now_utc_ns:
                         next_checks.append(cooldown_until)
                         continue
@@ -4419,6 +4480,46 @@ class Database:
             )
         return previous_attempt
 
+    async def _facebook_search_route_cooldowns(
+        self, connection: AsyncConnection, now_utc_ns: int
+    ) -> dict[str, int]:
+        """Read fenced search-only cooldowns; cancelled sources contribute nothing.
+
+        Leave sibling deadlines untouched so removing one source cannot erase a
+        different backoff or an explicit not-before deadline. Drive the lookup
+        from indexed search work, never historical item/image work or events.
+        """
+        cursor = await connection.execute(
+            """
+            WITH cooldowns AS (
+                SELECT coalesce(
+                    json_extract(event.data_json,'$.reason.facebook_search_cooldown.network_path'),
+                    json_extract(event.data_json,'$.error.facebook_search_cooldown.network_path')
+                ) AS routing, coalesce(
+                    json_extract(event.data_json,'$.reason.facebook_search_cooldown.until_utc_ns'),
+                    json_extract(event.data_json,'$.error.facebook_search_cooldown.until_utc_ns')
+                ) AS until_ns
+                FROM work_items AS work INDEXED BY work_items_analysis_lookup
+                CROSS JOIN work_events AS event INDEXED BY work_events_work_item
+                  ON event.work_item_id=work.id
+                WHERE work.kind_parts_json=?
+                  AND work.state NOT IN ('cancelled','cancelling')
+                  AND event.event_kind IN ('released','terminal_failure')
+                  AND event.recorded_at_utc_ns>?
+            )
+            SELECT routing,max(until_ns) FROM cooldowns
+            WHERE json_valid(routing) AND json_type(routing)='array'
+              AND typeof(until_ns)='integer' AND until_ns>?
+            GROUP BY routing
+            """,
+            (
+                _json(list(COLLECT_SEARCH_WORK_KIND)),
+                max(0, now_utc_ns - 60 * 60_000_000_000),
+                now_utc_ns,
+            ),
+        )
+        return {_text(row[0]): _integer(row[1]) for row in await cursor.fetchall()}
+
     async def _ebay_search_stack_cooldowns(
         self, connection: AsyncConnection, now_utc_ns: int
     ) -> dict[str, int]:
@@ -4907,8 +5008,8 @@ class Database:
 
         Requested scopes and payloads remain intact. Only previous effective-route
         scopes are removed, including when waiting for the new route's capacity.
-        Decodo sessions do not share Proton's transport concurrency gate, but still
-        require a valid lease and retain their effective acquisition scope.
+        Every route, including Decodo, admits one search at a time across
+        processes and retains its effective acquisition scope.
         """
 
         constraint = facebook_effective_search_work_constraint(routing)

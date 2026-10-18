@@ -30,6 +30,10 @@ from carl.core.facebook_images import (
     legacy_image_session_work_constraint_identifiers,
 )
 from carl.core.facebook_refresh import refresh_search_work_constraints
+from carl.core.facebook_work import (
+    facebook_effective_search_work_constraint,
+    facebook_search_work_constraint,
+)
 from carl.core.item_analysis import analysis_work_constraints
 from carl.core.marketplace_images import marketplace_image_network_constraint
 from carl.core.pipeline import pipeline_work_constraints
@@ -84,6 +88,7 @@ class WorkRuntime:
 async def prepare_worker_constraints(database: Database, repository_root: Path) -> None:
     """Upgrade immutable limits before workers can claim previously queued work."""
 
+    search_routes = await database.facebook_search_work_routes()
     constraints = (
         *analysis_work_constraints(),
         *refresh_search_work_constraints(),
@@ -94,6 +99,8 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
         *ebay_item_work_constraints(),
         *refresh_ebay_search_work_constraints(),
         *pipeline_work_constraints(),
+        *(facebook_search_work_constraint(route) for route in search_routes),
+        *(facebook_effective_search_work_constraint(route) for route in search_routes),
     )
     retired_identifiers = (
         *legacy_image_session_work_constraint_identifiers(),
@@ -129,7 +136,7 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
                 at_utc_ns=time_ns(),
                 reason=(
                     "Apply shared image concurrency 25, eBay description concurrency 10, "
-                    "and effective-provider Facebook search admission"
+                    "and one Facebook search per requested/effective acquisition route"
                 ),
             )
             await database.complete_operation(
