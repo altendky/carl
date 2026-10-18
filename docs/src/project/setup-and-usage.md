@@ -90,7 +90,8 @@ country_code = "us"
 
 [routes.endpoint]
 host = "dc.decodo.com"
-port = 10001
+port = 11000
+port_end = 19000
 
 [[routes]]
 provider = "decodo"
@@ -104,7 +105,8 @@ session_duration_minutes = 10
 
 [routes.endpoint]
 host = "gate.decodo.com"
-port = 7000
+port = 11000
+port_end = 19000
 ```
 
 The mandatory Wireproxy declaration does not install or invoke Wireproxy for
@@ -116,6 +118,15 @@ Use your account-generated HTTP endpoint if it differs; provider examples are no
 that every product or subscription uses the same gateway.
 The pinned `wreq` Python dependency supplies Chrome 154/Linux emulation; this does not
 require installing or automating a Chrome browser.
+For any Decodo product, `endpoint.port_end` enables uniform random selection from
+the inclusive range starting at `endpoint.port`. Choose a range available to your
+account. Each new session chooses one port and retains it through requests,
+pagination, same-session page retries and reconnects. Routing observations record
+the selected port. A durable retry that opens a new session chooses again.
+Omit `port_end` to use one fixed port, or specify an explicit `endpoint.ports` list
+instead of a range. A new session makes a new selection, which can repeat a port.
+Install this version and restart workers and MCP before adding the new settings;
+older configuration parsers reject them.
 Search pages retry challenges and HTTP 403/429 responses in the same session, up to
 seven total attempts per page. A homepage 403 gets one retry before search continues,
 even if the homepage remains blocked. Each attempt retains its acquisition evidence.
@@ -148,7 +159,8 @@ They do not import from 1Password. Never put passwords in arguments, examples,
 provenance, or agent-visible output.
 
 Decodo [documents static ports and rotating port 10000](https://help.decodo.com/docs/datacenter-pay-per-gb-proxy-session-types).
-Use a static datacenter port for Facebook bootstrap and follow-ups. Mobile/residential
+Use a static datacenter port for Facebook bootstrap and follow-ups; a session can
+select it from a configured pool. Mobile/residential
 searches use one requested sticky session per attempt and fresh sessions for
 independent attempts. Neither policy guarantees the provider's exit remains
 healthy. An explicit Proton route is real Proton; no automatic fallback changes

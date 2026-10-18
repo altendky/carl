@@ -107,6 +107,29 @@ class BrightDataRouteConfiguration(StrictModel):
 class DecodoEndpointConfiguration(StrictModel):
     host: str = Field(pattern=r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)$")
     port: int = Field(ge=1, le=65535)
+    port_end: int | None = Field(default=None, ge=1, le=65535)
+    ports: (
+        Annotated[
+            tuple[Annotated[int, Field(ge=1, le=65535)], ...], BeforeValidator(_tuple_from_toml)
+        ]
+        | None
+    ) = Field(default=None, min_length=1)
+
+    @field_validator("ports")
+    @classmethod
+    def validate_ports(cls, value: tuple[int, ...] | None) -> tuple[int, ...] | None:
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError("Decodo endpoint ports must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_port_range(self) -> "DecodoEndpointConfiguration":
+        if self.port_end is not None:
+            if self.ports is not None:
+                raise ValueError("Decodo endpoint ports and port_end cannot be combined")
+            if self.port_end < self.port:
+                raise ValueError("Decodo endpoint port_end must be at least port")
+        return self
 
 
 class DecodoRouteConfiguration(StrictModel):
@@ -136,8 +159,13 @@ class DecodoRouteConfiguration(StrictModel):
             part in self.proxy_username for part in managed_parts
         ):
             raise ValueError("Decodo username prefix, country, and session options are managed")
-        if self.product == DecodoProduct.DATACENTER_PROXY and not (
-            10000 <= self.endpoint.port <= 63000
+        if self.product == DecodoProduct.DATACENTER_PROXY and any(
+            not 10000 <= port <= 63000
+            for port in (
+                self.endpoint.port,
+                self.endpoint.port_end or self.endpoint.port,
+                *(self.endpoint.ports or ()),
+            )
         ):
             raise ValueError(
                 "Decodo datacenter requires rotating port 10000 or static port 10001-63000"

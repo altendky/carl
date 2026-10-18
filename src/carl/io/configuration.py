@@ -531,6 +531,8 @@ def decodo_settings(
             route=route.route_identity(),
             configuration=loaded.identity(),
             session_duration_minutes=route.session_duration_minutes,
+            endpoint_ports=route.endpoint.ports or (),
+            endpoint_port_end=route.endpoint.port_end,
         ),
         StaticDecodoCredentialSource(DecodoCredentials(proxy_password=SecretStr(password))),
     )

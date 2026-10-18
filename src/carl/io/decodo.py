@@ -3,17 +3,17 @@
 import secrets
 import string
 import sys
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import monotonic
-from typing import Protocol, final
+from typing import Annotated, Protocol, final
 
 import anyio
 import httpx
 import wreq
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 
 from carl.core.http import FormField, RequestPlan
 from carl.core.models import ConfigurationDocumentIdentity, JsonValue, StrictModel
@@ -48,6 +48,27 @@ class DecodoProxySettings(StrictModel):
     route: DecodoRouteIdentity
     configuration: ConfigurationDocumentIdentity
     session_duration_minutes: int = Field(default=10, ge=1, le=1440)
+    endpoint_ports: tuple[Annotated[int, Field(ge=1, le=65535)], ...] = ()
+    endpoint_port_end: int | None = Field(default=None, ge=1, le=65535)
+
+    @model_validator(mode="after")
+    def validate_endpoint_ports(self) -> "DecodoProxySettings":
+        if len(set(self.endpoint_ports)) != len(self.endpoint_ports):
+            raise ValueError("Decodo endpoint ports must be unique")
+        if self.route.product is DecodoProduct.DATACENTER_PROXY and any(
+            not 10000 <= port <= 63000 for port in self.endpoint_ports
+        ):
+            raise ValueError("Decodo datacenter pool ports must be between 10000 and 63000")
+        if self.endpoint_port_end is not None:
+            if self.endpoint_ports:
+                raise ValueError("Decodo endpoint_ports and endpoint_port_end cannot be combined")
+            if self.endpoint_port_end < self.route.endpoint.port:
+                raise ValueError("Decodo endpoint_port_end must be at least the endpoint port")
+            if self.route.product is DecodoProduct.DATACENTER_PROXY and not (
+                10000 <= self.route.endpoint.port <= self.endpoint_port_end <= 63000
+            ):
+                raise ValueError("Decodo datacenter pool ports must be between 10000 and 63000")
+        return self
 
     def safe_configuration(self) -> dict[str, JsonValue]:
         return self.model_dump(mode="json")
@@ -90,6 +111,26 @@ def _default_client_factory(*, proxy: httpx.Proxy, verify: bool) -> httpx.AsyncC
 
 def _provider_session_identifier() -> str:
     return "".join(secrets.choice(_PROVIDER_SESSION_ALPHABET) for _ in range(20))
+
+
+def select_decodo_session_settings(
+    settings: DecodoProxySettings,
+    port_choice: Callable[[Sequence[int]], int] = secrets.choice,
+) -> DecodoProxySettings:
+    """Choose one endpoint for the entire cookie/provider session, including reconnects."""
+    ports: Sequence[int] = settings.endpoint_ports
+    if settings.endpoint_port_end is not None:
+        ports = range(settings.route.endpoint.port, settings.endpoint_port_end + 1)
+    if not ports:
+        return settings
+    port = port_choice(ports)
+    if port not in ports:
+        raise RouteConfigurationFailure("invalid_decodo_selected_port")
+    endpoint = settings.route.endpoint.model_copy(update={"port": port})
+    route = settings.route.model_copy(update={"endpoint": endpoint})
+    return settings.model_copy(
+        update={"route": route, "endpoint_ports": (), "endpoint_port_end": None}
+    )
 
 
 def _sticky_proxy(
@@ -342,9 +383,11 @@ class DecodoSessionManager:
         *,
         client_factory: DecodoClientFactory = _default_client_factory,
         provider_session_factory: Callable[[], str] = _provider_session_identifier,
+        port_choice: Callable[[Sequence[int]], int] = secrets.choice,
     ):
         self.client_factory = client_factory
         self.provider_session_factory = provider_session_factory
+        self.port_choice: Callable[[Sequence[int]], int] = port_choice
 
     @asynccontextmanager
     async def open(
@@ -355,6 +398,7 @@ class DecodoSessionManager:
         new_identifier: IdentifierFactory,
         target_authentication: str = "anonymous_cookie_session",
     ) -> AsyncGenerator[ManagedDecodoSession]:
+        settings = select_decodo_session_settings(settings, self.port_choice)
         stack = AsyncExitStack()
         client: httpx.AsyncClient | None = None
         session: ManagedDecodoSession | None = None
@@ -577,27 +621,30 @@ class ManagedDecodoWreqAcquirer:
         transport_settings: WreqTransportSettings | None = None,
         client_factory: WreqClientFactory | None = None,
         provider_session_factory: Callable[[], str] = _provider_session_identifier,
+        port_choice: Callable[[Sequence[int]], int] = secrets.choice,
     ):
         self.settings = settings
         self.credential_source = credential_source
         self.transport_settings = transport_settings or WreqTransportSettings()
         self.client_factory = client_factory
         self.provider_session_factory = provider_session_factory
+        self.port_choice = port_choice
 
     @asynccontextmanager
     async def session(
         self, new_identifier: IdentifierFactory
     ) -> AsyncGenerator[ManagedDecodoWreqSession]:
         """Open a fresh session for one independent multi-page acquisition attempt."""
+        settings = select_decodo_session_settings(self.settings, self.port_choice)
         session: ManagedDecodoWreqSession | None = None
         credential_stack = AsyncExitStack()
         try:
             credentials = await credential_stack.enter_async_context(self.credential_source.open())
             username, password = _sticky_proxy_credentials(
-                self.settings.route,
+                settings.route,
                 credentials,
                 self.provider_session_factory(),
-                self.settings.session_duration_minutes,
+                settings.session_duration_minutes,
             )
             session_identifier = new_identifier()
             started_at_utc = datetime.now(UTC).isoformat()
@@ -605,11 +652,11 @@ class ManagedDecodoWreqAcquirer:
             options = {} if self.client_factory is None else {"client_factory": self.client_factory}
             proxy_acquirer = ProxyWreqAcquirer(
                 proxy_factory=lambda: wreq.Proxy.all(
-                    self.settings.route.endpoint.url, username=username, password=password
+                    settings.route.endpoint.url, username=username, password=password
                 ),
-                expected_routing=self.settings.route.network_path,
+                expected_routing=settings.route.network_path,
                 routing_observation=_wreq_session_observation(
-                    settings=self.settings,
+                    settings=settings,
                     transport_settings=self.transport_settings,
                     session_record_identifier=session_identifier,
                     started_at_utc=started_at_utc,
@@ -623,7 +670,7 @@ class ManagedDecodoWreqAcquirer:
                     "target": "anonymous_cookie_session",
                     "network": {
                         "kind": "proxy_basic",
-                        "credential_reference": list(self.settings.route.credential_reference),
+                        "credential_reference": list(settings.route.credential_reference),
                     },
                 },
                 settings=self.transport_settings,
@@ -631,7 +678,7 @@ class ManagedDecodoWreqAcquirer:
             )
             async with proxy_acquirer.session() as shared_acquirer:
                 session = ManagedDecodoWreqSession(
-                    settings=self.settings,
+                    settings=settings,
                     transport_settings=self.transport_settings,
                     acquirer=shared_acquirer,
                     session_record_identifier=session_identifier,
@@ -654,6 +701,7 @@ class ManagedDecodoWreqAcquirer:
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         if plan.routing != self.settings.route.network_path:
             raise RouteConfigurationFailure("request_route_does_not_match_decodo_route")
+        settings = select_decodo_session_settings(self.settings, self.port_choice)
         provider_session_identifier = self.provider_session_factory()
         session_record_identifier = new_identifier()
         started_at_utc = datetime.now(UTC).isoformat()
@@ -661,13 +709,13 @@ class ManagedDecodoWreqAcquirer:
         failure: AcquisitionFailure | None = None
         async with self.credential_source.open() as credentials:
             username, password = _sticky_proxy_credentials(
-                self.settings.route,
+                settings.route,
                 credentials,
                 provider_session_identifier,
-                self.settings.session_duration_minutes,
+                settings.session_duration_minutes,
             )
             active_observation = _wreq_session_observation(
-                settings=self.settings,
+                settings=settings,
                 transport_settings=self.transport_settings,
                 session_record_identifier=session_record_identifier,
                 started_at_utc=started_at_utc,
@@ -677,7 +725,7 @@ class ManagedDecodoWreqAcquirer:
 
             def proxy_factory() -> wreq.Proxy:
                 return wreq.Proxy.all(
-                    self.settings.route.endpoint.url,
+                    settings.route.endpoint.url,
                     username=username,
                     password=password,
                 )
@@ -686,13 +734,13 @@ class ManagedDecodoWreqAcquirer:
                 "target": "anonymous_cookie_session",
                 "network": {
                     "kind": "proxy_basic",
-                    "credential_reference": list(self.settings.route.credential_reference),
+                    "credential_reference": list(settings.route.credential_reference),
                 },
             }
             if self.client_factory is None:
                 acquirer = ProxyWreqAcquirer(
                     proxy_factory=proxy_factory,
-                    expected_routing=self.settings.route.network_path,
+                    expected_routing=settings.route.network_path,
                     routing_observation=active_observation,
                     authentication=authentication,
                     settings=self.transport_settings,
@@ -700,7 +748,7 @@ class ManagedDecodoWreqAcquirer:
             else:
                 acquirer = ProxyWreqAcquirer(
                     proxy_factory=proxy_factory,
-                    expected_routing=self.settings.route.network_path,
+                    expected_routing=settings.route.network_path,
                     routing_observation=active_observation,
                     authentication=authentication,
                     settings=self.transport_settings,
@@ -712,7 +760,7 @@ class ManagedDecodoWreqAcquirer:
                 failure = error
         ended_at_utc = datetime.now(UTC).isoformat()
         observation = _wreq_session_observation(
-            settings=self.settings,
+            settings=settings,
             transport_settings=self.transport_settings,
             session_record_identifier=session_record_identifier,
             started_at_utc=started_at_utc,
