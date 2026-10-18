@@ -22,7 +22,7 @@ pull_request_rules:
       queue:
         name: default
 
-  - name: Automatically approve Renovate PRs
+  - name: Automatically approve and enqueue Renovate PRs
     conditions:
       - author = altendky-renovate[bot]
       - base = main
@@ -30,6 +30,9 @@ pull_request_rules:
     actions:
       review:
         type: APPROVE
+      label:
+        add:
+          - enqueue
 
 merge_protections_settings:
   reporting_method: deployments
