@@ -174,6 +174,8 @@ async def test_work_runtime_starts_and_cancels_cleanly(tmp_path: Path) -> None:
             ("carl", "facebook", "work", "request_missing_listing_analyses"),
             ("carl", "marketplace", "work", "search_pipeline"),
             ("carl", "marketplace", "work", "listing_pipeline"),
+            ("carl", "travel", "refresh_listing"),
+            ("carl", "travel", "setup_data"),
         }
         assert {
             capability.payload_schema_version

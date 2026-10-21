@@ -64,6 +64,19 @@
               "title": "Maximum Scan Pages",
               "type": "integer"
             },
+            "travel": {
+              "$ref": "#/$defs/TravelFilters",
+              "default": {
+                "maximum_driving_distance_miles": null,
+                "maximum_driving_duration_minutes": null,
+                "include_unknown": true
+              }
+            },
+            "include_travel": {
+              "default": true,
+              "title": "Include Travel",
+              "type": "boolean"
+            },
             "request_identifier": {
               "maxLength": 200,
               "minLength": 1,
@@ -117,6 +130,44 @@
           ],
           "title": "ReviewState",
           "type": "string"
+        },
+        "TravelFilters": {
+          "additionalProperties": false,
+          "properties": {
+            "maximum_driving_distance_miles": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Maximum Driving Distance Miles"
+            },
+            "maximum_driving_duration_minutes": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Maximum Driving Duration Minutes"
+            },
+            "include_unknown": {
+              "default": true,
+              "title": "Include Unknown",
+              "type": "boolean"
+            }
+          },
+          "title": "TravelFilters",
+          "type": "object"
         }
       },
       "properties": {
@@ -533,6 +584,17 @@
               "maxItems": 20,
               "title": "Warnings",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -1569,6 +1631,17 @@
               },
               "title": "Truncated Fields",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -1872,6 +1945,469 @@
           "title": "SearchMembershipProjection",
           "type": "object"
         },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
+          "type": "object"
+        },
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "review",
+        "acquire_batch"
+      ]
+    }
+  },
+  {
+    "name": "activate_travel_dataset",
+    "description": "Verify an installed dataset and atomically select it in private config; supports rollback without rebuilding.",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "TravelDataProvider": {
+          "enum": [
+            "osrm",
+            "geonames"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/TravelDataProvider"
+        },
+        "dataset_identifier": {
+          "title": "Dataset Identifier",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "dataset_identifier"
+      ],
+      "title": "activate_travel_datasetArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "routing_provider": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Routing Provider"
+            },
+            "geocoding_provider": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Geocoding Provider"
+            },
+            "origin_configured": {
+              "default": false,
+              "title": "Origin Configured",
+              "type": "boolean"
+            },
+            "configuration_message": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Configuration Message"
+            },
+            "providers": {
+              "items": {
+                "$ref": "#/$defs/TravelProviderStatus"
+              },
+              "title": "Providers",
+              "type": "array"
+            },
+            "build": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "$ref": "#/$defs/JsonValue"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Build"
+            }
+          },
+          "required": [
+            "routing_provider",
+            "geocoding_provider",
+            "providers"
+          ],
+          "title": "TravelDataStatus",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "JsonValue": {},
+        "TravelDataProvider": {
+          "enum": [
+            "osrm",
+            "geonames"
+          ],
+          "type": "string"
+        },
+        "TravelProviderStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "$ref": "#/$defs/TravelDataProvider"
+            },
+            "state": {
+              "enum": [
+                "unconfigured",
+                "missing",
+                "invalid",
+                "incompatible",
+                "ready"
+              ],
+              "title": "State",
+              "type": "string"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reason"
+            },
+            "message": {
+              "title": "Message",
+              "type": "string"
+            },
+            "actions": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "title": "Actions",
+              "type": "array"
+            },
+            "size_bytes": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Size Bytes",
+              "type": "integer"
+            },
+            "created_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Created At Utc"
+            },
+            "outdated": {
+              "default": false,
+              "title": "Outdated",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "state",
+            "message"
+          ],
+          "title": "TravelProviderStatus",
+          "type": "object"
+        },
         "CarlResponsePage_JsonValue": {}
       }
     },
@@ -1884,8 +2420,8 @@
     "_meta": {
       "carl/operation": [
         "carl",
-        "review",
-        "acquire_batch"
+        "travel",
+        "activate_travel_dataset"
       ]
     }
   },
@@ -9193,6 +9729,11 @@
               "minimum": 100,
               "title": "Maximum Observations",
               "type": "integer"
+            },
+            "include_travel": {
+              "default": true,
+              "title": "Include Travel",
+              "type": "boolean"
             }
           },
           "required": [
@@ -9372,6 +9913,17 @@
               "maxItems": 20,
               "title": "Warnings",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -10211,6 +10763,148 @@
           "title": "SearchMembershipProjection",
           "type": "object"
         },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
+          "type": "object"
+        },
         "CarlResponsePage_JsonValue": {}
       }
     },
@@ -10218,7 +10912,7 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": true,
-      "openWorldHint": false
+      "openWorldHint": true
     },
     "_meta": {
       "carl/operation": [
@@ -10987,6 +11681,413 @@
         "carl",
         "review",
         "get_listing_image"
+      ]
+    }
+  },
+  {
+    "name": "get_listing_route_estimate",
+    "description": "Read one immutable driving estimate, its frozen destination and origin identity.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "record_identifier": {
+          "title": "Record Identifier",
+          "type": "string"
+        }
+      },
+      "required": [
+        "record_identifier"
+      ],
+      "title": "get_listing_route_estimateArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "record_identifier": {
+              "minLength": 1,
+              "title": "Record Identifier",
+              "type": "string"
+            },
+            "listing_id": {
+              "pattern": "^(?:[0-9]+|ebay:[0-9]{9,15})$",
+              "title": "Listing Id",
+              "type": "string"
+            },
+            "origin_identity": {
+              "minLength": 1,
+              "title": "Origin Identity",
+              "type": "string"
+            },
+            "destination_identity": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Destination Identity",
+              "type": "string"
+            },
+            "destination": {
+              "$ref": "#/$defs/TravelDestination"
+            },
+            "estimate": {
+              "$ref": "#/$defs/TravelEstimate"
+            },
+            "recorded_at_utc": {
+              "minLength": 1,
+              "title": "Recorded At Utc",
+              "type": "string"
+            }
+          },
+          "required": [
+            "record_identifier",
+            "listing_id",
+            "origin_identity",
+            "destination_identity",
+            "destination",
+            "estimate",
+            "recorded_at_utc"
+          ],
+          "title": "TravelEstimateRecord",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "TravelCoordinate": {
+          "additionalProperties": false,
+          "properties": {
+            "latitude": {
+              "maximum": 90,
+              "minimum": -90,
+              "title": "Latitude",
+              "type": "number"
+            },
+            "longitude": {
+              "maximum": 180,
+              "minimum": -180,
+              "title": "Longitude",
+              "type": "number"
+            }
+          },
+          "required": [
+            "latitude",
+            "longitude"
+          ],
+          "title": "TravelCoordinate",
+          "type": "object"
+        },
+        "TravelDestination": {
+          "additionalProperties": false,
+          "properties": {
+            "coordinate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelCoordinate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "label": {
+              "anyOf": [
+                {
+                  "maxLength": 500,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Label"
+            },
+            "precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Precision",
+              "type": "string"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            }
+          },
+          "title": "TravelDestination",
+          "type": "object"
+        },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
+          "type": "object"
+        },
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "travel",
+        "get_listing_route_estimate"
       ]
     }
   },
@@ -11854,6 +12955,17 @@
               "maxItems": 20,
               "title": "Warnings",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -12702,6 +13814,148 @@
             "absence_comparison_valid"
           ],
           "title": "SearchMembershipProjection",
+          "type": "object"
+        },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
           "type": "object"
         },
         "CarlResponsePage_JsonValue": {}
@@ -13762,6 +15016,17 @@
               "maxItems": 20,
               "title": "Warnings",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -14023,6 +15288,148 @@
             "absence_comparison_valid"
           ],
           "title": "SearchMembershipProjection",
+          "type": "object"
+        },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
           "type": "object"
         },
         "CarlResponsePage_JsonValue": {}
@@ -14519,6 +15926,17 @@
               },
               "title": "Truncated Fields",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -14575,6 +15993,148 @@
           ],
           "title": "ScalarFieldName",
           "type": "string"
+        },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
+          "type": "object"
         },
         "CarlResponsePage_JsonValue": {}
       }
@@ -19514,6 +21074,312 @@
     }
   },
   {
+    "name": "get_travel_data_status",
+    "description": "Check local routing/geocoding readiness and build progress; verify=true hashes active data and may take time.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "verify": {
+          "default": false,
+          "title": "Verify",
+          "type": "boolean"
+        }
+      },
+      "title": "get_travel_data_statusArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "routing_provider": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Routing Provider"
+            },
+            "geocoding_provider": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Geocoding Provider"
+            },
+            "origin_configured": {
+              "default": false,
+              "title": "Origin Configured",
+              "type": "boolean"
+            },
+            "configuration_message": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Configuration Message"
+            },
+            "providers": {
+              "items": {
+                "$ref": "#/$defs/TravelProviderStatus"
+              },
+              "title": "Providers",
+              "type": "array"
+            },
+            "build": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "$ref": "#/$defs/JsonValue"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Build"
+            }
+          },
+          "required": [
+            "routing_provider",
+            "geocoding_provider",
+            "providers"
+          ],
+          "title": "TravelDataStatus",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "JsonValue": {},
+        "TravelDataProvider": {
+          "enum": [
+            "osrm",
+            "geonames"
+          ],
+          "type": "string"
+        },
+        "TravelProviderStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "$ref": "#/$defs/TravelDataProvider"
+            },
+            "state": {
+              "enum": [
+                "unconfigured",
+                "missing",
+                "invalid",
+                "incompatible",
+                "ready"
+              ],
+              "title": "State",
+              "type": "string"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reason"
+            },
+            "message": {
+              "title": "Message",
+              "type": "string"
+            },
+            "actions": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "title": "Actions",
+              "type": "array"
+            },
+            "size_bytes": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Size Bytes",
+              "type": "integer"
+            },
+            "created_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Created At Utc"
+            },
+            "outdated": {
+              "default": false,
+              "title": "Outdated",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "state",
+            "message"
+          ],
+          "title": "TravelProviderStatus",
+          "type": "object"
+        },
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "travel",
+        "get_travel_data_status"
+      ]
+    }
+  },
+  {
     "name": "get_work_status",
     "description": "Get compact live progress; include details only for raw durable diagnostic fields.",
     "inputSchema": {
@@ -20449,6 +22315,11 @@
               "title": "Maximum Observations",
               "type": "integer"
             },
+            "include_travel": {
+              "default": true,
+              "title": "Include Travel",
+              "type": "boolean"
+            },
             "compact": {
               "default": false,
               "description": "Return scalar values and deduplicated sellers without repeated evidence or prior snapshots.",
@@ -20754,6 +22625,17 @@
               "maxItems": 20,
               "title": "Warnings",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "as_of_completion_sequence": {
               "minimum": 0,
@@ -21714,6 +23596,148 @@
           "title": "SearchMembershipProjection",
           "type": "object"
         },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
+          "type": "object"
+        },
         "WorkspaceListingReview": {
           "additionalProperties": false,
           "description": "A listing projection with its workspace-specific review comparison.",
@@ -21873,6 +23897,17 @@
               "title": "Warnings",
               "type": "array"
             },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "review_state": {
               "$ref": "#/$defs/ReviewState",
               "default": "unreviewed"
@@ -21937,7 +23972,7 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": true,
-      "openWorldHint": false
+      "openWorldHint": true
     },
     "_meta": {
       "carl/operation": [
@@ -22383,6 +24418,14 @@
             "analysis": {
               "$ref": "#/$defs/AnalysisPresenceFilter",
               "default": "any"
+            },
+            "travel": {
+              "$ref": "#/$defs/TravelFilters",
+              "default": {
+                "maximum_driving_distance_miles": null,
+                "maximum_driving_duration_minutes": null,
+                "include_unknown": true
+              }
             }
           },
           "title": "ComposedListingFilters",
@@ -22412,7 +24455,12 @@
                   "available"
                 ],
                 "product_guide_record_identifier": null,
-                "analysis": "any"
+                "analysis": "any",
+                "travel": {
+                  "include_unknown": true,
+                  "maximum_driving_distance_miles": null,
+                  "maximum_driving_duration_minutes": null
+                }
               }
             },
             "maximum_ancestry_runs": {
@@ -22468,6 +24516,11 @@
               ],
               "default": null,
               "title": "Cursor"
+            },
+            "include_travel": {
+              "default": true,
+              "title": "Include Travel",
+              "type": "boolean"
             }
           },
           "required": [
@@ -22486,6 +24539,44 @@
           ],
           "title": "ListingStatus",
           "type": "string"
+        },
+        "TravelFilters": {
+          "additionalProperties": false,
+          "properties": {
+            "maximum_driving_distance_miles": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Maximum Driving Distance Miles"
+            },
+            "maximum_driving_duration_minutes": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Maximum Driving Duration Minutes"
+            },
+            "include_unknown": {
+              "default": true,
+              "title": "Include Unknown",
+              "type": "boolean"
+            }
+          },
+          "title": "TravelFilters",
+          "type": "object"
         }
       },
       "properties": {
@@ -22955,6 +25046,17 @@
               "maxItems": 20,
               "title": "Warnings",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -23562,6 +25664,148 @@
           "title": "SearchMembershipProjection",
           "type": "object"
         },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
+          "type": "object"
+        },
         "CarlResponsePage_JsonValue": {}
       }
     },
@@ -23569,7 +25813,7 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": true,
-      "openWorldHint": false
+      "openWorldHint": true
     },
     "_meta": {
       "carl/operation": [
@@ -26606,6 +28850,238 @@
     }
   },
   {
+    "name": "list_travel_datasets",
+    "description": "Page installed immutable map and geocoder versions, marking selected datasets.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "default": 20,
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        }
+      },
+      "title": "list_travel_datasetsArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/$defs/TravelDatasetSummary"
+              },
+              "title": "Items",
+              "type": "array"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Next Cursor"
+            }
+          },
+          "required": [
+            "items"
+          ],
+          "title": "TravelDatasetPage",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "TravelDataProvider": {
+          "enum": [
+            "osrm",
+            "geonames"
+          ],
+          "type": "string"
+        },
+        "TravelDatasetSummary": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "$ref": "#/$defs/TravelDataProvider"
+            },
+            "dataset_identifier": {
+              "minLength": 1,
+              "title": "Dataset Identifier",
+              "type": "string"
+            },
+            "active": {
+              "title": "Active",
+              "type": "boolean"
+            },
+            "size_bytes": {
+              "minimum": 0,
+              "title": "Size Bytes",
+              "type": "integer"
+            },
+            "created_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created At Utc"
+            }
+          },
+          "required": [
+            "provider",
+            "dataset_identifier",
+            "active",
+            "size_bytes",
+            "created_at_utc"
+          ],
+          "title": "TravelDatasetSummary",
+          "type": "object"
+        },
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "travel",
+        "list_travel_datasets"
+      ]
+    }
+  },
+  {
     "name": "list_workspace_listings",
     "description": "Page through compact workspace listings; use get_workspace_listing for details.",
     "inputSchema": {
@@ -26651,6 +29127,14 @@
             "analysis": {
               "$ref": "#/$defs/AnalysisPresenceFilter",
               "default": "any"
+            },
+            "travel": {
+              "$ref": "#/$defs/TravelFilters",
+              "default": {
+                "maximum_driving_distance_miles": null,
+                "maximum_driving_duration_minutes": null,
+                "include_unknown": true
+              }
             }
           },
           "title": "ComposedListingFilters",
@@ -26671,7 +29155,12 @@
                   "available"
                 ],
                 "product_guide_record_identifier": null,
-                "analysis": "any"
+                "analysis": "any",
+                "travel": {
+                  "include_unknown": true,
+                  "maximum_driving_distance_miles": null,
+                  "maximum_driving_duration_minutes": null
+                }
               }
             },
             "maximum_search_runs": {
@@ -26731,6 +29220,11 @@
               ],
               "default": null,
               "title": "Cursor"
+            },
+            "include_travel": {
+              "default": true,
+              "title": "Include Travel",
+              "type": "boolean"
             }
           },
           "required": [
@@ -26749,6 +29243,44 @@
           ],
           "title": "ListingStatus",
           "type": "string"
+        },
+        "TravelFilters": {
+          "additionalProperties": false,
+          "properties": {
+            "maximum_driving_distance_miles": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Maximum Driving Distance Miles"
+            },
+            "maximum_driving_duration_minutes": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Maximum Driving Duration Minutes"
+            },
+            "include_unknown": {
+              "default": true,
+              "title": "Include Unknown",
+              "type": "boolean"
+            }
+          },
+          "title": "TravelFilters",
+          "type": "object"
         }
       },
       "properties": {
@@ -26947,6 +29479,148 @@
           "title": "ListingStatus",
           "type": "string"
         },
+        "TravelEstimate": {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": [
+                "ready",
+                "unavailable"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "provider": {
+              "default": "openrouteservice",
+              "enum": [
+                "openrouteservice",
+                "osrm"
+              ],
+              "title": "Provider",
+              "type": "string"
+            },
+            "distance_meters": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Distance Meters"
+            },
+            "duration_seconds": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Seconds"
+            },
+            "approximate": {
+              "default": true,
+              "title": "Approximate",
+              "type": "boolean"
+            },
+            "destination_label": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Destination Label"
+            },
+            "location_precision": {
+              "default": "unavailable",
+              "enum": [
+                "source_approximate",
+                "geocoded_locality",
+                "unavailable"
+              ],
+              "title": "Location Precision",
+              "type": "string"
+            },
+            "estimated_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Estimated At Utc"
+            },
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Identifier"
+            },
+            "expires_at_utc": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expires At Utc"
+            },
+            "dataset_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Dataset Identifier"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "title": "TravelEstimate",
+          "type": "object"
+        },
         "WorkspaceListingSummary": {
           "additionalProperties": false,
           "description": "Compact workspace index entry; use get_workspace_listing for evidence.",
@@ -27047,6 +29721,17 @@
               "maxItems": 20,
               "title": "Warnings",
               "type": "array"
+            },
+            "route_estimate": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TravelEstimate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -27072,7 +29757,7 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": true,
-      "openWorldHint": false
+      "openWorldHint": true
     },
     "_meta": {
       "carl/operation": [
@@ -31892,6 +34577,226 @@
     }
   },
   {
+    "name": "request_listing_route_refresh",
+    "description": "Queue only driving-distance/time refresh for one listing; retain an independent estimate record.",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "RequestListingRouteRefresh": {
+          "additionalProperties": false,
+          "properties": {
+            "request_identifier": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Request Identifier",
+              "type": "string"
+            },
+            "listing_identifier": {
+              "pattern": "^(?:[0-9]+|ebay:[0-9]{9,15})$",
+              "title": "Listing Identifier",
+              "type": "string"
+            },
+            "workspace_record_identifier": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Workspace Record Identifier"
+            }
+          },
+          "required": [
+            "request_identifier",
+            "listing_identifier"
+          ],
+          "title": "RequestListingRouteRefresh",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/RequestListingRouteRefresh"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "request_listing_route_refreshArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "work_identifier": {
+              "minLength": 1,
+              "title": "Work Identifier",
+              "type": "string"
+            },
+            "created": {
+              "title": "Created",
+              "type": "boolean"
+            },
+            "state": {
+              "$ref": "#/$defs/WorkState"
+            },
+            "listing_identifier": {
+              "pattern": "^(?:[0-9]+|ebay:[0-9]{9,15})$",
+              "title": "Listing Identifier",
+              "type": "string"
+            }
+          },
+          "required": [
+            "work_identifier",
+            "created",
+            "state",
+            "listing_identifier"
+          ],
+          "title": "RequestListingRouteRefreshResult",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "WorkState": {
+          "enum": [
+            "pending",
+            "leased",
+            "completed",
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
+          ],
+          "title": "WorkState",
+          "type": "string"
+        },
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "travel",
+        "request_listing_route_refresh"
+      ]
+    }
+  },
+  {
     "name": "request_search_pipeline",
     "description": "Request bounded details, images, or exact-guide analysis for an explicit search scope; replay safely by request ID.",
     "inputSchema": {
@@ -33934,6 +36839,241 @@
         "carl",
         "review",
         "request_selection_analyses"
+      ]
+    }
+  },
+  {
+    "name": "request_travel_data_setup",
+    "description": "Explicitly queue setup/update of OSRM or GeoNames; requires a running worker, preserves old data, optionally activates after verification.",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "TravelDataProvider": {
+          "enum": [
+            "osrm",
+            "geonames"
+          ],
+          "type": "string"
+        },
+        "TravelDataSetupRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "request_identifier": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Request Identifier",
+              "type": "string"
+            },
+            "provider": {
+              "$ref": "#/$defs/TravelDataProvider"
+            },
+            "activate": {
+              "default": true,
+              "title": "Activate",
+              "type": "boolean"
+            },
+            "radius_miles": {
+              "default": 250,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Radius Miles",
+              "type": "number"
+            },
+            "threads": {
+              "default": 4,
+              "maximum": 16,
+              "minimum": 1,
+              "title": "Threads",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "request_identifier",
+            "provider"
+          ],
+          "title": "TravelDataSetupRequest",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/TravelDataSetupRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "request_travel_data_setupArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "work_identifier": {
+              "minLength": 1,
+              "title": "Work Identifier",
+              "type": "string"
+            },
+            "created": {
+              "title": "Created",
+              "type": "boolean"
+            },
+            "state": {
+              "$ref": "#/$defs/WorkState"
+            },
+            "message": {
+              "default": "Poll get_work_status with the work identifier for progress and the result.",
+              "title": "Message",
+              "type": "string"
+            },
+            "worker_required": {
+              "default": true,
+              "title": "Worker Required",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "work_identifier",
+            "created",
+            "state"
+          ],
+          "title": "RequestTravelDataSetupResult",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "WorkState": {
+          "enum": [
+            "pending",
+            "leased",
+            "completed",
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
+          ],
+          "title": "WorkState",
+          "type": "string"
+        },
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "travel",
+        "request_travel_data_setup"
       ]
     }
   },

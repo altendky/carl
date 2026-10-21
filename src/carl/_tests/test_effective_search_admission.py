@@ -144,11 +144,14 @@ async def test_legacy_alias_and_direct_route_share_admission(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("second_route", (("proton", "personal", "alias"), DATACENTER))
-async def test_decodo_alias_and_direct_route_share_one_admission(
+async def test_decodo_alias_and_direct_route_share_twenty_admissions(
     tmp_path: Path, second_route: tuple[str, ...]
 ) -> None:
     path = tmp_path / "carl.sqlite3"
     async with Database.managed(path, initialize=True) as database:
+        for index in range(19):
+            lease = await _claim(database, f"prefill-{index}", ("proton", "prefill", str(index)))
+            assert await _admit(database, lease, DATACENTER)
         first = await _claim(database, "first", ("proton", "personal", "legacy"))
         second = await _claim(database, "second", second_route)
         before = await _rows(database, "SELECT id,payload_json FROM work_items ORDER BY id")
@@ -179,6 +182,9 @@ async def test_decodo_admission_validates_lease_and_rebinding_preserves_proton_e
         first = await _claim(database, "first", TARGET)
         second = await _claim(database, "second", DATACENTER)
         expired = await _claim(database, "expired", ("decodo", "personal", "expired"), duration=100)
+        for index in range(19):
+            lease = await _claim(database, f"prefill-{index}", ("proton", "prefill", str(index)))
+            assert await _admit(database, lease, DATACENTER)
         assert await _admit(database, first, TARGET)
         assert await _admit(database, second, DATACENTER)
         scopes = await _scopes(database, "second")

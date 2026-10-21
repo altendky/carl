@@ -4,14 +4,19 @@ import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 
 from carl.cli import _activate_facebook_page_network_policy
 from carl.core.components import Component, ComponentId
+from carl.core.facebook_images import image_network_activity
 from carl.core.facebook_work import (
     ITEM_PAGE_NETWORK_ACTIVITY_KIND,
+    SEARCH_SESSION_BOOTSTRAP_NETWORK_ACTIVITY_KIND,
     facebook_item_network_activity,
+    facebook_network_path_constraint,
+    facebook_search_network_activity,
     legacy_facebook_network_constraint_identifiers,
 )
 from carl.core.models import CodeProvenance
@@ -22,7 +27,14 @@ from carl.core.work import (
     SlidingWindowRateConstraint,
     UniformHoldoffConstraint,
 )
+from carl.io.network_activity import network_activity_definition
 from carl.io.sqlite import Database
+
+
+class _ActivityContext(TypedDict):
+    operation_identifier: str
+    network_session_identifier: str
+    attempt: int
 
 
 def _provenance() -> CodeProvenance:
@@ -125,3 +137,128 @@ async def test_page_policy_retires_route_and_origin_limits(tmp_path: Path) -> No
         ).fetchone()
     assert retired == {constraint.identifier for constraint in old_constraints}
     assert policy_records == (1,)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("provider", ("decodo", "proton"))
+async def test_request_budget_counts_http_once_and_excludes_setup_and_other_sources(
+    tmp_path: Path, provider: str
+) -> None:
+    routing = (provider, "personal", "test")
+    budget = facebook_network_path_constraint(routing).model_copy(update={"maximum_starts": 3})
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await database.register_constraint(budget, registered_at_utc_ns=1)
+        await database.begin_operation(
+            operation_id="operation",
+            component=Component(ComponentId(("test", "request_budget")), 1, lambda: None),
+            provenance=_provenance(),
+            invocation={},
+            configuration={},
+            started_at_utc="2026-10-18T00:00:00+00:00",
+        )
+        common = _ActivityContext(
+            operation_identifier="operation",
+            network_session_identifier="session",
+            attempt=1,
+        )
+        # All three actual Facebook HTTP paths share the same route allowance.
+        requests = (
+            image_network_activity(
+                identifier="image",
+                routing=routing,
+                url="https://scontent.example.fbcdn.net/image.jpg",
+                **common,
+            ),
+            facebook_item_network_activity(identifier="item", routing=routing, **common),
+            facebook_search_network_activity(
+                identifier="search",
+                kind=SEARCH_SESSION_BOOTSTRAP_NETWORK_ACTIVITY_KIND,
+                routing=routing,
+                ordinal=1,
+                **common,
+            ),
+        )
+        for activity in requests:
+            await database.create_network_activity(
+                activity,
+                created_at_utc_ns=10,
+                event_identifier=activity.identifier + "-created",
+                sample_uniform_holdoff_ns=lambda minimum, maximum: minimum,
+            )
+            result = await database.try_admit_network_activity(
+                network_activity_identifier=activity.identifier,
+                admission_token=activity.identifier + "-token",
+                permit_duration_ns=100,
+                now_utc_ns=10,
+                event_identifier=activity.identifier + "-admitted",
+            )
+            assert result.admission is not None
+
+        # Exhausting the HTTP budget must not block local setup or eBay on that route.
+        for kind in (
+            ("carl", "facebook", "network_activity", "image_session_open"),
+            ("carl", "facebook", "network_activity", "search_session_open"),
+            ("carl", "ebay", "network_activity", "gallery_image"),
+        ):
+            identifier = kind[-1]
+            activity = network_activity_definition(
+                identifier=identifier,
+                kind=kind,
+                network_path=routing,
+                **common,
+            )
+            await database.create_network_activity(
+                activity,
+                created_at_utc_ns=10,
+                event_identifier=identifier + "-created",
+                sample_uniform_holdoff_ns=lambda minimum, maximum: minimum,
+            )
+            result = await database.try_admit_network_activity(
+                network_activity_identifier=identifier,
+                admission_token=identifier + "-token",
+                permit_duration_ns=100,
+                now_utc_ns=10,
+                event_identifier=identifier + "-admitted",
+            )
+            assert result.admission is not None
+
+        fourth = image_network_activity(
+            identifier="fourth",
+            routing=routing,
+            url="https://scontent.example.fbcdn.net/fourth.jpg",
+            **common,
+        )
+        await database.create_network_activity(
+            fourth,
+            created_at_utc_ns=10,
+            event_identifier="fourth-created",
+            sample_uniform_holdoff_ns=lambda minimum, maximum: minimum,
+        )
+        waiting = await database.try_admit_network_activity(
+            network_activity_identifier="fourth",
+            admission_token="fourth-token",
+            permit_duration_ns=100,
+            now_utc_ns=10,
+            event_identifier="fourth-waiting",
+        )
+        assert waiting.admission is None
+        assert waiting.next_eligible_at_utc_ns == 10 + budget.period_ns
+        admitted = await database.try_admit_network_activity(
+            network_activity_identifier="fourth",
+            admission_token="fourth-token",
+            permit_duration_ns=100,
+            now_utc_ns=10 + budget.period_ns,
+            event_identifier="fourth-admitted",
+        )
+        assert admitted.admission is not None
+
+        async with database._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT subject_identifier FROM rate_starts ORDER BY subject_identifier"
+            )
+            assert [row[0] for row in await cursor.fetchall()] == [
+                "fourth",
+                "image",
+                "item",
+                "search",
+            ]

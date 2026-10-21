@@ -1013,6 +1013,7 @@ async def _ebay_projection(
             absence_comparison_valid=False,
         )
     title, price = scalar("title"), scalar("displayed_price")
+    location = scalar("location_text")
     condition, shipping = scalar("condition"), scalar("shipping_text")
     last_sale = (
         ComposedField(
@@ -1038,7 +1039,7 @@ async def _ebay_projection(
         status=status,
         title=title,
         price=price,
-        location=None,
+        location=location,
         description=description,
         seller=None,
         last_sale=last_sale,
@@ -1058,7 +1059,7 @@ async def _ebay_projection(
         status=status,
         title=title,
         price=price,
-        location=None,
+        location=location,
         description=description,
         seller=None,
         last_sale=last_sale,
@@ -1126,6 +1127,7 @@ async def get_marketplace_composed_listing(
             update={
                 "search_run_record_identifier": facebook_runs[0] if facebook_runs else None,
                 "additional_search_run_record_identifiers": facebook_runs[1:],
+                "include_travel": False,
             }
         )
     )
@@ -1306,8 +1308,10 @@ async def list_marketplace_composed_search(
     if request.filters.product_guide_record_identifier is not None:
         await database.require_product_guide_record(request.filters.product_guide_record_identifier)
     # Batch scans shrink page size as slots fill; it is not part of the search scope.
+    travel_enabled = request.include_travel or request.filters.travel.active
+    origin_identity = await application._travel_origin_identity(enabled=travel_enabled)
     scope = hashlib.sha256(
-        request.model_dump_json(exclude={"cursor", "page_size"}).encode()
+        (request.model_dump_json(exclude={"cursor", "page_size"}) + str(origin_identity)).encode()
     ).hexdigest()
     cursor: dict[str, JsonValue] = {}
     if request.cursor:
@@ -1321,9 +1325,15 @@ async def list_marketplace_composed_search(
                     request.cursor + "=" * (-len(request.cursor) % 4), altchars=b"-_", validate=True
                 ).decode()
             )
-            if not isinstance(value, dict) or cast(dict[str, JsonValue], value).get(
-                "scope"
-            ) not in (scope, legacy_scope):
+            valid_scopes = (
+                (scope,)
+                if travel_enabled and origin_identity is not None
+                else (scope, legacy_scope)
+            )
+            if (
+                not isinstance(value, dict)
+                or cast(dict[str, JsonValue], value).get("scope") not in valid_scopes
+            ):
                 raise ValueError("Marketplace cursor belongs to another projection scope")
             cursor = cast(dict[str, JsonValue], value)
             for key in ("as_of", "boundary", "after_sequence"):
@@ -1415,8 +1425,9 @@ async def list_marketplace_composed_search(
     examined = 0
     candidates = ordered[: request.maximum_candidate_listings_examined]
     facebook_statuses: dict[str, ListingStatus] = {}
+    pending: list[ComposedListingProjection] = []
+    positions_examined: list[int] = []
     for position, identifier in enumerate(candidates):
-        examined += 1
         # Rare status filters must not hydrate every nonmatching Facebook listing.
         # Preserve candidate counts/cursor positions, and use exactly the status
         # evidence and history bounds of the full projection at this snapshot.
@@ -1434,6 +1445,8 @@ async def list_marketplace_composed_search(
                     )
                 )
             if facebook_statuses[identifier] not in request.filters.statuses:
+                if not pending:
+                    examined = position + 1
                 continue
         get_request = GetComposedListingRequest(
             listing_identifier=identifier,
@@ -1449,14 +1462,44 @@ async def list_marketplace_composed_search(
             )
         else:
             projection = await _facebook_projection(application, get_request, facebook_runs, as_of)
-        # Truncation retains presence when the compact transport requests zero reports.
-        present = bool(projection.analyses) or projection.analyses_truncated
-        if composed_listing_matches_filters(
-            projection, request.filters, matching_analysis_present=present
-        ):
-            selected.append(projection)
+        pending.append(projection)
+        positions_examined.append(position + 1)
+        if len(pending) < request.page_size and position + 1 < len(candidates):
+            continue
+        enriched = (
+            await application._with_travel_estimates(pending) if travel_enabled else tuple(pending)
+        )
+        for provisional, candidate_position in zip(enriched, positions_examined, strict=True):
+            examined = candidate_position
+            # Truncation retains presence when the compact transport requests zero reports.
+            present = bool(provisional.analyses) or provisional.analyses_truncated
+            if composed_listing_matches_filters(
+                provisional, request.filters, matching_analysis_present=present
+            ):
+                selected.append(provisional)
+                if len(selected) == request.page_size:
+                    break
+        pending.clear()
+        positions_examined.clear()
+        if len(selected) == request.page_size:
+            break
+    if pending and len(selected) < request.page_size:
+        enriched = (
+            await application._with_travel_estimates(pending) if travel_enabled else tuple(pending)
+        )
+        for provisional, candidate_position in zip(enriched, positions_examined, strict=True):
+            examined = candidate_position
+            if composed_listing_matches_filters(
+                provisional,
+                request.filters,
+                matching_analysis_present=bool(provisional.analyses)
+                or provisional.analyses_truncated,
+            ):
+                selected.append(provisional)
             if len(selected) == request.page_size:
                 break
+    if len(selected) < request.page_size:
+        examined = len(candidates)
     more = examined < len(ordered)
     next_cursor = None
     if more and examined:

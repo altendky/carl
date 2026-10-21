@@ -205,6 +205,7 @@ def _compact_item(
         saved_image_count=None if gallery is None else gallery.saved_image_count,
         analysis_available=bool(projection.analyses) or projection.analyses_truncated,
         warnings=projection.warnings,
+        route_estimate=projection.route_estimate,
     )
     return CompactReviewItem(
         projection=compact_projection,
