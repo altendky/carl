@@ -21,18 +21,18 @@ jobs:
       - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5
 
       - name: Install dependencies
-        run: uv sync --locked --python 3.13.16
+        run: uv sync --locked --python 3.13.17
 
       - name: Check formatting
-        run: uv run --locked --python 3.13.16 ruff format --check .
+        run: uv run --locked --python 3.13.17 ruff format --check .
 
       - name: Lint
-        run: uv run --locked --python 3.13.16 ruff check .
+        run: uv run --locked --python 3.13.17 ruff check .
 
       - name: Type check
         # Basedpyright makes warnings fatal whenever GITHUB_ACTIONS is present,
         # even when --level error hides them. Keep the local error-only policy.
-        run: env --unset=GITHUB_ACTIONS uv run --locked --python 3.13.16 basedpyright --level error
+        run: env --unset=GITHUB_ACTIONS uv run --locked --python 3.13.17 basedpyright --level error
 
   test:
     name: Test (Python ${{ matrix.python-version }})
@@ -43,7 +43,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python-version: 3.13.16
+          - python-version: 3.13.17
             coverage: true
           - python-version: 3.14.9
             coverage: false
