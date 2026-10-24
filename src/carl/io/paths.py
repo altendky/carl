@@ -47,6 +47,22 @@ class CarlDirectories(StrictModel):
         return self.config / "private" / "decodo"
 
     @property
+    def openrouteservice_credential_directory(self) -> Path:
+        return self.config / "private" / "openrouteservice"
+
+    @property
+    def routing_cache_file(self) -> Path:
+        return self.cache / "routing" / "estimates.sqlite3"
+
+    @property
+    def travel_data_directory(self) -> Path:
+        return self.data / "routing"
+
+    @property
+    def travel_data_state_directory(self) -> Path:
+        return self.state / "travel-data"
+
+    @property
     def mullvad_configuration_directory(self) -> Path:
         return self.config / "private" / "mullvad"
 

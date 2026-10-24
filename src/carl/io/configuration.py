@@ -500,6 +500,31 @@ def bright_data_settings(
     )
 
 
+def openrouteservice_api_key(
+    loaded: LoadedCarlConfiguration, directories: CarlDirectories
+) -> SecretStr:
+    """Resolve private routing credentials without putting them in config values."""
+    configuration = loaded.configuration.openrouteservice
+    if configuration is None:
+        raise ConfigurationLoadFailure("openrouteservice_not_configured")
+    raw = _read_regular_file(
+        directories.openrouteservice_credential_directory
+        / f"{configuration.credential_id}.api-key",
+        maximum_bytes=16 * 1024,
+        require_private=True,
+        failure=ConfigurationLoadFailure,
+        unavailable_code="openrouteservice_credential_unavailable",
+        permissions_code="openrouteservice_credential_permissions",
+    )
+    try:
+        key = raw.decode("utf-8")
+    except UnicodeError:
+        raise ConfigurationLoadFailure("invalid_openrouteservice_credential") from None
+    if not key or "\n" in key or "\r" in key:
+        raise ConfigurationLoadFailure("invalid_openrouteservice_credential")
+    return SecretStr(key)
+
+
 def decodo_settings(
     loaded: LoadedCarlConfiguration,
     directories: CarlDirectories,

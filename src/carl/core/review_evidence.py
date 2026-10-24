@@ -26,6 +26,7 @@ from carl.core.review_workspace import (
     ReviewBatchItem,
     ReviewState,
 )
+from carl.core.travel import TravelEstimate
 
 
 class ProjectionEvidenceReference(StrictModel):
@@ -83,6 +84,7 @@ class ReferencedListingProjection(StrictModel):
     analyses_truncated: bool
     search_membership: SearchMembershipProjection | None
     warnings: tuple[str, ...] = Field(default=(), max_length=20)
+    route_estimate: TravelEstimate | None = None
 
 
 class InternedReviewBatchItem(StrictModel):

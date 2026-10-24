@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from carl._tests.test_ebay import _Acquirer
+from carl._tests.test_ebay_cooldown import _enqueue, _fail
 from carl._tests.test_ebay_workers import _directories, _provenance
 from carl._tests.test_wreq import _decodo_settings
 from carl.core.configuration import CarlConfiguration, EbaySearchConfiguration
@@ -22,9 +23,12 @@ from carl.core.ebay import (
     CollectEbaySearchPayload,
     EbaySearchRequest,
     ebay_search_url,
+    ebay_search_work_constraint,
 )
 from carl.core.http import RequestPlan
+from carl.core.json import decode_json
 from carl.core.models import CodeProvenance, JsonValue
+from carl.core.routing import DecodoProduct
 from carl.core.work import NetworkActivityState
 from carl.core.worker import AttemptContext, RetryWork
 from carl.ebay import collect_configured_ebay_search
@@ -137,6 +141,7 @@ def _configure(
     monkeypatch: pytest.MonkeyPatch,
     sessions: _CookieSessions,
     policy: EbaySearchConfiguration | None = None,
+    route_settings: DecodoProxySettings | None = None,
 ) -> None:
     def load(path: Path) -> LoadedCarlConfiguration:
         return LoadedCarlConfiguration(
@@ -148,7 +153,7 @@ def _configure(
         )
 
     def settings(*_arguments: object) -> tuple[DecodoProxySettings, None, WreqTransportSettings]:
-        return _decodo_settings(), None, WreqTransportSettings()
+        return route_settings or _decodo_settings(), None, WreqTransportSettings()
 
     def managed(**_arguments: object) -> _CookieSessions:
         return sessions
@@ -160,6 +165,102 @@ def _configure(
     monkeypatch.setattr("carl.ebay.decodo_wreq_stack_settings", settings)
     monkeypatch.setattr("carl.ebay.ManagedDecodoWreqAcquirer", managed)
     monkeypatch.setattr("carl.ebay.collect_code_provenance_async", provenance)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["403", "search_timeout", "homepage_deadline"])
+@pytest.mark.parametrize(
+    ("product", "ports", "port_end", "independent"),
+    [
+        (DecodoProduct.RESIDENTIAL_PROXY, (), None, True),
+        (DecodoProduct.MOBILE_PROXY, (), None, True),
+        (DecodoProduct.DATACENTER_PROXY, (), None, False),
+        (DecodoProduct.DATACENTER_PROXY, (), 19000, True),
+        (DecodoProduct.DATACENTER_PROXY, (11000, 11001), None, True),
+        (DecodoProduct.DATACENTER_PROXY, (11000,), None, False),
+        (DecodoProduct.DATACENTER_PROXY, (), 11000, False),
+    ],
+    ids=["residential", "mobile", "fixed-dc", "range-dc", "pool-dc", "one-port-dc", "one-range-dc"],
+)
+async def test_verified_independent_sessions_keep_retry_without_cooling_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    product: DecodoProduct,
+    ports: tuple[int, ...],
+    port_end: int | None,
+    independent: bool,
+) -> None:
+    settings = _decodo_settings()
+    route = settings.route.model_copy(
+        update={
+            "product": product,
+            "endpoint": settings.route.endpoint.model_copy(update={"port": 11000}),
+        }
+    )
+    settings = settings.model_copy(
+        update={"route": route, "endpoint_ports": ports, "endpoint_port_end": port_end}
+    )
+    sessions = _CookieSessions(
+        search_status=403 if failure == "403" else 200,
+        search_timeout=failure == "search_timeout",
+        homepage_failure="deadline" if failure == "homepage_deadline" else None,
+    )
+    _configure(monkeypatch, sessions, route_settings=settings)
+    path, now = tmp_path / "test.sqlite3", 1_000_000_000_000
+    deadline = now + 600_000_000_000
+    async with Database.managed(path, initialize=True) as database:
+        await database.register_constraint(ebay_search_work_constraint(), registered_at_utc_ns=now)
+        await _enqueue(database, "blocked", now)
+        await _enqueue(database, "sibling", now)
+        await _fail(database, tmp_path, "blocked", now, collector=collect_configured_ebay_search)
+        work = await database.work("blocked")
+        assert work["state"] == "pending"
+        assert work["eligible_at_utc_ns"] == deadline
+        assert work["attempt"] == 1
+        async with database._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT data_json FROM work_events WHERE work_item_id=? AND event_kind='released'",
+                ("blocked",),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        released = decode_json(str(row[0]))
+        assert isinstance(released, dict)
+        reason = cast(dict[str, JsonValue], cast(dict[str, JsonValue], released)["reason"])
+        assert reason["maximum_attempts"] == 5
+        assert ("cooldown" not in reason) == independent
+        await _enqueue(database, "future", now + 1)
+        for identifier in ("sibling", "future"):
+            eligible = (await database.work(identifier))["eligible_at_utc_ns"]
+            assert eligible <= now + 1 if independent else eligible == deadline
+    assert sessions.sessions[0].closed
+    async with Database.managed(path) as database:
+        registry = build_ebay_worker_registry(
+            EbaySearchWorkerDependencies(database, _directories(tmp_path), lambda: str(uuid4()))
+        )
+        waiting = await database.claim_work(
+            supported_capabilities=registry.capabilities,
+            worker_identifier="test",
+            lease_token=str(uuid4()),
+            lease_duration_ns=60_000_000_000,
+            utc_now_ns=lambda: now + 1,
+            event_identifier=str(uuid4()),
+            eligible_identifiers=("blocked",),
+        )
+        assert waiting.lease is None and waiting.next_eligible_at_utc_ns == deadline
+        sibling = await database.claim_work(
+            supported_capabilities=registry.capabilities,
+            worker_identifier="test",
+            lease_token=str(uuid4()),
+            lease_duration_ns=60_000_000_000,
+            utc_now_ns=lambda: now + 1,
+            event_identifier=str(uuid4()),
+            eligible_identifiers=("sibling",),
+        )
+        assert (sibling.lease is not None) == independent
+        if sibling.lease is None:
+            assert sibling.next_eligible_at_utc_ns == deadline
 
 
 @pytest.mark.anyio
@@ -274,7 +375,8 @@ async def test_bootstrap_and_search_timeout_use_worker_retry_policy_with_retaine
         assert isinstance(outcome.reason, dict)
         reason = cast(dict[str, JsonValue], outcome.reason)
         assert reason["maximum_attempts"] == 5
-        assert "cooldown" in reason
+        assert reason["retry_scope"] == "independent_session"
+        assert "cooldown" not in reason
         acquisition = cast(dict[str, JsonValue], outcome.result["acquisition"])
         if failure == "search_timeout":
             assert acquisition["failure_phase"] == "request_timeout"
@@ -478,7 +580,7 @@ async def test_unrecognized_and_server_errors_do_not_consume_local_block_retry_b
 
 
 @pytest.mark.anyio
-async def test_page_two_timeout_after_403_retains_attempts_and_uses_existing_worker_cooldown(
+async def test_page_two_timeout_after_403_retains_attempts_and_uses_worker_retry_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sessions = _CookieSessions(search_statuses=(200, 403, 0))
@@ -506,7 +608,10 @@ async def test_page_two_timeout_after_403_retains_attempts_and_uses_existing_wor
         )
         assert isinstance(outcome, RetryWork)
         assert outcome.delay_ns == 600_000_000_000
-        assert isinstance(outcome.reason, dict) and "cooldown" in outcome.reason
+        assert isinstance(outcome.reason, dict)
+        reason = cast(dict[str, JsonValue], outcome.reason)
+        assert reason["retry_scope"] == "independent_session"
+        assert "cooldown" not in reason
         acquisition = cast(dict[str, JsonValue], outcome.result["acquisition"])
         assert acquisition["failure_phase"] == "request_timeout"
         attempts = cast(list[dict[str, JsonValue]], acquisition["search_page_attempts"])

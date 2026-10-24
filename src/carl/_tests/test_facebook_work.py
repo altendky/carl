@@ -21,6 +21,7 @@ from carl.core.facebook_work import (
     SearchRadius,
     SearchTextLocation,
     collect_search_work,
+    facebook_effective_search_work_constraint,
     facebook_item_network_constraints,
     facebook_network_policy_constraints,
     facebook_search_network_activity,
@@ -167,6 +168,27 @@ def test_search_work_retains_intent_and_network_scopes() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("provider", "product", "maximum_active", "version"),
+    (
+        ("proton", "carl", 1, "v2"),
+        ("decodo", "datacenter", 20, "v3"),
+        ("decodo", "mobile", 20, "v3"),
+        ("decodo", "residential", 20, "v3"),
+    ),
+)
+def test_search_work_limit_depends_on_route_provider(
+    provider: str, product: str, maximum_active: int, version: str
+) -> None:
+    routing = (provider, "personal", product)
+    for constraint in (
+        facebook_search_work_constraint(routing),
+        facebook_effective_search_work_constraint(routing),
+    ):
+        assert constraint.maximum_active == maximum_active
+        assert constraint.identifier[4] == version
+
+
 @pytest.mark.parametrize("provider", ("proton", "decodo"))
 def test_search_network_policy_is_typed_and_applies_to_each_followup_request(provider: str) -> None:
     routing = (provider, "personal", "route")
@@ -186,7 +208,10 @@ def test_search_network_policy_is_typed_and_applies_to_each_followup_request(pro
     holdoffs = tuple(item for item in constraints if isinstance(item, UniformHoldoffConstraint))
     assert all(rate.subject_kind is SchedulingSubjectKind.NETWORK_ACTIVITY for rate in rates)
     assert {(rate.scope.kind, rate.scope.identity) for rate in rates} == {
-        (SchedulingScopeKind.NETWORK_PATH, routing),
+        (
+            SchedulingScopeKind.NETWORK_ACTIVITY_KIND,
+            ("carl", "facebook", "http_requests", *routing),
+        ),
         (SchedulingScopeKind.REMOTE_ORIGIN, ("https", "www.facebook.com", "443")),
     }
     assert {(rate.maximum_starts, rate.period_ns) for rate in rates} == {
@@ -214,6 +239,10 @@ def test_search_network_policy_is_typed_and_applies_to_each_followup_request(pro
     assert {(scope.kind, scope.identity) for scope in activity.scopes} == {
         (SchedulingScopeKind.OVERALL, ()),
         (SchedulingScopeKind.NETWORK_PATH, routing),
+        (
+            SchedulingScopeKind.NETWORK_ACTIVITY_KIND,
+            ("carl", "facebook", "http_requests", *routing),
+        ),
         (
             SchedulingScopeKind.NETWORK_ACTIVITY_KIND,
             SEARCH_PAGINATION_NETWORK_ACTIVITY_KIND,

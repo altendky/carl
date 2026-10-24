@@ -123,6 +123,7 @@ class EbayItemExtraction(StrictModel):
     displayed_price: str | None = None
     currency: str | None = None
     condition: str | None = None
+    location_text: str | None = Field(default=None, max_length=500)
     description: str | None = None
     description_url: str | None = None
     gallery_urls: tuple[str, ...] = Field(default=(), max_length=50)
@@ -320,6 +321,7 @@ class _ItemParser(HTMLParser):
     json_blocks: list[str] = field(default_factory=list)
     json_parts: list[str] = field(default_factory=list)
     json_size: int = 0
+    location_count: int = 0
 
     def __post_init__(self) -> None:
         HTMLParser.__init__(self, convert_charrefs=True)
@@ -356,6 +358,11 @@ class _ItemParser(HTMLParser):
             fields.add("condition")
         if attributes.get("id") == "desc_div":
             fields.add("description")
+        if classes.intersection(
+            {"ux-labels-values--itemLocation", "ux-labels-values--item-location"}
+        ):
+            fields.add(f"item_location_{self.location_count}")
+            self.location_count += 1
         gallery = bool(self.frames and self.frames[-1].gallery) or any(
             token.startswith(
                 ("ux-image-carousel", "ux-image-filmstrip", "ux-image-grid", "x-item-image")
@@ -426,6 +433,80 @@ def _objects(value: JsonValue) -> Iterator[dict[str, JsonValue]]:
             pending.extend(reversed(tuple(node.values())))
         elif isinstance(node, list):
             pending.extend(reversed(node))
+
+
+def _item_location_labels(value: JsonValue, *, remaining_depth: int = 4) -> tuple[str, ...]:
+    """Read only explicit item/offer places; never generic seller or delivery addresses."""
+
+    if remaining_depth <= 0:
+        return ()
+    if isinstance(value, list):
+        values = cast(list[JsonValue], value)
+        if len(values) > 20:
+            return ()
+        return tuple(
+            label
+            for child in values
+            for label in _item_location_labels(child, remaining_depth=remaining_depth - 1)
+        )
+    if isinstance(value, str):
+        text = _SPACE.sub(" ", value).strip()
+        return (text,) if text and len(text) <= 500 else ()
+    if not isinstance(value, dict):
+        return ()
+    mapping = cast(dict[str, JsonValue], value)
+    address_value = mapping.get("address", mapping)
+    if isinstance(address_value, str):
+        return _item_location_labels(address_value, remaining_depth=remaining_depth - 1)
+    if not isinstance(address_value, dict):
+        return ()
+    address = cast(dict[str, JsonValue], address_value)
+    parts = [
+        _SPACE.sub(" ", part).strip()
+        for name in ("addressLocality", "addressRegion", "postalCode")
+        if isinstance((part := address.get(name)), str) and part.strip()
+    ]
+    # A country or region alone is not a usable item pickup locality.
+    if not any(
+        isinstance((part := address.get(name)), str) and part.strip()
+        for name in ("addressLocality", "postalCode")
+    ):
+        return ()
+    country = address.get("addressCountry")
+    if isinstance(country, dict):
+        country = cast(dict[str, JsonValue], country).get("name")
+    if isinstance(country, str) and country.strip():
+        parts.append(_SPACE.sub(" ", country).strip())
+    label = ", ".join(parts)
+    return (label,) if label and len(label) <= 500 else ()
+
+
+def _item_location(
+    products: list[dict[str, JsonValue]], parser: _ItemParser, issues: list[JsonValue]
+) -> str | None:
+    labels: list[str] = []
+    for product in products:
+        labels.extend(_item_location_labels(product.get("itemLocation")))
+        offers = product.get("offers")
+        for offer in cast(list[JsonValue], offers) if isinstance(offers, list) else (offers,):
+            if isinstance(offer, dict):
+                labels.extend(
+                    _item_location_labels(
+                        cast(dict[str, JsonValue], offer).get("availableAtOrFrom")
+                    )
+                )
+    for name, parts in parser.texts.items():
+        if name.startswith("item_location_"):
+            text = _text(parts)
+            if text is not None:
+                text = re.sub(r"^(?:Item location|Located in)\s*:\s*", "", text, flags=re.I)
+                if text and len(text) <= 500:
+                    labels.append(text)
+    distinct = {label.casefold(): label for label in labels}
+    if len(distinct) > 1:
+        issues.append({"kind": "conflicting_item_locations"})
+        return None
+    return next(iter(distinct.values()), None)
 
 
 def _strings(value: JsonValue | None) -> tuple[str, ...]:
@@ -616,6 +697,7 @@ def extract_ebay_item(
         displayed_price=price,
         currency=currency if isinstance(currency, str) else None,
         condition=condition,
+        location_text=_item_location(matching, parser, issues),
         description=description,
         description_url=description_url,
         gallery_urls=tuple(gallery),

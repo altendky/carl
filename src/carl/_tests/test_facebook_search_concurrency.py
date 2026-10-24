@@ -103,7 +103,7 @@ async def _parallel_processes(
 @pytest.mark.parametrize("route", (TARGET, DATACENTER))
 @pytest.mark.parametrize("work_kind", ("search", "refresh"))
 @pytest.mark.parametrize("execution", ("tasks", "processes"))
-async def test_eight_parallel_claimers_hold_exactly_one_search(
+async def test_eight_parallel_claimers_hold_exactly_the_route_limit(
     tmp_path: Path,
     route: tuple[str, ...],
     work_kind: Literal["search", "refresh"],
@@ -111,7 +111,11 @@ async def test_eight_parallel_claimers_hold_exactly_one_search(
 ) -> None:
     path = tmp_path / "carl.sqlite3"
     count = 8
+    maximum_active = 20 if work_kind == "search" and route[0] == "decodo" else 1
     async with Database.managed(path, initialize=True) as database:
+        # Contend for the last slot without launching twenty-eight processes.
+        for index in range(maximum_active - 1):
+            _ = await _claim(database, f"prefill-{index}", route)
         capability = CAPABILITY
         if work_kind == "refresh":
             capability = WorkCapability(
@@ -246,12 +250,16 @@ async def test_eight_parallel_claimers_hold_exactly_one_search(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("route", (TARGET, DATACENTER))
-async def test_eight_parallel_alias_processes_admit_one_effective_route(
+async def test_eight_parallel_alias_processes_admit_the_route_limit(
     tmp_path: Path, route: tuple[str, ...]
 ) -> None:
     path = tmp_path / "carl.sqlite3"
     count = 8
+    maximum_active = 20 if route[0] == "decodo" else 1
     async with Database.managed(path, initialize=True) as database:
+        for index in range(maximum_active - 1):
+            lease = await _claim(database, f"prefill-{index}", ("proton", "prefill", str(index)))
+            assert await _admit(database, lease, route)
         leases = tuple(
             [
                 await _claim(database, f"alias-{index}", ("proton", "personal", f"alias-{index}"))

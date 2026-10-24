@@ -107,6 +107,29 @@ session_duration_minutes = 10
 host = "gate.decodo.com"
 port = 11000
 port_end = 19000
+
+# Optional driving estimates. Replace this example origin in local config only.
+[travel]
+provider = "openrouteservice"
+origin_label = "Philadelphia, PA"
+country_code = "USA"
+cache_ttl_seconds = 604800
+maximum_geocodes_per_batch = 20
+
+[openrouteservice]
+credential_id = "carl"
+
+# Optional local backend; select it with travel.provider = "osrm" after preparation.
+[osrm]
+dataset_path = "/absolute/path/to/region.osrm"
+dataset_identifier = "example-map-version"
+maximum_snap_distance_meters = 5000
+use_mmap = true
+
+# Optional offline US locality/ZIP lookup; setup writes these paths automatically.
+[geonames]
+database_path = "/absolute/path/to/places.sqlite3"
+dataset_identifier = "example-geocoder-version"
 ```
 
 The mandatory Wireproxy declaration does not install or invoke Wireproxy for
@@ -146,6 +169,114 @@ Existing transports explicitly selecting `chrome_153` retain that profile and it
 default platform. After updating Carl and restarting its workers and MCP clients,
 change their `emulation_profile` to `chrome_154` to select the new profile. The
 transport identifier and acquisition-stack references can stay unchanged.
+
+The optional `[travel]` section above enables driving distance and duration
+estimates on listing and review reads. Keep the pickup origin in local config;
+do not commit personal locations.
+Alternatively, supply `origin = { latitude = 40.0, longitude = -75.0 }` instead
+of `origin_label`. Coordinates take precedence when both are present. The API key
+belongs in `private/openrouteservice/carl.api-key`, with owner-only permissions
+(`0600`), following the same separation as Decodo credentials. Inline API keys
+are rejected. Restart workers and MCP after updating Carl before adding this
+section, so every process recognizes it. Legacy origin/cache settings in
+`[openrouteservice]` still work when `[travel]` is absent.
+
+Set `travel.provider` to `"osrm"` for local driving tables through the pinned
+`osrm-bindings` dependency, or `"openrouteservice"` for HeiGIT's hosted Matrix API.
+There is no automatic provider fallback. The local backend needs a prepared car
+MLD dataset: run the packaged `python -m osrm extract`, `partition`, and `customize`
+tools using the package's car profile. `osrm.dataset_path` is the absolute
+`.osrm` prefix; the suffixed companion files must remain together. Give every
+rebuilt dataset a new immutable directory and `dataset_identifier`. Never replace
+files while mapped by a running process. Changing the dataset identity reloads
+the engine and invalidates cached and retained route selection. Carl automatically
+manages a local subprocess for the memory-mapped engine so native Python-lock
+holds cannot stall MCP or lease renewal. Queries time out after 60 seconds and
+cancel the busy subprocess. A distant endpoint snap is
+reported unavailable rather than inventing a route to the edge of the map.
+Keep a buffered map larger than the listing search area and retain its source
+timestamps, car-profile hash, and build manifest outside the repository.
+
+Local routes between known coordinates need no API key or network. Text-only
+locations can use the full-US offline GeoNames database with
+`travel.geocoding_provider = "geonames"`, or the separately cached ORS geocoder with its quota;
+set `travel.geocoding_provider = "disabled"` to allow only coordinates and cached
+geocodes. An explicit coordinate origin avoids a geocoding request at startup.
+
+Listing reads return an approximate `route_estimate` using retained item or search
+card coordinates where available, otherwise a geocoded locality. Distances are
+road distances in meters; durations are seconds without live traffic. Missing,
+ambiguous, conflicting, unreachable, and provider-failed locations remain explicit
+unknowns; they never fall back to straight-line estimates. Older eBay evidence
+without an item location remains unknown until new extraction captures one.
+Routing and geocoding use a separate private cache and paced, batched requests.
+The per-batch geocoding budget limits new hosted lookups; cached and local GeoNames
+lookups do not consume it. GeoNames resolves exact city/state, aliases and ZIP codes,
+including ZIP+4. It rejects ambiguity instead of choosing a nearby/populous namesake.
+It supplies locality coordinates, not street-address precision. Data attribution:
+[GeoNames](https://www.geonames.org/), Creative Commons Attribution 4.0.
+
+Local dataset management is part of Carl. Neither worker startup nor listing reads
+download or rebuild data. Run `carl travel status` for readiness, age and corrective
+actions; `carl travel verify` also checks file hashes and GeoNames SQLite integrity.
+Use `carl travel setup geonames` for the full US locality/alias/ZIP database, and
+`carl travel setup osrm` for a buffered US road map around the coordinates in your
+private `travel.origin` config. Both run in the foreground without a queue worker.
+OSRM preparation requires the separate `osmium-tool` package (`osmium` on PATH);
+the OSRM tools and car profile come from the pinned Python dependency. The measured
+250-mile build took about 30 minutes, 23 GiB peak RAM and 8.84 GiB installed space.
+Updates also need room for temporary files and both map versions. Choose
+`--radius-miles` and `--threads` explicitly if needed; defaults are 250 and 4.
+
+`carl travel update geonames` and `carl travel update osrm` explicitly rebuild from
+current sources. Downloads are checksummed, road inputs share one dated snapshot,
+and completed data is published under an immutable version. Activation atomically
+updates only the corresponding provider settings in private config. A failed or
+cancelled build leaves the selected version unchanged. `--no-activate` prepares a
+version without selecting it. Use `carl travel datasets --limit 20` (and `--cursor`
+for continuation) and `carl travel activate PROVIDER DATASET_IDENTIFIER` to select
+an installed version or roll back. Old versions remain installed until you choose
+to remove them; mapped files must never be overwritten. Data over 30 days old is
+reported as outdated, without triggering automatic network access.
+
+MCP equivalents are `get_travel_data_status`, `list_travel_datasets`,
+`request_travel_data_setup` and `activate_travel_dataset`. Setup/update requests use
+stable request IDs and return durable work IDs promptly; a running Carl worker is
+required. Poll `get_work_status` and `get_travel_data_status` for outcome/current
+build stage; ordinary work cancellation also stops a build. Builds are serialized
+across providers and foreground CLI commands with a process-shared lock. MCP does
+not start a worker. Full verification and activation hash entire datasets; use the
+CLI for large maps when a client's MCP timeout would be restrictive.
+If a foreground build owns the lock, queued setup waits for a minute before
+checking again. Failed OSRM builds retain the failing stage's last 64 KiB in a
+private `build-reports` log; status reports the stage, reason and log filename.
+
+For composed/workspace listing filters, use `filters.travel` with
+`maximum_driving_distance_miles`, `maximum_driving_duration_minutes`, and
+`include_unknown` (default `true`). Review-batch acquisition accepts the same
+limits in `travel`. Estimates and filters apply before listing pagination, with
+cursors bound to the origin. Set `include_travel=false` to skip estimates when
+no travel filter is active. Estimates do not invalidate completed reviews.
+Automatic search-pipeline selection and explicit analysis selection remain
+unchanged; they do not apply these travel filters.
+
+To refresh only a listing's driving estimate, call `request_listing_route_refresh`
+with an exact `listing_identifier`, a new `request_identifier`, and optionally a
+`workspace_record_identifier` for ownership and cancellation. This queues a
+standalone worker job without fetching marketplace pages, images, or analyses.
+The worker bypasses cached route metrics and publishes an immutable
+`["carl", "travel", "estimate"]` record in Carl's main database, with origin and
+destination identities, the frozen destination, timestamp, and source-record links.
+Poll `get_work_status` for `estimate_record_identifier`, then read it with
+`get_listing_route_estimate`. Replaying a request ID returns the same work even
+after completion; use a new ID for a new measurement. Composed listing reads
+select the newest retained record matching the current origin and location.
+An unavailable measurement remains explicit rather than reviving an older
+successful result. Changed origin or location inputs cannot select the old record.
+Expired results fall back to the normal routing service; their immutable records
+remain available by ID. Successful estimates use the configured cache lifetime;
+unavailable results expire after 60 seconds. These retained estimates are
+independent of completed review revisions.
 
 Store each product's separate password through a non-echoing prompt:
 

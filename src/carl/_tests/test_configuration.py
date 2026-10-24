@@ -32,6 +32,7 @@ from carl.io.configuration import (
     import_proton_configuration,
     load_configuration,
     mullvad_settings,
+    openrouteservice_api_key,
     proton_settings,
 )
 from carl.io.paths import CarlDirectories, user_directories
@@ -369,6 +370,7 @@ def test_loads_strict_versioned_configuration_and_builds_bright_data_settings(
     _, path = _write_configuration(tmp_path)
 
     loaded = load_configuration(path)
+    assert loaded.configuration.openrouteservice is None
     settings = bright_data_settings(loaded, ("bright_data", "personal", "marketplace_search"))
 
     assert loaded.configuration.schema_identity.version == 1
@@ -384,6 +386,72 @@ def test_loads_strict_versioned_configuration_and_builds_bright_data_settings(
         "password",
     )
     assert settings.max_idle_seconds == 180
+
+
+def _write_openrouteservice_configuration(tmp_path: Path) -> tuple[CarlDirectories, Path]:
+    directories, path = _write_configuration(tmp_path)
+    with path.open("ab") as configuration:
+        _ = configuration.write(b'\n[openrouteservice]\ncredential_id = "carl"\n')
+    (directories.config / "private").mkdir(mode=0o700)
+    directories.openrouteservice_credential_directory.mkdir(mode=0o700)
+    return directories, path
+
+
+def test_openrouteservice_key_is_separate_from_config_and_redacted_when_resolved(
+    tmp_path: Path,
+) -> None:
+    directories, path = _write_openrouteservice_configuration(tmp_path)
+    key = "test-routing-key-not-a-real-credential"
+    credential = directories.openrouteservice_credential_directory / "carl.api-key"
+    _ = credential.write_text(key)
+    credential.chmod(0o600)
+
+    loaded = load_configuration(path)
+    routing = loaded.configuration.openrouteservice
+    assert routing is not None
+    assert routing.credential_id == "carl"
+    secret = openrouteservice_api_key(loaded, directories)
+    assert secret.get_secret_value() == key
+    assert key not in repr(secret)
+    configuration_value = loaded.configuration.as_json()["openrouteservice"]
+    assert configuration_value["credential_id"] == "carl"
+    assert "api_key" not in configuration_value
+    assert key not in path.read_text()
+    assert key not in repr(loaded)
+    assert key not in repr(loaded.configuration)
+    assert key not in loaded.configuration.model_dump_json()
+
+
+@pytest.mark.parametrize("failure", ("missing", "public", "symlink", "empty", "newline", "unicode"))
+def test_openrouteservice_rejects_unsafe_or_invalid_credentials(
+    tmp_path: Path, failure: str
+) -> None:
+    directories, path = _write_openrouteservice_configuration(tmp_path)
+    credential = directories.openrouteservice_credential_directory / "carl.api-key"
+    if failure == "symlink":
+        target = tmp_path / "target"
+        _ = target.write_text("test-key")
+        target.chmod(0o600)
+        credential.symlink_to(target)
+    elif failure != "missing":
+        content = {"empty": b"", "newline": b"test-key\n", "unicode": b"\xff"}.get(
+            failure, b"test-key"
+        )
+        _ = credential.write_bytes(content)
+        credential.chmod(0o644 if failure == "public" else 0o600)
+    with pytest.raises(ConfigurationLoadFailure):
+        _ = openrouteservice_api_key(load_configuration(path), directories)
+
+
+@pytest.mark.parametrize("section", ('api_key = "test-key"', 'credential_id = "../outside"'))
+def test_openrouteservice_rejects_inline_keys_and_traversing_references(
+    tmp_path: Path, section: str
+) -> None:
+    _, path = _write_configuration(tmp_path)
+    with path.open("ab") as configuration:
+        _ = configuration.write(f"\n[openrouteservice]\n{section}\n".encode())
+    with pytest.raises(ConfigurationLoadFailure, match="invalid_configuration"):
+        _ = load_configuration(path)
 
 
 def test_configures_and_loads_private_decodo_credential(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ import pytest
 from mcp import Client, StdioServerParameters
 from mcp.types import TextContent
 
+from carl._tests.test_configuration import _directories
 from carl.core.composed_projection import (
     ComposedListingPage,
     ComposedListingProjection,
@@ -48,6 +49,7 @@ from carl.core.review_workspace import (
 )
 from carl.core.work import WorkState
 from carl.io.sqlite import Database
+from carl.io.travel_data import TravelDataManager
 from carl.mcp_server import build_server, managed_mcp_runtime, tool_definitions
 from carl.review import ReviewApplication
 
@@ -67,6 +69,11 @@ EXPECTED_TOOLS = {
     "get_activity_snapshot",
     "get_composed_listing",
     "get_listing_analysis",
+    "get_listing_route_estimate",
+    "get_travel_data_status",
+    "list_travel_datasets",
+    "request_travel_data_setup",
+    "activate_travel_dataset",
     "get_listing_image",
     "get_listing_details",
     "get_product_guide",
@@ -122,6 +129,7 @@ EXPECTED_TOOLS = {
     "update_workspace_product_guide_binding",
     "wait_for_workspace_work",
     "get_selection_snapshot",
+    "request_listing_route_refresh",
 }
 
 
@@ -461,6 +469,7 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             database=database,
             repository_root=tmp_path,
             server_source_tree_sha256="a" * 64,
+            travel_data_manager=TravelDataManager(_directories(tmp_path)),
         )
         definitions = tool_definitions(application)
         assert {definition.name for definition in definitions} == EXPECTED_TOOLS
@@ -622,9 +631,9 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 58
+            assert capability_versions[("carl", "mcp", "instructions")] == 62
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 43
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 47
             assert capability_versions[("carl", "mcp", "response_pages")] == 3
             assert capability_versions[("carl", "marketplace", "search_pipeline")] == 1
             assert capability_versions[("carl", "review", "workspace_work")] == 4
@@ -1381,10 +1390,19 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                     }
                 },
             )
+            missing_route = await call_json(
+                "get_listing_route_estimate", {"record_identifier": "missing-route"}
+            )
+            missing_route_refresh = await call_json(
+                "request_listing_route_refresh",
+                {"request": {"request_identifier": "route-smoke", "listing_identifier": "123"}},
+            )
             for domain_error in (
                 missing_analysis,
                 missing_image,
                 requested_batch,
+                missing_route,
+                missing_route_refresh,
             ):
                 assert domain_error.is_error
                 assert isinstance(domain_error.content[0], TextContent)
@@ -1405,6 +1423,28 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             )
             assert missing_pipeline_request.is_error
             assert missing_pipeline_status.is_error
+            local_status = await call_json("get_travel_data_status")
+            assert not local_status.is_error
+            assert all(
+                item["state"] == "unconfigured"
+                for item in local_status.structured_content["providers"]
+            )
+            datasets = await call_json("list_travel_datasets")
+            assert not datasets.is_error and datasets.structured_content["items"] == []
+            setup_request = await call_json(
+                "request_travel_data_setup",
+                {"request": {"request_identifier": "setup-smoke", "provider": "geonames"}},
+            )
+            assert (
+                not setup_request.is_error
+                and setup_request.structured_content["state"] == "pending"
+            )
+            assert setup_request.structured_content["worker_required"]
+            missing_dataset = await call_json(
+                "activate_travel_dataset", {"provider": "geonames", "dataset_identifier": "missing"}
+            )
+            assert missing_dataset.is_error
+            assert "carl travel setup geonames" in missing_dataset.content[0].text
             for tool_name, arguments in (
                 ("cancel_work", {"work_identifier": "missing-work", "reason": "Stop"}),
                 (

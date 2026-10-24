@@ -35,6 +35,7 @@ from carl.core.network_defaults import (
     populate_legacy_proton_paths,
     validate_legacy_proton_paths,
 )
+from carl.core.travel import TravelEstimate, TravelFilters
 from carl.core.work import WorkState
 
 CREATE_REVIEW_WORKSPACE = ComponentId(("carl", "review", "create", "workspace"))
@@ -474,6 +475,7 @@ class ListWorkspaceListingsRequest(StrictModel):
     maximum_candidate_listings_examined: int = Field(default=2_500, ge=1, le=10_000)
     page_size: int = Field(default=25, ge=1, le=100)
     cursor: str | None = None
+    include_travel: bool = True
 
 
 class WorkspaceListingSummary(StrictModel):
@@ -496,6 +498,7 @@ class WorkspaceListingSummary(StrictModel):
     analysis_available: bool
     projection_revision_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     warnings: tuple[str, ...] = Field(default=(), max_length=20)
+    route_estimate: TravelEstimate | None = None
 
 
 class WorkspaceListingPage(StrictModel):
@@ -516,6 +519,7 @@ class GetWorkspaceListingRequest(StrictModel):
     maximum_gallery_images: int = Field(default=20, ge=0, le=100)
     maximum_analyses: int = Field(default=10, ge=0, le=20)
     maximum_observations: int = Field(default=100, ge=100, le=100)
+    include_travel: bool = True
     compact: bool = Field(
         default=False,
         description="Return scalar values and deduplicated sellers without repeated evidence or prior snapshots.",
@@ -723,6 +727,8 @@ class CreateReviewBatchRequest(StrictModel):
     page_size: int = Field(default=25, ge=1, le=100)
     cursor: str | None = None
     maximum_scan_pages: int = Field(default=10, ge=1, le=100)
+    travel: TravelFilters = TravelFilters()
+    include_travel: bool = True
 
     @field_validator("statuses", "include_review_states")
     @classmethod

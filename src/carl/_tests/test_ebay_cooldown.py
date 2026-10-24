@@ -2,6 +2,7 @@
 
 import json
 import tomllib
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -61,7 +62,14 @@ async def _enqueue(
     )
 
 
-async def _fail(database: Database, directory: Path, identifier: str, now: int) -> None:
+async def _fail(
+    database: Database,
+    directory: Path,
+    identifier: str,
+    now: int,
+    *,
+    collector: Callable[..., Awaitable[dict[str, JsonValue]]] | None = None,
+) -> None:
     async def collect(*_args: object, **_kwargs: object) -> dict[str, JsonValue]:
         return {
             "state": "response_failed",
@@ -75,7 +83,7 @@ async def _fail(database: Database, directory: Path, identifier: str, now: int) 
             database,
             _directories(directory),
             lambda: str(uuid4()),
-            collector=collect,
+            collector=collector or collect,
             utc_now_ns=lambda: now,
         )
     )
@@ -177,6 +185,35 @@ async def test_terminal_failure_cools_stack_and_operator_retry_keeps_history(
         await _fail(database, tmp_path, "blocked", deadline)
         assert (await database.work("blocked"))["error"] is None
         assert (await database.work("blocked"))["attempt"] == 6
+
+
+@pytest.mark.anyio
+async def test_independent_session_exhausts_budget_without_cooling_other_work(
+    tmp_path: Path,
+) -> None:
+    async def collect(*_args: object, **_kwargs: object) -> dict[str, JsonValue]:
+        return {
+            "state": "response_failed",
+            "response_classification": {"kind": "error_page", "evidence": ["http_status_403"]},
+            "stopping_reason": "error_page",
+            "listing_count": 0,
+            "retry_scope": "independent_session",
+        }
+
+    now = 1_000_000_000_000
+    async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
+        await _enqueue(database, "blocked", now)
+        await _enqueue(database, "sibling", now)
+        for delay in (0, 600_000_000_000, 1200_000_000_000, 2400_000_000_000, 3600_000_000_000):
+            now += delay
+            await _fail(database, tmp_path, "blocked", now, collector=collect)
+            assert (await database.work("sibling"))["eligible_at_utc_ns"] <= now
+        work = await database.work("blocked")
+        assert work["state"] == "terminal_failure" and work["attempt"] == 5
+        assert work["error"]["retry_scope"] == "independent_session"
+        assert "cooldown" not in work["error"]
+        await _enqueue(database, "future", now)
+        assert (await database.work("future"))["eligible_at_utc_ns"] <= now
 
 
 @pytest.mark.anyio

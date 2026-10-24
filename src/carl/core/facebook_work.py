@@ -106,6 +106,7 @@ FACEBOOK_NETWORK_SHORT_RATE_MAXIMUM_STARTS = 3
 FACEBOOK_NETWORK_PATH_RATE_PERIOD_NS = 60_000_000_000
 FACEBOOK_NETWORK_PATH_RATE_MAXIMUM_STARTS = 180
 FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE = 1
+FACEBOOK_DECODO_SEARCH_ROUTE_MAXIMUM_ACTIVE = 20
 FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY = "effective_search_acquisition"
 
 
@@ -119,13 +120,24 @@ def _search_route_scope(routing: tuple[str, ...]) -> SchedulingScope:
 
 
 def facebook_search_work_constraint(routing: tuple[str, ...]) -> ConcurrencyConstraint:
-    """Claim one search child per requested route across worker processes."""
+    """Bound search children per requested route across worker processes."""
 
     return ConcurrencyConstraint(
-        identifier=("carl", "facebook", "search", "route_concurrency", "v2", *routing),
+        identifier=(
+            "carl",
+            "facebook",
+            "search",
+            "route_concurrency",
+            "v3" if routing[0] == "decodo" else "v2",
+            *routing,
+        ),
         subject_kind=SchedulingSubjectKind.WORK_ITEM,
         scope=_search_route_scope(routing),
-        maximum_active=FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE,
+        maximum_active=(
+            FACEBOOK_DECODO_SEARCH_ROUTE_MAXIMUM_ACTIVE
+            if routing[0] == "decodo"
+            else FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE
+        ),
     )
 
 
@@ -141,13 +153,24 @@ def facebook_effective_search_scope(routing: tuple[str, ...]) -> SchedulingScope
 def facebook_effective_search_work_constraint(
     routing: tuple[str, ...],
 ) -> ConcurrencyConstraint:
-    """Serialize searches sharing the route selected after configuration remapping."""
+    """Bound searches sharing the route selected after configuration remapping."""
 
     return ConcurrencyConstraint(
-        identifier=("carl", "facebook", "search", "effective_route_concurrency", "v2", *routing),
+        identifier=(
+            "carl",
+            "facebook",
+            "search",
+            "effective_route_concurrency",
+            "v3" if routing[0] == "decodo" else "v2",
+            *routing,
+        ),
         subject_kind=SchedulingSubjectKind.WORK_ITEM,
         scope=facebook_effective_search_scope(routing),
-        maximum_active=FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE,
+        maximum_active=(
+            FACEBOOK_DECODO_SEARCH_ROUTE_MAXIMUM_ACTIVE
+            if routing[0] == "decodo"
+            else FACEBOOK_SEARCH_ROUTE_MAXIMUM_ACTIVE
+        ),
     )
 
 
@@ -181,13 +204,26 @@ def _facebook_remote_origin_network_constraints() -> tuple[SlidingWindowRateCons
     )
 
 
+def facebook_request_budget_scope(routing: tuple[str, ...]) -> SchedulingScope:
+    """Group actual Facebook HTTP requests on a route, excluding local setup."""
+
+    return SchedulingScope(
+        kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND,
+        identity=("carl", "facebook", "http_requests", *routing),
+    )
+
+
+def legacy_facebook_network_path_constraint_identifier(routing: tuple[str, ...]) -> tuple[str, ...]:
+    return ("carl", "facebook", "network_path", "network_activity_rate", "v2", *routing)
+
+
 def facebook_network_path_constraint(routing: tuple[str, ...]) -> SlidingWindowRateConstraint:
-    """A route-wide budget shared by Marketplace pages and CDN image traffic."""
+    """Share a route budget only between Facebook page and image HTTP requests."""
 
     return SlidingWindowRateConstraint(
-        identifier=("carl", "facebook", "network_path", "network_activity_rate", "v2", *routing),
+        identifier=("carl", "facebook", "network_path", "network_activity_rate", "v3", *routing),
         subject_kind=SchedulingSubjectKind.NETWORK_ACTIVITY,
-        scope=SchedulingScope(kind=SchedulingScopeKind.NETWORK_PATH, identity=routing),
+        scope=facebook_request_budget_scope(routing),
         maximum_starts=FACEBOOK_NETWORK_PATH_RATE_MAXIMUM_STARTS,
         period_ns=FACEBOOK_NETWORK_PATH_RATE_PERIOD_NS,
     )
@@ -228,6 +264,7 @@ def facebook_item_network_activity(
         scopes=(
             SchedulingScope(kind=SchedulingScopeKind.OVERALL, identity=()),
             SchedulingScope(kind=SchedulingScopeKind.NETWORK_PATH, identity=routing),
+            facebook_request_budget_scope(routing),
             SchedulingScope(
                 kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND,
                 identity=ITEM_PAGE_NETWORK_ACTIVITY_KIND,
@@ -303,6 +340,7 @@ def legacy_facebook_network_constraint_identifiers(
                 SEARCH_PAGINATION_NETWORK_ACTIVITY_KIND,
             )
         ),
+        legacy_facebook_network_path_constraint_identifier(routing),
     )
 
 
@@ -332,6 +370,7 @@ def facebook_search_network_activity(
         scopes=(
             SchedulingScope(kind=SchedulingScopeKind.OVERALL, identity=()),
             SchedulingScope(kind=SchedulingScopeKind.NETWORK_PATH, identity=routing),
+            facebook_request_budget_scope(routing),
             SchedulingScope(kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND, identity=kind),
             SchedulingScope(
                 kind=SchedulingScopeKind.REMOTE_ORIGIN,

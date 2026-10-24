@@ -15,6 +15,7 @@ from carl.core.facebook_search import SearchStoppingReason
 from carl.core.json import decode_json, encode_json
 from carl.core.listing_identity import LISTING_IDENTIFIER_PATTERN, canonical_listing_url
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
+from carl.core.travel import TravelEstimate, TravelFilters, travel_matches_filters
 
 
 class ListingStatus(JsonStringEnumeration):
@@ -240,6 +241,7 @@ class ComposedListingProjection(StrictModel):
     analyses_truncated: bool
     search_membership: SearchMembershipProjection | None
     warnings: tuple[str, ...] = Field(default=(), max_length=20)
+    route_estimate: TravelEstimate | None = None
 
     @model_validator(mode="after")
     def validate_canonical_url(self) -> ComposedListingProjection:
@@ -254,6 +256,7 @@ class ComposedListingFilters(StrictModel):
     )
     product_guide_record_identifier: str | None = Field(default=None, min_length=1)
     analysis: AnalysisPresenceFilter = AnalysisPresenceFilter.ANY
+    travel: TravelFilters = TravelFilters()
 
     @field_validator("statuses")
     @classmethod
@@ -272,6 +275,7 @@ class GetComposedListingRequest(StrictModel):
     maximum_gallery_images: int = Field(default=20, ge=0, le=100)
     maximum_analyses: int = Field(default=10, ge=0, le=20)
     maximum_observations: int = Field(default=100, ge=100, le=100)
+    include_travel: bool = True
 
     @model_validator(mode="after")
     def validate_search_runs(self) -> GetComposedListingRequest:
@@ -296,6 +300,7 @@ class ListComposedSearchRequest(StrictModel):
     maximum_candidate_listings_examined: int = Field(default=2_500, ge=1, le=10_000)
     page_size: int = Field(default=25, ge=1, le=100)
     cursor: str | None = None
+    include_travel: bool = True
 
     @model_validator(mode="after")
     def validate_search_runs(self) -> ListComposedSearchRequest:
@@ -1277,6 +1282,8 @@ def composed_listing_matches_filters(
 ) -> bool:
     if projection.status.value not in filters.statuses:
         return False
+    if not travel_matches_filters(projection.route_estimate, filters.travel):
+        return False
     if filters.analysis is AnalysisPresenceFilter.PRESENT:
         return matching_analysis_present
     if filters.analysis is AnalysisPresenceFilter.ABSENT:
@@ -1284,7 +1291,9 @@ def composed_listing_matches_filters(
     return True
 
 
-def composed_listing_cursor_scope_sha256(request: ListComposedSearchRequest) -> str:
+def composed_listing_cursor_scope_sha256(
+    request: ListComposedSearchRequest, *, travel_origin_identity: str | None = None
+) -> str:
     """Bind a cursor to every request setting that affects traversal semantics."""
 
     content: JsonValue = {
@@ -1293,7 +1302,10 @@ def composed_listing_cursor_scope_sha256(request: ListComposedSearchRequest) -> 
             "statuses": sorted(status.value for status in request.filters.statuses),
             "product_guide_record_identifier": (request.filters.product_guide_record_identifier),
             "analysis": request.filters.analysis.value,
+            "travel": request.filters.travel.model_dump(mode="json"),
         },
+        "include_travel": request.include_travel,
+        "travel_origin_identity": travel_origin_identity,
         "maximum_ancestry_runs": request.maximum_ancestry_runs,
         "maximum_gallery_images_per_listing": request.maximum_gallery_images_per_listing,
         "maximum_analyses_per_listing": request.maximum_analyses_per_listing,
@@ -1322,6 +1334,10 @@ def decode_composed_listing_cursor(value: str) -> ComposedListingCursor:
 def validate_composed_listing_cursor_scope(
     cursor: ComposedListingCursor,
     request: ListComposedSearchRequest,
+    *,
+    travel_origin_identity: str | None = None,
 ) -> None:
-    if cursor.scope_sha256 != composed_listing_cursor_scope_sha256(request):
+    if cursor.scope_sha256 != composed_listing_cursor_scope_sha256(
+        request, travel_origin_identity=travel_origin_identity
+    ):
         raise ValueError("Composed-listing cursor does not match the request scope")
