@@ -32,7 +32,9 @@ from carl.core.facebook_images import (
 from carl.core.facebook_refresh import refresh_search_work_constraints
 from carl.core.facebook_work import (
     facebook_effective_search_work_constraint,
+    facebook_network_path_constraint,
     facebook_search_work_constraint,
+    legacy_facebook_network_path_constraint_identifier,
 )
 from carl.core.item_analysis import analysis_work_constraints
 from carl.core.marketplace_images import marketplace_image_network_constraint
@@ -63,7 +65,9 @@ from carl.io.connectivity import ConnectivityMonitor
 from carl.io.paths import user_directories
 from carl.io.proton import SharedProtonWireproxyManager
 from carl.io.provenance import collect_code_provenance_async, process_invocation
+from carl.io.routing import ConfiguredTravelService
 from carl.io.sqlite import Database
+from carl.io.travel_data import TravelDataManager
 from carl.io.worker import WorkerRuntimeServices, WorkHandlerRegistry, run_worker_pool
 from carl.pipeline_listing_workers import (
     PipelineListingWorkerDependencies,
@@ -71,6 +75,8 @@ from carl.pipeline_listing_workers import (
 )
 from carl.pipeline_workers import PipelineWorkerDependencies, build_pipeline_worker_registry
 from carl.review import ReviewApplication
+from carl.travel_data_workers import build_travel_data_worker_registry
+from carl.travel_workers import TravelWorkerDependencies, build_travel_worker_registry
 
 
 def _identifier() -> str:
@@ -89,6 +95,7 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
     """Upgrade immutable limits before workers can claim previously queued work."""
 
     search_routes = await database.facebook_search_work_routes()
+    request_budget_routes = await database.legacy_facebook_request_budget_routes()
     constraints = (
         *analysis_work_constraints(),
         *refresh_search_work_constraints(),
@@ -101,12 +108,17 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
         *pipeline_work_constraints(),
         *(facebook_search_work_constraint(route) for route in search_routes),
         *(facebook_effective_search_work_constraint(route) for route in search_routes),
+        *(facebook_network_path_constraint(route) for route in request_budget_routes),
     )
     retired_identifiers = (
         *legacy_image_session_work_constraint_identifiers(),
         ("carl", "facebook", "image", "network_activity_concurrency", "all_cdns", "v3"),
         *legacy_ebay_item_work_constraint_identifiers(),
         *await database.legacy_facebook_search_constraint_identifiers(),
+        *(
+            legacy_facebook_network_path_constraint_identifier(route)
+            for route in request_budget_routes
+        ),
     )
     operation_identifier = _identifier()
     started = perf_counter_ns()
@@ -136,7 +148,9 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
                 at_utc_ns=time_ns(),
                 reason=(
                     "Apply shared image concurrency 25, eBay description concurrency 10, "
-                    "and one Facebook search per requested/effective acquisition route"
+                    "and Facebook search concurrency one for Proton, twenty for Decodo "
+                    "per requested/effective acquisition route; count only Facebook HTTP "
+                    "requests in Facebook route budgets"
                 ),
             )
             await database.complete_operation(
@@ -243,6 +257,12 @@ async def managed_worker_pool(
             proton_manager=proton_manager,
         )
     )
+    travel_registry = build_travel_worker_registry(
+        TravelWorkerDependencies(
+            service=ConfiguredTravelService(directories=user_directories()),
+            new_identifier=_identifier,
+        )
+    )
     registry = WorkHandlerRegistry(
         handlers=(
             *analysis_registry.handlers,
@@ -256,6 +276,8 @@ async def managed_worker_pool(
             *facebook_listing_registry.handlers,
             *pipeline_registry.handlers,
             *pipeline_listing_registry.handlers,
+            *travel_registry.handlers,
+            *build_travel_data_worker_registry(TravelDataManager(user_directories())).handlers,
         )
     )
     services = WorkerRuntimeServices(

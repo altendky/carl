@@ -176,12 +176,9 @@ async def _collect(
                     {
                         "exception_type": error.result.get("exception_type"),
                         "failure_phase": error.result.get("failure_phase"),
-                        "cooldown": {
-                            "stack_identifier": payload.request.stack_identifier,
-                            "until_utc_ns": dependencies.utc_now_ns() + delay_ns,
-                        },
                     }
                 )
+                _set_retry_cooldown(reason, error.result, payload, delay_ns, dependencies)
             if policy_attempt < maximum_attempts:
                 return RetryWork(
                     inputs=homepage_inputs,
@@ -263,10 +260,7 @@ async def _collect(
         # cookie jar. Give blocked queries time to recover between those sessions.
         delay_ns = ebay_response_retry_delay_ns(policy_attempt, blocked=blocked)
         if blocked:
-            reason["cooldown"] = {
-                "stack_identifier": payload.request.stack_identifier,
-                "until_utc_ns": dependencies.utc_now_ns() + delay_ns,
-            }
+            _set_retry_cooldown(reason, result, payload, delay_ns, dependencies)
         if policy_attempt < maximum_attempts:
             return RetryWork(
                 inputs=tuple(inputs),
@@ -280,6 +274,26 @@ async def _collect(
             result={**result, "state": "terminal_failure"},
         )
     return CompletedWork(inputs=tuple(inputs), result=result)
+
+
+def _set_retry_cooldown(
+    reason: dict[str, JsonValue],
+    result: dict[str, JsonValue],
+    payload: CollectEbaySearchPayload,
+    delay_ns: int,
+    dependencies: EbaySearchWorkerDependencies,
+) -> None:
+    # The configured collector verifies session isolation using its actual
+    # provider settings. Keep the failing query's bounded durable retry, but do
+    # not pause sibling queries that select independent Decodo sessions. Unknown
+    # collectors and fixed exits retain the existing conservative stack scope.
+    if result.get("retry_scope") == "independent_session":
+        reason["retry_scope"] = "independent_session"
+        return
+    reason["cooldown"] = {
+        "stack_identifier": payload.request.stack_identifier,
+        "until_utc_ns": dependencies.utc_now_ns() + delay_ns,
+    }
 
 
 def build_ebay_worker_registry(dependencies: EbaySearchWorkerDependencies) -> WorkHandlerRegistry:

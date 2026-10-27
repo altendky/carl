@@ -1678,7 +1678,13 @@ class Database:
                 WHERE json_extract(identifier_parts_json, '$[0]') = 'carl'
                   AND json_extract(identifier_parts_json, '$[1]') = 'facebook'
                   AND json_extract(identifier_parts_json, '$[2]') = 'search'
-                  AND json_extract(identifier_parts_json, '$[4]') = 'v1'
+                  AND (
+                      json_extract(identifier_parts_json, '$[4]') = 'v1'
+                      OR (
+                          json_extract(identifier_parts_json, '$[4]') = 'v2'
+                          AND json_extract(identifier_parts_json, '$[5]') = 'decodo'
+                      )
+                  )
                   AND json_extract(identifier_parts_json, '$[3]') IN
                       ('route_concurrency', 'effective_route_concurrency')
                 ORDER BY identifier_parts_json
@@ -1686,6 +1692,27 @@ class Database:
             )
             rows = await cursor.fetchall()
         return tuple(CONSTRAINT_ADAPTER.validate_json(_text(row[0])).identifier for row in rows)
+
+    async def legacy_facebook_request_budget_routes(self) -> tuple[tuple[str, ...], ...]:
+        """Find persisted route-wide v2 budgets, including routes with no queued searches."""
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT scope_identity_json FROM scheduling_constraints
+                WHERE scope_kind='network_path' AND subject_kind='network_activity'
+                  AND constraint_kind='sliding_window_rate'
+                  AND json_extract(identifier_parts_json, '$[0]')='carl'
+                  AND json_extract(identifier_parts_json, '$[1]')='facebook'
+                  AND json_extract(identifier_parts_json, '$[2]')='network_path'
+                  AND json_extract(identifier_parts_json, '$[3]')='network_activity_rate'
+                  AND json_extract(identifier_parts_json, '$[4]')='v2'
+                ORDER BY scope_identity_json
+                """
+            )
+            return tuple(
+                tuple(str(part) for part in cast(list[JsonValue], decode_json(_text(row[0]))))
+                for row in await cursor.fetchall()
+            )
 
     async def facebook_search_work_routes(self) -> tuple[tuple[str, ...], ...]:
         """Discover still-active requested/effective routes, including retired aliases."""
@@ -5008,8 +5035,8 @@ class Database:
 
         Requested scopes and payloads remain intact. Only previous effective-route
         scopes are removed, including when waiting for the new route's capacity.
-        Every route, including Decodo, admits one search at a time across
-        processes and retains its effective acquisition scope.
+        Proton admits one search and Decodo admits twenty per effective route
+        across processes, retaining each search's acquisition scope.
         """
 
         constraint = facebook_effective_search_work_constraint(routing)
@@ -8150,6 +8177,87 @@ class Database:
         if row is None:
             raise AssertionError("Completion-boundary query returned no row")
         return _integer(row[0])
+
+    async def latest_travel_estimate_records(
+        self,
+        listing_identifiers: Sequence[str],
+        *,
+        origin_identity: str,
+        destination_identities: dict[str, str],
+        as_of_completion_sequence: int,
+    ) -> dict[str, tuple[str, JsonValue]]:
+        """Seek exact listings' newest completed route records at a frozen boundary."""
+
+        if (
+            len(listing_identifiers) > 1000
+            or any(not is_listing_identifier(identifier) for identifier in listing_identifiers)
+            or not origin_identity
+            or as_of_completion_sequence < 0
+            or any(not destination_identities.get(identifier) for identifier in listing_identifiers)
+        ):
+            raise ValueError("Travel estimate lookup bounds or identities are invalid")
+        if not listing_identifiers:
+            return {}
+        requested = [
+            {"listing_id": identifier, "destination_identity": destination_identities[identifier]}
+            for identifier in dict.fromkeys(listing_identifiers)
+        ]
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                WITH travel_requested AS MATERIALIZED (
+                    SELECT json_extract(value, '$.listing_id') AS listing_identifier,
+                           json_extract(value, '$.destination_identity') AS destination_identity
+                    FROM json_each(?)
+                ),
+                travel_ranked AS MATERIALIZED (
+                    SELECT requested.listing_identifier,
+                           estimate.id AS record_identifier,
+                           record.value_json,
+                           row_number() OVER (
+                               PARTITION BY requested.listing_identifier
+                               ORDER BY completed.sequence DESC, estimate.rowid DESC
+                           ) AS history_rank
+                    FROM travel_requested AS requested
+                    CROSS JOIN records AS record
+                        INDEXED BY records_listing_observation_listing
+                      ON json_extract(record.value_json, '$.listing_id') =
+                         requested.listing_identifier
+                    CROSS JOIN objects AS estimate
+                        INDEXED BY sqlite_autoindex_objects_1
+                      ON estimate.id = record.object_id
+                     AND estimate.kind_parts_json = ?
+                    CROSS JOIN operations AS operation
+                        INDEXED BY sqlite_autoindex_operations_1
+                      ON operation.id = estimate.created_by_operation_id
+                     AND operation.state = 'completed'
+                    CROSS JOIN work_operations AS work
+                        INDEXED BY sqlite_autoindex_work_operations_1
+                      ON work.operation_id = estimate.created_by_operation_id
+                    CROSS JOIN work_events AS completed
+                        INDEXED BY work_events_work_item
+                      ON completed.work_item_id = work.work_item_id
+                     AND completed.event_kind = 'completed'
+                     AND completed.sequence <= ?
+                    WHERE json_extract(record.value_json, '$.listing_id') IS NOT NULL
+                      AND record.schema_version = 1
+                      AND json_extract(record.value_json, '$.origin_identity') = ?
+                      AND json_extract(record.value_json, '$.destination_identity') =
+                          requested.destination_identity
+                )
+                SELECT listing_identifier, record_identifier, value_json
+                FROM travel_ranked
+                WHERE history_rank = 1
+                """,
+                (
+                    _json(requested),
+                    _json(["carl", "travel", "estimate"]),
+                    as_of_completion_sequence,
+                    origin_identity,
+                ),
+            )
+            rows = await cursor.fetchall()
+        return {_text(row[0]): (_text(row[1]), decode_json(_text(row[2]))) for row in rows}
 
     async def current_object_boundary(self) -> int:
         """Freeze immutable publications, including records without work events."""

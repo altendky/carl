@@ -343,6 +343,28 @@ from carl.core.review_workspace import (
     classify_review_state,
     review_mutation_request_sha256,
 )
+from carl.core.travel import TravelDestination, TravelEstimate, TravelFilters, TravelService
+from carl.core.travel_data import (
+    RequestTravelDataSetupResult,
+    TravelDataProvider,
+    TravelDatasetPage,
+    TravelDataSetupRequest,
+    TravelDataStatus,
+    travel_data_constraint,
+    travel_data_work,
+    travel_data_work_identifier,
+)
+from carl.core.travel_locations import listing_travel_destination
+from carl.core.travel_refresh import (
+    TRAVEL_ESTIMATE_RECORD_KIND,
+    RequestListingRouteRefresh,
+    RequestListingRouteRefreshResult,
+    TravelEstimateRecord,
+    TravelRefreshPayload,
+    refresh_listing_route_work,
+    travel_destination_identity,
+    travel_refresh_work_identifier,
+)
 from carl.core.work import WorkEventKind, WorkRequester, WorkState
 from carl.core.work_cancellation import WorkCancellationResult, WorkCancellationSummary
 from carl.core.workspace_search_results import (
@@ -380,6 +402,7 @@ from carl.io.provenance import (
     source_tree_sha256_async,
 )
 from carl.io.sqlite import Database
+from carl.io.travel_data import TravelDataManager
 from carl.marketplace_listing import ebay_observations, read_ebay_listing
 from carl.marketplace_projection import (
     _facebook_listing_statuses,
@@ -552,6 +575,273 @@ class ReviewApplication:
     server_started_at_utc_ns: int = field(default_factory=time_ns)
     server_code_provenance: CodeProvenance | None = None
     server_source_tree_sha256: str | None = None
+    travel_service: TravelService | None = None
+    travel_data_manager: TravelDataManager = field(
+        default_factory=lambda: TravelDataManager(user_directories())
+    )
+
+    async def get_travel_data_status(self, verify: bool = False) -> TravelDataStatus:
+        return await self.travel_data_manager.status(verify=verify)
+
+    async def list_travel_datasets(
+        self, limit: int = 20, cursor: str | None = None
+    ) -> TravelDatasetPage:
+        return await self.travel_data_manager.datasets(limit=limit, cursor=cursor)
+
+    async def activate_travel_dataset(
+        self, provider: TravelDataProvider, dataset_identifier: str
+    ) -> TravelDataStatus:
+        return await self.travel_data_manager.activate(provider, dataset_identifier)
+
+    async def request_travel_data_setup(
+        self, request: TravelDataSetupRequest
+    ) -> RequestTravelDataSetupResult:
+        identifier = travel_data_work_identifier(request.request_identifier)
+        async with self.database.transaction():
+            try:
+                existing = await self.database.work(identifier)
+            except KeyError:
+                existing = None
+            if existing is not None:
+                if (
+                    TravelDataSetupRequest.model_validate_json(encode_json(existing["payload"]))
+                    != request
+                ):
+                    raise ReviewInputError(
+                        "Travel data request identifier was already used for different inputs"
+                    )
+                return RequestTravelDataSetupResult(
+                    work_identifier=identifier,
+                    created=False,
+                    state=WorkState(str(existing["state"])),
+                )
+            await self.database.register_constraint(
+                travel_data_constraint(), registered_at_utc_ns=self.utc_now_ns()
+            )
+            enqueued = await self.database.enqueue_work(
+                travel_data_work(request),
+                WorkRequester(
+                    request_identifier=self.new_identifier(),
+                    kind=("carl", "mcp", "request_travel_data_setup"),
+                    identifier=request.provider,
+                    context={"request": request.model_dump(mode="json")},
+                ),
+                event_identifier=self.new_identifier(),
+                enqueued_at_utc_ns=self.utc_now_ns(),
+            )
+        return RequestTravelDataSetupResult(
+            work_identifier=enqueued.work_item_identifier,
+            created=enqueued.created,
+            state=await self.database.work_state(enqueued.work_item_identifier),
+            message="Setup/update queued. A Carl worker must run to process it; startup alone never schedules a build. Poll get_work_status and get_travel_data_status for progress.",
+        )
+
+    async def _travel_origin_identity(self, *, enabled: bool) -> str | None:
+        if not enabled or self.travel_service is None:
+            return None
+        return await self.travel_service.origin_identity()
+
+    async def _travel_inputs(
+        self,
+        projections: Sequence[ComposedListingProjection],
+        *,
+        observations: dict[str, tuple[ListingObservationCandidate, ...]] | None = None,
+        search_cards: dict[str, tuple[SearchCardCandidate, ...]] | None = None,
+    ) -> tuple[tuple[TravelDestination, ...], tuple[tuple[str, ...], ...]]:
+        if not projections:
+            return (), ()
+        identifiers = tuple(
+            item.listing_identifier
+            for item in projections
+            if not item.listing_identifier.startswith("ebay:")
+        )
+        as_of = projections[0].as_of_completion_sequence
+        if observations is None:
+            candidates = (
+                await self.database.facebook_projection_item_observations(
+                    identifiers, as_of_completion_sequence=as_of, maximum_per_listing=100
+                )
+                if identifiers
+                else ()
+            )
+            observations, _ = self._bounded_observations_by_listing(
+                candidates, maximum_per_listing=100
+            )
+        if search_cards is None:
+            cards = (
+                await self.database.facebook_projection_search_cards(
+                    identifiers, as_of_completion_sequence=as_of, maximum_per_listing=100
+                )
+                if identifiers
+                else ()
+            )
+            search_cards, _ = self._bounded_search_cards_by_listing(cards, maximum_per_listing=100)
+        destinations = tuple(
+            listing_travel_destination(
+                observations=observations.get(item.listing_identifier, ()),
+                search_cards=search_cards.get(item.listing_identifier, ()),
+                label=None if item.location is None else item.location.value,
+            )
+            for item in projections
+        )
+        sources: list[tuple[str, ...]] = []
+        for item in projections:
+            evidence = [
+                candidate.evidence
+                for candidate in (
+                    *observations.get(item.listing_identifier, ()),
+                    *search_cards.get(item.listing_identifier, ()),
+                )
+            ]
+            if item.location is not None:
+                evidence.append(item.location.evidence)
+            sources.append(
+                tuple(dict.fromkeys(source.evidence_record_identifier for source in evidence))
+            )
+        return destinations, tuple(sources)
+
+    async def _with_travel_estimates(
+        self,
+        projections: Sequence[ComposedListingProjection],
+        *,
+        observations: dict[str, tuple[ListingObservationCandidate, ...]] | None = None,
+        search_cards: dict[str, tuple[SearchCardCandidate, ...]] | None = None,
+    ) -> tuple[ComposedListingProjection, ...]:
+        if not projections or self.travel_service is None:
+            return tuple(projections)
+        destinations, _ = await self._travel_inputs(
+            projections, observations=observations, search_cards=search_cards
+        )
+        origin_identity = await self.travel_service.origin_identity()
+        identities = {
+            item.listing_identifier: travel_destination_identity(destination)
+            for item, destination in zip(projections, destinations, strict=True)
+        }
+        retained = await self.database.latest_travel_estimate_records(
+            tuple(item.listing_identifier for item in projections),
+            origin_identity=origin_identity,
+            destination_identities=identities,
+            as_of_completion_sequence=projections[0].as_of_completion_sequence,
+        )
+        estimates: list[TravelEstimate | None] = [None] * len(projections)
+        missing: list[int] = []
+        for index, item in enumerate(projections):
+            stored = retained.get(item.listing_identifier)
+            if stored is None:
+                missing.append(index)
+            else:
+                identifier, value = stored
+                record = TravelEstimateRecord.model_validate(value)
+                if (
+                    record.estimate.expires_at_utc is None
+                    or datetime.fromisoformat(record.estimate.expires_at_utc).timestamp()
+                    <= self.utc_now_ns() / 1_000_000_000
+                ):
+                    missing.append(index)
+                else:
+                    estimates[index] = record.estimate.model_copy(
+                        update={"record_identifier": identifier}
+                    )
+        fetched = (
+            await self.travel_service.estimate_many(tuple(destinations[index] for index in missing))
+            if missing
+            else ()
+        )
+        if len(fetched) != len(missing):
+            raise ValueError("Travel service returned a mismatched estimate count")
+        for index, estimate in zip(missing, fetched, strict=True):
+            estimates[index] = estimate
+        if len(estimates) != len(projections):
+            raise ValueError("Travel service returned a mismatched estimate count")
+        return tuple(
+            projection.model_copy(update={"route_estimate": estimate})
+            for projection, estimate in zip(projections, estimates, strict=True)
+        )
+
+    async def _route_refresh_replay(
+        self, request: RequestListingRouteRefresh
+    ) -> RequestListingRouteRefreshResult | None:
+        identifier = travel_refresh_work_identifier(request.request_identifier)
+        try:
+            work = await self.database.work(identifier)
+        except KeyError:
+            return None
+        payload = TravelRefreshPayload.model_validate_json(encode_json(work["payload"]))
+        if payload.request != request:
+            raise ReviewInputError(
+                "Route refresh request identifier was already used for different inputs"
+            )
+        return RequestListingRouteRefreshResult(
+            work_identifier=identifier,
+            created=False,
+            state=WorkState(str(work["state"])),
+            listing_identifier=request.listing_identifier,
+        )
+
+    async def request_listing_route_refresh(
+        self, request: RequestListingRouteRefresh
+    ) -> RequestListingRouteRefreshResult:
+        replay = await self._route_refresh_replay(request)
+        if replay is not None:
+            return replay
+        if self.travel_service is None:
+            raise ReviewInputError("Routing service is not configured")
+        if request.workspace_record_identifier is not None:
+            workspace = await self.get_review_workspace(request.workspace_record_identifier)
+            _, _, projections = await self._workspace_bulk_review_projections(
+                workspace,
+                maximum_candidate_listings_examined=1,
+                selected_listing_identifiers=(request.listing_identifier,),
+            )
+            if not projections:
+                raise ReviewInputError("Listing is outside the active workspace scope")
+            projection = projections[0]
+        else:
+            projection = await self.get_composed_listing(
+                GetComposedListingRequest(
+                    listing_identifier=request.listing_identifier,
+                    maximum_gallery_images=0,
+                    maximum_analyses=0,
+                    include_travel=False,
+                )
+            )
+        destinations, sources = await self._travel_inputs((projection,))
+        payload = TravelRefreshPayload(
+            request=request,
+            destination=destinations[0],
+            origin_identity=await self.travel_service.origin_identity(),
+            destination_identity=travel_destination_identity(destinations[0]),
+            source_record_identifiers=sources[0],
+        )
+        # Serialize request-ID replay checks with enqueue; source/provider work
+        # above deliberately occurs before taking the database writer.
+        async with self.database.transaction():
+            replay = await self._route_refresh_replay(request)
+            if replay is not None:
+                return replay
+            enqueued = await self.database.enqueue_work(
+                refresh_listing_route_work(payload),
+                WorkRequester(
+                    request_identifier=self.new_identifier(),
+                    kind=("carl", "mcp", "request_listing_route_refresh"),
+                    identifier=request.workspace_record_identifier or request.listing_identifier,
+                    context={"request": request.model_dump(mode="json")},
+                ),
+                event_identifier=self.new_identifier(),
+                enqueued_at_utc_ns=self.utc_now_ns(),
+            )
+        return RequestListingRouteRefreshResult(
+            work_identifier=enqueued.work_item_identifier,
+            created=enqueued.created,
+            state=await self.database.work_state(enqueued.work_item_identifier),
+            listing_identifier=request.listing_identifier,
+        )
+
+    async def get_listing_route_estimate(self, record_identifier: str) -> TravelEstimateRecord:
+        kind, schema, value = await self.database.get_record(record_identifier)
+        if kind != TRAVEL_ESTIMATE_RECORD_KIND or schema != 1:
+            raise ReviewInputError("Record is not a supported route estimate")
+        return TravelEstimateRecord.model_validate(value)
 
     async def _code_provenance(self) -> CodeProvenance:
         if self.code_provenance is not None:
@@ -574,8 +864,9 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=58),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=43),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=62),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=47),
+                ServerCapability(identity=("carl", "review", "driving_estimates"), version=4),
                 ServerCapability(identity=("carl", "mcp", "response_pages"), version=3),
                 ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
@@ -1078,7 +1369,10 @@ class ReviewApplication:
         if request.listing_identifier.startswith("ebay:") or await scope_contains_ebay(
             self.database, roots
         ):
-            return await get_marketplace_composed_listing(self, request)
+            projection = await get_marketplace_composed_listing(self, request)
+            if request.include_travel:
+                return (await self._with_travel_estimates((projection,)))[0]
+            return projection
         if request.product_guide_record_identifier is not None:
             await self._active_product_guide(request.product_guide_record_identifier)
         as_of = await self.database.current_completion_boundary()
@@ -1171,9 +1465,19 @@ class ReviewApplication:
                 if condition
             ),
         )
+        if request.include_travel:
+            return (
+                await self._with_travel_estimates(
+                    (projection,),
+                    observations={request.listing_identifier: observations},
+                    search_cards={request.listing_identifier: search_cards},
+                )
+            )[0]
         return projection
 
     async def list_composed_search(self, request: ListComposedSearchRequest) -> ComposedListingPage:
+        travel_enabled = request.include_travel or request.filters.travel.active
+        travel_origin_identity = await self._travel_origin_identity(enabled=travel_enabled)
         if await scope_contains_ebay(
             self.database,
             (
@@ -1187,7 +1491,9 @@ class ReviewApplication:
                 None if request.cursor is None else decode_composed_listing_cursor(request.cursor)
             )
             if cursor is not None:
-                validate_composed_listing_cursor_scope(cursor, request)
+                validate_composed_listing_cursor_scope(
+                    cursor, request, travel_origin_identity=travel_origin_identity
+                )
         except ValueError as error:
             raise ReviewInputError(str(error)) from error
         if request.filters.product_guide_record_identifier is not None:
@@ -1235,6 +1541,7 @@ class ReviewApplication:
         selected_statuses: dict[str, tuple[StatusObservationCandidate, ...]] = {}
         selected_analyses: dict[str, tuple[ProjectionAnalysisDescriptor, ...]] = {}
         selected_warnings: dict[str, tuple[str, ...]] = {}
+        nontravel_filters = request.filters.model_copy(update={"travel": TravelFilters()})
         examined = 0
         last_examined = None
         evidence_chunk_size = 100
@@ -1275,10 +1582,11 @@ class ReviewApplication:
             for status in search_statuses:
                 statuses_by_listing.setdefault(status.listing_identifier, []).append(status)
 
+            chunk_projections: list[ComposedListingProjection] = []
+            matching_analyses: dict[str, bool] = {}
+            route_candidates: list[ComposedListingProjection] = []
             for membership_candidate in chunk:
                 listing_identifier = membership_candidate.candidate.listing_identifier
-                examined += 1
-                last_examined = membership_candidate.candidate
                 listing_observations = frozen_observations.get(listing_identifier, ())
                 listing_search_cards = frozen_search_cards.get(listing_identifier, ())
                 listing_statuses = tuple(statuses_by_listing.get(listing_identifier, ()))
@@ -1311,17 +1619,50 @@ class ReviewApplication:
                     maximum_gallery_images=0,
                     warnings=listing_warnings,
                 )
+                chunk_projections.append(projection)
+                matching_analyses[listing_identifier] = matching_analysis_present
+                if composed_listing_matches_filters(
+                    projection,
+                    nontravel_filters,
+                    matching_analysis_present=matching_analysis_present,
+                ):
+                    route_candidates.append(projection)
+                    if not request.filters.travel.active and (
+                        len(route_candidates) >= request.page_size - len(selected)
+                    ):
+                        break
+            enriched = (
+                await self._with_travel_estimates(
+                    route_candidates,
+                    observations=frozen_observations,
+                    search_cards=frozen_search_cards,
+                )
+                if travel_enabled
+                else tuple(route_candidates)
+            )
+            enriched_by_identifier = {item.listing_identifier: item for item in enriched}
+            for membership_candidate, provisional in zip(
+                chunk[: len(chunk_projections)], chunk_projections, strict=True
+            ):
+                projection = enriched_by_identifier.get(provisional.listing_identifier, provisional)
+                listing_identifier = projection.listing_identifier
+                examined += 1
+                last_examined = membership_candidate.candidate
+                listing_observations = frozen_observations.get(listing_identifier, ())
+                listing_search_cards = frozen_search_cards.get(listing_identifier, ())
+                listing_statuses = tuple(statuses_by_listing.get(listing_identifier, ()))
+                listing_analyses = analyses_by_listing.get(listing_identifier, ())
                 if composed_listing_matches_filters(
                     projection,
                     request.filters,
-                    matching_analysis_present=matching_analysis_present,
+                    matching_analysis_present=matching_analyses[listing_identifier],
                 ):
                     selected.append(projection)
                     selected_observations[listing_identifier] = listing_observations
                     selected_search_cards[listing_identifier] = listing_search_cards
                     selected_statuses[listing_identifier] = listing_statuses
                     selected_analyses[listing_identifier] = listing_analyses
-                    selected_warnings[listing_identifier] = listing_warnings
+                    selected_warnings[listing_identifier] = projection.warnings
                     if len(selected) >= request.page_size:
                         break
             if len(selected) >= request.page_size:
@@ -1360,7 +1701,9 @@ class ReviewApplication:
                 ),
                 warnings=selected_warnings[listing_identifier],
             )
-            finalized.append(projection)
+            finalized.append(
+                projection.model_copy(update={"route_estimate": provisional.route_estimate})
+            )
         final_listings = tuple(finalized)
         more_candidates_may_exist = last_examined is not None and (
             examined < len(membership_candidates) or candidate_lookahead_present
@@ -1371,7 +1714,9 @@ class ReviewApplication:
             else encode_composed_listing_cursor(
                 ComposedListingCursor(
                     as_of_completion_sequence=as_of,
-                    scope_sha256=composed_listing_cursor_scope_sha256(request),
+                    scope_sha256=composed_listing_cursor_scope_sha256(
+                        request, travel_origin_identity=travel_origin_identity
+                    ),
                     after_membership_completion_sequence=(
                         last_examined.search_run_completion_sequence
                     ),
@@ -1429,6 +1774,7 @@ class ReviewApplication:
                 maximum_candidate_listings_examined=(request.maximum_candidate_listings_examined),
                 page_size=request.page_size,
                 cursor=request.cursor,
+                include_travel=request.include_travel,
             )
         )
         return WorkspaceListingPage(
@@ -1465,6 +1811,7 @@ class ReviewApplication:
                     analysis_available=(bool(listing.analyses) or listing.analyses_truncated),
                     projection_revision_sha256=(listing.projection_revision.aggregate_sha256),
                     warnings=listing.warnings,
+                    route_estimate=listing.route_estimate,
                 )
                 for listing in page.listings
             ),
@@ -1745,6 +2092,7 @@ class ReviewApplication:
                 maximum_gallery_images=request.maximum_gallery_images,
                 maximum_analyses=request.maximum_analyses,
                 maximum_observations=request.maximum_observations,
+                include_travel=request.include_travel,
             )
         )
         prior_by_listing = await self._latest_listing_reviews(
@@ -3388,11 +3736,13 @@ class ReviewApplication:
                     filters=ComposedListingFilters(
                         statuses=request.statuses,
                         product_guide_record_identifier=(workspace.product_guide_record_identifier),
+                        travel=request.travel,
                     ),
                     maximum_gallery_images_per_listing=10,
                     maximum_analyses_per_listing=5,
                     page_size=request.page_size - len(selected),
                     cursor=cursor,
+                    include_travel=request.include_travel,
                 )
             )
             scanned_pages += 1
@@ -3696,6 +4046,7 @@ class ReviewApplication:
                         product_guide_record_identifier=(workspace.product_guide_record_identifier),
                         maximum_gallery_images=0,
                         maximum_analyses=0,
+                        include_travel=False,
                     )
                 )
                 if current.projection_revision != review.projection_revision:
@@ -4308,6 +4659,7 @@ class ReviewApplication:
                             ),
                             maximum_gallery_images=0,
                             maximum_analyses=0,
+                            include_travel=False,
                         )
                     )
                     for identifier in identifiers
@@ -5904,6 +6256,7 @@ class ReviewApplication:
                         listing_identifier=identifier,
                         maximum_gallery_images=0,
                         maximum_analyses=0,
+                        include_travel=False,
                     )
                 )
                 statuses[identifier] = projection.status.value
@@ -5949,6 +6302,7 @@ class ReviewApplication:
                         page_size=min(100, maximum_candidate_listings_examined),
                         maximum_candidate_listings_examined=maximum_candidate_listings_examined,
                         maximum_analyses_per_listing=0,
+                        include_travel=False,
                         cursor=cursor,
                     )
                 )
@@ -6887,6 +7241,7 @@ class ReviewApplication:
                 GetComposedListingRequest(
                     listing_identifier=request.external_identifier,
                     maximum_gallery_images=request.maximum_images,
+                    include_travel=False,
                 )
             )
         except KeyError:

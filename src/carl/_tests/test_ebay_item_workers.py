@@ -99,6 +99,7 @@ def _item_html() -> bytes:
         '<h1 class="x-item-title__mainTitle">Workshop vise</h1>'
         '<div class="x-price-primary">US $35.00</div>'
         '<div class="x-item-condition-text">Used</div>'
+        '<div class="ux-labels-values--itemLocation">Item location: Example City, PA, United States</div>'
         '<div class="ux-image-carousel">'
         f'<img src="{IMAGE_URL}"><img src="{IMAGE_URL}"></div>'
         '<div class="recommendations"><img src="https://i.ebayimg.com/unrelated.png"></div>'
@@ -351,6 +352,18 @@ async def test_durable_item_pipeline_retains_html_and_schedules_description_and_
         _, _, value = await database.get_record(observation_identifier)
         observation = _mapping(value)
         assert observation["title"] == "Workshop vise"
+        assert observation["location_text"] == "Example City, PA, United States"
+        extraction_handler = next(
+            handler
+            for handler in registry.handlers
+            if handler.capability.kind == EXTRACT_EBAY_ITEM_WORK_KIND
+        )
+        assert extraction_handler.component.output_schema_version == 2
+        with apsw.Connection(str(database.path), flags=apsw.SQLITE_OPEN_READONLY) as connection:
+            assert connection.execute(
+                "SELECT output_schema_version FROM operations WHERE id=?",
+                (_string(observation["operation_identifier"]),),
+            ).fetchone() == (2,)
         assert observation["acquisition_record_identifier"] == acquisition_identifier
         assert observation["gallery_urls"] == [IMAGE_URL]
         decoded_identifier = _string(observation["decoded_body_artifact_identifier"])

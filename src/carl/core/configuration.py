@@ -1,5 +1,6 @@
 """Pure, versioned configuration values for concrete network routes."""
 
+from pathlib import Path
 from typing import Annotated, Literal, cast
 
 from pydantic import BeforeValidator, Field, field_validator, model_validator
@@ -17,6 +18,7 @@ from carl.core.routing import (
     RemoteProxyEndpoint,
     WireproxyIdentity,
 )
+from carl.core.travel import TravelCoordinate
 
 
 def _tuple_from_toml(value: object) -> object:
@@ -343,11 +345,70 @@ class EbayItemConfiguration(StrictModel):
         return self
 
 
+class TravelOriginConfiguration(StrictModel):
+    origin: TravelCoordinate | None = None
+    origin_label: str | None = Field(default=None, min_length=1, max_length=500)
+    country_code: str | None = Field(default=None, pattern=r"^[A-Z]{2,3}$")
+    cache_ttl_seconds: int = Field(default=604_800, ge=60, le=2_678_400)
+    maximum_geocodes_per_batch: int = Field(default=20, ge=0, le=100)
+
+
+class OpenrouteserviceConfiguration(TravelOriginConfiguration):
+    """Private API access reference; legacy origin settings remain supported."""
+
+    credential_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+class TravelConfiguration(TravelOriginConfiguration):
+    provider: Literal["openrouteservice", "osrm"] = "openrouteservice"
+    geocoding_provider: Literal["openrouteservice", "geonames", "disabled"] = "openrouteservice"
+
+
+class OsrmConfiguration(StrictModel):
+    dataset_path: Path
+    dataset_identifier: str = Field(min_length=1, max_length=200)
+    maximum_snap_distance_meters: float = Field(default=5000, gt=0, le=20000)
+    use_mmap: bool = True
+
+    @field_validator("dataset_path", mode="before")
+    @classmethod
+    def parse_path(cls, value: object) -> object:
+        return Path(value) if isinstance(value, str) else value
+
+    @field_validator("dataset_path")
+    @classmethod
+    def require_absolute_dataset_path(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("OSRM dataset path must be absolute")
+        return value
+
+
+class GeonamesConfiguration(StrictModel):
+    database_path: Path
+    dataset_identifier: str = Field(min_length=1, max_length=200)
+
+    @field_validator("database_path", mode="before")
+    @classmethod
+    def parse_path(cls, value: object) -> object:
+        return Path(value) if isinstance(value, str) else value
+
+    @field_validator("database_path")
+    @classmethod
+    def require_absolute_database_path(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("GeoNames database path must be absolute")
+        return value
+
+
 class CarlConfiguration(StrictModel):
     schema_identity: ConfigurationSchemaIdentity = Field(alias="schema")
     wireproxy: WireproxyToolConfiguration
     ebay_search: EbaySearchConfiguration = Field(default_factory=EbaySearchConfiguration)
     ebay_item: EbayItemConfiguration = Field(default_factory=EbayItemConfiguration)
+    openrouteservice: OpenrouteserviceConfiguration | None = None
+    travel: TravelConfiguration | None = None
+    osrm: OsrmConfiguration | None = None
+    geonames: GeonamesConfiguration | None = None
     http_transports: Annotated[
         tuple[HttpTransportConfiguration, ...], BeforeValidator(_tuple_from_toml)
     ] = ()
@@ -359,8 +420,19 @@ class CarlConfiguration(StrictModel):
         tuple[NetworkRouteOverride, ...], BeforeValidator(_tuple_from_toml)
     ] = ()
 
+    def travel_settings(self) -> TravelConfiguration | None:
+        if self.travel is not None:
+            return self.travel
+        if self.openrouteservice is None:
+            return None
+        return TravelConfiguration.model_validate_json(
+            self.openrouteservice.model_dump_json(exclude={"credential_id"})
+        )
+
     @model_validator(mode="after")
     def validate_unique_components(self) -> "CarlConfiguration":
+        if self.travel is not None and self.travel.provider == "osrm" and self.osrm is None:
+            raise ValueError("The OSRM travel provider requires an osrm dataset configuration")
         paths = tuple(route.network_path for route in self.routes)
         if len(paths) != len(set(paths)):
             raise ValueError("Duplicate network_path")

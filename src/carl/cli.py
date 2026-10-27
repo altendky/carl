@@ -154,9 +154,11 @@ from carl.io.sqlite import Database
 from carl.io.worker import WorkerRuntimeServices, execute_lease
 from carl.mcp_server import serve_stdio
 from carl.review import ReviewApplication
+from carl.travel_cli import travel_app
 from carl.work_runtime import managed_worker_pool, work_forever
 
 app = App(name="carl", help="Preserve web evidence and derived information")
+app.command(travel_app)
 _HEADER_PAIRS = TypeAdapter(list[tuple[str, str]], config=ConfigDict(strict=True))
 
 

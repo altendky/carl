@@ -14,6 +14,8 @@ from carl.core.content_encoding import decoded_stored_body
 from carl.core.facebook_work import (
     FACEBOOK_NETWORK_PATH_RATE_MAXIMUM_STARTS,
     facebook_network_path_constraint,
+    facebook_request_budget_scope,
+    legacy_facebook_network_path_constraint_identifier,
 )
 from carl.core.http import RequestPlan, stored_content_encodings, stored_header_values
 from carl.core.marketplace_images import MARKETPLACE_IMAGE_MAXIMUM_ACTIVE, MARKETPLACE_IMAGE_SCOPE
@@ -399,6 +401,7 @@ def legacy_image_network_constraint_identifiers(
     """Old limits matching images, including source rules scoped too broadly."""
 
     return (
+        legacy_facebook_network_path_constraint_identifier(routing),
         ("carl", "facebook", "image", "network_activity_concurrency", "all_cdns"),
         (
             "carl",
@@ -530,6 +533,7 @@ def image_network_activity(
         scopes=(
             SchedulingScope(kind=SchedulingScopeKind.OVERALL, identity=()),
             SchedulingScope(kind=SchedulingScopeKind.NETWORK_PATH, identity=routing),
+            facebook_request_budget_scope(routing),
             SchedulingScope(
                 kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND, identity=IMAGE_NETWORK_ACTIVITY_KIND
             ),

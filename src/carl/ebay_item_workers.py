@@ -1356,7 +1356,7 @@ def build_ebay_item_worker_registry(
                 capability=WorkCapability(
                     kind=EXTRACT_EBAY_ITEM_WORK_KIND, payload_schema_version=1
                 ),
-                component=Component(EXTRACT_ITEM, 1, extract_ebay_item),
+                component=Component(EXTRACT_ITEM, 2, extract_ebay_item),
                 payload_type=ExtractEbayItemPayload,
                 handler=extract,
             ),

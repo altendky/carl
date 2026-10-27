@@ -134,6 +134,19 @@ from carl.core.review_workspace import (
     WorkspaceWorkWaitResult,
 )
 from carl.core.tool_response_pages import ToolResponseReadResult
+from carl.core.travel_data import (
+    RequestTravelDataSetupResult,
+    TravelDataFailure,
+    TravelDataProvider,
+    TravelDatasetPage,
+    TravelDataSetupRequest,
+    TravelDataStatus,
+)
+from carl.core.travel_refresh import (
+    RequestListingRouteRefresh,
+    RequestListingRouteRefreshResult,
+    TravelEstimateRecord,
+)
 from carl.core.work_cancellation import WorkCancellationResult
 from carl.core.workspace_search_results import (
     ListWorkspaceSearchResultsRequest,
@@ -146,7 +159,9 @@ from carl.core.workspace_summaries import (
 from carl.io.claude import ClaudeCli
 from carl.io.mcp_errors import report_mcp_failure
 from carl.io.mcp_response_budget import BudgetedMCPServer, ToolResponseStore
+from carl.io.paths import user_directories
 from carl.io.provenance import collect_code_provenance_async, source_tree_sha256_async
+from carl.io.routing import ConfiguredTravelService
 from carl.io.sqlite import Database
 from carl.review import IncompleteGalleryError, ReviewApplication, ReviewInputError
 
@@ -155,6 +170,12 @@ _READ_ONLY = ToolAnnotations(
     destructive_hint=False,
     idempotent_hint=True,
     open_world_hint=False,
+)
+_OPEN_WORLD_READ_ONLY = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=True,
 )
 _LOCAL_MUTATION = ToolAnnotations(
     read_only_hint=False,
@@ -372,8 +393,35 @@ Workspace processing roots also appear in get_workspace_work_status. Pipeline pr
 replace the explicit search-refresh workflow or advance workspace search tracks.
 MCP servers do not run workers. Keep `carl work` or `carl monitor --work` running while queued work
 should progress. Review with list_composed_search or get_composed_listing, fetching full reports or
-images only when needed. These read only retained database evidence, make no network requests, and
-compose a projection at a fixed database completion boundary. Status, scalar fields, a coherent
+images only when needed. Marketplace evidence reads compose a projection at a fixed database
+completion boundary. When routing is configured, listing and review reads additionally return
+cached driving distance/time estimates from the local configured origin, requesting missing
+estimates from the configured openrouteservice or local OSRM provider. Local OSRM uses a prepared
+road dataset without hosted Matrix requests; text-only locations may still use the separately
+configured geocoder. Provider selection is explicit, with no automatic fallback. Set
+travel.geocoding_provider="geonames" for offline US city/state/ZIP conversion. Use
+get_travel_data_status before local routing to check readiness and corrective actions; a missing
+dataset remains unavailable and is never downloaded by a listing read or worker startup.
+request_travel_data_setup explicitly queues setup or update for provider="osrm" or "geonames";
+a worker must run to perform it. Poll get_work_status and get_travel_data_status for progress.
+OSRM builds require osmium-tool on PATH and substantial memory/disk; the previous 250-mile build
+used about 23 GiB peak RAM and 30 minutes preparation. GeoNames downloads full US localities and
+ZIPs. Setup verifies a new immutable version before activation; old versions remain installed.
+Use list_travel_datasets for paged versions and activate_travel_dataset to roll back. Full
+verify=true status and activation hash all selected files and can take time; prefer CLI
+carl travel verify / activate for a large routing dataset if MCP timeouts are restrictive. Set
+include_travel=false to skip routing requests; active
+filters.travel thresholds still require estimates. Travel filters accept maximum_driving_distance_miles
+and maximum_driving_duration_minutes; unknown destinations remain visible unless include_unknown=false.
+Estimates use approximate seller locations and are separate from reviewed evidence and its revision.
+Use request_listing_route_refresh to queue only driving-distance/time calculation for one exact
+listing, optionally owned by a workspace. A new request_identifier creates an independent immutable
+estimate record; replay the same identifier to recover the same work. The worker bypasses cached
+route metrics and retains its location inputs. get_work_status returns estimate_record_identifier
+when finished; get_listing_route_estimate reads that exact record. Composed reads prefer the latest
+retained estimate matching the current origin and listing location, including explicit unavailable
+results. Changed inputs cannot reuse an old record. This does not refresh marketplace pages or images.
+Status, scalar fields, a coherent
 gallery, analyses, and membership select evidence independently and can have different ages;
 the boundary does not imply that their sources were observed together. Re-extraction does not
 advance acquisition age. list_composed_search defaults to available listings only;
@@ -550,6 +598,8 @@ async def _expected[T](
         raise ToolError(message) from error
     except ReviewInputError as error:
         raise ToolError(str(error)) from error
+    except TravelDataFailure as error:
+        raise ToolError(f"{error.reason}: {error.message}") from None
     except KeyError as error:
         identifier = error.args[0] if error.args else "requested object"
         raise ToolError(f"Carl object was not found: {identifier}") from error
@@ -607,6 +657,30 @@ def tool_definitions(
     """Construct the immutable, duplicate-checked Carl MCP tool registry."""
 
     response_store = response_store or ToolResponseStore()
+
+    async def get_travel_data_status(verify: bool = False) -> TravelDataStatus:
+        """Check local routing/geocoding readiness and build progress; verify=true hashes active data and may take time."""
+        return await expected(lambda: application.get_travel_data_status(verify))
+
+    async def list_travel_datasets(
+        limit: Annotated[int, Field(ge=1, le=50)] = 20, cursor: str | None = None
+    ) -> TravelDatasetPage:
+        """Page installed immutable map and geocoder versions, marking selected datasets."""
+        return await expected(lambda: application.list_travel_datasets(limit, cursor))
+
+    async def request_travel_data_setup(
+        request: TravelDataSetupRequest,
+    ) -> RequestTravelDataSetupResult:
+        """Explicitly queue setup/update of OSRM or GeoNames; requires a running worker, preserves old data, optionally activates after verification."""
+        return await expected(lambda: application.request_travel_data_setup(request))
+
+    async def activate_travel_dataset(
+        provider: TravelDataProvider, dataset_identifier: str
+    ) -> TravelDataStatus:
+        """Verify an installed dataset and atomically select it in private config; supports rollback without rebuilding."""
+        return await expected(
+            lambda: application.activate_travel_dataset(provider, dataset_identifier)
+        )
 
     async def get_tool_response_page(
         cursor: str, acknowledge: bool = False
@@ -1018,6 +1092,18 @@ def tool_definitions(
 
         return await expected(lambda: application.request_search_refresh(request))
 
+    async def request_listing_route_refresh(
+        request: RequestListingRouteRefresh,
+    ) -> RequestListingRouteRefreshResult:
+        """Queue only driving-distance/time refresh for one listing; retain an independent estimate record."""
+
+        return await expected(lambda: application.request_listing_route_refresh(request))
+
+    async def get_listing_route_estimate(record_identifier: str) -> TravelEstimateRecord:
+        """Read one immutable driving estimate, its frozen destination and origin identity."""
+
+        return await expected(lambda: application.get_listing_route_estimate(record_identifier))
+
     async def request_search_pipeline(
         request: RequestSearchPipelineRequest,
     ) -> SearchPipelineRequestResult:
@@ -1236,14 +1322,14 @@ def tool_definitions(
             ("carl", "review", "get_composed_listing"),
             get_composed_listing,
             get_composed_listing.__doc__ or "",
-            _READ_ONLY,
+            _OPEN_WORLD_READ_ONLY,
         ),
         ToolDefinition(
             "list_composed_search",
             ("carl", "review", "list_composed_search"),
             list_composed_search,
             list_composed_search.__doc__ or "",
-            _READ_ONLY,
+            _OPEN_WORLD_READ_ONLY,
         ),
         ToolDefinition(
             "create_review_workspace",
@@ -1320,14 +1406,14 @@ def tool_definitions(
             ("carl", "review", "list_workspace_listings"),
             list_workspace_listings,
             list_workspace_listings.__doc__ or "",
-            _READ_ONLY,
+            _OPEN_WORLD_READ_ONLY,
         ),
         ToolDefinition(
             "get_workspace_listing",
             ("carl", "review", "get_workspace_listing"),
             get_workspace_listing,
             get_workspace_listing.__doc__ or "",
-            _READ_ONLY,
+            _OPEN_WORLD_READ_ONLY,
         ),
         ToolDefinition(
             "list_workspace_search_results",
@@ -1404,7 +1490,7 @@ def tool_definitions(
             ("carl", "review", "acquire_batch"),
             acquire_review_batch,
             acquire_review_batch.__doc__ or "",
-            _IDEMPOTENT_LOCAL_MUTATION,
+            _IDEMPOTENT_OPEN_WORLD_MUTATION,
         ),
         ToolDefinition(
             "renew_review_claim",
@@ -1573,6 +1659,48 @@ def tool_definitions(
             request_selection_analyses,
             request_selection_analyses.__doc__ or "",
             _OPEN_WORLD_MUTATION,
+        ),
+        ToolDefinition(
+            "request_listing_route_refresh",
+            ("carl", "travel", "request_listing_route_refresh"),
+            request_listing_route_refresh,
+            request_listing_route_refresh.__doc__ or "",
+            _IDEMPOTENT_OPEN_WORLD_MUTATION,
+        ),
+        ToolDefinition(
+            "get_travel_data_status",
+            ("carl", "travel", "get_travel_data_status"),
+            get_travel_data_status,
+            get_travel_data_status.__doc__ or "",
+            _READ_ONLY,
+        ),
+        ToolDefinition(
+            "list_travel_datasets",
+            ("carl", "travel", "list_travel_datasets"),
+            list_travel_datasets,
+            list_travel_datasets.__doc__ or "",
+            _READ_ONLY,
+        ),
+        ToolDefinition(
+            "request_travel_data_setup",
+            ("carl", "travel", "request_travel_data_setup"),
+            request_travel_data_setup,
+            request_travel_data_setup.__doc__ or "",
+            _IDEMPOTENT_OPEN_WORLD_MUTATION,
+        ),
+        ToolDefinition(
+            "activate_travel_dataset",
+            ("carl", "travel", "activate_travel_dataset"),
+            activate_travel_dataset,
+            activate_travel_dataset.__doc__ or "",
+            _IDEMPOTENT_LOCAL_MUTATION,
+        ),
+        ToolDefinition(
+            "get_listing_route_estimate",
+            ("carl", "travel", "get_listing_route_estimate"),
+            get_listing_route_estimate,
+            get_listing_route_estimate.__doc__ or "",
+            _READ_ONLY,
         ),
         ToolDefinition(
             "get_listing_analysis",
@@ -1791,6 +1919,7 @@ async def managed_mcp_runtime(
             claude=ClaudeCli(),
             server_code_provenance=code_provenance,
             server_source_tree_sha256=source_sha256,
+            travel_service=ConfiguredTravelService(directories=user_directories()),
         )
         try:
             yield McpRuntime(

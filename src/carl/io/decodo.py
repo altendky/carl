@@ -73,6 +73,22 @@ class DecodoProxySettings(StrictModel):
     def safe_configuration(self) -> dict[str, JsonValue]:
         return self.model_dump(mode="json")
 
+    def session_retry_scope(self) -> str:
+        """Scope retries by whether a fresh session can select a peer independently.
+
+        Datacenter sticky identities are selected by port, unlike mobile and
+        residential identities. A fixed datacenter port retains shared cooldowns
+        even when its HTTP cookie jar is new.
+        """
+        independent = self.route.product is not DecodoProduct.DATACENTER_PROXY or (
+            len(self.endpoint_ports) > 1
+            or (
+                self.endpoint_port_end is not None
+                and self.endpoint_port_end > self.route.endpoint.port
+            )
+        )
+        return "independent_session" if independent else "stack"
+
 
 class DecodoCredentials(StrictModel):
     """Secret proxy values that must never become ordinary provenance."""

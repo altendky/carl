@@ -72,7 +72,7 @@ def build_ebay_component_registry() -> Registry:
             Component(COLLECT_EBAY_SEARCH_HOMEPAGE, 3, _collect_component),
             Component(EXTRACT_EBAY_SEARCH, 4, extract_ebay_search),
             Component(FINALIZE_EBAY_SEARCH, 4, _finalize_component),
-            Component(RUN_EBAY_SEARCH_WORK, 7, _run_work_component),
+            Component(RUN_EBAY_SEARCH_WORK, 8, _run_work_component),
         )
     )
 
@@ -162,6 +162,7 @@ async def collect_configured_ebay_search(
         directories,
         request.stack_identifier,
     )
+    retry_scope = route.session_retry_scope()
     acquirer = ManagedDecodoWreqAcquirer(
         settings=route,
         credential_source=credential_source,
@@ -189,6 +190,7 @@ async def collect_configured_ebay_search(
                     request_attempt=attempt,
                 )
             except AcquisitionFailure as error:
+                error.result["retry_scope"] = retry_scope
                 if home_attempts:
                     error.result["homepage_attempts"] = home_attempts
                 raise
@@ -206,7 +208,7 @@ async def collect_configured_ebay_search(
         assert homepage is not None
         homepage["attempts"] = home_attempts
         try:
-            return await collect_ebay_search(
+            result = await collect_ebay_search(
                 database,
                 request=request,
                 network_path=route.route.network_path,
@@ -221,7 +223,9 @@ async def collect_configured_ebay_search(
                     and transport.emulation_platform == "Linux"
                 ),
             )
+            return {**result, "retry_scope": retry_scope}
         except AcquisitionFailure as error:
+            error.result["retry_scope"] = retry_scope
             error.result["homepage_acquisition"] = homepage
             raise
 

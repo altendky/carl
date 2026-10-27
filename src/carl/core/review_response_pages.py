@@ -24,6 +24,7 @@ from carl.core.review_workspace import (
     ReviewDisposition,
     ReviewState,
 )
+from carl.core.travel import TravelEstimate
 
 REVIEW_RESPONSE_PAGE_BYTE_BUDGET = 9_000
 REVIEW_RESPONSE_PAGE_DEFAULT_LIMIT = 5
@@ -67,6 +68,7 @@ class ReviewBatchProjectionSummary(StrictModel):
     analysis_available: bool
     warning_count: int = Field(ge=0)
     truncated_fields: tuple[ScalarFieldName, ...] = ()
+    route_estimate: TravelEstimate | None = None
 
 
 class ReviewBatchItemSummary(StrictModel):
@@ -280,6 +282,7 @@ def _item_summary(item: ReviewBatchItem, *, minimal: bool = False) -> ReviewBatc
             saved_image_count=None if gallery is None else gallery.saved_image_count,
             analysis_available=bool(projection.analyses) or projection.analyses_truncated,
             warning_count=len(projection.warnings),
+            route_estimate=projection.route_estimate,
             truncated_fields=tuple(truncated),
         ),
         review_state=item.review_state,
