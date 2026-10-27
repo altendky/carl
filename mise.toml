@@ -2,7 +2,7 @@
 locked = true
 
 [tools]
-python = ["3.13.18", "3.14.9"]
+python = ["3.13.18", "3.14.10"]
 uv = "0.13.6"
 "pipx:pre-commit" = "4.7.0"
 "cargo:lychee" = "0.24.2"
