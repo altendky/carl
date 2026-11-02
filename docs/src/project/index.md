@@ -355,7 +355,7 @@ remains the default. This is retained evidence, not automatic matching or deal s
 
 ## Storage implementation
 
-SQLite uses WAL mode, foreign keys, a busy timeout, and short transactions.
+SQLite uses WAL mode, foreign keys, a bounded busy wait, and short transactions.
 Network activity never occurs inside a database transaction. SQLite permits
 concurrent readers and serializes writers; this is adequate for the initial
 local collector and will be measured rather than assumed at larger scale.
@@ -370,6 +370,13 @@ and ownership semantics of Chia's `DBWrapper2` while avoiding its
 `asyncio`/`aiosqlite` dependency. Query-only mode is set and verified for every
 reader rather than assumed from pool membership. Evidence-store, durable-queue,
 and worker operations use this layer and share the same managed lifetime.
+
+Each connection uses an async busy handler that yields between retries against a
+monotonic deadline, defaulting to 30 seconds. A contending transaction therefore lets
+the current writer and event loop continue. The handler preserves the configured
+timeout and existing shielded transaction-entry handoff; cancellation may wait for
+that handoff. SQLite's native `PRAGMA busy_timeout` reports zero when this custom
+handler is installed; the connection configuration controls the effective deadline.
 
 Opening an existing database must validate its schema identity before running
 any DDL. Initialization may create the current schema only in an empty database;
