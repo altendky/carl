@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from time import time_ns
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 import anyio
@@ -87,6 +87,7 @@ DEFAULT_RESOURCE_CAPACITIES = {
     "http": 25,
     "cpu": 4,
     "analysis": 10,
+    "routing_engines": 1,
     "resident_sessions": 32,
     "resident_state_bytes": 128 * 1024 * 1024,
 }
@@ -235,6 +236,53 @@ class ResourceManager:
     owner: str
     lease_duration_ns: int = 60_000_000_000
     poll_seconds: float = 0.1
+    _tasks: anyio.abc.TaskGroup | None = field(default=None, init=False)
+    _services: dict[str, object] = field(default_factory=dict, init=False)
+    _closers: dict[str, Callable[[], Awaitable[None]]] = field(default_factory=dict, init=False)
+    _closing: bool = field(default=False, init=False)
+
+    def _require_lifecycle(self) -> anyio.abc.TaskGroup:
+        if self._tasks is None or self._closing:
+            raise RuntimeError("Resource owner services require an active manager lifecycle")
+        return self._tasks
+
+    def get_or_create_service[T](self, key: str, factory: Callable[[], T]) -> T:
+        """Share a synchronously constructed service within this managed runtime."""
+
+        self._require_lifecycle()
+        if not key or key != key.strip():
+            raise ValueError("Resource service keys must be nonempty and trimmed")
+        if key not in self._services:
+            self._services[key] = factory()
+        return cast(T, self._services[key])
+
+    def register_closer(self, key: str, close: Callable[[], Awaitable[None]]) -> None:
+        """Close each owned service once, before cancelling its root background tasks."""
+
+        self._require_lifecycle()
+        if not key or key != key.strip():
+            raise ValueError("Resource service keys must be nonempty and trimmed")
+        previous = self._closers.get(key)
+        if previous is not None and previous != close:
+            raise ValueError("A resource service key already has a different closer")
+        self._closers[key] = close
+
+    def start_background(self, task: Callable[..., Awaitable[None]], *args: object) -> None:
+        """Start an owner task whose scopes and permits never belong to its caller."""
+
+        tasks = self._require_lifecycle()
+        tasks.start_soon(self._run_background, task, args)
+
+    async def _run_background(
+        self, task: Callable[..., Awaitable[None]], args: tuple[object, ...]
+    ) -> None:
+        manager_token = _CURRENT_MANAGER.set(self)
+        permits_token = _CURRENT_PERMITS.set(())
+        try:
+            await task(*args)
+        finally:
+            _CURRENT_PERMITS.reset(permits_token)
+            _CURRENT_MANAGER.reset(manager_token)
 
     def _guard(self, token: str) -> int:
         # Tokens are generated UUIDs, never supplied paths. Keep admitted-token
@@ -420,14 +468,81 @@ async def resource_manager_context(
         owner=str(uuid4()),
     )
     context_token = _CURRENT_MANAGER.set(manager)
+    body_error: BaseException | None = None
+    group_error: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
     try:
-        yield manager
+        try:
+            async with anyio.create_task_group() as tasks:
+                manager._tasks = tasks
+                try:
+                    yield manager
+                except BaseException as error:
+                    # Let the task group exit normally so ordinary body errors
+                    # retain their public exception type and identity.
+                    body_error = error
+                finally:
+                    manager._closing = True
+                    with anyio.CancelScope(shield=True):
+                        for close in reversed(tuple(manager._closers.values())):
+                            try:
+                                await close()
+                            except BaseException as error:
+                                cleanup_errors.append(error)
+                    tasks.cancel_scope.cancel()
+        except BaseException as error:
+            group_error = error
     finally:
+        manager._tasks = None
         _CURRENT_MANAGER.reset(context_token)
+    errors: list[BaseException] = []
+    if body_error is not None and (
+        group_error is None or not isinstance(body_error, anyio.get_cancelled_exc_class())
+    ):
+        errors.append(body_error)
+    if group_error is not None:
+        errors.append(group_error)
+    errors.extend(cleanup_errors)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Resource owner lifecycle failed", errors)
 
 
 def current_resource_manager() -> ResourceManager | None:
     return _CURRENT_MANAGER.get()
+
+
+async def current_cpu_guard_descriptor() -> int:
+    """Borrow the live CPU guard FD for inheritance; never close the original FD."""
+
+    manager = current_resource_manager()
+    permit = None if manager is None else _current_permit(manager, "cpu")
+    borrower = (anyio.get_current_task().id, "cpu")
+
+    def descriptor() -> int:
+        if (
+            manager is None
+            or permit is None
+            or permit.closed
+            or permit.lease.scope != manager.scope
+            or permit.borrowers.get(borrower, 0) < 1
+        ):
+            raise ResourceLeaseLost("CPU guard inheritance requires an active task CPU borrow")
+        guard = permit.execution_guard
+        if guard is not None:
+            if guard.closing or guard.sealed or guard.closed or guard.descriptor is None:
+                raise ResourceLeaseLost("CPU execution guard is closing or sealed")
+            return guard.descriptor
+        return permit.guard_descriptor
+
+    _ = descriptor()
+    assert manager is not None and permit is not None
+    if not await manager.database.validate_resource_permit(
+        token=permit.lease.token, owner=permit.lease.owner, now_utc_ns=time_ns()
+    ):
+        raise ResourceLeaseLost("CPU guard ownership expired or changed")
+    return descriptor()
 
 
 def _current_permit(

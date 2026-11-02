@@ -581,7 +581,28 @@ restart without another model call. An uncertain invocation with no retained
 capture becomes an explicit terminal uncertainty result; observed timeouts
 retain their existing bounded retry policy.
 
-These adapters are opt-in. Production dispatcher cutover is tracked separately;
+Local OSRM engines have a separate `routing_engines` budget, configured with
+`CARL_RESOURCE_ROUTING_ENGINES` and defaulting to one engine per host/database
+scope. Router objects in one managed runtime share warm engines. An idle engine
+retains its residency unit while releasing CPU; initialization and each query
+use CPU admission. A caller waits for an available engine before acquiring CPU,
+and staged callers can check availability without waiting. The engine count
+bounds mapped graph copies; it does not measure their RSS or charge graph file
+sizes to the marketplace session-state budget.
+
+The owned native supervisor accepts bounded query messages and execution guard
+descriptors. It enforces query deadlines and a 30-second idle lifetime
+independently of Carl's event loop. Parent loss or cancellation closes the actual
+native worker before residency is released; a failed physical cleanup leaves
+capacity occupied until guarded recovery can prove the worker has exited.
+Runtime shutdown closes native owners before closing their database. A native
+worker also terminates if its supervisor disappears.
+Standalone routing outside `Database.managed` uses an eagerly closed supervised
+worker and a process-local limit of one; it does not share a durable host budget
+or retain a warm graph between calls.
+
+The marketplace and analysis stage adapters are opt-in. Production dispatcher
+cutover is tracked separately;
 the existing foreground runtime remains the default until integration is ready.
 The adapter registry starts no workers, and the resident pool creates no task
 for work that fails nonblocking admission.
