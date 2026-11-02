@@ -104,6 +104,12 @@ from carl.core.models import (
     StorageBackend,
     StorageSchemaIdentity,
 )
+from carl.core.residents import (
+    ResidentDefinition,
+    ResidentLease,
+    ResidentRequestCharge,
+    ResidentState,
+)
 from carl.core.resources import ResourceLease, ResourceRequest
 from carl.core.review import (
     AnalysisDescriptor,
@@ -132,6 +138,7 @@ from carl.core.review_workspace import (
 )
 from carl.core.search_scope import search_scope_sha256
 from carl.core.stages import (
+    StageAttemptContext,
     StageClaimResult,
     StageDefinition,
     StageLease,
@@ -191,9 +198,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=15,
+    version=16,
 )
 
+_V15_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 15})
+_V15_SCHEMA_DEFINITION_SHA256 = "24911645cf1e3c228f6ec427a042f0723b1435f2688420b61a227bb90f29177c"
 _V14_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 14})
 _V14_SCHEMA_DEFINITION_SHA256 = "3897ad46eeef3ab426ab20b9964dd4604f69b31335aefcdf76a3becf04c52079"
 _V13_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 13})
@@ -345,6 +354,54 @@ CREATE TABLE IF NOT EXISTS resource_allocations (
 
 CREATE INDEX IF NOT EXISTS resource_allocations_budget
 ON resource_allocations(scope, name, permit_token, units);
+
+CREATE TABLE IF NOT EXISTS resident_sessions (
+    id TEXT PRIMARY KEY CHECK (length(id) > 0),
+    work_item_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL CHECK (length(operation_id) > 0),
+    definition_json TEXT NOT NULL CHECK (json_valid(definition_json)),
+    generation INTEGER NOT NULL CHECK (generation >= 1),
+    token TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('opening','ready','closing','closed','parked','lost','quarantined')),
+    active_stage_token TEXT UNIQUE,
+    UNIQUE (work_item_id, generation),
+    FOREIGN KEY (work_item_id) REFERENCES work_items(id),
+    FOREIGN KEY (token) REFERENCES resource_permits(token),
+    FOREIGN KEY (active_stage_token) REFERENCES stage_execution_tokens(token)
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS resident_sessions_live_work
+ON resident_sessions(work_item_id) WHERE state IN ('opening','ready','closing','quarantined');
+
+CREATE TABLE IF NOT EXISTS resident_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    resident_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL CHECK (length(event_kind) > 0),
+    recorded_at_utc_ns INTEGER NOT NULL CHECK (recorded_at_utc_ns >= 0),
+    data_json TEXT NOT NULL CHECK (json_valid(data_json)),
+    FOREIGN KEY (resident_id) REFERENCES resident_sessions(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS resident_events_resident ON resident_events(resident_id, sequence);
+
+CREATE TABLE IF NOT EXISTS resident_request_charges (
+    operation_id TEXT NOT NULL,
+    request_identity_json TEXT NOT NULL CHECK (json_valid(request_identity_json)),
+    stage_token TEXT NOT NULL,
+    stage_id TEXT NOT NULL,
+    execution INTEGER NOT NULL CHECK (execution >= 1),
+    resident_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
+    maximum_attempts INTEGER NOT NULL CHECK (maximum_attempts >= 1 AND ordinal <= maximum_attempts),
+    charged_at_utc_ns INTEGER NOT NULL CHECK (charged_at_utc_ns >= 0),
+    PRIMARY KEY (operation_id, request_identity_json, stage_token),
+    UNIQUE (operation_id, request_identity_json, ordinal),
+    FOREIGN KEY (operation_id) REFERENCES operations(id),
+    FOREIGN KEY (stage_token) REFERENCES stage_execution_tokens(token),
+    FOREIGN KEY (stage_id) REFERENCES work_stages(id),
+    FOREIGN KEY (resident_id) REFERENCES resident_sessions(id)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS network_connectivity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1287,6 +1344,7 @@ class Database:
         component: Component,
         provenance: CodeProvenance,
         invocation: dict[str, JsonValue],
+        resident_lease: ResidentLease | None = None,
     ) -> StageClaimResult:
         """Atomically reserve execution, work, resources and HTTP admission, or none."""
 
@@ -1376,6 +1434,36 @@ class Database:
                 # Nested writer is a savepoint: unavailable HTTP/resource admission
                 # rolls back work attempts, operations and all reservations together.
                 async with self._connections.writer():
+                    resident = None
+                    if definition.resident_session_identifier is not None:
+                        resident = (
+                            await self._owned_resident(connection, resident_lease)
+                            if resident_lease is not None
+                            else None
+                        )
+                        if (
+                            resident is None
+                            or resident.identifier != definition.resident_session_identifier
+                            or resident.coordination_scope != resource_scope
+                            or resident.owner != worker_identifier
+                            or resident.definition.work_item_identifier
+                            != definition.work_item_identifier
+                            or resident.definition.operation_identifier
+                            != definition.operation_identifier
+                            or resident.active_stage_token is not None
+                            or not await self.validate_resident_session(
+                                resident, now_utc_ns=now_utc_ns
+                            )
+                        ):
+                            raise _StageAdmissionDeferred(
+                                StageClaimResult(
+                                    lease=None,
+                                    wait_kind=StageWaitKind.OWNERSHIP,
+                                    next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
+                                )
+                            )
+                    elif resident_lease is not None:
+                        raise ValueError("An unbound stage cannot borrow a resident session")
                     cursor = await connection.execute(
                         "SELECT 1 FROM stage_execution_tokens WHERE token = ? UNION ALL SELECT 1 FROM resource_permits WHERE token = ? LIMIT 1",
                         (token, token),
@@ -1531,6 +1619,24 @@ class Database:
                         "INSERT INTO stage_execution_tokens VALUES (?, ?, ?)",
                         (token, stage_identifier, execution),
                     )
+                    if resident is not None:
+                        await connection.execute(
+                            "UPDATE resident_sessions SET active_stage_token = ? WHERE id = ? AND token = ? AND generation = ? AND active_stage_token IS NULL",
+                            (token, resident.identifier, resident.token, resident.generation),
+                        )
+                        if await connection.changes() != 1:
+                            raise LeaseLostError("Resident ownership changed during admission")
+                        await self._resident_event(
+                            connection,
+                            resident,
+                            "stage_bound",
+                            now_utc_ns,
+                            {
+                                "stage": stage_identifier,
+                                "stage_token": token,
+                                "execution": execution,
+                            },
+                        )
                     expires = min(
                         work_lease.expires_at_utc_ns,
                         resource_lease.expires_at_utc_ns
@@ -1611,6 +1717,21 @@ class Database:
             assert row is not None
             if _integer(row[0]) <= now_utc_ns:
                 return False
+            if lease.definition.resident_session_identifier is not None:
+                resident = await self._resident_session(
+                    connection, lease.definition.resident_session_identifier
+                )
+                if (
+                    resident is None
+                    or resident.active_stage_token != lease.token
+                    or resident.coordination_scope != lease.coordination_scope
+                    or resident.definition.work_item_identifier
+                    != lease.definition.work_item_identifier
+                    or resident.definition.operation_identifier
+                    != lease.definition.operation_identifier
+                    or not await self.validate_resident_session(resident, now_utc_ns=now_utc_ns)
+                ):
+                    return False
             try:
                 attempt, _ = await self._require_active_lease(
                     connection,
@@ -1755,6 +1876,10 @@ class Database:
         eligible_at_utc_ns: int,
         wait_kind: StageWaitKind | None = None,
     ) -> None:
+        await connection.execute(
+            "UPDATE resident_sessions SET active_stage_token = NULL WHERE active_stage_token = (SELECT token FROM work_stages WHERE id = ?)",
+            (identifier,),
+        )
         await connection.execute(
             """
             UPDATE work_stages SET state = ?, token = NULL, worker_identifier = NULL,
@@ -2024,6 +2149,543 @@ class Database:
             (work_item_identifier,),
         )
 
+    async def charge_resident_request(
+        self,
+        context: StageAttemptContext,
+        *,
+        request_identity: tuple[str, ...],
+        maximum_attempts: int,
+        now_utc_ns: int,
+    ) -> ResidentRequestCharge | None:
+        """Commit a conservative dispatch charge before invoking HTTP.
+
+        Budget identities contain only public request labels, never tokens or
+        incarnation IDs. A repeated execution returns newly_charged=False and
+        must not invoke HTTP again. An uncertain recovered execution has a fresh
+        token and consumes another ordinal within the same logical budget.
+        """
+        if (
+            now_utc_ns < 0
+            or type(maximum_attempts) is not int
+            or not 1 <= maximum_attempts <= 1000
+            or not isinstance(request_identity, tuple)
+            or not 1 <= len(request_identity) <= 16
+            or any(
+                not isinstance(part, str)
+                or not 1 <= len(part) <= 256
+                or part != part.strip()
+                or any(ord(c) < 32 or ord(c) == 127 for c in part)
+                for part in request_identity
+            )
+        ):
+            raise ValueError("Request charge requires bounded public labels, budget and time")
+        identity = encode_json(list(request_identity))
+        if len(identity.encode()) > 4096:
+            raise ValueError("Request budget identity exceeds its 4 KiB bound")
+        if self._connections._current_writer_task_identifier == anyio.get_current_task().id:
+            raise ValueError("Request charges must commit outside an existing writer transaction")
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                "SELECT lease_json FROM work_stages WHERE id = ? AND state = 'running' AND token = ? AND worker_identifier = ? AND execution = ?",
+                (
+                    context.stage_identifier,
+                    context.lease_token,
+                    context.worker_identifier,
+                    context.execution,
+                ),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise LeaseLostError("Request charge no longer owns its stage execution")
+            lease = StageLease.model_validate_json(_text(row[0]))
+            if (
+                context.work_item_identifier != lease.definition.work_item_identifier
+                or context.operation_identifier != lease.definition.operation_identifier
+                or context.attempt != lease.work_lease.attempt
+                or context.resident_session_identifier is None
+                or context.resident_session_identifier
+                != lease.definition.resident_session_identifier
+                or not await self.validate_stage(lease, now_utc_ns=now_utc_ns)
+            ):
+                raise LeaseLostError("Request charge lost its work or resident ownership")
+            if (
+                lease.definition.network_activity is None
+                or lease.network_admission is None
+                or not any(request.name == "http" for request in lease.definition.resources)
+            ):
+                raise ValueError("Request charges require an admitted resident HTTP/network stage")
+            if (
+                context.network_admission is None
+                or context.network_admission.activity_identifier
+                != lease.network_admission.activity_identifier
+                or context.network_admission.token != lease.token
+            ):
+                raise LeaseLostError("Request charge does not match its network admission")
+            cursor = await connection.execute(
+                "SELECT maximum_attempts, max(ordinal) FROM resident_request_charges WHERE operation_id = ? AND request_identity_json = ? GROUP BY maximum_attempts",
+                (context.operation_identifier, identity),
+            )
+            budget = await cursor.fetchone()
+            if budget is not None and _integer(budget[0]) != maximum_attempts:
+                raise ValueError("A logical request budget cannot change after its first charge")
+            cursor = await connection.execute(
+                "SELECT ordinal FROM resident_request_charges WHERE operation_id = ? AND request_identity_json = ? AND stage_token = ?",
+                (context.operation_identifier, identity, context.lease_token),
+            )
+            previous = await cursor.fetchone()
+            if previous is not None:
+                return ResidentRequestCharge(ordinal=_integer(previous[0]), newly_charged=False)
+            ordinal = 1 if budget is None else _integer(budget[1]) + 1
+            if ordinal > maximum_attempts:
+                return None
+            await connection.execute(
+                """INSERT INTO resident_request_charges(operation_id, request_identity_json,
+                    stage_token, stage_id, execution, resident_id, ordinal, maximum_attempts,
+                    charged_at_utc_ns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    context.operation_identifier,
+                    identity,
+                    context.lease_token,
+                    context.stage_identifier,
+                    context.execution,
+                    context.resident_session_identifier,
+                    ordinal,
+                    maximum_attempts,
+                    now_utc_ns,
+                ),
+            )
+            return ResidentRequestCharge(ordinal=ordinal, newly_charged=True)
+
+    async def _resident_session(
+        self,
+        connection: AsyncConnection,
+        identifier: str,
+    ) -> ResidentLease | None:
+        cursor = await connection.execute(
+            """
+            SELECT resident.definition_json, resident.generation, resident.state,
+                   resident.active_stage_token, permit.token, permit.scope,
+                   permit.owner, permit.acquired_at_utc_ns, permit.expires_at_utc_ns
+            FROM resident_sessions AS resident
+            JOIN resource_permits AS permit ON permit.token = resident.token
+            WHERE resident.id = ?
+            """,
+            (identifier,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        resource = await self._resource_lease_from_row(connection, row[4:])
+        return ResidentLease(
+            definition=ResidentDefinition.model_validate_json(_text(row[0])),
+            generation=_integer(row[1]),
+            state=ResidentState(_text(row[2])),
+            active_stage_token=None if row[3] is None else _text(row[3]),
+            token=resource.token,
+            owner=resource.owner,
+            coordination_scope=resource.scope,
+            resource_lease=resource,
+        )
+
+    async def resident_session(self, identifier: str) -> ResidentLease | None:
+        async with self._connections.reader() as connection:
+            return await self._resident_session(connection, identifier)
+
+    async def _owned_resident(
+        self,
+        connection: AsyncConnection,
+        lease: ResidentLease,
+    ) -> ResidentLease | None:
+        current = await self._resident_session(connection, lease.identifier)
+        if current is None or (
+            current.definition,
+            current.generation,
+            current.token,
+            current.owner,
+            current.coordination_scope,
+        ) != (
+            lease.definition,
+            lease.generation,
+            lease.token,
+            lease.owner,
+            lease.coordination_scope,
+        ):
+            return None
+        return current
+
+    @staticmethod
+    async def _resident_event(
+        connection: AsyncConnection,
+        lease: ResidentLease,
+        kind: str,
+        now_utc_ns: int,
+        reason: JsonValue = None,
+    ) -> None:
+        data = {"generation": lease.generation, "token": lease.token, "reason": reason}
+        encoded = encode_json(data)
+        if len(encoded.encode()) > 65_536:
+            raise ValueError("Resident event exceeds its 64 KiB bound")
+        await connection.execute(
+            "INSERT INTO resident_events(id, resident_id, event_kind, recorded_at_utc_ns, data_json) VALUES (?, ?, ?, ?, ?)",
+            (str(uuid4()), lease.identifier, kind, now_utc_ns, encoded),
+        )
+
+    async def try_acquire_resident_session(
+        self,
+        definition: ResidentDefinition,
+        *,
+        token: str,
+        owner: str,
+        scope: str,
+        capacities: dict[str, int],
+        now_utc_ns: int,
+        lease_duration_ns: int,
+    ) -> ResidentLease | None:
+        """Reserve one actor and its bounded state together, or allocate nothing."""
+        if now_utc_ns < 0 or lease_duration_ns <= 0:
+            raise ValueError("Resident admission timestamps are invalid")
+        async with self._connections.writer() as connection:
+            if await self._resident_session(connection, definition.identifier) is not None:
+                raise ValueError("Resident incarnation identifiers may never be reused")
+            cursor = await connection.execute(
+                "SELECT state FROM work_items WHERE id = ?",
+                (definition.work_item_identifier,),
+            )
+            work = await cursor.fetchone()
+            if work is None:
+                raise KeyError(definition.work_item_identifier)
+            if work[0] not in {"pending", "leased"}:
+                return None
+            cursor = await connection.execute(
+                "SELECT 1 FROM resident_sessions WHERE work_item_id = ? AND state IN ('opening','ready','closing','quarantined')",
+                (definition.work_item_identifier,),
+            )
+            if await cursor.fetchone() is not None:
+                return None
+            resource = await self.try_acquire_resource_permit(
+                scope=scope,
+                token=token,
+                owner=owner,
+                requests=(
+                    ResourceRequest(name="resident_sessions"),
+                    ResourceRequest(name="resident_state_bytes", units=definition.state_bytes),
+                ),
+                capacities=capacities,
+                now_utc_ns=now_utc_ns,
+                lease_duration_ns=lease_duration_ns,
+            )
+            if resource is None:
+                return None
+            cursor = await connection.execute(
+                "SELECT coalesce(max(generation), 0) + 1 FROM resident_sessions WHERE work_item_id = ?",
+                (definition.work_item_identifier,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            lease = ResidentLease(
+                definition=definition,
+                generation=_integer(row[0]),
+                token=token,
+                owner=owner,
+                coordination_scope=scope,
+                state=ResidentState.OPENING,
+                resource_lease=resource,
+            )
+            await connection.execute(
+                "INSERT INTO resident_sessions(id, work_item_id, operation_id, definition_json, generation, token, state) VALUES (?, ?, ?, ?, ?, ?, 'opening')",
+                (
+                    definition.identifier,
+                    definition.work_item_identifier,
+                    definition.operation_identifier,
+                    definition.model_dump_json(),
+                    lease.generation,
+                    token,
+                ),
+            )
+            await self._resident_event(connection, lease, "acquired", now_utc_ns)
+            return lease
+
+    async def validate_resident_session(self, lease: ResidentLease, *, now_utc_ns: int) -> bool:
+        if now_utc_ns < 0:
+            raise ValueError("Resident validation time must be nonnegative")
+        async with self._connections.reader() as connection:
+            current = await self._owned_resident(connection, lease)
+            if current is None or current.state not in {ResidentState.OPENING, ResidentState.READY}:
+                return False
+            cursor = await connection.execute(
+                "SELECT state FROM work_items WHERE id = ?",
+                (lease.definition.work_item_identifier,),
+            )
+            work = await cursor.fetchone()
+            return (
+                work is not None
+                and work[0] in {"pending", "leased"}
+                and await self.validate_resource_permit(
+                    token=lease.token, owner=lease.owner, now_utc_ns=now_utc_ns
+                )
+            )
+
+    async def renew_resident_session(
+        self,
+        lease: ResidentLease,
+        *,
+        now_utc_ns: int,
+        lease_duration_ns: int,
+    ) -> ResidentLease | None:
+        if now_utc_ns < 0 or lease_duration_ns <= 0:
+            raise ValueError("Resident renewal timestamps are invalid")
+        async with self._connections.writer() as connection:
+            current = await self._owned_resident(connection, lease)
+            if current is None or current.state in {
+                ResidentState.CLOSED,
+                ResidentState.PARKED,
+                ResidentState.LOST,
+            }:
+                return None
+            if current.state in {
+                ResidentState.OPENING,
+                ResidentState.READY,
+            } and not await self.validate_resident_session(current, now_utc_ns=now_utc_ns):
+                return None
+            resource = await self.renew_resource_permit(
+                token=lease.token,
+                owner=lease.owner,
+                now_utc_ns=now_utc_ns,
+                lease_duration_ns=lease_duration_ns,
+            )
+            if resource is None:
+                return None
+            renewed = current.model_copy(update={"resource_lease": resource})
+            await self._resident_event(connection, renewed, "renewed", now_utc_ns)
+            return renewed
+
+    async def transition_resident_session(
+        self,
+        lease: ResidentLease,
+        *,
+        state: ResidentState,
+        now_utc_ns: int,
+        reason: JsonValue = None,
+    ) -> ResidentLease | None:
+        """Fence actor admission before closing; quarantined state remains occupied."""
+        if now_utc_ns < 0:
+            raise ValueError("Resident transition time must be nonnegative")
+        allowed = {
+            ResidentState.OPENING: {
+                ResidentState.READY,
+                ResidentState.CLOSING,
+                ResidentState.QUARANTINED,
+            },
+            ResidentState.READY: {ResidentState.CLOSING, ResidentState.QUARANTINED},
+            ResidentState.CLOSING: {ResidentState.QUARANTINED},
+            ResidentState.QUARANTINED: {ResidentState.CLOSING},
+        }
+        if state not in {ResidentState.READY, ResidentState.CLOSING, ResidentState.QUARANTINED}:
+            raise ValueError("Terminal resident states require guarded finalization")
+        async with self._connections.writer() as connection:
+            current = await self._owned_resident(connection, lease)
+            if current is None:
+                return None
+            if current.state == state:
+                return (
+                    current
+                    if state != ResidentState.READY
+                    or await self.validate_resident_session(current, now_utc_ns=now_utc_ns)
+                    else None
+                )
+            if state not in allowed.get(current.state, set()):
+                return None
+            if state == ResidentState.READY and not await self.validate_resident_session(
+                current, now_utc_ns=now_utc_ns
+            ):
+                return None
+            await connection.execute(
+                "UPDATE resident_sessions SET state = ? WHERE id = ?",
+                (state.value, lease.identifier),
+            )
+            updated = current.model_copy(update={"state": state})
+            await self._resident_event(
+                connection,
+                updated,
+                "state_changed",
+                now_utc_ns,
+                {"previous": current.state.value, "state": state.value, "reason": reason},
+            )
+            return updated
+
+    async def _finish_resident_session(
+        self,
+        connection: AsyncConnection,
+        lease: ResidentLease,
+        *,
+        state: ResidentState,
+        now_utc_ns: int,
+        reason: JsonValue,
+        reclaimed: bool = False,
+    ) -> bool:
+        current = await self._owned_resident(connection, lease)
+        if (
+            current is None
+            or current.active_stage_token is not None
+            or current.state
+            in {
+                ResidentState.CLOSED,
+                ResidentState.PARKED,
+                ResidentState.LOST,
+            }
+        ):
+            return False
+        await connection.execute(
+            "UPDATE resource_permits SET state = ? WHERE token = ? AND owner = ? AND state = 'held'",
+            ("reclaimed" if reclaimed else "released", lease.token, lease.owner),
+        )
+        if await connection.changes() != 1:
+            return False
+        await connection.execute(
+            "UPDATE resident_sessions SET state = ? WHERE id = ?", (state.value, lease.identifier)
+        )
+        await self._resident_event(connection, current, state.value, now_utc_ns, reason)
+        return True
+
+    async def finish_resident_session(
+        self,
+        lease: ResidentLease,
+        *,
+        state: ResidentState,
+        now_utc_ns: int,
+        reason: JsonValue = None,
+    ) -> bool:
+        """Finalize only after the caller proves actor/children are gone under its guard."""
+        if now_utc_ns < 0 or state not in {
+            ResidentState.CLOSED,
+            ResidentState.PARKED,
+            ResidentState.LOST,
+        }:
+            raise ValueError("Resident finalization requires a terminal state and valid time")
+        async with self._connections.writer() as connection:
+            return await self._finish_resident_session(
+                connection, lease, state=state, now_utc_ns=now_utc_ns, reason=reason
+            )
+
+    async def expired_resident_sessions(
+        self,
+        *,
+        scope: str,
+        now_utc_ns: int,
+    ) -> tuple[ResidentLease, ...]:
+        if not scope or scope != scope.strip() or now_utc_ns < 0:
+            raise ValueError("Resident expiry lookup requires a scope and valid time")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """SELECT resident.id FROM resident_sessions AS resident
+                JOIN resource_permits AS permit ON permit.token = resident.token
+                WHERE permit.scope = ? AND permit.state = 'held' AND permit.expires_at_utc_ns <= ?
+                  AND resident.state IN ('opening','ready','closing','quarantined')
+                ORDER BY permit.expires_at_utc_ns, resident.id""",
+                (scope, now_utc_ns),
+            )
+            identifiers = [_text(row[0]) for row in await cursor.fetchall()]
+            leases: list[ResidentLease] = []
+            for identifier in identifiers:
+                lease = await self._resident_session(connection, identifier)
+                assert lease is not None
+                leases.append(lease)
+            return tuple(leases)
+
+    async def recover_resident_session(self, lease: ResidentLease, *, now_utc_ns: int) -> bool:
+        """Caller must hold both resident and captured active-stage guards through commit."""
+        if now_utc_ns < 0:
+            raise ValueError("Resident recovery time must be nonnegative")
+        async with self._connections.writer() as connection:
+            current = await self._owned_resident(connection, lease)
+            if (
+                current is None
+                or current.expires_at_utc_ns > now_utc_ns
+                or current.active_stage_token != lease.active_stage_token
+            ):
+                return False
+            if current.active_stage_token is not None:
+                cursor = await connection.execute(
+                    "SELECT lease_json FROM work_stages WHERE token = ? AND state = 'running'",
+                    (current.active_stage_token,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    return False
+                stage = StageLease.model_validate_json(_text(row[0]))
+                if not await self.release_stage_execution(
+                    stage, now_utc_ns=now_utc_ns, reason={"kind": "resident_guard_recovered"}
+                ):
+                    return False
+                if stage.resource_lease is not None:
+                    await self.release_resource_permit(
+                        token=stage.token, owner=stage.resource_lease.owner
+                    )
+            return await self._finish_resident_session(
+                connection,
+                current,
+                state=ResidentState.LOST,
+                now_utc_ns=now_utc_ns,
+                reason={"kind": "expired_resident_guards_recovered"},
+                reclaimed=True,
+            )
+
+    async def rebind_resident_stage(
+        self,
+        stage_identifier: str,
+        previous_resident_identifier: str,
+        lease: ResidentLease,
+        *,
+        now_utc_ns: int,
+    ) -> bool:
+        """Explicitly resume a pending checkpoint using a fresh resident incarnation."""
+        async with self._connections.writer() as connection:
+            if not await self.validate_resident_session(lease, now_utc_ns=now_utc_ns):
+                return False
+            current = await self._owned_resident(connection, lease)
+            assert current is not None
+            previous = await self._resident_session(connection, previous_resident_identifier)
+            if (
+                previous is None
+                or previous.state
+                not in {ResidentState.CLOSED, ResidentState.PARKED, ResidentState.LOST}
+                or previous.active_stage_token is not None
+                or current.active_stage_token is not None
+            ):
+                return False
+            cursor = await connection.execute(
+                "SELECT definition_json, state FROM work_stages WHERE id = ?", (stage_identifier,)
+            )
+            row = await cursor.fetchone()
+            if row is None or row[1] != "pending":
+                return False
+            definition = StageDefinition.model_validate_json(_text(row[0]))
+            if definition.resident_session_identifier != previous_resident_identifier or any(
+                (resident.definition.work_item_identifier, resident.definition.operation_identifier)
+                != (definition.work_item_identifier, definition.operation_identifier)
+                for resident in (previous, current)
+            ):
+                return False
+            updated = definition.model_copy(
+                update={"resident_session_identifier": lease.identifier}
+            )
+            await connection.execute(
+                "UPDATE work_stages SET definition_json = ? WHERE id = ?",
+                (updated.model_dump_json(), stage_identifier),
+            )
+            await self._append_stage_event(
+                connection,
+                stage_identifier,
+                "resident_rebound",
+                now_utc_ns,
+                {
+                    "previous_resident": previous_resident_identifier,
+                    "resident": lease.identifier,
+                    "generation": lease.generation,
+                },
+            )
+            return True
+
     @staticmethod
     async def _resource_lease_from_row(
         connection: AsyncConnection, row: Sequence[apsw.SQLiteValue]
@@ -2197,7 +2859,9 @@ class Database:
 
         async with self._connections.writer() as connection:
             await connection.execute(
-                "UPDATE resource_permits SET state = 'released' WHERE token = ? AND owner = ? AND state = 'held'",
+                """UPDATE resource_permits SET state = 'released'
+                WHERE token = ? AND owner = ? AND state = 'held'
+                  AND NOT EXISTS (SELECT 1 FROM resident_sessions WHERE resident_sessions.token = resource_permits.token)""",
                 (token, owner),
             )
             return await connection.changes() == 1
@@ -2215,6 +2879,7 @@ class Database:
                 SELECT token, scope, owner, acquired_at_utc_ns, expires_at_utc_ns
                 FROM resource_permits
                 WHERE scope = ? AND state = 'held' AND expires_at_utc_ns <= ?
+                  AND NOT EXISTS (SELECT 1 FROM resident_sessions WHERE resident_sessions.token = resource_permits.token)
                 ORDER BY expires_at_utc_ns, token
                 """,
                 (scope, now_utc_ns),
@@ -2242,6 +2907,7 @@ class Database:
                 """
                 UPDATE resource_permits SET state = 'reclaimed'
                 WHERE token = ? AND owner = ? AND state = 'held' AND expires_at_utc_ns <= ?
+                  AND NOT EXISTS (SELECT 1 FROM resident_sessions WHERE resident_sessions.token = resource_permits.token)
                 """,
                 (token, owner, now_utc_ns),
             )
@@ -2396,6 +3062,14 @@ class Database:
         }
 
     @staticmethod
+    def _v15_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V15_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "15",
+            "schema_definition_sha256": _V15_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v7_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V7_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -2448,6 +3122,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v15_metadata())
                 and not await cls._metadata_matches(connection, cls._v14_metadata())
                 and not await cls._metadata_matches(connection, cls._v13_metadata())
                 and not await cls._metadata_matches(connection, cls._v12_metadata())
@@ -2876,6 +3551,12 @@ class Database:
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
                     )
             if await self._metadata_matches(connection, self._v14_metadata()):
+                await connection.execute(_SCHEMA)
+                for key, value in self._expected_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v15_metadata()):
                 await connection.execute(_SCHEMA)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
@@ -7857,6 +8538,46 @@ class Database:
                 (work_item_identifier, retry_budget_start_attempt, before_attempt),
             )
             return tuple(_text(row[0]) for row in await cursor.fetchall())
+
+    async def retained_ebay_item_request_attempts(
+        self,
+        work_item_identifier: str,
+        *,
+        before_attempt: int,
+        retry_budget_start_attempt: int = 0,
+    ) -> int:
+        """Count uncertain charged requests and legacy responses without duplication."""
+        if (
+            not work_item_identifier
+            or before_attempt < 1
+            or retry_budget_start_attempt < 0
+            or retry_budget_start_attempt >= before_attempt
+        ):
+            raise ValueError("Item acquisition retry budget bounds are invalid")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT coalesce(sum(max(
+                    (SELECT count(*) FROM resident_request_charges AS charge
+                     WHERE charge.operation_id = owner.operation_id
+                       AND charge.request_identity_json = '["ebay","item"]'),
+                    (SELECT count(*) FROM objects AS acquisition
+                     JOIN records AS record ON record.object_id = acquisition.id
+                     WHERE acquisition.created_by_operation_id = owner.operation_id
+                       AND acquisition.kind_parts_json = '["carl","http","acquisition"]'
+                       AND json_extract(record.value_json, '$.purpose') = 'ebay_item')
+                )), 0)
+                FROM work_operations AS owner
+                JOIN work_items AS work ON work.id = owner.work_item_id
+                WHERE owner.work_item_id = ?
+                  AND work.kind_parts_json = '["carl","ebay","collect","item"]'
+                  AND owner.attempt > ? AND owner.attempt < ?
+                """,
+                (work_item_identifier, retry_budget_start_attempt, before_attempt),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            return _integer(row[0])
 
     async def expedite_pending_ebay_item_retries(
         self,

@@ -83,7 +83,13 @@ class ResourceDatabase(Protocol):
     ) -> tuple[ResourceLease, ...]: ...
 
 
-DEFAULT_RESOURCE_CAPACITIES = {"http": 25, "cpu": 4, "analysis": 10}
+DEFAULT_RESOURCE_CAPACITIES = {
+    "http": 25,
+    "cpu": 4,
+    "analysis": 10,
+    "resident_sessions": 32,
+    "resident_state_bytes": 128 * 1024 * 1024,
+}
 _CURRENT_MANAGER: ContextVar[ResourceManager | None] = ContextVar("resource_manager", default=None)
 _CURRENT_PERMITS: ContextVar[tuple[ResourcePermit, ...]] = ContextVar(
     "resource_permits", default=()

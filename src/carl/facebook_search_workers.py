@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from functools import partial
-from typing import Literal
+from typing import Literal, Protocol
 
 from carl.core.components import Component
 from carl.core.content_encoding import decoded_stored_body
@@ -70,7 +70,15 @@ from carl.core.facebook_work import (
     facebook_search_network_activity,
 )
 from carl.core.http import stored_content_encodings, stored_response_charset
-from carl.core.models import BytesDraft, Header, JsonValue, NamedInput, NamedOutput, RecordDraft
+from carl.core.models import (
+    ArtifactDraft,
+    BytesDraft,
+    Header,
+    JsonValue,
+    NamedInput,
+    NamedOutput,
+    RecordDraft,
+)
 from carl.core.work import NetworkActivityAdmission
 from carl.core.worker import (
     AttemptContext,
@@ -86,6 +94,47 @@ from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 
 SEARCH_RETRY_DELAY_NS = 1_000_000_000
+
+
+class SearchCheckpointDependencies(Protocol):
+    @property
+    def database(self) -> Database: ...
+
+    @property
+    def new_identifier(self) -> IdentifierFactory: ...
+
+    @property
+    def utc_now_ns(self) -> Callable[[], int]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SearchCheckpointDrafts:
+    result: JsonValue
+    records: tuple[RecordDraft, ...] = ()
+    artifacts: tuple[ArtifactDraft, ...] = ()
+    inputs: tuple[NamedInput, ...] = ()
+    outputs: tuple[NamedOutput, ...] = ()
+    occurrence_identifiers: tuple[str, ...] = ()
+
+
+async def _publish_search_checkpoint(
+    draft: SearchCheckpointDrafts,
+    *,
+    dependencies: SearchCheckpointDependencies,
+    context: AttemptContext,
+) -> None:
+    await dependencies.database.publish_leased_operation_checkpoint(
+        work_item_identifier=context.work_item_identifier,
+        lease_token=context.lease_token,
+        worker_identifier=context.worker_identifier,
+        utc_now_ns=dependencies.utc_now_ns,
+        operation_id=context.operation_identifier,
+        records=draft.records,
+        artifacts=draft.artifacts,
+        inputs=draft.inputs,
+        outputs=draft.outputs,
+        checkpoint_result=draft.result,
+    )
 
 
 def _search_retry_delay_ns(attempt: int) -> int:
@@ -127,12 +176,12 @@ def _partition_checkpoint(
     )
 
 
-async def _resume_partition_occurrences(
+async def build_resumed_partition_checkpoint(
     *,
-    dependencies: "FacebookSearchWorkerDependencies",
+    dependencies: SearchCheckpointDependencies,
     context: AttemptContext,
     checkpoint: PartitionSearchRetryCheckpoint,
-) -> PartitionSearchRetryCheckpoint:
+) -> tuple[PartitionSearchRetryCheckpoint, SearchCheckpointDrafts]:
     """Bind retained evidence to this attempt so completed search views include it."""
     records: list[RecordDraft] = []
     inputs: list[NamedInput] = []
@@ -168,23 +217,33 @@ async def _resume_partition_occurrences(
             copied.append(copied_identifier)
         pages.append({**page, "listing_occurrence_records": copied})
     checkpoint = checkpoint.model_copy(update={"page_references": tuple(pages)})
-    await dependencies.database.publish_leased_operation_checkpoint(
-        work_item_identifier=context.work_item_identifier,
-        lease_token=context.lease_token,
-        worker_identifier=context.worker_identifier,
-        utc_now_ns=dependencies.utc_now_ns,
-        operation_id=context.operation_identifier,
-        records=records,
-        artifacts=(),
-        inputs=inputs,
-        outputs=outputs,
-        checkpoint_result={
+    draft = SearchCheckpointDrafts(
+        result={
             "state": "collecting",
             "pages_persisted": checkpoint.traversal_state.partitions_processed,
             "traversal_state": checkpoint.traversal_state.model_dump(mode="json"),
             "partition_retry_checkpoint": checkpoint.model_dump(mode="json"),
         },
+        records=tuple(records),
+        artifacts=(),
+        inputs=tuple(inputs),
+        outputs=tuple(outputs),
     )
+    return checkpoint, draft
+
+
+async def _resume_partition_occurrences(
+    *,
+    dependencies: "FacebookSearchWorkerDependencies",
+    context: AttemptContext,
+    checkpoint: PartitionSearchRetryCheckpoint,
+) -> PartitionSearchRetryCheckpoint:
+    checkpoint, draft = await build_resumed_partition_checkpoint(
+        dependencies=dependencies,
+        context=context,
+        checkpoint=checkpoint,
+    )
+    await _publish_search_checkpoint(draft, dependencies=dependencies, context=context)
     return checkpoint
 
 
@@ -448,9 +507,9 @@ async def _acquire_for_network_activity(
     return _bind_network_activity(result, admission)
 
 
-async def _checkpoint_session_bootstrap(
+def build_search_bootstrap_checkpoint(
     *,
-    dependencies: FacebookSearchWorkerDependencies,
+    dependencies: SearchCheckpointDependencies,
     context: AttemptContext,
     extractor_component: Component,
     search_run_identifier: str,
@@ -463,7 +522,7 @@ async def _checkpoint_session_bootstrap(
     session_evidence: SearchSessionMaterialEvidence | None,
     session_issues: tuple[SearchSessionMaterialIssue, ...],
     partition_retry_checkpoint: PartitionSearchRetryCheckpoint | None = None,
-) -> None:
+) -> SearchCheckpointDrafts:
     decoded_identifier = dependencies.new_identifier()
     extraction_identifier = dependencies.new_identifier()
     acquisition_record = dict(acquisition.record)
@@ -579,16 +638,8 @@ async def _checkpoint_session_bootstrap(
         )
         for index, body in enumerate(acquisition.bodies)
     )
-    await dependencies.database.publish_leased_operation_checkpoint(
-        work_item_identifier=context.work_item_identifier,
-        lease_token=context.lease_token,
-        worker_identifier=context.worker_identifier,
-        utc_now_ns=dependencies.utc_now_ns,
-        operation_id=context.operation_identifier,
-        records=records,
-        artifacts=artifacts,
-        outputs=outputs,
-        checkpoint_result={
+    draft = SearchCheckpointDrafts(
+        result={
             "state": "collecting",
             "session_bootstrap_persisted": True,
             "pages_persisted": (
@@ -607,12 +658,50 @@ async def _checkpoint_session_bootstrap(
                 else partition_retry_checkpoint.model_dump(mode="json")
             ),
         },
+        records=tuple(records),
+        artifacts=tuple(artifacts),
+        outputs=tuple(outputs),
     )
+    return draft
 
 
-async def _checkpoint_page(
+async def _checkpoint_session_bootstrap(
     *,
     dependencies: FacebookSearchWorkerDependencies,
+    context: AttemptContext,
+    extractor_component: Component,
+    search_run_identifier: str,
+    network_session_identifier: str,
+    acquisition_identifier: str,
+    acquisition: Acquisition,
+    decoded: _DecodedResponse,
+    blocks: tuple[dict[str, JsonValue], ...],
+    response_classification: dict[str, JsonValue],
+    session_evidence: SearchSessionMaterialEvidence | None,
+    session_issues: tuple[SearchSessionMaterialIssue, ...],
+    partition_retry_checkpoint: PartitionSearchRetryCheckpoint | None = None,
+) -> None:
+    draft = build_search_bootstrap_checkpoint(
+        dependencies=dependencies,
+        context=context,
+        extractor_component=extractor_component,
+        search_run_identifier=search_run_identifier,
+        network_session_identifier=network_session_identifier,
+        acquisition_identifier=acquisition_identifier,
+        acquisition=acquisition,
+        decoded=decoded,
+        blocks=blocks,
+        response_classification=response_classification,
+        session_evidence=session_evidence,
+        session_issues=session_issues,
+        partition_retry_checkpoint=partition_retry_checkpoint,
+    )
+    await _publish_search_checkpoint(draft, dependencies=dependencies, context=context)
+
+
+def build_search_page_checkpoint(
+    *,
+    dependencies: SearchCheckpointDependencies,
     context: AttemptContext,
     extractor_component: Component,
     search_run_identifier: str,
@@ -634,7 +723,7 @@ async def _checkpoint_page(
     price_partition: SearchPricePartition | None = None,
     price_partition_planner_component: Component | None = None,
     partition_retry_checkpoint: PartitionSearchRetryCheckpoint | None = None,
-) -> tuple[str, ...]:
+) -> SearchCheckpointDrafts:
     decoded_identifier = dependencies.new_identifier()
     extraction_identifier = dependencies.new_identifier()
     record = dict(acquisition.record)
@@ -895,16 +984,8 @@ async def _checkpoint_page(
                     "challenge_page_ordinal": traversal_state.partitions_processed + 1,
                 }
             )
-    await dependencies.database.publish_leased_operation_checkpoint(
-        work_item_identifier=context.work_item_identifier,
-        lease_token=context.lease_token,
-        worker_identifier=context.worker_identifier,
-        utc_now_ns=dependencies.utc_now_ns,
-        operation_id=context.operation_identifier,
-        records=records,
-        artifacts=artifacts,
-        outputs=outputs,
-        checkpoint_result={
+    draft = SearchCheckpointDrafts(
+        result={
             "state": "collecting",
             "pages_persisted": page_ordinal,
             "traversal_state": (
@@ -916,8 +997,63 @@ async def _checkpoint_page(
                 else partition_retry_checkpoint.model_dump(mode="json")
             ),
         },
+        records=tuple(records),
+        artifacts=tuple(artifacts),
+        outputs=tuple(outputs),
+        occurrence_identifiers=tuple(occurrence_identifiers),
     )
-    return tuple(occurrence_identifiers)
+    return draft
+
+
+async def _checkpoint_page(
+    *,
+    dependencies: FacebookSearchWorkerDependencies,
+    context: AttemptContext,
+    extractor_component: Component,
+    search_run_identifier: str,
+    network_session_identifier: str,
+    page_ordinal: int,
+    page_kind: str,
+    acquisition_identifier: str,
+    acquisition: Acquisition,
+    decoded: _DecodedResponse,
+    page: SearchPageExtraction | None,
+    extraction: (
+        SearchBootstrapExtraction | SearchRouteDefinitionExtraction | SearchPaginationExtraction
+    ),
+    applied_configuration: AppliedSearchConfiguration | None,
+    session_evidence: SearchSessionMaterialEvidence | None,
+    response_classification: dict[str, JsonValue] | None,
+    traversal_state: SearchTraversalState | PricePartitionSearchTraversalState | None,
+    requested_search: FacebookSearchRequest,
+    price_partition: SearchPricePartition | None = None,
+    price_partition_planner_component: Component | None = None,
+    partition_retry_checkpoint: PartitionSearchRetryCheckpoint | None = None,
+) -> tuple[str, ...]:
+    draft = build_search_page_checkpoint(
+        dependencies=dependencies,
+        context=context,
+        extractor_component=extractor_component,
+        search_run_identifier=search_run_identifier,
+        network_session_identifier=network_session_identifier,
+        page_ordinal=page_ordinal,
+        page_kind=page_kind,
+        acquisition_identifier=acquisition_identifier,
+        acquisition=acquisition,
+        decoded=decoded,
+        page=page,
+        extraction=extraction,
+        applied_configuration=applied_configuration,
+        session_evidence=session_evidence,
+        response_classification=response_classification,
+        traversal_state=traversal_state,
+        requested_search=requested_search,
+        price_partition=price_partition,
+        price_partition_planner_component=price_partition_planner_component,
+        partition_retry_checkpoint=partition_retry_checkpoint,
+    )
+    await _publish_search_checkpoint(draft, dependencies=dependencies, context=context)
+    return draft.occurrence_identifiers
 
 
 def build_search_handler(

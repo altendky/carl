@@ -507,9 +507,61 @@ cap, including reconnect prefixes. Request-plan
 serialization and stored request identities stay compatible. Complete bodies
 received before response-close failure remain available as raw evidence.
 
-These adapters are opt-in. Bounded resident sessions and production dispatcher
-cutover are tracked separately; the existing foreground runtime remains the
-default until those adapters are ready. The adapter registry starts no workers.
+Marketplace session adapters additionally use a resident pool, separate from
+active stage execution. Admission reserves one session and its entire idle-state
+budget before creating an actor task or opening a client. Defaults are 32
+sessions and 128 MiB of accounted application state, with a 4 MiB reservation
+per actor; `CARL_RESOURCE_RESIDENT_SESSIONS` and
+`CARL_RESOURCE_RESIDENT_STATE_BYTES` configure the shared budgets. Accounting
+includes encoded cookies, headers, bootstrap material and pagination state,
+with a per-cookie overhead allowance. It does not measure whole-process RSS or
+native transport connection buffers. HTTP/CPU body and concurrency bounds
+remain separate.
+
+Each resident executes requests sequentially in one task. A pool-owned heartbeat
+renews ownership without keeping an execution scope around the provider context.
+Between HTTP and CPU phases the actor retains its client, cookies and small
+session material while releasing execution resources. Raw bodies are externally
+checkpointed before CPU waits; publication buffers and progress arrays are not
+retained in idle actor state. Child eBay document/extraction operations publish
+in the same short transaction as their parent stage, preserving their component
+identities and the current execution's provenance without bypassing the parent
+publication fence. The logical parent retains its original start metadata.
+
+A stage's resident identity is enforced by immutable incarnation, generation,
+owner, coordination scope and active execution token. Thirty seconds without
+progress, or a known longer wait, parks and closes the session. A later actor
+explicitly rebinds the pending checkpoint to a fresh incarnation; Facebook always
+bootstraps new cookies before another request. A retained page response can be
+processed offline first. eBay then bootstraps a fresh homepage before further
+pages, using its retained homepage budget and preserving page request counters;
+the previous session's private Fetch token is discarded. Real acquisition
+retries retain their existing budgets;
+parking and execution continuations do not start another attempt.
+
+HTTP dispatch charges its request allowance durably before starting transport.
+An interrupted request with an unknown outcome therefore still consumes its
+allowance after recovery. Facebook limits a bootstrap at each progress frontier
+and each bucket request within the logical attempt; exhaustion follows the
+existing deferred transport retry policy. eBay uses its existing homepage/page
+attempt limits, including uncertain executions. Checkpoint replay does not
+charge another request. A replay retains its original planned network-attempt
+metadata and gets a distinct execution-specific activity identity; the durable
+charge and acquisition record carry the actual dispatch ordinal.
+
+Cancellation closes the provider before releasing resident capacity. Failed
+cleanup quarantines the client and its physical guard, so capacity remains
+charged until process death permits guarded recovery. Expiry alone releases
+neither a live resident nor its active stage. Recovery holds both relevant
+guards and validates their exact persisted binding before changing ownership.
+Provider factories must shield their own physical finalizers; their task scopes
+remain in the owning actor throughout their lifetime. Shared route processes
+retain their existing separate provider ownership.
+
+These adapters are opt-in. Production dispatcher cutover is tracked separately;
+the existing foreground runtime remains the default until integration is ready.
+The adapter registry starts no workers, and the resident pool creates no task
+for work that fails nonblocking admission.
 
 SQLite is the durable source of pending work. A claim uses a short transaction
 to assign a lease token, worker identity, and expiration time. Processing occurs

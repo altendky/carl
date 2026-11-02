@@ -259,6 +259,15 @@ class ManagedDecodoSession:
     requests_completed: int = 0
     ended_at_utc: str | None = None
     failed: bool = False
+    _close_completed: bool = False
+
+    def is_closed(self) -> bool:
+        return self._close_completed
+
+    def retained_bytes(self) -> int:
+        from carl.io.resident_memory import httpx_retained_bytes
+
+        return httpx_retained_bytes(self.client)
 
     def _observation(self, *, state: str) -> dict[str, JsonValue]:
         return {
@@ -469,7 +478,9 @@ class DecodoSessionManager:
                 try:
                     if client is not None:
                         try:
-                            await close_httpx_client(client)
+                            closed = await close_httpx_client(client)
+                            if session is not None:
+                                session._close_completed = closed
                         except Exception as error:
                             if session is not None:
                                 session.failed = True
@@ -610,6 +621,12 @@ class ManagedDecodoWreqSession:
     ended_at_utc: str | None = None
     failed: bool = False
     _lock: anyio.Lock = field(default_factory=anyio.Lock)
+
+    def retained_bytes(self) -> int:
+        return self.acquirer.retained_bytes()
+
+    def is_closed(self) -> bool:
+        return self.acquirer.is_closed()
 
     def observation(self) -> dict[str, JsonValue]:
         return _wreq_session_observation(

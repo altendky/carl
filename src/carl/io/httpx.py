@@ -25,9 +25,10 @@ MAX_ACQUISITION_BODY_BYTES = 100_000_000
 
 async def close_httpx_client(
     client: httpx.AsyncClient, *, primary_error: BaseException | None = None
-) -> None:
+) -> bool:
     """Clear session material and close the transport even if either step fails."""
     cookie_error: BaseException | None = None
+    transport_closed = False
     try:
         async with shielded_cleanup("http_client_cookies", primary_error=primary_error):
             client.cookies.clear()
@@ -39,6 +40,8 @@ async def close_httpx_client(
             "http_client_close", primary_error=primary_error or cookie_error
         ):
             await client.aclose()
+            transport_closed = True
+    return transport_closed
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,6 +763,11 @@ class LocalSocks5HttpxAcquirer(_HttpxAcquirer):
 
 class ClientHttpxAcquirer(_HttpxAcquirer):
     """Use a caller-owned client so cookies and connections span acquisitions."""
+
+    def retained_bytes(self) -> int:
+        from carl.io.resident_memory import httpx_retained_bytes
+
+        return 0 if self.client is None else httpx_retained_bytes(self.client)
 
     def __init__(
         self,

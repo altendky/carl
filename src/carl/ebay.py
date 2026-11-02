@@ -27,10 +27,12 @@ from carl.core.ebay_navigation import ebay_fetch_plan, ebay_pagination_token, is
 from carl.core.ebay_search_support import require_supported_ebay_search_acquisition
 from carl.core.http import RequestPlan, stored_content_encodings, stored_response_charset
 from carl.core.models import (
+    ArtifactDraft,
     BytesDraft,
     CodeProvenance,
     Header,
     JsonValue,
+    NamedInput,
     NamedOutput,
     RecordDraft,
 )
@@ -47,6 +49,7 @@ from carl.io.paths import CarlDirectories
 from carl.io.provenance import collect_code_provenance_async, process_invocation
 from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
+from carl.io.stage_publication import ChildOperationDraft
 
 COLLECT_EBAY_SEARCH = ComponentId(("carl", "ebay", "collect", "search_page"))
 COLLECT_EBAY_SEARCH_HOMEPAGE = ComponentId(("carl", "ebay", "collect", "search_homepage"))
@@ -554,6 +557,47 @@ async def _collect_ebay_search_document(
             raise
         raise failure from error
 
+    draft, result = build_search_document_draft(
+        acquisition=acquisition,
+        request=request,
+        plan=plan,
+        page_number=page_number,
+        page_ordinal=page_ordinal,
+        search_run_identifier=search_run_identifier,
+        operation_identifier=operation_identifier,
+        new_identifier=new_identifier,
+        started_at_utc=started_at_utc,
+        ended_at_utc=_utc_now(),
+        duration_ns=perf_counter_ns() - started,
+        artifacts=_body_artifacts(acquisition),
+        request_attempt=request_attempt,
+    )
+    await complete_search_child_draft(database, draft)
+    return result
+
+
+def build_search_document_draft(
+    *,
+    acquisition: Acquisition,
+    request: EbaySearchRequest,
+    plan: RequestPlan,
+    page_number: int | None,
+    page_ordinal: int | None,
+    search_run_identifier: str,
+    operation_identifier: str,
+    new_identifier: Callable[[], str],
+    started_at_utc: str,
+    ended_at_utc: str,
+    duration_ns: int,
+    artifacts: tuple[ArtifactDraft, ...],
+    request_attempt: int = 1,
+) -> tuple[ChildOperationDraft, dict[str, JsonValue]]:
+    """Prepare one captured document's original child-operation evidence."""
+    homepage = page_number is None
+    purpose = "ebay_search_homepage" if homepage else "ebay_search_page"
+    component = build_ebay_component_registry().require(
+        COLLECT_EBAY_SEARCH_HOMEPAGE if homepage else COLLECT_EBAY_SEARCH
+    )
     acquisition_identifier = new_identifier()
     acquisition_value = dict(acquisition.record)
     acquisition_value.update(
@@ -576,30 +620,43 @@ async def _collect_ebay_search_document(
             value=acquisition_value,
         ),
     )
-    artifacts = _body_artifacts(acquisition)
     outputs = [NamedOutput(name=("acquisition",), object_identifier=acquisition_identifier)]
     outputs.extend(
         NamedOutput(name=("response", str(index), "body"), object_identifier=body.identifier)
         for index, body in enumerate(acquisition.bodies)
     )
     terminal_response = _terminal_response(acquisition_value)
-    await database.complete_operation(
-        operation_id=operation_identifier,
+    draft = ChildOperationDraft(
+        identifier=operation_identifier,
+        component=component,
+        configuration={
+            "request": request.model_dump(mode="json"),
+            "purpose": purpose,
+            "page_number": page_number,
+            "page_ordinal": page_ordinal,
+            "request_attempt": request_attempt,
+            "search_run_record_identifier": search_run_identifier,
+            "request_plan": plan.as_json(),
+        },
+        inputs=(),
         records=records,
         artifacts=artifacts,
-        outputs=outputs,
+        outputs=tuple(outputs),
         result={
             "acquisition_record_identifier": acquisition_identifier,
             "http_status": terminal_response.get("status_code"),
         },
-        ended_at_utc=_utc_now(),
-        duration_ns=perf_counter_ns() - started,
+        started_at_utc=started_at_utc,
+        ended_at_utc=ended_at_utc,
+        duration_ns=duration_ns,
     )
-    return {
+    result: dict[str, JsonValue] = {
         "acquisition_operation_identifier": operation_identifier,
         "acquisition_record_identifier": acquisition_identifier,
         "http_status": terminal_response.get("status_code"),
     }
+
+    return draft, result
 
 
 async def _collect_ebay_search_page(
@@ -696,37 +753,20 @@ async def extract_ebay_search_acquisition(
         ),
     )
     try:
-        headers = terminal_response.get("headers")
-        decoded = await run_cpu(
-            decoded_stored_body,
-            stored_body,
-            body_metadata.get("representation"),
-            stored_content_encodings(headers),
-        )
-        charset, charset_source = stored_response_charset(headers)
-        try:
-            html = decoded.decode(charset)
-            decoding_issues: tuple[JsonValue, ...] = ()
-        except (LookupError, UnicodeError):
-            html = decoded.decode("utf-8", errors="replace")
-            charset = "utf-8"
-            charset_source = "fallback_after_decode_failure"
-            decoding_issues = ({"kind": "text_decoding_failure", "fallback": "utf-8-replace"},)
-        status_code = terminal_response.get("status_code")
-        if not isinstance(status_code, int) or isinstance(status_code, bool):
-            raise ValueError("eBay acquisition terminal response has no HTTP status")
-        extraction = await run_cpu(
-            partial(
-                extract_ebay_search,
-                html,
-                status_code=status_code,
-                listing_state=request.listing_state,
-                redirect_target=(
-                    terminal_response["redirect_target"]
-                    if isinstance(terminal_response.get("redirect_target"), str)
-                    else None
-                ),
-            )
+        draft, result, _ = await build_search_extraction_draft(
+            acquisition_value=acquisition_value,
+            acquisition_identifier=acquisition_identifier,
+            body_identifier=body_identifier,
+            body_metadata=body_metadata,
+            stored_body=stored_body,
+            request=request,
+            search_run_identifier=search_run_identifier,
+            page_number=page_number,
+            page_ordinal=page_ordinal,
+            operation_identifier=operation_identifier,
+            new_identifier=new_identifier,
+            started_at_utc=started_at_utc,
+            started_monotonic_ns=started,
         )
     except Exception as error:
         await database.fail_operation(
@@ -738,6 +778,61 @@ async def extract_ebay_search_acquisition(
         )
         raise
 
+    await complete_search_child_draft(database, draft)
+    return result
+
+
+async def build_search_extraction_draft(
+    *,
+    acquisition_value: dict[str, JsonValue],
+    acquisition_identifier: str,
+    body_identifier: str,
+    body_metadata: dict[str, JsonValue],
+    stored_body: bytes,
+    request: EbaySearchRequest,
+    search_run_identifier: str,
+    page_number: int,
+    page_ordinal: int,
+    operation_identifier: str,
+    new_identifier: Callable[[], str],
+    started_at_utc: str,
+    started_monotonic_ns: int,
+) -> tuple[ChildOperationDraft, dict[str, JsonValue], str]:
+    """Decode and prepare immutable search extraction evidence, with no writes."""
+    component = build_ebay_component_registry().require(EXTRACT_EBAY_SEARCH)
+    terminal_response = _terminal_response(acquisition_value)
+    headers = terminal_response.get("headers")
+    decoded = await run_cpu(
+        decoded_stored_body,
+        stored_body,
+        body_metadata.get("representation"),
+        stored_content_encodings(headers),
+    )
+    charset, charset_source = stored_response_charset(headers)
+    try:
+        html = decoded.decode(charset)
+        decoding_issues: tuple[JsonValue, ...] = ()
+    except (LookupError, UnicodeError):
+        html = decoded.decode("utf-8", errors="replace")
+        charset = "utf-8"
+        charset_source = "fallback_after_decode_failure"
+        decoding_issues = ({"kind": "text_decoding_failure", "fallback": "utf-8-replace"},)
+    status_code = terminal_response.get("status_code")
+    if not isinstance(status_code, int) or isinstance(status_code, bool):
+        raise ValueError("eBay acquisition terminal response has no HTTP status")
+    extraction = await run_cpu(
+        partial(
+            extract_ebay_search,
+            html,
+            status_code=status_code,
+            listing_state=request.listing_state,
+            redirect_target=(
+                terminal_response["redirect_target"]
+                if isinstance(terminal_response.get("redirect_target"), str)
+                else None
+            ),
+        )
+    )
     decoded_identifier = new_identifier()
     extraction_identifier = new_identifier()
     occurrence_identifiers = tuple(new_identifier() for _ in extraction.listing_occurrences)
@@ -812,21 +907,34 @@ async def extract_ebay_search_acquisition(
         )
         for index, identifier in enumerate(occurrence_identifiers)
     )
-    await database.complete_operation(
-        operation_id=operation_identifier,
+    draft = ChildOperationDraft(
+        identifier=operation_identifier,
+        component=component,
+        configuration={
+            "acquisition_record_identifier": acquisition_identifier,
+            "request": request.model_dump(mode="json"),
+            "search_run_record_identifier": search_run_identifier,
+            "page_number": page_number,
+            "page_ordinal": page_ordinal,
+        },
+        inputs=(
+            NamedInput(name=("acquisition",), object_identifier=acquisition_identifier),
+            NamedInput(name=("terminal_response", "body"), object_identifier=body_identifier),
+        ),
         records=records,
         artifacts=(decoded_artifact,),
-        outputs=outputs,
+        outputs=tuple(outputs),
         result={
             "extraction_record_identifier": extraction_identifier,
             "response_classification": classification,
             "next_page_number": extraction.next_page_number,
             "listing_count": len(occurrence_identifiers),
         },
+        started_at_utc=started_at_utc,
         ended_at_utc=_utc_now(),
-        duration_ns=perf_counter_ns() - started,
+        duration_ns=perf_counter_ns() - started_monotonic_ns,
     )
-    return {
+    result: dict[str, JsonValue] = {
         "extraction_operation_identifier": operation_identifier,
         "extraction_record_identifier": extraction_identifier,
         "page_number": page_number,
@@ -839,6 +947,8 @@ async def extract_ebay_search_acquisition(
         ],
         "listing_occurrence_record_identifiers": list(occurrence_identifiers),
     }
+
+    return draft, result, html
 
 
 async def _finalize_ebay_search(
@@ -854,6 +964,41 @@ async def _finalize_ebay_search(
     homepage_acquisition: dict[str, JsonValue] | None = None,
     pagination: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
+    draft, result = build_search_finalization_draft(
+        request=request,
+        search_run_identifier=search_run_identifier,
+        pages=pages,
+        stopping_reason=stopping_reason,
+        new_identifier=new_identifier,
+        policy=policy,
+        homepage_acquisition=homepage_acquisition,
+        pagination=pagination,
+    )
+    await database.begin_operation(
+        operation_id=draft.identifier,
+        component=draft.component,
+        provenance=provenance,
+        invocation=process_invocation(),
+        configuration=draft.configuration,
+        started_at_utc=draft.started_at_utc,
+        inputs=tuple((item.name, item.object_identifier) for item in draft.inputs),
+    )
+    await complete_search_child_draft(database, draft)
+    return result
+
+
+def build_search_finalization_draft(
+    *,
+    request: EbaySearchRequest,
+    search_run_identifier: str,
+    pages: Sequence[dict[str, JsonValue]],
+    stopping_reason: str,
+    new_identifier: Callable[[], str],
+    policy: EbaySearchConfiguration,
+    homepage_acquisition: dict[str, JsonValue] | None = None,
+    pagination: dict[str, JsonValue] | None = None,
+) -> tuple[ChildOperationDraft, dict[str, JsonValue]]:
+    """Prepare the original manifest and its complete page-input provenance."""
     if not pages:
         raise ValueError("An eBay search run requires at least one retained page")
     registry = build_ebay_component_registry()
@@ -951,11 +1096,9 @@ async def _finalize_ebay_search(
         **({} if homepage_acquisition is None else {"homepage_acquisition": homepage_acquisition}),
         **({} if pagination is None else {"pagination": pagination}),
     }
-    await database.begin_operation(
-        operation_id=operation_identifier,
+    draft = ChildOperationDraft(
+        identifier=operation_identifier,
         component=component,
-        provenance=provenance,
-        invocation=process_invocation(),
         configuration={
             "request": request.model_dump(mode="json"),
             "search_run_record_identifier": search_run_identifier,
@@ -963,11 +1106,9 @@ async def _finalize_ebay_search(
             "stopping_reason": stopping_reason,
             "collection_policy": policy.model_dump(mode="json"),
         },
-        started_at_utc=started_at_utc,
-        inputs=tuple(inputs),
-    )
-    await database.complete_operation(
-        operation_id=operation_identifier,
+        inputs=tuple(
+            NamedInput(name=name, object_identifier=identifier) for name, identifier in inputs
+        ),
         records=(
             RecordDraft(
                 identifier=search_run_identifier,
@@ -985,10 +1126,11 @@ async def _finalize_ebay_search(
             "listing_occurrence_count": len(occurrence_identifiers),
             "stopping_reason": stopping_reason,
         },
+        started_at_utc=started_at_utc,
         ended_at_utc=_utc_now(),
         duration_ns=perf_counter_ns() - started,
     )
-    return {
+    result: dict[str, JsonValue] = {
         "finalization_operation_identifier": operation_identifier,
         "search_run_record_identifier": search_run_identifier,
         "page_count": len(pages),
@@ -998,3 +1140,18 @@ async def _finalize_ebay_search(
         "listing_occurrence_record_identifiers": occurrence_identifiers,
         **({} if pagination is None else {"pagination": pagination}),
     }
+
+    return draft, result
+
+
+async def complete_search_child_draft(database: Database, draft: ChildOperationDraft) -> None:
+    """Complete a legacy operation that has already been started by its wrapper."""
+    await database.complete_operation(
+        operation_id=draft.identifier,
+        records=draft.records,
+        artifacts=draft.artifacts,
+        outputs=draft.outputs,
+        result=draft.result,
+        ended_at_utc=draft.ended_at_utc,
+        duration_ns=draft.duration_ns,
+    )
