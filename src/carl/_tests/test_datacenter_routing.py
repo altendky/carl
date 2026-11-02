@@ -92,6 +92,14 @@ class _Session:
         return {"network_session_identifier": self.identifier, "state": "closed"}
 
 
+@dataclass
+class _RouteSettings:
+    routing: tuple[str, ...]
+
+    def session_retry_scope(self) -> str:
+        return "stack"
+
+
 def _patch_routes(
     monkeypatch: pytest.MonkeyPatch,
     module: object,
@@ -104,10 +112,10 @@ def _patch_routes(
     def settings(_loaded: object, _directories: object, routing: tuple[str, ...]) -> object:
         assert routing == expected
         opened.append(routing)
-        return (routing, object()) if routing[0] == "decodo" else routing
+        return (_RouteSettings(routing), object()) if routing[0] == "decodo" else routing
 
     def factory(*, settings: object, **_kwargs: object) -> Callable[[str], object]:
-        assert settings == expected
+        assert (settings.routing if isinstance(settings, _RouteSettings) else settings) == expected
 
         @asynccontextmanager
         async def session(identifier: str) -> AsyncGenerator[_Session]:

@@ -877,7 +877,7 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=64),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=65),
                 ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=48),
                 ServerCapability(
                     identity=("carl", "facebook", "price_partition_search_only"), version=1
@@ -905,7 +905,7 @@ class ReviewApplication:
                 ServerCapability(identity=("carl", "facebook", "search_run_summary"), version=1),
                 ServerCapability(identity=("carl", "facebook", "search_run_membership"), version=1),
                 ServerCapability(
-                    identity=("carl", "facebook", "search_transport_retry"), version=5
+                    identity=("carl", "facebook", "search_transport_retry"), version=6
                 ),
                 ServerCapability(
                     identity=("carl", "facebook", "search_refresh", "child_progress"),

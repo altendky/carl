@@ -1072,7 +1072,13 @@ stop queue processing. `carl monitor --work` runs that same bounded pool alongsi
 MCP servers and `carl search` never start workers implicitly; stale or concurrent clients therefore
 cannot multiply worker pools. Search session and HTTP transport failures use bounded exponential
 backoff. A transport failure invalidates the runtime-scoped WireProxy entry, whose child is always
-waited and reaped; the next attempt starts and health-probes a fresh child. Refresh coordinators
+waited and reaped; the next attempt starts and health-probes a fresh child.
+For Facebook, verified independently selectable Decodo sessions retain only the failed job's
+backoff; they do not impose challenge cooldowns or transport deferrals on sibling searches.
+Fixed exits and unknown collectors keep shared route protection. The worker classifies the
+resolved configuration before datacenter port selection removes the pool information and records
+the selected retry scope. Independent selection can repeat a port and is not proof of unique IPs.
+Refresh coordinators
 resume retryable terminal search children before declaring the whole refresh failed. Work claims
 and concurrency constraints are atomic SQLite state, so explicit worker
 processes share global limits. Expired leases are recovered when a worker process restarts. Route
