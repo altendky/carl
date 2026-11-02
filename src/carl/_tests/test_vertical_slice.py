@@ -389,8 +389,13 @@ async def test_composed_projection_storage_queries_are_targeted_and_bounded(tmp_
         ) -> None:
             connection.execute(
                 """
-                INSERT INTO work_items VALUES (?, ?, 1, '{}', '{}', 'completed', 0, 0, 0,
-                                               NULL, NULL, NULL, 1, '{}', NULL)
+                INSERT INTO work_items(
+                    id, kind_parts_json, payload_schema_version, payload_json,
+                    deduplication_identity_json, state, priority, eligible_at_utc_ns,
+                    created_at_utc_ns, lease_token, lease_owner, lease_expires_at_utc_ns,
+                    attempt, result_json, error_json
+                ) VALUES (?, ?, 1, '{}', '{}', 'completed', 0, 0, 0,
+                          NULL, NULL, NULL, 1, '{}', NULL)
                 """,
                 (identifier, encode_json(list(kind))),
             )

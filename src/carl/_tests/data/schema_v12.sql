@@ -1,0 +1,457 @@
+
+CREATE TABLE IF NOT EXISTS network_connectivity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    next_probe_utc_ns INTEGER NOT NULL CHECK (next_probe_utc_ns >= 0),
+    probe_token TEXT,
+    probe_expires_utc_ns INTEGER,
+    checked_at_utc_ns INTEGER,
+    result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json))
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS schema_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS code_states (
+    id INTEGER PRIMARY KEY,
+    commit_hash BLOB CHECK (commit_hash IS NULL OR length(commit_hash) IN (20, 32)),
+    worktree_state TEXT NOT NULL CHECK (worktree_state IN ('clean', 'dirty', 'unknown'))
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS code_states_identity
+ON code_states(coalesce(commit_hash, X''), worktree_state);
+
+CREATE TABLE IF NOT EXISTS operations (
+    id TEXT PRIMARY KEY,
+    component_parts_json TEXT NOT NULL CHECK (json_valid(component_parts_json)),
+    output_schema_version INTEGER NOT NULL CHECK (output_schema_version >= 1),
+    code_provenance_json TEXT NOT NULL CHECK (json_valid(code_provenance_json)),
+    invocation_json TEXT NOT NULL CHECK (json_valid(invocation_json)),
+    configuration_json TEXT NOT NULL CHECK (json_valid(configuration_json)),
+    state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'failed')),
+    started_at_utc TEXT NOT NULL,
+    ended_at_utc TEXT,
+    duration_ns INTEGER CHECK (duration_ns IS NULL OR duration_ns >= 0),
+    result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+    error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json)),
+    code_state_id INTEGER REFERENCES code_states(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS operations_code_state ON operations(code_state_id);
+
+CREATE TABLE IF NOT EXISTS objects (
+    id TEXT PRIMARY KEY,
+    object_type TEXT NOT NULL CHECK (object_type IN ('record', 'artifact')),
+    kind_parts_json TEXT NOT NULL CHECK (json_valid(kind_parts_json)),
+    created_by_operation_id TEXT NOT NULL,
+    FOREIGN KEY (created_by_operation_id) REFERENCES operations(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS objects_kind
+ON objects(kind_parts_json);
+
+CREATE INDEX IF NOT EXISTS objects_operation_kind
+ON objects(created_by_operation_id, kind_parts_json, id);
+
+CREATE TABLE IF NOT EXISTS records (
+    object_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+    value_json TEXT NOT NULL CHECK (json_valid(value_json)),
+    FOREIGN KEY (object_id) REFERENCES objects(id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS saved_image_lookup (
+    marketplace TEXT NOT NULL CHECK (marketplace IN ('facebook', 'ebay')),
+    lookup_kind TEXT NOT NULL CHECK (lookup_kind IN ('url', 'photo_id', 'path')),
+    lookup_value TEXT NOT NULL,
+    result_object_id TEXT NOT NULL,
+    PRIMARY KEY (marketplace, lookup_kind, lookup_value, result_object_id),
+    FOREIGN KEY (result_object_id) REFERENCES objects(id)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS records_gallery_observation
+ON records(json_extract(value_json, '$.listing_observation_record_identifier'), object_id)
+WHERE json_extract(value_json, '$.listing_observation_record_identifier') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_ebay_gallery_observation
+ON records(json_extract(value_json, '$.observation_record_identifier'), object_id)
+WHERE json_extract(value_json, '$.observation_record_identifier') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_saved_image_reference
+ON records(json_extract(value_json, '$.image_reference_record_identifier'), object_id)
+WHERE json_extract(value_json, '$.state') = 'saved'
+  AND json_extract(value_json, '$.image_reference_record_identifier') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_saved_image_rendition
+ON records(
+    json_extract(value_json, '$.original_url'),
+    json_extract(value_json, '$.source_photo_id'),
+    object_id
+)
+WHERE json_extract(value_json, '$.state') = 'saved'
+  AND json_extract(value_json, '$.original_url') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_listing_observation_listing
+ON records(json_extract(value_json, '$.listing_id'), object_id)
+WHERE json_extract(value_json, '$.listing_id') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_search_occurrence_run_position
+ON records(
+    json_extract(value_json, '$.search_run_identifier'),
+    json_extract(value_json, '$.page_ordinal'),
+    json_extract(value_json, '$.edge_index'),
+    json_extract(value_json, '$.listing_identifier'),
+    object_id
+)
+WHERE json_extract(value_json, '$.listing_identifier') IS NOT NULL
+  AND json_extract(value_json, '$.search_run_identifier') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_search_occurrence_listing
+ON records(json_extract(value_json, '$.listing_identifier'), object_id)
+WHERE json_extract(value_json, '$.listing_identifier') IS NOT NULL
+  AND json_extract(value_json, '$.search_run_identifier') IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS content (
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    storage_backend TEXT NOT NULL CHECK (storage_backend IN ('sqlite')),
+    inline_bytes BLOB NOT NULL,
+    external_locator TEXT,
+    PRIMARY KEY (sha256, size),
+    CHECK (length(inline_bytes) = size),
+    CHECK (external_locator IS NULL)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    object_id TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    media_type TEXT,
+    representation_json TEXT NOT NULL CHECK (json_valid(representation_json)),
+    FOREIGN KEY (object_id) REFERENCES objects(id),
+    FOREIGN KEY (sha256, size) REFERENCES content(sha256, size)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS operation_inputs (
+    operation_id TEXT NOT NULL,
+    name_parts_json TEXT NOT NULL CHECK (json_valid(name_parts_json)),
+    object_id TEXT NOT NULL,
+    PRIMARY KEY (operation_id, name_parts_json, object_id),
+    FOREIGN KEY (operation_id) REFERENCES operations(id),
+    FOREIGN KEY (object_id) REFERENCES objects(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS operation_inputs_object_name_operation
+ON operation_inputs(object_id, name_parts_json, operation_id);
+
+CREATE TABLE IF NOT EXISTS operation_outputs (
+    operation_id TEXT NOT NULL,
+    name_parts_json TEXT NOT NULL CHECK (json_valid(name_parts_json)),
+    object_id TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (operation_id, name_parts_json, object_id),
+    FOREIGN KEY (operation_id) REFERENCES operations(id),
+    FOREIGN KEY (object_id) REFERENCES objects(id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS work_items (
+    id TEXT PRIMARY KEY,
+    kind_parts_json TEXT NOT NULL CHECK (json_valid(kind_parts_json)),
+    payload_schema_version INTEGER NOT NULL CHECK (payload_schema_version >= 1),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    deduplication_identity_json TEXT NOT NULL CHECK (json_valid(deduplication_identity_json)),
+    state TEXT NOT NULL CHECK (
+        state IN ('pending', 'leased', 'completed', 'terminal_failure')
+    ),
+    priority INTEGER NOT NULL,
+    eligible_at_utc_ns INTEGER NOT NULL CHECK (eligible_at_utc_ns >= 0),
+    created_at_utc_ns INTEGER NOT NULL CHECK (created_at_utc_ns >= 0),
+    lease_token TEXT,
+    lease_owner TEXT,
+    lease_expires_at_utc_ns INTEGER CHECK (
+        lease_expires_at_utc_ns IS NULL OR lease_expires_at_utc_ns >= 0
+    ),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+    error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json)),
+    CHECK (
+        (state = 'leased' AND lease_token IS NOT NULL AND lease_owner IS NOT NULL
+         AND lease_expires_at_utc_ns IS NOT NULL)
+        OR
+        (state != 'leased' AND lease_token IS NULL AND lease_owner IS NULL
+         AND lease_expires_at_utc_ns IS NULL)
+    )
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS work_items_claim
+ON work_items(state, eligible_at_utc_ns, priority DESC, created_at_utc_ns);
+
+CREATE UNIQUE INDEX IF NOT EXISTS work_items_active_deduplication
+ON work_items(kind_parts_json, deduplication_identity_json)
+WHERE state IN ('pending', 'leased');
+
+CREATE INDEX IF NOT EXISTS work_items_analysis_lookup
+ON work_items(
+    kind_parts_json,
+    payload_schema_version,
+    json_extract(payload_json, '$.evidence_set_record_identifier'),
+    json_extract(payload_json, '$.product_guide_record_identifier'),
+    state,
+    created_at_utc_ns
+);
+
+CREATE TABLE IF NOT EXISTS work_operations (
+    operation_id TEXT PRIMARY KEY,
+    work_item_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt >= 1),
+    lease_token TEXT NOT NULL,
+    worker_identifier TEXT NOT NULL,
+    UNIQUE (work_item_id, attempt),
+    FOREIGN KEY (operation_id) REFERENCES operations(id),
+    FOREIGN KEY (work_item_id) REFERENCES work_items(id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS work_scopes (
+    work_item_id TEXT NOT NULL,
+    scope_kind TEXT NOT NULL CHECK (
+        scope_kind IN (
+            'overall', 'network_path', 'work_kind', 'network_activity_kind',
+            'remote_origin'
+        )
+    ),
+    scope_identity_json TEXT NOT NULL CHECK (json_valid(scope_identity_json)),
+    PRIMARY KEY (work_item_id, scope_kind, scope_identity_json),
+    FOREIGN KEY (work_item_id) REFERENCES work_items(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS work_scopes_lookup
+ON work_scopes(scope_kind, scope_identity_json, work_item_id);
+
+CREATE TABLE IF NOT EXISTS work_requests (
+    id TEXT PRIMARY KEY,
+    work_item_id TEXT NOT NULL,
+    requester_kind_parts_json TEXT NOT NULL CHECK (json_valid(requester_kind_parts_json)),
+    requester_identifier TEXT NOT NULL,
+    requested_at_utc_ns INTEGER NOT NULL CHECK (requested_at_utc_ns >= 0),
+    context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+    FOREIGN KEY (work_item_id) REFERENCES work_items(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS work_requests_work_item
+ON work_requests(work_item_id, requested_at_utc_ns);
+
+CREATE INDEX IF NOT EXISTS work_requests_requester
+ON work_requests(requester_identifier, requester_kind_parts_json, work_item_id);
+
+CREATE TABLE IF NOT EXISTS work_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    work_item_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL CHECK (
+        event_kind IN (
+            'enqueued', 'requester_attached', 'claimed', 'lease_expired',
+            'lease_renewed', 'released', 'completed', 'terminal_failure'
+        )
+    ),
+    recorded_at_utc_ns INTEGER NOT NULL CHECK (recorded_at_utc_ns >= 0),
+    data_json TEXT NOT NULL CHECK (json_valid(data_json)),
+    FOREIGN KEY (work_item_id) REFERENCES work_items(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS work_events_work_item
+ON work_events(work_item_id, sequence);
+
+CREATE TABLE IF NOT EXISTS scheduling_constraints (
+    identifier_parts_json TEXT PRIMARY KEY CHECK (json_valid(identifier_parts_json)),
+    constraint_kind TEXT NOT NULL CHECK (
+        constraint_kind IN ('concurrency', 'sliding_window_rate', 'uniform_holdoff')
+    ),
+    subject_kind TEXT NOT NULL CHECK (
+        subject_kind IN ('work_item', 'network_activity')
+    ),
+    scope_kind TEXT NOT NULL CHECK (
+        scope_kind IN (
+            'overall', 'network_path', 'work_kind', 'network_activity_kind',
+            'remote_origin'
+        )
+    ),
+    scope_identity_json TEXT NOT NULL CHECK (json_valid(scope_identity_json)),
+    schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+    definition_json TEXT NOT NULL CHECK (json_valid(definition_json)),
+    registered_at_utc_ns INTEGER NOT NULL CHECK (registered_at_utc_ns >= 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS scheduling_constraints_scope
+ON scheduling_constraints(
+    subject_kind, scope_kind, scope_identity_json, constraint_kind
+);
+
+CREATE TABLE IF NOT EXISTS external_artifacts (
+    object_id TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    size INTEGER NOT NULL CHECK (size >= 0),
+    media_type TEXT,
+    representation_json TEXT NOT NULL CHECK (json_valid(representation_json)),
+    locator TEXT NOT NULL CHECK (length(locator) > 0),
+    FOREIGN KEY (object_id) REFERENCES objects(id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS scheduling_constraint_retirements (
+    identifier_parts_json TEXT PRIMARY KEY CHECK (json_valid(identifier_parts_json)),
+    retired_at_utc_ns INTEGER NOT NULL CHECK (retired_at_utc_ns >= 0),
+    operation_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (length(reason) > 0),
+    FOREIGN KEY (identifier_parts_json)
+        REFERENCES scheduling_constraints(identifier_parts_json),
+    FOREIGN KEY (operation_id) REFERENCES operations(id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS network_activities (
+    id TEXT PRIMARY KEY,
+    kind_parts_json TEXT NOT NULL CHECK (json_valid(kind_parts_json)),
+    operation_id TEXT NOT NULL,
+    network_session_identifier TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
+    attempt INTEGER NOT NULL CHECK (attempt >= 1),
+    state TEXT NOT NULL CHECK (
+        state IN ('pending', 'admitted', 'completed', 'skipped', 'failed', 'cancelled')
+    ),
+    eligible_at_utc_ns INTEGER NOT NULL CHECK (eligible_at_utc_ns >= 0),
+    created_at_utc_ns INTEGER NOT NULL CHECK (created_at_utc_ns >= 0),
+    admission_token TEXT,
+    admitted_at_utc_ns INTEGER CHECK (
+        admitted_at_utc_ns IS NULL OR admitted_at_utc_ns >= 0
+    ),
+    permit_expires_at_utc_ns INTEGER CHECK (
+        permit_expires_at_utc_ns IS NULL OR permit_expires_at_utc_ns >= 0
+    ),
+    ended_at_utc_ns INTEGER CHECK (ended_at_utc_ns IS NULL OR ended_at_utc_ns >= 0),
+    result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+    FOREIGN KEY (operation_id) REFERENCES operations(id),
+    CHECK (
+        (state = 'admitted' AND admission_token IS NOT NULL
+         AND admitted_at_utc_ns IS NOT NULL AND permit_expires_at_utc_ns IS NOT NULL)
+        OR
+        (state != 'admitted' AND admission_token IS NULL
+         AND permit_expires_at_utc_ns IS NULL)
+    )
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS network_activities_state
+ON network_activities(state, eligible_at_utc_ns, permit_expires_at_utc_ns);
+
+CREATE TABLE IF NOT EXISTS network_activity_scopes (
+    network_activity_id TEXT NOT NULL,
+    scope_kind TEXT NOT NULL CHECK (
+        scope_kind IN (
+            'overall', 'network_path', 'work_kind', 'network_activity_kind',
+            'remote_origin'
+        )
+    ),
+    scope_identity_json TEXT NOT NULL CHECK (json_valid(scope_identity_json)),
+    PRIMARY KEY (network_activity_id, scope_kind, scope_identity_json),
+    FOREIGN KEY (network_activity_id) REFERENCES network_activities(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS network_activity_scopes_lookup
+ON network_activity_scopes(scope_kind, scope_identity_json, network_activity_id);
+
+CREATE TABLE IF NOT EXISTS network_activity_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    network_activity_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL CHECK (
+        event_kind IN ('created', 'admitted', 'completed', 'skipped', 'failed', 'cancelled')
+    ),
+    recorded_at_utc_ns INTEGER NOT NULL CHECK (recorded_at_utc_ns >= 0),
+    data_json TEXT NOT NULL CHECK (json_valid(data_json)),
+    FOREIGN KEY (network_activity_id) REFERENCES network_activities(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS network_activity_events_activity
+ON network_activity_events(network_activity_id, sequence);
+
+CREATE TABLE IF NOT EXISTS rate_starts (
+    id TEXT PRIMARY KEY,
+    constraint_identifier_parts_json TEXT NOT NULL,
+    subject_kind TEXT NOT NULL CHECK (
+        subject_kind IN ('work_item', 'network_activity')
+    ),
+    subject_identifier TEXT NOT NULL,
+    permit_token TEXT NOT NULL,
+    reserved_at_utc_ns INTEGER NOT NULL CHECK (reserved_at_utc_ns >= 0),
+    FOREIGN KEY (constraint_identifier_parts_json)
+        REFERENCES scheduling_constraints(identifier_parts_json)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS rate_starts_constraint_time
+ON rate_starts(constraint_identifier_parts_json, reserved_at_utc_ns);
+
+CREATE TABLE IF NOT EXISTS review_listing_claims (
+    workspace_record_id TEXT NOT NULL,
+    listing_identifier TEXT NOT NULL CHECK (
+        length(listing_identifier) > 0
+        AND (
+            listing_identifier NOT GLOB '*[^0-9]*'
+            OR (
+                listing_identifier GLOB 'ebay:[0-9]*'
+                AND length(substr(listing_identifier, 6)) BETWEEN 9 AND 15
+                AND substr(listing_identifier, 6) NOT GLOB '*[^0-9]*'
+            )
+        )
+    ),
+    batch_record_id TEXT NOT NULL,
+    claim_token TEXT NOT NULL CHECK (length(claim_token) > 0),
+    owner_identifier TEXT NOT NULL CHECK (length(owner_identifier) > 0),
+    acquired_at_utc_ns INTEGER NOT NULL CHECK (acquired_at_utc_ns >= 0),
+    lease_expires_at_utc_ns INTEGER NOT NULL CHECK (
+        lease_expires_at_utc_ns > acquired_at_utc_ns
+    ),
+    PRIMARY KEY (workspace_record_id, listing_identifier),
+    FOREIGN KEY (workspace_record_id) REFERENCES objects(id),
+    FOREIGN KEY (batch_record_id) REFERENCES objects(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS review_listing_claims_token
+ON review_listing_claims(claim_token, owner_identifier, lease_expires_at_utc_ns);
+
+CREATE INDEX IF NOT EXISTS review_listing_claims_batch
+ON review_listing_claims(batch_record_id, claim_token, lease_expires_at_utc_ns);
+
+CREATE TABLE IF NOT EXISTS review_mutation_requests (
+    action TEXT NOT NULL CHECK (
+        action IN (
+            'acquire_batch', 'renew_claim', 'release_claim', 'record_reviews',
+            'record_workspace_bulk_review'
+        )
+    ),
+    request_identifier TEXT NOT NULL CHECK (length(request_identifier) > 0),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    request_schema_version INTEGER NOT NULL CHECK (request_schema_version >= 1),
+    response_schema_version INTEGER NOT NULL CHECK (response_schema_version >= 1),
+    response_json TEXT NOT NULL CHECK (json_valid(response_json)),
+    operation_id TEXT NOT NULL,
+    created_at_utc_ns INTEGER NOT NULL CHECK (created_at_utc_ns >= 0),
+    PRIMARY KEY (action, request_identifier),
+    FOREIGN KEY (operation_id) REFERENCES operations(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS review_mutation_requests_operation
+ON review_mutation_requests(operation_id);
+
+CREATE INDEX IF NOT EXISTS records_listing_review_workspace_listing
+ON records(
+    json_extract(value_json, '$.workspace_record_identifier'),
+    json_extract(value_json, '$.listing_identifier'),
+    object_id
+)
+WHERE json_extract(value_json, '$.workspace_record_identifier') IS NOT NULL
+  AND json_extract(value_json, '$.listing_identifier') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS records_marketplace_item_observation
+ON records(json_extract(value_json, '$.item_identifier'),
+           json_extract(value_json, '$.observation_record_identifier'), object_id);
+
+CREATE INDEX IF NOT EXISTS records_marketplace_source_run
+ON records(json_extract(value_json, '$.search_run_record_identifier'), object_id);

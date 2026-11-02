@@ -27,6 +27,7 @@ pytestmark = pytest.mark.anyio
 
 # Frozen from ca216bbf2205f96437f548ff0769a49c0658a53f, before schema 18.
 _V17_SHA256 = "237aa1054113cb8c61eb1f2d079e741eca10cbb794fac1caa2e74ca312427acf"
+_V18_SHA256 = "e1451850f5bd245e419c06b205c2d4f7b2193220dbdf54b8ce122271f3bffc45"
 _V17_METADATA = {
     "schema_identity_json": encode_json(
         {"namespace": "carl", "domain": "storage", "backend": "sqlite", "version": 17}
@@ -63,7 +64,9 @@ def _create_v17(path: Path) -> None:
     # Reconstruct the exact prior DDL, rather than labelling current DDL as old.
     # The frozen hash catches any accidental column/table/index discrepancy and
     # avoids depending on Git history being available in an installed checkout.
-    schema = sqlite._SCHEMA
+    # Frozen v18 contains neither the v19 derived column nor its partial index.
+    schema = (Path(__file__).parent / "data" / "schema_v18.sql").read_text()
+    assert hashlib.sha256(schema.encode()).hexdigest() == _V18_SHA256
     for index in (_DISPATCH_INDEX, _EXPIRY_INDEX):
         assert schema.count(index) == 1
         schema = schema.replace(index, "")
@@ -87,7 +90,17 @@ def _rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
         return {
             name: tuple(
                 sorted(
-                    connection.execute('SELECT * FROM "' + name.replace('"', '""') + '"'),
+                    connection.execute(
+                        "SELECT "
+                        + ",".join(
+                            '"' + row[1].replace('"', '""') + '"'
+                            for row in connection.execute(f'PRAGMA table_info("{name}")')
+                            if row[1] != "acquisition_resource_identity_json"
+                        )
+                        + ' FROM "'
+                        + name.replace('"', '""')
+                        + '"'
+                    ),
                     key=repr,
                 )
             )
@@ -101,8 +114,8 @@ def _assert_current_schema(path: Path) -> None:
     with closing(sqlite3.connect(path)) as connection:
         actual = dict(connection.execute("SELECT key, value FROM schema_metadata"))
         assert actual == Database._expected_metadata()
-        assert sqlite.DATABASE_SCHEMA.version == 18
-        assert actual["schema_version"] == "18"
+        assert sqlite.DATABASE_SCHEMA.version == 19
+        assert actual["schema_version"] == "19"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         for name, expected in _INDEX_COLUMNS.items():
             # Verify key order and descending priority, not just index names.
@@ -115,8 +128,11 @@ def _assert_current_schema(path: Path) -> None:
 
 
 async def _seed_live_ownership(path: Path) -> tuple[StageLease, StageLease]:
-    # This opens the genuinely old file without silently migrating it first.
-    async with Database.managed(path, prepare_schema=False) as database:
+    # Use the current API to generate real lease/evidence structures, then copy
+    # only the old columns into the genuinely historical schema. New adapters
+    # cannot enqueue directly into an old table lacking their derived column.
+    seed = path.with_suffix(".seed.sqlite3")
+    async with Database.managed(seed, initialize=True) as database:
         await database.begin_operation(
             operation_id="retained-evidence",
             component=COMPONENT,
@@ -218,7 +234,46 @@ async def _seed_live_ownership(path: Path) -> tuple[StageLease, StageLease]:
             checkpoint_result={"phase": "captured"},
             inputs=(NamedInput(name=("source",), object_identifier="evidence"),),
         )
+    _copy_seed_to_legacy(seed, path)
     return resident_stage, stateless_stage
+
+
+def _copy_seed_to_legacy(seed: Path, path: Path) -> None:
+    """Copy closed fixture evidence into exact legacy DDL without relabeling it."""
+
+    with closing(sqlite3.connect(seed)) as source, closing(sqlite3.connect(path)) as target:
+        _ = target.execute("PRAGMA foreign_keys = ON")
+        _ = target.execute("BEGIN")
+        _ = target.execute("PRAGMA defer_foreign_keys = ON")
+        tables = [
+            row[0]
+            for row in target.execute(
+                "SELECT name FROM sqlite_schema WHERE type='table' "
+                + "AND name NOT IN ('schema_metadata','sqlite_sequence') ORDER BY name"
+            )
+        ]
+        for name in (*tables, "sqlite_sequence"):
+            columns = [row[1] for row in target.execute(f'PRAGMA table_info("{name}")')]
+            assert columns
+            available = {row[1] for row in source.execute(f'PRAGMA table_info("{name}")')}
+            assert set(columns) <= available
+            if name == "work_items":
+                assert available - set(columns) == {"acquisition_resource_identity_json"}
+            else:
+                assert set(columns) == available
+            quoted = ",".join('"' + column.replace('"', '""') + '"' for column in columns)
+            if name == "sqlite_sequence":
+                _ = target.execute("DELETE FROM sqlite_sequence")
+            rows = source.execute(f'SELECT {quoted} FROM "{name}"')
+            while batch := rows.fetchmany(128):
+                if name == "sqlite_sequence":
+                    batch = [row for row in batch if row[0] in tables]
+                _ = target.executemany(
+                    f'INSERT INTO "{name}" ({quoted}) VALUES ({",".join("?" for _ in columns)})',
+                    batch,
+                )
+        assert target.execute("PRAGMA foreign_key_check").fetchall() == []
+        target.commit()
 
 
 async def test_v17_migration_preserves_all_evidence_ownership_and_request_fences(

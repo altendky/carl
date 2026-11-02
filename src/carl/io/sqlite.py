@@ -19,6 +19,7 @@ import apsw
 
 from carl.core.acquisition_identity import (
     acquisition_resource_identity,
+    acquisition_resource_identity_json,
     ebay_image_identity,
     facebook_image_identity,
 )
@@ -213,9 +214,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=18,
+    version=19,
 )
 
+_V18_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 18})
+_V18_SCHEMA_DEFINITION_SHA256 = "e1451850f5bd245e419c06b205c2d4f7b2193220dbdf54b8ce122271f3bffc45"
 _V17_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 17})
 _V17_SCHEMA_DEFINITION_SHA256 = "237aa1054113cb8c61eb1f2d079e741eca10cbb794fac1caa2e74ca312427acf"
 _V16_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 16})
@@ -583,6 +586,9 @@ CREATE TABLE IF NOT EXISTS work_items (
     kind_parts_json TEXT NOT NULL CHECK (json_valid(kind_parts_json)),
     payload_schema_version INTEGER NOT NULL CHECK (payload_schema_version >= 1),
     payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    acquisition_resource_identity_json TEXT CHECK (
+        acquisition_resource_identity_json IS NULL OR json_valid(acquisition_resource_identity_json)
+    ),
     deduplication_identity_json TEXT NOT NULL CHECK (json_valid(deduplication_identity_json)),
     state TEXT NOT NULL CHECK (
         state IN ('pending', 'leased', 'completed', 'terminal_failure', 'cancelling', 'cancelled')
@@ -615,6 +621,10 @@ ON work_items(state, priority DESC, eligible_at_utc_ns, created_at_utc_ns, id);
 
 CREATE INDEX IF NOT EXISTS work_items_expired
 ON work_items(state, lease_expires_at_utc_ns, id);
+
+CREATE INDEX IF NOT EXISTS work_items_live_acquisition
+ON work_items(kind_parts_json, acquisition_resource_identity_json, lease_expires_at_utc_ns, id)
+WHERE acquisition_resource_identity_json IS NOT NULL AND state IN ('leased', 'cancelling');
 
 CREATE UNIQUE INDEX IF NOT EXISTS work_items_active_deduplication
 ON work_items(kind_parts_json, deduplication_identity_json)
@@ -1736,7 +1746,7 @@ class Database:
         cursor = await connection.execute(
             """
             SELECT state, lease_expires_at_utc_ns, attempt, kind_parts_json,
-                   payload_schema_version, payload_json
+                   payload_schema_version, payload_json, acquisition_resource_identity_json
             FROM work_items WHERE id = ?
             """,
             (definition.work_item_identifier,),
@@ -1788,23 +1798,27 @@ class Database:
                     ),
                 )
             )
-        resource = acquisition_resource_identity(kind, payload)
-        if resource is not None:
+        resource_json = work[6]
+        if resource_json is not None:
             cursor = await connection.execute(
                 """
-                SELECT payload_json FROM work_items
-                WHERE kind_parts_json = ? AND id != ? AND state IN ('leased','cancelling')
+                SELECT 1 FROM work_items
+                WHERE kind_parts_json = ? AND acquisition_resource_identity_json = ?
+                  AND id != ? AND state IN ('leased','cancelling')
                   AND (lease_expires_at_utc_ns > ? OR EXISTS (
                       SELECT 1 FROM stage_attempts
                       WHERE work_item_id = work_items.id AND state = 'active'
                   ))
+                LIMIT 1
                 """,
-                (_text(work[3]), definition.work_item_identifier, now_utc_ns),
+                (
+                    _text(work[3]),
+                    _text(resource_json),
+                    definition.work_item_identifier,
+                    now_utc_ns,
+                ),
             )
-            if any(
-                acquisition_resource_identity(kind, decode_json(_text(row[0]))) == resource
-                for row in await cursor.fetchall()
-            ):
+            if await cursor.fetchall():
                 raise _StageAdmissionDeferred(
                     StageClaimResult(
                         lease=None,
@@ -3548,6 +3562,14 @@ class Database:
         }
 
     @staticmethod
+    def _v18_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V18_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": str(_V18_DATABASE_SCHEMA.version),
+            "schema_definition_sha256": _V18_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v17_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V17_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -3720,6 +3742,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v18_metadata())
                 and not await cls._metadata_matches(connection, cls._v17_metadata())
                 and not await cls._metadata_matches(connection, cls._v16_metadata())
                 and not await cls._metadata_matches(connection, cls._v15_metadata())
@@ -4145,20 +4168,20 @@ class Database:
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
                     )
             if await self._metadata_matches(connection, self._v13_metadata()):
-                await connection.execute(_SCHEMA)
+                await self._apply_schema(connection)
                 for key, value in self._v14_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
                     )
             if await self._metadata_matches(connection, self._v14_metadata()):
-                await connection.execute(_SCHEMA)
-                for key, value in self._expected_metadata().items():
+                await self._apply_schema(connection)
+                for key, value in self._v18_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
                     )
             if await self._metadata_matches(connection, self._v15_metadata()):
-                await connection.execute(_SCHEMA)
-                for key, value in self._expected_metadata().items():
+                await self._apply_schema(connection)
+                for key, value in self._v18_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
                     )
@@ -4166,17 +4189,24 @@ class Database:
                 await connection.execute(
                     "ALTER TABLE resident_request_charges RENAME TO resident_request_charges_v16"
                 )
-                await connection.execute(_SCHEMA)
+                await self._apply_schema(connection)
                 await connection.execute(
                     "INSERT INTO resident_request_charges SELECT * FROM resident_request_charges_v16"
                 )
                 await connection.execute("DROP TABLE resident_request_charges_v16")
-                for key, value in self._expected_metadata().items():
+                for key, value in self._v18_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
                     )
             if await self._metadata_matches(connection, self._v17_metadata()):
-                await connection.execute(_SCHEMA)
+                await self._apply_schema(connection)
+                for key, value in self._v18_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v18_metadata()):
+                await self._apply_schema(connection)
+                await self._migrate_acquisition_resource_identities(connection)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
@@ -4184,6 +4214,57 @@ class Database:
             if not await self._metadata_matches(connection, self._expected_metadata()):
                 raise RuntimeError("Unsupported database schema metadata")
             await self._validate_schema(connection)
+
+    @staticmethod
+    async def _apply_schema(connection: AsyncConnection) -> None:
+        """Prepare older work tables before applying indexes from the current schema."""
+
+        cursor = await connection.execute("PRAGMA table_info(work_items)")
+        columns = {_text(row[1]) for row in await cursor.fetchall()}
+        if columns and "acquisition_resource_identity_json" not in columns:
+            await connection.execute(
+                "ALTER TABLE work_items ADD COLUMN acquisition_resource_identity_json TEXT "
+                "CHECK (acquisition_resource_identity_json IS NULL OR "
+                "json_valid(acquisition_resource_identity_json))"
+            )
+        await connection.execute(_SCHEMA)
+
+    @staticmethod
+    async def _migrate_acquisition_resource_identities(connection: AsyncConnection) -> None:
+        """Backfill all acquisition history without retaining the full queue's payloads."""
+
+        after: str | None = None
+        while True:
+            cursor = await connection.execute(
+                """
+                SELECT id, kind_parts_json,
+                       CASE WHEN kind_parts_json IN (
+                         '["carl","ebay","collect","item"]',
+                         '["carl","ebay","collect","description"]',
+                         '["carl","ebay","collect","image"]',
+                         '["carl","facebook","work","collect_item"]',
+                         '["carl","facebook","work","collect_image"]'
+                       ) THEN payload_json END
+                FROM work_items
+                """
+                + ("WHERE id > ? " if after is not None else "")
+                + "ORDER BY id LIMIT 128",
+                (after,) if after is not None else (),
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return
+            for row in rows:
+                if row[2] is not None:
+                    identity = acquisition_resource_identity_json(
+                        tuple(cast(list[str], decode_json(_text(row[1])))),
+                        decode_json(_text(row[2])),
+                    )
+                    await connection.execute(
+                        "UPDATE work_items SET acquisition_resource_identity_json=? WHERE id=?",
+                        (identity, _text(row[0])),
+                    )
+            after = _text(rows[-1][0])
 
     async def _migrate_work_cancellation(self, connection: AsyncConnection) -> None:
         """Rebuild mutable scheduling tables, retaining all identifiers and evidence."""
@@ -4195,11 +4276,22 @@ class Database:
                 f"CREATE TABLE IF NOT EXISTS {name} (", f"CREATE TABLE {name}_new (", 1
             )
             await connection.execute(definition)
-            await connection.execute(f"INSERT INTO {name}_new SELECT * FROM {name}")
+            if name == "work_items":
+                columns = (
+                    "id,kind_parts_json,payload_schema_version,payload_json,"
+                    "deduplication_identity_json,state,priority,eligible_at_utc_ns,"
+                    "created_at_utc_ns,lease_token,lease_owner,lease_expires_at_utc_ns,"
+                    "attempt,result_json,error_json"
+                )
+                await connection.execute(
+                    f"INSERT INTO {name}_new({columns}) SELECT {columns} FROM {name}"
+                )
+            else:
+                await connection.execute(f"INSERT INTO {name}_new SELECT * FROM {name}")
             await connection.execute(f"DROP TABLE {name}")
             await connection.execute(f"ALTER TABLE {name}_new RENAME TO {name}")
         # Recreate indexes and the new request table from the authoritative schema.
-        await connection.execute(_SCHEMA)
+        await self._apply_schema(connection)
         await self._publish_work_request_dependencies(connection)
         cursor = await connection.execute("PRAGMA foreign_key_check")
         if await cursor.fetchone() is not None:
@@ -4389,7 +4481,7 @@ class Database:
             if table_names:
                 await self._validate_schema(connection)
 
-            await connection.execute(_SCHEMA)
+            await self._apply_schema(connection)
             for key, expected in self._expected_metadata().items():
                 await connection.execute(
                     "INSERT OR IGNORE INTO schema_metadata(key, value) VALUES (?, ?)",
@@ -5198,15 +5290,16 @@ class Database:
                     """
                     INSERT INTO work_items(
                         id, kind_parts_json, payload_schema_version, payload_json,
-                        deduplication_identity_json, state, priority,
+                        acquisition_resource_identity_json, deduplication_identity_json, state, priority,
                         eligible_at_utc_ns, created_at_utc_ns
-                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                     """,
                     (
                         work_item_identifier,
                         kind_json,
                         definition.payload_schema_version,
                         _json(definition.payload),
+                        acquisition_resource_identity_json(definition.kind, definition.payload),
                         deduplication_json,
                         definition.priority,
                         eligible_at,
@@ -6026,8 +6119,17 @@ class Database:
             capability_bindings.extend(
                 (_json(list(capability.kind)), capability.payload_schema_version)
             )
+        exact_identifier = (
+            eligible_identifiers[0]
+            if eligible_identifiers is not None and len(eligible_identifiers) == 1
+            else None
+        )
         identifier_predicate = (
-            "AND id IN (SELECT value FROM json_each(?))" if eligible_identifiers is not None else ""
+            "AND id = ?"
+            if exact_identifier is not None
+            else "AND id IN (SELECT value FROM json_each(?))"
+            if eligible_identifiers is not None
+            else ""
         )
         staged_predicate = (
             ""
@@ -6035,7 +6137,11 @@ class Database:
             else "AND NOT EXISTS (SELECT 1 FROM stage_attempts WHERE work_item_id = work_items.id)"
         )
         identifier_bindings: tuple[apsw.SQLiteValue, ...] = (
-            (_json(list(eligible_identifiers)),) if eligible_identifiers is not None else ()
+            (exact_identifier,)
+            if exact_identifier is not None
+            else (_json(list(eligible_identifiers)),)
+            if eligible_identifiers is not None
+            else ()
         )
         async with self._connections.writer() as connection:
             now_utc_ns = utc_now_ns()
@@ -6087,6 +6193,7 @@ class Database:
                     SELECT id, kind_parts_json, payload_schema_version, payload_json,
                            state, lease_token, lease_owner, lease_expires_at_utc_ns,
                            attempt, priority, eligible_at_utc_ns, created_at_utc_ns,
+                           acquisition_resource_identity_json,
                            coalesce(
                                (
                                    SELECT json_group_array(
@@ -6138,7 +6245,7 @@ class Database:
                 )
                 SELECT id, kind_parts_json, payload_schema_version, payload_json,
                        state, lease_token, lease_owner, lease_expires_at_utc_ns,
-                       attempt
+                       attempt, acquisition_resource_identity_json
                 FROM representatives
                 WHERE profile_rank = 1
                 ORDER BY priority DESC, eligible_at_utc_ns, created_at_utc_ns, id
@@ -6147,7 +6254,6 @@ class Database:
             )
             rows = await cursor.fetchall()
             next_checks: list[int] = []
-            resource_leases: dict[str, tuple[tuple[JsonValue, int], ...]] = {}
             connectivity_cursor = await connection.execute(
                 "SELECT paused, next_probe_utc_ns, probe_expires_utc_ns FROM network_connectivity WHERE singleton = 1"
             )
@@ -6180,39 +6286,34 @@ class Database:
                         next_checks.append(cooldown_until)
                         continue
                 kind_json = _text(row[1])
-                kind = tuple(str(part) for part in cast(list[JsonValue], decode_json(kind_json)))
-                resource = acquisition_resource_identity(kind, decode_json(_text(row[3])))
-                if resource is not None:
+                resource_json = row[9]
+                if resource_json is not None:
                     # Caller-bound jobs have different payload/evidence identities.
                     # Serialize their actual fetch resource under this same writer
                     # transaction, until reusable evidence is durably published.
-                    # Deriving keys from payloads also protects already queued jobs.
-                    if kind_json not in resource_leases:
-                        leases_cursor = await connection.execute(
-                            """
-                            SELECT payload_json,
-                                   CASE WHEN lease_expires_at_utc_ns > ?
-                                        THEN lease_expires_at_utc_ns ELSE ? END
-                            FROM work_items
-                            WHERE kind_parts_json = ? AND state IN ('leased','cancelling')
-                              AND (lease_expires_at_utc_ns > ? OR EXISTS (
-                                  SELECT 1 FROM stage_attempts
-                                  WHERE work_item_id = work_items.id AND state = 'active'
-                              ))
-                            """,
-                            (now_utc_ns, now_utc_ns + 100_000_000, kind_json, now_utc_ns),
-                        )
-                        resource_leases[kind_json] = tuple(
-                            (decode_json(_text(lease[0])), _integer(lease[1]))
-                            for lease in await leases_cursor.fetchall()
-                        )
-                    matching_expiries = tuple(
-                        expires
-                        for leased_payload, expires in resource_leases[kind_json]
-                        if acquisition_resource_identity(kind, leased_payload) == resource
+                    leases_cursor = await connection.execute(
+                        """
+                        SELECT min(CASE WHEN lease_expires_at_utc_ns > ?
+                                        THEN lease_expires_at_utc_ns ELSE ? END)
+                        FROM work_items
+                        WHERE kind_parts_json = ? AND acquisition_resource_identity_json = ?
+                          AND state IN ('leased','cancelling')
+                          AND (lease_expires_at_utc_ns > ? OR EXISTS (
+                              SELECT 1 FROM stage_attempts
+                              WHERE work_item_id = work_items.id AND state = 'active'
+                          ))
+                        """,
+                        (
+                            now_utc_ns,
+                            now_utc_ns + 100_000_000,
+                            kind_json,
+                            _text(resource_json),
+                            now_utc_ns,
+                        ),
                     )
-                    if matching_expiries:
-                        next_checks.append(min(matching_expiries))
+                    blockers = await leases_cursor.fetchall()
+                    if blockers and blockers[0][0] is not None:
+                        next_checks.append(_integer(blockers[0][0]))
                         continue
                 available, next_eligible, constraints = await self._constraint_availability(
                     connection,
@@ -7178,12 +7279,14 @@ class Database:
                     await connection.execute(
                         """
                         UPDATE work_items SET payload_json=?, payload_schema_version=?,
-                            deduplication_identity_json=? WHERE id=?
+                            deduplication_identity_json=?, acquisition_resource_identity_json=?
+                        WHERE id=?
                         """,
                         (
                             _json(definition.payload),
                             definition.payload_schema_version,
                             _json(list(definition.deduplication_identity)),
+                            acquisition_resource_identity_json(definition.kind, definition.payload),
                             identifier,
                         ),
                     )
@@ -7282,12 +7385,18 @@ class Database:
                 SET state = 'pending', eligible_at_utc_ns = ?,
                     payload_schema_version = ?,
                     payload_json = json_set(payload_json, '$.retry_attempt_offset', attempt),
+                    acquisition_resource_identity_json = ?,
                     result_json = NULL, error_json = NULL,
                     lease_token = NULL, lease_owner = NULL,
                     lease_expires_at_utc_ns = NULL
                 WHERE id = ? AND state = 'terminal_failure'
                 """,
-                (retried_at_utc_ns, payload_schema_version, work_item_identifier),
+                (
+                    retried_at_utc_ns,
+                    payload_schema_version,
+                    acquisition_resource_identity_json(COLLECT_SEARCH_WORK_KIND, payload),
+                    work_item_identifier,
+                ),
             )
             if await connection.changes() != 1:
                 raise RuntimeError("Terminal search work changed during retry")
@@ -7358,6 +7467,7 @@ class Database:
                 UPDATE work_items SET state='pending', eligible_at_utc_ns=?,
                     payload_schema_version=?,
                     payload_json=?,deduplication_identity_json=?,
+                    acquisition_resource_identity_json=?,
                     result_json=NULL,error_json=NULL,lease_token=NULL,lease_owner=NULL,
                     lease_expires_at_utc_ns=NULL
                 WHERE id=? AND state='terminal_failure'
@@ -7367,6 +7477,7 @@ class Database:
                     payload_schema_version,
                     _json(payload.as_json()),
                     _json(list(definition.deduplication_identity)),
+                    acquisition_resource_identity_json(definition.kind, definition.payload),
                     work_item_identifier,
                 ),
             )
