@@ -8,6 +8,12 @@ from pathlib import Path
 
 import anyio
 
+from carl.core.analysis_stages import (
+    MAX_ANALYSIS_INPUT_BYTES,
+    MAX_ANALYSIS_TEXT_BYTES,
+    AnalysisImage,
+    PreparedAnalysis,
+)
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.item_analysis import (
     ANALYSIS_RECIPE_VERSION,
@@ -38,7 +44,7 @@ from carl.core.worker import (
     TerminalFailureWork,
     WorkOutcome,
 )
-from carl.io.claude import ClaudeCli, temporary_analysis_directory
+from carl.io.claude import ClaudeCli, ClaudeRun, temporary_analysis_directory
 from carl.io.sqlite import Database
 from carl.io.worker import TypedWorkHandler, WorkHandlerRegistry
 
@@ -79,14 +85,6 @@ class AnalysisWorkerDependencies:
     new_identifier: Callable[[], str]
 
 
-@dataclass(frozen=True, slots=True)
-class _ResolvedImage:
-    artifact_identifier: str
-    sha256: str
-    mime_type: str
-    gallery_order: int
-
-
 def _image_result_satisfies_reference(
     *,
     reference_identifier: str,
@@ -114,6 +112,191 @@ async def _link_file(path: Path, target: Path) -> None:
     await anyio.to_thread.run_sync(lambda: os.link(target, path, follow_symlinks=False))
 
 
+async def prepare_facebook_analysis(
+    payload: AnalyzeItemPayload, database: Database
+) -> PreparedAnalysis:
+    """Resolve exact saved evidence without invoking the analysis child."""
+    inputs = [
+        NamedInput(
+            name=("listing_analysis_evidence",),
+            object_identifier=payload.evidence_set_record_identifier,
+        ),
+        NamedInput(
+            name=("product_guide",),
+            object_identifier=payload.product_guide_record_identifier,
+        ),
+    ]
+    guide_kind, guide_schema_version, guide_value = await database.get_record(
+        payload.product_guide_record_identifier
+    )
+    if guide_kind != ("carl", "analysis", "product_guide") or guide_schema_version not in {
+        1,
+        2,
+    }:
+        raise ValueError("Input is not a supported product guide record")
+    _ = ProductGuideRecord.model_validate_json(encode_json(guide_value))
+    (
+        guide_operation_identifier,
+        _,
+        guide_outputs,
+    ) = await database.object_operation_relations(payload.product_guide_record_identifier)
+    guide_operation = await database.operation(guide_operation_identifier)
+    if guide_operation.get("component_parts") not in (
+        list(REGISTER_PRODUCT_GUIDE.parts),
+        list(AUTHOR_PRODUCT_GUIDE.parts),
+    ):
+        raise ValueError("Product guide was not produced by a registered guide component")
+    if (
+        guide_operation.get("output_schema_version") != 1
+        or guide_operation.get("state") != "completed"
+    ):
+        raise ValueError("Product guide was not produced by the registered guide component")
+    guide_text_identifiers = [
+        output.object_identifier for output in guide_outputs if output.name == ("guide_text",)
+    ]
+    if len(guide_text_identifiers) != 1:
+        raise ValueError("Product guide has no unique exact-text artifact")
+    guide_metadata, guide_bytes = await database.get_artifact(
+        guide_text_identifiers[0], maximum_bytes=MAX_ANALYSIS_TEXT_BYTES
+    )
+    if guide_metadata.get("media_type") != "text/plain; charset=utf-8" or guide_metadata.get(
+        "representation"
+    ) != {"exact_product_guide": True}:
+        raise ValueError("Product guide text artifact has unsupported metadata")
+    guide_text = guide_bytes.decode("utf-8")
+    prompt = identification_prompt(guide_text)
+    evidence_kind, _, evidence_value = await database.get_record(
+        payload.evidence_set_record_identifier
+    )
+    if evidence_kind != ("carl", "facebook", "listing_analysis_evidence"):
+        raise ValueError("Input is not listing-analysis evidence")
+    if not isinstance(evidence_value, dict):
+        raise ValueError("Listing-analysis evidence record is malformed")
+    raw_unavailable = evidence_value.get("unavailable_gallery_images", [])
+    gallery_absence_reason = evidence_value.get("gallery_absence_reason")
+    if (
+        set(evidence_value) - {"unavailable_gallery_images", "gallery_absence_reason"}
+        or not isinstance(raw_unavailable, list)
+        or (gallery_absence_reason is not None and not isinstance(gallery_absence_reason, str))
+    ):
+        raise ValueError("Listing-analysis evidence selection metadata is malformed")
+    unavailable_images = tuple(
+        UnavailableAnalysisImageSelection.model_validate(item) for item in raw_unavailable
+    )
+    _, evidence_inputs, _ = await database.object_operation_relations(
+        payload.evidence_set_record_identifier
+    )
+    observation_identifiers = [
+        input_value.object_identifier
+        for input_value in evidence_inputs
+        if input_value.name == ("listing_observation",)
+    ]
+    references = {
+        input_value.name[1]: input_value.object_identifier
+        for input_value in evidence_inputs
+        if len(input_value.name) == 2 and input_value.name[0] == "gallery_image_reference"
+    }
+    image_results = {
+        input_value.name[1]: input_value.object_identifier
+        for input_value in evidence_inputs
+        if len(input_value.name) == 2 and input_value.name[0] == "image_result"
+    }
+    if len(observation_identifiers) != 1 or not image_results.keys() <= references.keys():
+        raise ValueError("Listing-analysis evidence has malformed input edges")
+    unavailable_reference_identifiers = {
+        image.gallery_image_reference_record_identifier for image in unavailable_images
+    }
+    if {
+        references[index] for index in references.keys() - image_results.keys()
+    } != unavailable_reference_identifiers:
+        raise ValueError("Listing-analysis evidence has incomplete gallery selection metadata")
+    observation_identifier = observation_identifiers[0]
+    kind, _, observation = await database.get_record(observation_identifier)
+    if kind != ("carl", "facebook", "listing_observation"):
+        raise ValueError("Evidence does not reference a listing observation")
+    if payload.recipe_version != ANALYSIS_RECIPE_VERSION:
+        raise ValueError("Queued analysis recipe differs from registered recipe")
+    reused_results_by_reference = {
+        reuse.gallery_image_reference_record_identifier: (
+            reuse.source_image_result_record_identifier
+        )
+        for reuse in await database.facebook_image_reuse_resolutions(tuple(references.values()))
+    }
+    resolved_images: list[AnalysisImage] = []
+    unavailable_by_reference = {
+        image.gallery_image_reference_record_identifier: image for image in unavailable_images
+    }
+    for index in sorted(references):
+        reference_kind, _, reference = await database.get_record(references[index])
+        if reference_kind != ("carl", "facebook", "gallery_image_reference"):
+            raise ValueError("Evidence contains an invalid gallery reference")
+        if not isinstance(reference, dict):
+            raise ValueError("Gallery evidence is malformed")
+        if reference.get("listing_observation_record_identifier") != observation_identifier:
+            raise ValueError("Gallery reference belongs to another observation")
+        if index not in image_results:
+            unavailable = unavailable_by_reference.get(references[index])
+            if unavailable is None or unavailable.gallery_order != reference.get("gallery_order"):
+                raise ValueError("Unavailable gallery evidence does not match its reference")
+            continue
+        result_kind, _, image_result = await database.get_record(image_results[index])
+        if result_kind != ("carl", "facebook", "image_result"):
+            raise ValueError("Evidence contains an invalid image result")
+        if not isinstance(image_result, dict):
+            raise ValueError("Image evidence is malformed")
+        if not _image_result_satisfies_reference(
+            reference_identifier=references[index],
+            reference=reference,
+            image_result_identifier=image_results[index],
+            image_result=image_result,
+            reused_results_by_reference=reused_results_by_reference,
+        ):
+            raise ValueError("Image result does not satisfy its gallery reference")
+        artifact_identifier = image_result.get("image_artifact_identifier")
+        gallery_order = reference.get("gallery_order")
+        if not isinstance(artifact_identifier, str) or not isinstance(gallery_order, int):
+            raise ValueError("Image evidence has no saved artifact or gallery order")
+        metadata = await database.get_artifact_metadata(artifact_identifier)
+        sha256 = metadata.get("sha256")
+        mime_type = metadata.get("media_type")
+        if not isinstance(sha256, str) or mime_type not in _IMAGE_EXTENSIONS:
+            raise ValueError("Saved image artifact has unsupported metadata")
+        resolved_images.append(
+            AnalysisImage(
+                artifact_identifier=artifact_identifier,
+                sha256=sha256,
+                media_type=mime_type,
+                byte_length=metadata["size"],
+                filename=f"images/{gallery_order:03d}{_IMAGE_EXTENSIONS[mime_type]}",
+                gallery_order=gallery_order,
+            )
+        )
+    resolved_images.sort(key=lambda image: image.gallery_order)
+    orders = [image.gallery_order for image in resolved_images]
+    if len(set(orders)) != len(orders):
+        raise ValueError("Evidence images are not in unique gallery order")
+    filenames = tuple(
+        f"images/{image.gallery_order:03d}{_IMAGE_EXTENSIONS[image.media_type]}"
+        for image in resolved_images
+    )
+    brief = listing_brief(
+        observation=observation,
+        image_filenames=filenames,
+        unavailable_gallery_images=tuple(
+            sorted(unavailable_images, key=lambda image: image.gallery_order)
+        ),
+        gallery_absence_reason=gallery_absence_reason,
+    )
+    brief_bytes = encode_json(brief, indent=2).encode("utf-8")
+    prompt_bytes = prompt.encode("utf-8")
+    return PreparedAnalysis(
+        listing_input=brief_bytes,
+        prompt=prompt_bytes,
+        images=tuple(resolved_images),
+        inputs=tuple(inputs),
+    )
+
+
 async def _analyze(
     payload: AnalyzeItemPayload,
     context: AttemptContext,
@@ -130,179 +313,12 @@ async def _analyze(
         ),
     ]
     try:
-        guide_kind, guide_schema_version, guide_value = await dependencies.database.get_record(
-            payload.product_guide_record_identifier
-        )
-        if guide_kind != ("carl", "analysis", "product_guide") or guide_schema_version not in {
-            1,
-            2,
-        }:
-            raise ValueError("Input is not a supported product guide record")
-        _ = ProductGuideRecord.model_validate_json(encode_json(guide_value))
-        (
-            guide_operation_identifier,
-            _,
-            guide_outputs,
-        ) = await dependencies.database.object_operation_relations(
-            payload.product_guide_record_identifier
-        )
-        guide_operation = await dependencies.database.operation(guide_operation_identifier)
-        if guide_operation.get("component_parts") not in (
-            list(REGISTER_PRODUCT_GUIDE.parts),
-            list(AUTHOR_PRODUCT_GUIDE.parts),
-        ):
-            raise ValueError("Product guide was not produced by a registered guide component")
-        if (
-            guide_operation.get("output_schema_version") != 1
-            or guide_operation.get("state") != "completed"
-        ):
-            raise ValueError("Product guide was not produced by the registered guide component")
-        guide_text_identifiers = [
-            output.object_identifier for output in guide_outputs if output.name == ("guide_text",)
-        ]
-        if len(guide_text_identifiers) != 1:
-            raise ValueError("Product guide has no unique exact-text artifact")
-        guide_metadata, guide_bytes = await dependencies.database.get_artifact(
-            guide_text_identifiers[0]
-        )
-        if guide_metadata.get("media_type") != "text/plain; charset=utf-8" or guide_metadata.get(
-            "representation"
-        ) != {"exact_product_guide": True}:
-            raise ValueError("Product guide text artifact has unsupported metadata")
-        guide_text = guide_bytes.decode("utf-8")
-        prompt = identification_prompt(guide_text)
-        evidence_kind, _, evidence_value = await dependencies.database.get_record(
-            payload.evidence_set_record_identifier
-        )
-        if evidence_kind != ("carl", "facebook", "listing_analysis_evidence"):
-            raise ValueError("Input is not listing-analysis evidence")
-        if not isinstance(evidence_value, dict):
-            raise ValueError("Listing-analysis evidence record is malformed")
-        raw_unavailable = evidence_value.get("unavailable_gallery_images", [])
-        gallery_absence_reason = evidence_value.get("gallery_absence_reason")
-        if (
-            set(evidence_value) - {"unavailable_gallery_images", "gallery_absence_reason"}
-            or not isinstance(raw_unavailable, list)
-            or (gallery_absence_reason is not None and not isinstance(gallery_absence_reason, str))
-        ):
-            raise ValueError("Listing-analysis evidence selection metadata is malformed")
-        unavailable_images = tuple(
-            UnavailableAnalysisImageSelection.model_validate(item) for item in raw_unavailable
-        )
-        _, evidence_inputs, _ = await dependencies.database.object_operation_relations(
-            payload.evidence_set_record_identifier
-        )
-        observation_identifiers = [
-            input_value.object_identifier
-            for input_value in evidence_inputs
-            if input_value.name == ("listing_observation",)
-        ]
-        references = {
-            input_value.name[1]: input_value.object_identifier
-            for input_value in evidence_inputs
-            if len(input_value.name) == 2 and input_value.name[0] == "gallery_image_reference"
-        }
-        image_results = {
-            input_value.name[1]: input_value.object_identifier
-            for input_value in evidence_inputs
-            if len(input_value.name) == 2 and input_value.name[0] == "image_result"
-        }
-        if len(observation_identifiers) != 1 or not image_results.keys() <= references.keys():
-            raise ValueError("Listing-analysis evidence has malformed input edges")
-        unavailable_reference_identifiers = {
-            image.gallery_image_reference_record_identifier for image in unavailable_images
-        }
-        if {
-            references[index] for index in references.keys() - image_results.keys()
-        } != unavailable_reference_identifiers:
-            raise ValueError("Listing-analysis evidence has incomplete gallery selection metadata")
-        observation_identifier = observation_identifiers[0]
-        kind, _, observation = await dependencies.database.get_record(observation_identifier)
-        if kind != ("carl", "facebook", "listing_observation"):
-            raise ValueError("Evidence does not reference a listing observation")
-        if payload.recipe_version != ANALYSIS_RECIPE_VERSION:
-            raise ValueError("Queued analysis recipe differs from registered recipe")
-        reused_results_by_reference = {
-            reuse.gallery_image_reference_record_identifier: (
-                reuse.source_image_result_record_identifier
-            )
-            for reuse in await dependencies.database.facebook_image_reuse_resolutions(
-                tuple(references.values())
-            )
-        }
-        resolved_images: list[_ResolvedImage] = []
-        unavailable_by_reference = {
-            image.gallery_image_reference_record_identifier: image for image in unavailable_images
-        }
-        for index in sorted(references):
-            reference_kind, _, reference = await dependencies.database.get_record(references[index])
-            if reference_kind != ("carl", "facebook", "gallery_image_reference"):
-                raise ValueError("Evidence contains an invalid gallery reference")
-            if not isinstance(reference, dict):
-                raise ValueError("Gallery evidence is malformed")
-            if reference.get("listing_observation_record_identifier") != observation_identifier:
-                raise ValueError("Gallery reference belongs to another observation")
-            if index not in image_results:
-                unavailable = unavailable_by_reference.get(references[index])
-                if unavailable is None or unavailable.gallery_order != reference.get(
-                    "gallery_order"
-                ):
-                    raise ValueError("Unavailable gallery evidence does not match its reference")
-                continue
-            result_kind, _, image_result = await dependencies.database.get_record(
-                image_results[index]
-            )
-            if result_kind != ("carl", "facebook", "image_result"):
-                raise ValueError("Evidence contains an invalid image result")
-            if not isinstance(image_result, dict):
-                raise ValueError("Image evidence is malformed")
-            if not _image_result_satisfies_reference(
-                reference_identifier=references[index],
-                reference=reference,
-                image_result_identifier=image_results[index],
-                image_result=image_result,
-                reused_results_by_reference=reused_results_by_reference,
-            ):
-                raise ValueError("Image result does not satisfy its gallery reference")
-            artifact_identifier = image_result.get("image_artifact_identifier")
-            gallery_order = reference.get("gallery_order")
-            if not isinstance(artifact_identifier, str) or not isinstance(gallery_order, int):
-                raise ValueError("Image evidence has no saved artifact or gallery order")
-            external = await dependencies.database.get_external_artifact_path(artifact_identifier)
-            if external is not None:
-                metadata, _ = external
-            else:
-                metadata, _ = await dependencies.database.get_artifact(artifact_identifier)
-            sha256 = metadata.get("sha256")
-            mime_type = metadata.get("media_type")
-            if not isinstance(sha256, str) or mime_type not in _IMAGE_EXTENSIONS:
-                raise ValueError("Saved image artifact has unsupported metadata")
-            resolved_images.append(
-                _ResolvedImage(
-                    artifact_identifier=artifact_identifier,
-                    sha256=sha256,
-                    mime_type=mime_type,
-                    gallery_order=gallery_order,
-                )
-            )
-        resolved_images.sort(key=lambda image: image.gallery_order)
-        orders = [image.gallery_order for image in resolved_images]
-        if len(set(orders)) != len(orders):
-            raise ValueError("Evidence images are not in unique gallery order")
-        filenames = tuple(
-            f"images/{image.gallery_order:03d}{_IMAGE_EXTENSIONS[image.mime_type]}"
-            for image in resolved_images
-        )
-        brief = listing_brief(
-            observation=observation,
-            image_filenames=filenames,
-            unavailable_gallery_images=tuple(
-                sorted(unavailable_images, key=lambda image: image.gallery_order)
-            ),
-            gallery_absence_reason=gallery_absence_reason,
-        )
-        brief_bytes = encode_json(brief, indent=2).encode("utf-8")
-        prompt_bytes = prompt.encode("utf-8")
+        prepared = await prepare_facebook_analysis(payload, dependencies.database)
+        brief_bytes = prepared.listing_input
+        prompt_bytes = prepared.prompt
+        prompt = prompt_bytes.decode("utf-8")
+        resolved_images = prepared.images
+        filenames = tuple(image.filename for image in resolved_images)
         analysis_root = dependencies.database.path.parent.resolve() / ".analysis"
         async with temporary_analysis_directory(analysis_root) as directory:
             await anyio.to_thread.run_sync(lambda: (directory / "images").mkdir(mode=0o700))
@@ -316,17 +332,17 @@ async def _analyze(
                     metadata, source = external
                     if (
                         metadata["sha256"] != image.sha256
-                        or metadata["media_type"] != image.mime_type
+                        or metadata["media_type"] != image.media_type
                     ):
                         raise ValueError("Saved image no longer matches queued analysis input")
                     await _link_file(destination, source)
                 else:
                     metadata, content = await dependencies.database.get_artifact(
-                        image.artifact_identifier
+                        image.artifact_identifier, maximum_bytes=MAX_ANALYSIS_INPUT_BYTES
                     )
                     if (
                         metadata["sha256"] != image.sha256
-                        or metadata["media_type"] != image.mime_type
+                        or metadata["media_type"] != image.media_type
                         or hashlib.sha256(content).hexdigest() != image.sha256
                     ):
                         raise ValueError("Saved image no longer matches queued analysis input")
@@ -385,6 +401,27 @@ async def _analyze(
             content=run.stderr,
         ),
     )
+    outputs = (
+        NamedOutput(name=("listing_input",), object_identifier=brief_identifier),
+        NamedOutput(name=("prompt",), object_identifier=prompt_identifier),
+        NamedOutput(name=("claude", "stdout"), object_identifier=stdout_identifier),
+        NamedOutput(name=("claude", "stderr"), object_identifier=stderr_identifier),
+        NamedOutput(name=("item_analysis",), object_identifier=result_identifier),
+    )
+    outcome = facebook_analysis_outcome(payload, context, run, lambda: result_identifier)
+    return outcome.model_copy(
+        update={"inputs": tuple(inputs), "artifacts": artifacts, "outputs": outputs}
+    )
+
+
+def facebook_analysis_outcome(
+    payload: AnalyzeItemPayload,
+    context: AttemptContext,
+    run: ClaudeRun,
+    new_identifier: Callable[[], str],
+) -> WorkOutcome:
+    """Build the public report and unchanged bounded timeout policy."""
+    result_identifier = new_identifier()
     failure_kind = run.failure_kind
     state = "completed" if failure_kind is None else "failed"
     reported_turns = (
@@ -430,13 +467,7 @@ async def _analyze(
             },
         },
     )
-    outputs = (
-        NamedOutput(name=("listing_input",), object_identifier=brief_identifier),
-        NamedOutput(name=("prompt",), object_identifier=prompt_identifier),
-        NamedOutput(name=("claude", "stdout"), object_identifier=stdout_identifier),
-        NamedOutput(name=("claude", "stderr"), object_identifier=stderr_identifier),
-        NamedOutput(name=("item_analysis",), object_identifier=result_identifier),
-    )
+    outputs = (NamedOutput(name=("item_analysis",), object_identifier=result_identifier),)
     result: dict[str, JsonValue] = {
         "state": state,
         "analysis_record_identifier": result_identifier,
@@ -445,9 +476,7 @@ async def _analyze(
     if failure_kind is not None:
         if failure_kind == "claude_timeout" and context.attempt < ANALYSIS_TIMEOUT_MAXIMUM_ATTEMPTS:
             return RetryWork(
-                inputs=tuple(inputs),
                 records=(record,),
-                artifacts=artifacts,
                 outputs=outputs,
                 delay_ns=ANALYSIS_TIMEOUT_RETRY_BASE_DELAY_NS * 2 ** (context.attempt - 1),
                 reason={
@@ -459,9 +488,7 @@ async def _analyze(
                 result=result,
             )
         return TerminalFailureWork(
-            inputs=tuple(inputs),
             records=(record,),
-            artifacts=artifacts,
             outputs=outputs,
             error={
                 "kind": failure_kind,
@@ -474,9 +501,7 @@ async def _analyze(
             result=result,
         )
     return CompletedWork(
-        inputs=tuple(inputs),
         records=(record,),
-        artifacts=artifacts,
         outputs=outputs,
         result=result,
     )

@@ -562,6 +562,25 @@ Provider factories must shield their own physical finalizers; their task scopes
 remain in the owning actor throughout their lifetime. Shared route processes
 retain their existing separate provider ownership.
 
+The analysis registry separates CPU evidence preparation, the admitted model
+process, and CPU parsing/publication. Its versioned stages reference immutable
+input/output checkpoints rather than copying prompts, image bytes or large
+queued payloads into the 64 KiB continuation. Checkpoints keep verified image
+references and private external listing input, prompt, configuration, exact
+invocation and process streams. Public artifact aliases are published once by
+their producing phase; report schemas and recorded evidence remain compatible.
+
+Prepared analysis inputs permit at most 1,000 images and 100 MB in aggregate;
+text/configuration artifacts are bounded at 4 MiB. Existing 8 MiB stdout,
+1 MiB stderr and 8 MiB combined capture limits still apply, with oversized
+capture settings rejected before invocation. Legacy inline artifacts are
+checked against declared and actual stored length before materialization.
+The model process releases analysis capacity before parsing, and parsing runs
+off the event loop under CPU admission. A retained capture can publish after
+restart without another model call. An uncertain invocation with no retained
+capture becomes an explicit terminal uncertainty result; observed timeouts
+retain their existing bounded retry policy.
+
 These adapters are opt-in. Production dispatcher cutover is tracked separately;
 the existing foreground runtime remains the default until integration is ready.
 The adapter registry starts no workers, and the resident pool creates no task

@@ -17,6 +17,7 @@ from carl.core.item_analysis import ClaudeEffort
 from carl.io.resource_permits import (
     guarded_process_arguments,
     resource_operation,
+    run_cpu,
     terminate_guarded_process,
 )
 
@@ -40,6 +41,22 @@ async def temporary_analysis_directory(root: Path | None = None) -> AsyncIterato
     finally:
         with anyio.fail_after(30, shield=True):
             await anyio.to_thread.run_sync(shutil.rmtree, directory)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCapture:
+    """Raw bounded process evidence, independent from CPU interpretation."""
+
+    argv: tuple[str, ...]
+    started_at_utc_ns: int
+    ended_at_utc_ns: int
+    duration_ns: int
+    exit_code: int | None
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+    output_limited: bool = False
+    launch_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +193,45 @@ class ClaudeCli:
             output_limited,
         )
 
+    async def capture(
+        self,
+        *,
+        directory: Path,
+        prompt: str,
+        model: str,
+        effort: ClaudeEffort,
+        timeout_seconds: int,
+        maximum_turns: int | None = None,
+    ) -> ClaudeCapture:
+        """Run the admitted child and retain bytes without interpreting NDJSON."""
+
+        argv = self.argv(prompt, model, effort, maximum_turns)
+        started_at = time_ns()
+        started = perf_counter_ns()
+        exit_code: int | None = None
+        stdout, stderr = b"", b""
+        timed_out = output_limited = launch_failed = False
+        try:
+            exit_code, stdout, stderr, timed_out, output_limited = await self._capture(
+                argv, directory, timeout_seconds
+            )
+        except TimeoutError:
+            timed_out = True
+        except OSError:
+            launch_failed = True
+        return ClaudeCapture(
+            argv=argv,
+            started_at_utc_ns=started_at,
+            ended_at_utc_ns=time_ns(),
+            duration_ns=max(0, perf_counter_ns() - started),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=timed_out,
+            output_limited=output_limited,
+            launch_failed=launch_failed,
+        )
+
     async def run(
         self,
         *,
@@ -186,81 +242,86 @@ class ClaudeCli:
         timeout_seconds: int,
         maximum_turns: int | None = None,
     ) -> ClaudeRun:
-        argv = self.argv(prompt, model, effort, maximum_turns)
-        started_at_utc_ns = time_ns()
-        started_monotonic_ns = perf_counter_ns()
-        version: str | None = None
-        stdout = b""
-        stderr = b""
-        exit_code: int | None = None
-        text: str | None = None
-        output_metadata: dict[str, object] | None = None
-        failure_kind: str | None = None
-        tool_calls: tuple[str, ...] = ()
-        try:
-            exit_code, stdout, stderr, timed_out, output_limited = await self._capture(
-                argv, directory, timeout_seconds
-            )
-            if timed_out or output_limited:
-                try:
-                    partial_output, tool_calls, version = _parse_stream_events(
-                        stdout, allow_trailing_partial=True
-                    )
-                    if partial_output is not None:
-                        output_metadata = _output_metadata(partial_output)
-                except (UnicodeDecodeError, ValueError):
-                    tool_calls = ()
-                failure_kind = "claude_output_limit" if output_limited else "claude_timeout"
-            else:
-                try:
-                    version = _parse_stream_version(stdout)
-                except (UnicodeDecodeError, ValueError):
-                    version = None
-                try:
-                    output, tool_calls, parsed_version = _parse_stream_output(stdout)
-                    if parsed_version != version:
-                        raise ValueError("Claude stream version parsing is inconsistent")
-                    if version is None and exit_code == 0:
-                        raise ValueError("Claude stream has no CLI version")
-                    output_metadata = _output_metadata(output)
-                    result = output.get("result")
-                    if not isinstance(result, str):
-                        raise ValueError("Claude output has no text result")
-                    maximum_turns_exceeded = (
-                        output.get("subtype") == "error_max_turns"
-                        or output.get("terminal_reason") == "max_turns"
-                    )
-                    if maximum_turns_exceeded:
-                        failure_kind = "claude_maximum_turns_exceeded"
-                    elif exit_code != 0:
-                        failure_kind = "claude_process_failure"
-                    elif output.get("is_error") is True or not result.strip():
-                        failure_kind = "claude_reported_failure"
-                    else:
-                        text = result
-                except (UnicodeDecodeError, ValueError):
-                    failure_kind = (
-                        "claude_process_failure" if exit_code != 0 else "malformed_claude_output"
-                    )
-        except TimeoutError:
-            failure_kind = "claude_timeout"
-        except OSError:
-            failure_kind = "claude_launch_failure"
-        ended_at_utc_ns = time_ns()
-        return ClaudeRun(
-            argv=argv,
-            version=version,
-            started_at_utc_ns=started_at_utc_ns,
-            ended_at_utc_ns=ended_at_utc_ns,
-            duration_ns=max(0, perf_counter_ns() - started_monotonic_ns),
-            exit_code=exit_code,
-            stdout=stdout,
-            stderr=stderr,
-            text=text,
-            output_metadata=output_metadata,
-            tool_calls=tool_calls,
-            failure_kind=failure_kind,
+        capture = await self.capture(
+            directory=directory,
+            prompt=prompt,
+            model=model,
+            effort=effort,
+            timeout_seconds=timeout_seconds,
+            maximum_turns=maximum_turns,
         )
+        return await run_cpu(parse_claude_capture, capture)
+
+
+def parse_claude_capture(capture: ClaudeCapture) -> ClaudeRun:
+    """Interpret only retained bytes; never invoke a subprocess or read its environment."""
+
+    version: str | None = None
+    text: str | None = None
+    output_metadata: dict[str, object] | None = None
+    failure_kind: str | None = None
+    tool_calls: tuple[str, ...] = ()
+    stdout, stderr = capture.stdout, capture.stderr
+    exit_code = capture.exit_code
+    timed_out, output_limited = capture.timed_out, capture.output_limited
+    if capture.launch_failed:
+        failure_kind = "claude_launch_failure"
+    else:
+        if timed_out or output_limited:
+            try:
+                partial_output, tool_calls, version = _parse_stream_events(
+                    stdout, allow_trailing_partial=True
+                )
+                if partial_output is not None:
+                    output_metadata = _output_metadata(partial_output)
+            except (UnicodeDecodeError, ValueError):
+                tool_calls = ()
+            failure_kind = "claude_output_limit" if output_limited else "claude_timeout"
+        else:
+            try:
+                version = _parse_stream_version(stdout)
+            except (UnicodeDecodeError, ValueError):
+                version = None
+            try:
+                output, tool_calls, parsed_version = _parse_stream_output(stdout)
+                if parsed_version != version:
+                    raise ValueError("Claude stream version parsing is inconsistent")
+                if version is None and exit_code == 0:
+                    raise ValueError("Claude stream has no CLI version")
+                output_metadata = _output_metadata(output)
+                result = output.get("result")
+                if not isinstance(result, str):
+                    raise ValueError("Claude output has no text result")
+                maximum_turns_exceeded = (
+                    output.get("subtype") == "error_max_turns"
+                    or output.get("terminal_reason") == "max_turns"
+                )
+                if maximum_turns_exceeded:
+                    failure_kind = "claude_maximum_turns_exceeded"
+                elif exit_code != 0:
+                    failure_kind = "claude_process_failure"
+                elif output.get("is_error") is True or not result.strip():
+                    failure_kind = "claude_reported_failure"
+                else:
+                    text = result
+            except (UnicodeDecodeError, ValueError):
+                failure_kind = (
+                    "claude_process_failure" if exit_code != 0 else "malformed_claude_output"
+                )
+    return ClaudeRun(
+        argv=capture.argv,
+        version=version,
+        started_at_utc_ns=capture.started_at_utc_ns,
+        ended_at_utc_ns=capture.ended_at_utc_ns,
+        duration_ns=capture.duration_ns,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        text=text,
+        output_metadata=output_metadata,
+        tool_calls=tool_calls,
+        failure_kind=failure_kind,
+    )
 
 
 def _parse_stream_output(
