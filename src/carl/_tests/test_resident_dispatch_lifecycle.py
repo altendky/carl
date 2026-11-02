@@ -21,7 +21,7 @@ from carl.core.resources import ResourceRequest
 from carl.core.stages import StageAttemptContext, WaitWork
 from carl.core.worker import CompletedWork
 from carl.io.resident_sessions import ResidentSessionPool
-from carl.io.resource_permits import run_cpu
+from carl.io.resource_permits import ResourceLeaseLost, run_cpu
 from carl.io.sqlite import Database
 from carl.io.stage_workers import StageHandlerRegistry, TypedStageHandler
 from carl.io.stages import stage_manager
@@ -133,7 +133,7 @@ async def test_fresh_pool_rebind_validates_snapshot_before_reserving_new_generat
         assert (await database.work(stage.work_item_identifier))["attempt"] == 1
 
 
-async def test_unaffined_registered_stage_declines_without_leaking_speculative_resident(
+async def test_unaffined_registered_stage_is_rejected_without_leaking_speculative_resident(
     tmp_path: Path,
 ) -> None:
     async with Database.managed(
@@ -142,7 +142,8 @@ async def test_unaffined_registered_stage_declines_without_leaking_speculative_r
         stage = await _initial(database, resources=())
         await database.register_stage(stage, created_at_utc_ns=0)
         async with _pool(database, StageHandlerRegistry((), ())).managed() as pool:
-            assert not await pool.submit(stage, component=_COMPONENT)
+            with pytest.raises(ResourceLeaseLost, match="transfer resident ownership"):
+                await pool.submit(stage, component=_COMPONENT)
             assert await _count(database, "resident_sessions") == 0
             assert await _count(database, "resource_permits") == 0
             assert pool.active_count == 0

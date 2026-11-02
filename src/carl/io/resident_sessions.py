@@ -258,14 +258,15 @@ class ResidentSessionPool:
                                     expected_snapshot=expected_snapshot,
                                 )
                             previous = existing.resident_session_identifier
-                            if (
-                                previous is None
-                                or not await self.manager.database.rebind_resident_stage(
-                                    stage.identifier,
-                                    previous,
-                                    lease,
-                                    now_utc_ns=self.manager.utc_now_ns(),
+                            if previous is None:
+                                raise ResourceLeaseLost(
+                                    "Pending stage cannot transfer resident ownership"
                                 )
+                            if not await self.manager.database.rebind_resident_stage(
+                                stage.identifier,
+                                previous,
+                                lease,
+                                now_utc_ns=self.manager.utc_now_ns(),
                             ):
                                 raise _ResidentUnavailable
                             stage = await self.manager.database.stage(stage.identifier)
