@@ -126,3 +126,10 @@ def acquisition_resource_identity(
         if isinstance(item, str) and isinstance(plan, dict):
             return ("facebook", "item", item, _json(plan))
     return None
+
+
+def acquisition_resource_identity_json(kind: tuple[str, ...], payload: JsonValue) -> str | None:
+    """Serialize the exact resource identity for indexed queue admission."""
+
+    identity = acquisition_resource_identity(kind, payload)
+    return None if identity is None else _json(identity)

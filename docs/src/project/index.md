@@ -495,6 +495,13 @@ Full lease reads occur only after the matching physical guard is acquired. Stora
 dispatch/recovery indices without rewriting evidence or ownership. These APIs prepare the shared
 runtime cutover; they do not switch the legacy worker pool to stage dispatch.
 
+Schema 19 stores the existing canonical acquisition-resource identity as derived work
+metadata and indexes live leased/cancelling peers. Claim and resume checks compare these
+keys inside the writer transaction instead of loading unrelated peer payloads. The
+migration backfills old work in bounded batches, including terminal jobs that may later
+be retried. Enqueueing and route changes maintain the key. Caller deduplication, request
+equivalence, acquisition freshness and successful-result reuse keep their existing rules.
+
 The stateless adapter registry now supplies Facebook detail and Facebook/eBay
 gallery collection, eBay descriptions, and offline item/image extraction stages.
 Collection first

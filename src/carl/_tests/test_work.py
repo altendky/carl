@@ -16,6 +16,7 @@ from carl.core.models import CodeProvenance, NamedInput, NamedOutput, RecordDraf
 from carl.core.work import (
     ConcurrencyConstraint,
     HoldoffDecision,
+    NetworkActivityAdmissionResult,
     NetworkActivityDefinition,
     NetworkActivityState,
     SchedulingScope,
@@ -35,6 +36,8 @@ from carl.io.sqlite import Database, LeaseLostError
 
 
 class _CancellationAfterCreateDatabase(Database):
+    cancel_after_create: Callable[[], None] | None = None
+
     async def create_network_activity(
         self,
         definition: NetworkActivityDefinition,
@@ -49,7 +52,9 @@ class _CancellationAfterCreateDatabase(Database):
             event_identifier=event_identifier,
             sample_uniform_holdoff_ns=sample_uniform_holdoff_ns,
         )
-        await anyio.sleep_forever()
+        assert self.cancel_after_create is not None
+        self.cancel_after_create()
+        await anyio.lowlevel.checkpoint()
         return eligible_at
 
 
@@ -229,7 +234,9 @@ async def test_network_activities_share_durable_rate_and_holdoff_constraints(
 
 
 @pytest.mark.anyio
-async def test_network_activity_wait_is_level_cancellable_and_persisted(tmp_path: Path) -> None:
+async def test_network_activity_wait_is_level_cancellable_and_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "carl.sqlite3"
     activity_kind = SchedulingScope(
         kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND,
@@ -262,10 +269,32 @@ async def test_network_activity_wait_is_level_cancellable_and_persisted(tmp_path
             sample_uniform_holdoff_ns=lambda minimum, maximum: minimum,
             permit_duration_ns=1_000_000_000,
         )
-        with anyio.move_on_after(0.01) as cancellation_scope:
+        admit = database.try_admit_network_activity
+        with anyio.fail_after(5), anyio.CancelScope() as cancellation_scope:
+
+            async def cancel_when_waiting(
+                *,
+                network_activity_identifier: str,
+                admission_token: str,
+                permit_duration_ns: int,
+                now_utc_ns: int,
+                event_identifier: str,
+            ) -> NetworkActivityAdmissionResult:
+                result = await admit(
+                    network_activity_identifier=network_activity_identifier,
+                    admission_token=admission_token,
+                    permit_duration_ns=permit_duration_ns,
+                    now_utc_ns=now_utc_ns,
+                    event_identifier=event_identifier,
+                )
+                assert result.admission is None
+                cancellation_scope.cancel()
+                return result
+
+            monkeypatch.setattr(database, "try_admit_network_activity", cancel_when_waiting)
             async with scheduler.admit(_network_activity("network-cancelled", ordinal=1)):
                 raise AssertionError("A held network activity was admitted")
-        assert cancellation_scope.cancel_called
+        assert cancellation_scope.cancel_called and cancellation_scope.cancelled_caught
         activity = await database.network_activity("network-cancelled")
 
     assert activity["state"] == NetworkActivityState.CANCELLED
@@ -279,6 +308,7 @@ async def test_cancellation_after_activity_creation_persists_terminal_state(
     path = tmp_path / "carl.sqlite3"
     identifiers = iter(("created-event", "cancel-event"))
     async with _CancellationAfterCreateDatabase.managed(path, initialize=True) as database:
+        assert isinstance(database, _CancellationAfterCreateDatabase)
         await database.begin_operation(
             operation_id="network-operation",
             component=Component(ComponentId(("carl", "test", "network")), 1, lambda: None),
@@ -295,10 +325,11 @@ async def test_cancellation_after_activity_creation_persists_terminal_state(
             permit_duration_ns=1_000_000_000,
         )
 
-        with anyio.move_on_after(0.01) as cancellation_scope:
+        with anyio.fail_after(5), anyio.CancelScope() as cancellation_scope:
+            database.cancel_after_create = cancellation_scope.cancel
             async with scheduler.admit(_network_activity("cancelled-after-create", ordinal=1)):
                 raise AssertionError("Creation checkpoint unexpectedly reached admission")
-        assert cancellation_scope.cancel_called
+        assert cancellation_scope.cancel_called and cancellation_scope.cancelled_caught
         activity = await database.network_activity("cancelled-after-create")
 
     assert activity["state"] == NetworkActivityState.CANCELLED
