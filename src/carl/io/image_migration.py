@@ -2,12 +2,11 @@
 
 from collections.abc import Callable
 
-import anyio
-
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.facebook_images import verify_image
 from carl.core.models import JsonValue
 from carl.io.image_files import ImageFileStore
+from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 
 MIGRATE_EXTERNAL_IMAGE_FILES = ComponentId(("carl", "storage", "migrate", "external_image_files"))
@@ -93,12 +92,11 @@ async def externalize_saved_images(
         ):
             raise ValueError("Saved image result lacks migration identity")
         image_metadata, image_content = await database.get_artifact(image_identifier)
-        verified = await anyio.to_thread.run_sync(
+        verified = await run_cpu(
             verify_image,
             image_content,
             [{"name_latin1": "Content-Type", "value_latin1": expected_media_type}],
             {"kind": "content_decoded_http_body", "content_decoded": True},
-            abandon_on_cancel=True,
         )
         if verified.sha256 != expected_sha256 or verified.media_type != expected_media_type:
             raise ValueError("Saved image result does not match its retained bytes")

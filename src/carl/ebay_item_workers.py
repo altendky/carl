@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from random import uniform
 from time import time_ns
 
-import anyio
 from anyio import sleep as item_retry_sleep
 
 from carl.core.acquisition_identity import acquisition_resource_identity, ebay_image_identity
@@ -82,6 +82,7 @@ from carl.io.network_activity import (
 )
 from carl.io.paths import CarlDirectories
 from carl.io.proton import ProtonSessionManager
+from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 from carl.io.worker import TypedWorkHandler, WorkHandlerRegistry
 
@@ -322,11 +323,14 @@ async def _collect_item(
                 dependencies.database, acquisition, dependencies.new_identifier
             )
             response = _terminal_response(acquisition)
-            extracted = extract_ebay_item(
-                html,
-                item_identifier=payload.request.item_identifier,
-                effective_url=acquisition.get("effective_url", ""),
-                status_code=response.get("status_code", 0),
+            extracted = await run_cpu(
+                partial(
+                    extract_ebay_item,
+                    html,
+                    item_identifier=payload.request.item_identifier,
+                    effective_url=acquisition.get("effective_url", ""),
+                    status_code=response.get("status_code", 0),
+                )
             )
             if extracted.classification != "detail":
                 continue
@@ -375,11 +379,14 @@ async def _collect_item(
                 html, _, _ = await _html(
                     dependencies.database, retained, dependencies.new_identifier
                 )
-                prior = extract_ebay_item(
-                    html,
-                    item_identifier=payload.request.item_identifier,
-                    effective_url=retained.get("effective_url", ""),
-                    status_code=_terminal_response(retained).get("status_code", 0),
+                prior = await run_cpu(
+                    partial(
+                        extract_ebay_item,
+                        html,
+                        item_identifier=payload.request.item_identifier,
+                        effective_url=retained.get("effective_url", ""),
+                        status_code=_terminal_response(retained).get("status_code", 0),
+                    )
                 )
             except ValueError:
                 prior = None
@@ -458,7 +465,7 @@ async def _collect_item(
                     )
                 identifier = dependencies.new_identifier()
                 identifiers.append(identifier)
-                extracted = _item_response(acquisition, payload.request)
+                extracted = await run_cpu(_item_response, acquisition, payload.request)
                 blocked = (
                     extracted is not None
                     and extracted.classification == EbayItemResponseKind.CHALLENGE
@@ -611,7 +618,9 @@ async def _html(
     identifier = body["artifact_id"]
     metadata, content = await database.get_artifact(identifier)
     headers = response.get("headers")
-    html, charset, source = _decode_html(content, metadata.get("representation"), headers)
+    html, charset, source = await run_cpu(
+        _decode_html, content, metadata.get("representation"), headers
+    )
     artifact = BytesDraft(
         identifier=new_identifier(),
         kind=("carl", "http", "decoded_text"),
@@ -657,11 +666,14 @@ async def _extract_item(
             dependencies.database, acquisition, dependencies.new_identifier
         )
         response = _terminal_response(acquisition)
-        extraction = extract_ebay_item(
-            html,
-            item_identifier=payload.request.item_identifier,
-            effective_url=acquisition.get("effective_url", ""),
-            status_code=response.get("status_code", 0),
+        extraction = await run_cpu(
+            partial(
+                extract_ebay_item,
+                html,
+                item_identifier=payload.request.item_identifier,
+                effective_url=acquisition.get("effective_url", ""),
+                status_code=response.get("status_code", 0),
+            )
         )
     except (KeyError, ValueError, OSError) as error:
         return _failure(error, context, inputs=inputs)
@@ -1001,7 +1013,7 @@ async def _collect_image(
         )
         if acquired_body is None:
             raise ValueError("No complete image body")
-        verified = await anyio.to_thread.run_sync(
+        verified = await run_cpu(
             verify_image,
             acquired_body.content,
             response.get("headers"),
@@ -1269,11 +1281,14 @@ async def _collect_description(
             "application/xhtml+xml",
         }:
             raise ValueError("Description response is not HTML")
-        decoded = decoded_stored_body(
-            body.content, body.representation, stored_content_encodings(response.get("headers"))
+        decoded = await run_cpu(
+            decoded_stored_body,
+            body.content,
+            body.representation,
+            stored_content_encodings(response.get("headers")),
         )
         charset, _ = stored_response_charset(response.get("headers"))
-        text = extract_ebay_description(decoded.decode(charset)) or None
+        text = await run_cpu(extract_ebay_description, decoded.decode(charset)) or None
     except (ValueError, LookupError, UnicodeError):
         pass
     identifier = dependencies.new_identifier()

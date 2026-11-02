@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from time import time_ns
 from uuid import NAMESPACE_URL, uuid5
 
-import anyio
-
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.facebook_images import (
     COLLECT_IMAGE_WORK_KIND,
@@ -45,6 +43,7 @@ from carl.io.httpx import (
 )
 from carl.io.image_files import ImageFileStore
 from carl.io.network_activity import NetworkActivityScheduler
+from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 from carl.io.worker import TypedWorkHandler, WorkHandlerRegistry
 
@@ -568,12 +567,11 @@ async def _collect(
             raise ValueError("Image effective URL differs from the signed reference")
         if acquired_body is None:
             raise ValueError("Image acquisition has no complete terminal body")
-        verified = await anyio.to_thread.run_sync(
+        verified = await run_cpu(
             verify_image,
             acquired_body.content,
             response.get("headers"),
             acquired_body.representation,
-            abandon_on_cancel=True,
         )
         stored = await dependencies.image_files.publish(
             content=verified.content,
@@ -749,12 +747,11 @@ async def _extract(
             raise ValueError("Image HTTP status is not 200")
         if acquisition.get("effective_url") != reference.get("original_url"):
             raise ValueError("Image effective URL differs from the signed reference")
-        verified = await anyio.to_thread.run_sync(
+        verified = await run_cpu(
             verify_image,
             stored_body,
             response.get("headers"),
             body_metadata.get("representation"),
-            abandon_on_cancel=True,
         )
         stored = await dependencies.image_files.publish(
             content=verified.content,

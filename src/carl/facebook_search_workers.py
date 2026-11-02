@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Literal
 
-import anyio
-
 from carl.core.components import Component
 from carl.core.content_encoding import decoded_stored_body
 from carl.core.facebook import parse_json_blocks
@@ -84,6 +82,7 @@ from carl.core.worker import (
 from carl.io.facebook_search import FacebookSearchSessionFactory, FacebookSearchSessionFailure
 from carl.io.httpx import Acquisition, AcquisitionFailure, IdentifierFactory
 from carl.io.network_activity import NetworkActivityScheduler, network_activity_definition
+from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 
 SEARCH_RETRY_DELAY_NS = 1_000_000_000
@@ -1102,16 +1101,14 @@ def build_search_handler(
                         ),
                         permit.admission,
                     )
-                session_bootstrap_decoded = await anyio.to_thread.run_sync(
+                session_bootstrap_decoded = await run_cpu(
                     _decode_acquisition,
                     session_bootstrap_acquisition,
-                    abandon_on_cancel=True,
                 )
                 session_bootstrap_acquisition_identifier = dependencies.new_identifier()
-                session_bootstrap_blocks = await anyio.to_thread.run_sync(
+                session_bootstrap_blocks = await run_cpu(
                     parse_json_blocks,
                     session_bootstrap_decoded.text,
-                    abandon_on_cancel=True,
                 )
                 session_bootstrap_effective_url = session_bootstrap_decoded.terminal_response.get(
                     "url"
@@ -1203,19 +1200,17 @@ def build_search_handler(
                         ),
                         permit.admission,
                     )
-                decoded = await anyio.to_thread.run_sync(
+                decoded = await run_cpu(
                     _decode_acquisition,
                     acquisition,
-                    abandon_on_cancel=True,
                 )
                 acquisition_identifier = dependencies.new_identifier()
-                extraction = await anyio.to_thread.run_sync(
+                extraction = await run_cpu(
                     partial(
                         extract_search_route_definition,
                         decoded.text,
                         acquisition_record_identifier=acquisition_identifier,
                     ),
-                    abandon_on_cancel=True,
                 )
                 applied_configuration = extraction.applied_configuration
                 effective_url = decoded.terminal_response.get("url")
@@ -1413,19 +1408,17 @@ def build_search_handler(
                                 ),
                                 permit.admission,
                             )
-                        decoded = await anyio.to_thread.run_sync(
+                        decoded = await run_cpu(
                             _decode_acquisition,
                             acquisition,
-                            abandon_on_cancel=True,
                         )
                         acquisition_identifier = dependencies.new_identifier()
-                        extraction = await anyio.to_thread.run_sync(
+                        extraction = await run_cpu(
                             partial(
                                 extract_search_route_definition,
                                 decoded.text,
                                 acquisition_record_identifier=acquisition_identifier,
                             ),
-                            abandon_on_cancel=True,
                         )
                         partition_applied_configuration = extraction.applied_configuration
                         effective_url = decoded.terminal_response.get("url")
@@ -1590,19 +1583,17 @@ def build_search_handler(
                                 ),
                                 permit.admission,
                             )
-                        decoded = await anyio.to_thread.run_sync(
+                        decoded = await run_cpu(
                             _decode_acquisition,
                             acquisition,
-                            abandon_on_cancel=True,
                         )
                         acquisition_identifier = dependencies.new_identifier()
-                        page_extraction = await anyio.to_thread.run_sync(
+                        page_extraction = await run_cpu(
                             partial(
                                 extract_search_pagination,
                                 decoded.text,
                                 acquisition_record_identifier=acquisition_identifier,
                             ),
-                            abandon_on_cancel=True,
                         )
                         if page_extraction.page is None:
                             rate_limited = any(

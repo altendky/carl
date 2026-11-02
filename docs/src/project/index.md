@@ -403,6 +403,49 @@ one task per pending item and leave those tasks waiting on database or network
 limits. Different work kinds and network activities may have separate worker
 limits.
 
+Expensive adapters additionally share resource permits across worker, CLI, and
+MCP operations opened through `Database.managed`. Initial capacities are 25
+HTTP acquisitions, 4 CPU parsing/image-validation calls, and 10 analysis
+processes. `CARL_RESOURCE_HTTP`, `CARL_RESOURCE_CPU`, and `CARL_RESOURCE_ANALYSIS`
+configure positive integer capacities; embedding callers can supply
+`resource_capacities` to `Database.managed`. These are local capacity settings,
+separate from remote rate/cooldown policies and logical work ownership. SQLite
+writes remain short serialized transactions and consume no execution permit.
+
+The coordination boundary is one evidence database and one host identity
+(`CARL_RESOURCE_HOST`, defaulting to the hostname). It does not enforce a
+host-wide limit across unrelated databases, containers with distinct host
+identities, or separate machines. Participants must share the database and its
+adjacent `.resource-permits` guard directory on a local filesystem supporting
+`flock`; do not rename, delete, or replace live guard files. Low-level adapters
+used without an evidence-database context have no shared admission policy.
+
+An operation reserves all requested budgets in one transaction or none, then
+executes outside SQLite. A 60-second lease renews every 20 seconds. Changing a
+registered capacity while any permit occupies the scope fails clearly; apply
+configuration changes when the scope is idle. Expired reservations still count
+until their execution guard can be acquired. A paused live owner therefore
+cannot create overlapping physical execution simply by missing a heartbeat.
+Failure and cancellation release capacity after cleanup. CPU calls wait for
+their actual thread to exit; analysis runs under a supervisor retaining its
+guard and an independent deadline if Carl dies. Recovery assumes the local
+kernel's lock semantics and an intact supervisor; killing that supervisor
+separately from its analysis child is outside this failure boundary.
+
+Resource tokens are never reused. Renewal, release, and reclamation check exact
+ownership, and `ResourcePermit.publishing()` validates before and after writes
+inside their transaction. Durable work publication also retains its existing
+work-lease fence. HTTP admission precedes transport execution; CPU permits
+cover parsing and image validation, and analysis permits cover the owned child
+process. Stages release resources when their adapter call finishes. Dispatch
+admission and fairness are separate scheduler concerns.
+
+Counts are supplemented by per-operation bounds: HTTP body limits, bounded
+100 MB decompression (including each stacked encoding), 40-million-pixel image
+validation, and bounded analysis stdout/stderr (8 MiB/1 MiB, 8 MiB combined).
+Hitting an analysis output bound terminates and reaps the child and records
+`claude_output_limit`. These bounds do not constitute a whole-process RSS cap.
+
 SQLite is the durable source of pending work. A claim uses a short transaction
 to assign a lease token, worker identity, and expiration time. Processing occurs
 outside the transaction. Completion uses the lease token as a fencing value so
@@ -870,11 +913,10 @@ kind and type; its known acquisition and body input edges are still retained.
 These failures are discoverable by operation state and registered extractor
 identity without searching logs.
 
-Content decoding and HTML/JSON extraction run in AnyIO's bounded worker-thread
-pool so CPU work cannot stop Trio lease heartbeats. The call is abandoned on
-cancellation: the pure thread may finish computing, but it has no database or
-network capability and cannot publish after its owning leased task is
-cancelled. Durable publication remains fenced in the async worker.
+Content decoding and HTML/JSON extraction run in AnyIO's worker-thread pool
+under shared CPU resource admission so CPU work cannot stop Trio lease
+heartbeats. Cancellation waits for the physical call to finish before its
+capacity is released. Durable publication remains fenced in the async worker.
 
 Dedicated diagnostic records and indexed projections remain future work. They
 will support grouping warning and failure codes across request policy, HTTP

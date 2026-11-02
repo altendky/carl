@@ -228,7 +228,9 @@ async def _execute(database: Database, root: Path, now: int, *, response: str) -
         settings=WorkerSettings(
             worker_count=1,
             lease_duration_ns=60_000_000_000,
-            renewal_interval_ns=1_000_000_000,
+            # The retry-policy clock is frozen; heartbeat behavior is tested
+            # separately with an advancing clock.
+            renewal_interval_ns=30_000_000_000,
             idle_poll_interval_ns=1,
         ),
         services=WorkerRuntimeServices(

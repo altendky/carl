@@ -161,6 +161,7 @@ from carl.io.mcp_errors import report_mcp_failure
 from carl.io.mcp_response_budget import BudgetedMCPServer, ToolResponseStore
 from carl.io.paths import user_directories
 from carl.io.provenance import collect_code_provenance_async, source_tree_sha256_async
+from carl.io.resource_permits import run_cpu
 from carl.io.routing import ConfiguredTravelService
 from carl.io.sqlite import Database
 from carl.review import IncompleteGalleryError, ReviewApplication, ReviewInputError
@@ -1180,8 +1181,9 @@ def tool_definitions(
         """Return one exact validated listing image artifact for multimodal inspection."""
 
         image = await expected(lambda: application.get_image(artifact_identifier))
+        encoded = await run_cpu(base64.b64encode, image.content)
         return ImageContent(
-            data=base64.b64encode(image.content).decode("ascii"),
+            data=encoded.decode("ascii"),
             mime_type=image.media_type,
             _meta={
                 "carl/artifactIdentifier": image.artifact_identifier,

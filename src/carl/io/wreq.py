@@ -32,6 +32,7 @@ from carl.io.httpx import (
     IdentifierFactory,
     RouteConfigurationFailure,
 )
+from carl.io.resource_permits import resource_operation
 
 _DEFAULT_COMPRESSION = ("gzip", "deflate", "br", "zstd")
 _PROTECTED_REQUEST_HEADERS = frozenset({b"cookie", b"proxy-authorization", b"x-pl-config"})
@@ -1106,6 +1107,7 @@ class ProxyWreqAcquirer:
                     self._failed = True
                 raise
 
+    @resource_operation("http")
     async def _acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         if plan.routing != self.expected_routing:
             raise RouteConfigurationFailure("request_route_does_not_match_acquirer")
