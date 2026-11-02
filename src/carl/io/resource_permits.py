@@ -114,16 +114,62 @@ def configured_capacities(overrides: Mapping[str, int] | None = None) -> dict[st
     return capacities
 
 
+def _positive_units(units: int) -> None:
+    if type(units) is not int or units < 1:
+        raise ValueError("CPU reservation units must be a positive integer")
+
+
+@dataclass(slots=True)
+class _WeightedLimiter:
+    capacity: int
+    _condition: anyio.Condition = field(default_factory=anyio.Condition)
+    _waiting: list[object] = field(default_factory=list)
+    _available: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._available = self.capacity
+
+    @asynccontextmanager
+    async def borrow(self, units: int) -> AsyncIterator[None]:
+        """Acquire all units together, preserving order and removing cancelled waiters."""
+
+        ticket = object()
+        acquired = False
+        try:
+            async with self._condition:
+                self._waiting.append(ticket)
+                try:
+                    while self._waiting[0] is not ticket or self._available < units:
+                        await self._condition.wait()
+                    self._available -= units
+                    self._waiting.pop(0)
+                    acquired = True
+                    self._condition.notify_all()
+                except BaseException:
+                    if ticket in self._waiting:
+                        self._waiting.remove(ticket)
+                        self._condition.notify_all()
+                    raise
+            yield
+        finally:
+            if acquired:
+                with anyio.CancelScope(shield=True):
+                    async with self._condition:
+                        self._available += units
+                        self._condition.notify_all()
+
+
 @dataclass(slots=True)
 class ResourcePermit:
     manager: ResourceManager
     lease: ResourceLease
     guard_descriptor: int
     release_on_exit: bool = True
-    local_limiters: dict[str, anyio.Semaphore] = field(default_factory=dict)
+    local_limiters: dict[str, anyio.Semaphore | _WeightedLimiter] = field(default_factory=dict)
     borrowers: dict[tuple[int, str], int] = field(default_factory=dict)
     execution_guard: ExecutionGuard | None = None
     closed: bool = False
+    borrow_weights: dict[tuple[int, str], int] = field(default_factory=dict)
 
     @asynccontextmanager
     async def publishing(self) -> AsyncIterator[None]:
@@ -513,9 +559,62 @@ def current_resource_manager() -> ResourceManager | None:
     return _CURRENT_MANAGER.get()
 
 
-async def current_cpu_guard_descriptor() -> int:
+def validate_cpu_reservation(units: int = 1) -> ResourceManager:
+    """Check CPU reservation metadata before I/O, without waiting or admitting work."""
+
+    _positive_units(units)
+    manager = current_resource_manager()
+    if manager is None:
+        raise ResourceLeaseLost("CPU reservation requires a managed resource context")
+    if units > manager.capacities.get("cpu", 0):
+        raise ValueError("CPU reservation exceeds the configured CPU capacity")
+    permit = _current_permit(manager, "cpu", include_reserved=True)
+    if permit is None:
+        return manager
+    if permit.closed:
+        raise ResourceLeaseLost("Cannot execute after resource adoption ended")
+    guard = permit.execution_guard
+    if guard is not None and (
+        guard.closing or guard.sealed or guard.closed or guard.descriptor is None
+    ):
+        raise ResourceLeaseLost("CPU execution guard is closing or sealed")
+    allocation = next(
+        request.units for request in permit.lease.allocations if request.name == "cpu"
+    )
+    if units > allocation:
+        raise ValueError(
+            f"CPU reservation requires {units} units but the current permit reserves {allocation}"
+        )
+    borrower = (anyio.get_current_task().id, "cpu")
+    if borrower in permit.borrowers and units > permit.borrow_weights[borrower]:
+        raise ValueError("Cannot increase a nested CPU reservation above its held weight")
+    return manager
+
+
+def invalidate_cpu_reservation() -> None:
+    """Stop reuse after uncertain physical cleanup without releasing any capacity."""
+
+    manager = current_resource_manager()
+    if manager is None:
+        raise ResourceLeaseLost("CPU invalidation requires an active task CPU borrow")
+    permit = _current_permit(manager, "cpu")
+    borrower = (anyio.get_current_task().id, "cpu")
+    if (
+        permit is None
+        or permit.lease.scope != manager.scope
+        or permit.borrowers.get(borrower, 0) < 1
+        or permit.borrow_weights.get(borrower, 0) < 1
+    ):
+        raise ResourceLeaseLost("CPU invalidation requires an active task CPU borrow")
+    permit.closed = True
+    if permit.execution_guard is not None:
+        permit.execution_guard.closing = True
+
+
+async def current_cpu_guard_descriptor(*, required_units: int = 1) -> int:
     """Borrow the live CPU guard FD for inheritance; never close the original FD."""
 
+    _positive_units(required_units)
     manager = current_resource_manager()
     permit = None if manager is None else _current_permit(manager, "cpu")
     borrower = (anyio.get_current_task().id, "cpu")
@@ -529,6 +628,8 @@ async def current_cpu_guard_descriptor() -> int:
             or permit.borrowers.get(borrower, 0) < 1
         ):
             raise ResourceLeaseLost("CPU guard inheritance requires an active task CPU borrow")
+        if permit.borrow_weights.get(borrower, 0) < required_units:
+            raise ResourceLeaseLost("CPU guard borrow does not reserve the required units")
         guard = permit.execution_guard
         if guard is not None:
             if guard.closing or guard.sealed or guard.closed or guard.descriptor is None:
@@ -565,8 +666,11 @@ def _current_permit(
 
 @asynccontextmanager
 async def _borrow_resource(
-    manager: ResourceManager, name: str, *, include_reserved: bool = False
+    manager: ResourceManager, name: str, *, include_reserved: bool = False, units: int = 1
 ) -> AsyncIterator[bool]:
+    _positive_units(units)
+    if name != "cpu" and units != 1:
+        raise ValueError("Weighted borrowing is supported only for CPU operations")
     permit = _current_permit(manager, name, include_reserved=include_reserved)
     if permit is None:
         yield False
@@ -577,8 +681,15 @@ async def _borrow_resource(
         permit.execution_guard.sealed or permit.execution_guard.closed
     ):
         raise ResourceLeaseLost("Cannot execute after its stage guard was sealed")
+    allocation = next(request.units for request in permit.lease.allocations if request.name == name)
+    if units > allocation:
+        raise ValueError(
+            f"CPU reservation requires {units} units but the current permit reserves {allocation}"
+        )
     borrower = (anyio.get_current_task().id, name)
     if borrower in permit.borrowers:
+        if units > permit.borrow_weights[borrower]:
+            raise ValueError("Cannot increase a nested CPU reservation above its held weight")
         guard = permit.execution_guard
         if guard is not None:
             guard.begin_borrow()
@@ -598,16 +709,17 @@ async def _borrow_resource(
     # operations within this reservation instead of letting each reuse one unit.
     limiter = permit.local_limiters.get(name)
     if limiter is None:
-        units = next(request.units for request in permit.lease.allocations if request.name == name)
-        limiter = anyio.Semaphore(units)
+        limiter = _WeightedLimiter(allocation) if name == "cpu" else anyio.Semaphore(allocation)
         permit.local_limiters[name] = limiter
-    async with limiter:
+    reservation = limiter.borrow(units) if isinstance(limiter, _WeightedLimiter) else limiter
+    async with reservation:
         if permit.closed:
             raise ResourceLeaseLost("Cannot execute after resource adoption ended")
         guard = permit.execution_guard
         if guard is not None:
             guard.begin_borrow()
         permit.borrowers[borrower] = 1
+        permit.borrow_weights[borrower] = units
         try:
             if not await manager.database.validate_resource_permit(
                 token=permit.lease.token, owner=permit.lease.owner, now_utc_ns=time_ns()
@@ -616,8 +728,25 @@ async def _borrow_resource(
             yield True
         finally:
             del permit.borrowers[borrower]
+            del permit.borrow_weights[borrower]
             if guard is not None:
                 guard.end_borrow()
+
+
+@asynccontextmanager
+async def cpu_reservation(units: int = 1) -> AsyncIterator[int]:
+    """Reserve weighted CPU capacity, reusing a sufficient current stage allocation."""
+
+    manager = validate_cpu_reservation(units)
+    async with _borrow_resource(manager, "cpu", include_reserved=True, units=units) as borrowed:
+        if borrowed:
+            yield await current_cpu_guard_descriptor(required_units=units)
+            return
+    async with (
+        manager.admit(ResourceRequest(name="cpu", units=units)),
+        _borrow_resource(manager, "cpu", include_reserved=True, units=units),
+    ):
+        yield await current_cpu_guard_descriptor(required_units=units)
 
 
 def resource_operation[**P, T](

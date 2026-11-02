@@ -405,12 +405,14 @@ limits.
 
 Expensive adapters additionally share resource permits across worker, CLI, and
 MCP operations opened through `Database.managed`. Initial capacities are 25
-HTTP acquisitions, 4 CPU parsing/image-validation calls, and 10 analysis
+HTTP acquisitions, 4 CPU units, and 10 analysis
 processes. `CARL_RESOURCE_HTTP`, `CARL_RESOURCE_CPU`, and `CARL_RESOURCE_ANALYSIS`
 configure positive integer capacities; embedding callers can supply
 `resource_capacities` to `Database.managed`. These are local capacity settings,
 separate from remote rate/cooldown policies and logical work ownership. SQLite
 writes remain short serialized transactions and consume no execution permit.
+Parsing and image validation each reserve one CPU unit; native build commands
+reserve their configured thread count.
 
 The coordination boundary is one evidence database and one host identity
 (`CARL_RESOURCE_HOST`, defaulting to the hostname). It does not enforce a
@@ -602,6 +604,35 @@ worker also terminates if its supervisor disappears.
 Standalone routing outside `Database.managed` uses an eagerly closed supervised
 worker and a process-local limit of one; it does not share a durable host budget
 or retain a warm graph between calls.
+
+Native dataset commands have a separate reusable runner. It atomically reserves
+the requested thread count from the shared CPU budget before launch. Requests
+above the configured capacity, or above an already adopted stage allocation,
+fail before starting a command. Nested operations reuse their reserved weight;
+concurrent operations inside a stage cannot each spend the whole allocation.
+The caller supplies a held private workflow lock, and a stable phase lock
+excludes overlapping executions even when callers share that workflow handle.
+
+On Linux, a fresh supervisor retains CPU, workflow and phase guards and passes
+them through an exec gate to the actual command. It enforces an independent
+deadline, kills and reaps descendants on cancellation or parent loss, and writes
+private bounded stdout/stderr logs. Defaults retain at most 8 MiB per stream
+and 16 MiB combined; output overflow either terminates the command or drains
+and discards excess output while retaining a bounded prefix and tail. Packaged
+OSRM tools resolve to native executables directly, avoiding the Python wrapper
+that closes inherited descriptors.
+
+An immutable start receipt precedes spawning. A completion receipt follows
+physical cleanup and log finalization; replay verifies the frozen command/input
+identity and bounded log hashes without launching that phase again. Controllers
+must retain the same receipt directory for the phase. An incomplete receipt
+requires reconciliation, and command completion still requires dataset output
+validation before activation. Unknown cleanup quarantines the owner and guards
+and invalidates its CPU borrow. A root task releases quarantined handles only
+after physical exit is proven. Abrupt supervisor death protects the direct
+command with a parent-death signal but cannot prove arbitrary descendants have
+exited, so admission remains occupied. This foundation does not yet switch the
+dataset setup workflow to staged execution.
 
 Travel estimates use one replayable phase engine for direct service calls and
 queued route refreshes. CPU preparation resolves cache entries and plans each
