@@ -88,6 +88,7 @@ async def _enqueue(
     result = await dependencies.database.enqueue_work(
         definition,
         WorkRequester(
+            parent_work_identifier=context.work_item_identifier,
             request_identifier=dependencies.new_identifier(),
             kind=("carl", "facebook", "listing_details", stage),
             identifier=context.work_item_identifier,
@@ -167,6 +168,7 @@ async def _item_phase(
             enqueued, retained = await database.enqueue_work_unless_facebook_item_page_is_usable(
                 definition,
                 WorkRequester(
+                    parent_work_identifier=context.work_item_identifier,
                     request_identifier=dependencies.new_identifier(),
                     kind=("carl", "facebook", "listing_details", "item"),
                     identifier=context.work_item_identifier,
@@ -437,6 +439,7 @@ async def _image_phase(
             result = await database.enqueue_work(
                 definition,
                 WorkRequester(
+                    parent_work_identifier=context.work_item_identifier,
                     request_identifier=dependencies.new_identifier(),
                     kind=("carl", "facebook", "listing_details", "image_group"),
                     identifier=_identifier(context.work_item_identifier, "image_group", str(index)),
@@ -455,6 +458,7 @@ async def _image_phase(
                 await database.attach_work_request(
                     child,
                     WorkRequester(
+                        parent_work_identifier=context.work_item_identifier,
                         request_identifier=dependencies.new_identifier(),
                         kind=("carl", "facebook", "gallery_image_reference"),
                         identifier=identifier,

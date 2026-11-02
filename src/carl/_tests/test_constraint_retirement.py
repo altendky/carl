@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from carl._tests.legacy_schema import remove_fair_schema
 from carl.core.components import Component, ComponentId
 from carl.core.json import encode_json
 from carl.core.models import CodeProvenance
@@ -118,6 +119,7 @@ async def test_v1_migration_and_atomic_constraint_supersession(tmp_path: Path) -
     # Recreate the exact old metadata and table set to exercise a real v1 upgrade.
     with closing(sqlite3.connect(path)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
+        remove_fair_schema(connection)
         connection.execute("DROP TABLE scheduling_constraint_retirements")
         previous = DATABASE_SCHEMA.model_copy(update={"version": 1})
         connection.executemany(

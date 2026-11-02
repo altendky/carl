@@ -188,6 +188,7 @@ async def _run_pipeline(
                     enqueued = await database.enqueue_work(
                         definition,
                         WorkRequester(
+                            parent_work_identifier=context.work_item_identifier,
                             request_identifier=str(uuid4()),
                             kind=_LISTING_REQUEST_KIND,
                             identifier=owner,

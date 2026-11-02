@@ -111,7 +111,7 @@ async def test_invocation_charge_survives_restart_and_conservatively_spends_reco
             is None
         )
         assert await _scalar(database, "SELECT count(*) FROM resident_request_charges") == 2
-        assert DATABASE_SCHEMA.version == 19
+        assert DATABASE_SCHEMA.version == 20
 
 
 @pytest.mark.parametrize(

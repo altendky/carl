@@ -330,7 +330,9 @@ async def test_publishing_one_dependency_request_does_not_scan_unrelated_request
 
             before = await cost()
             await connection.executemany(
-                "INSERT INTO work_requests VALUES (?,'root','[\"test\"]','unrelated',1,'{}')",
+                "INSERT INTO work_requests(id,work_item_id,requester_kind_parts_json,"
+                "requester_identifier,requested_at_utc_ns,context_json) "
+                "VALUES (?,'root','[\"test\"]','unrelated',1,'{}')",
                 ((f"noise-{index}",) for index in range(5000)),
             )
             assert await cost() <= before + 300
@@ -402,12 +404,15 @@ async def test_cancelled_search_cooldown_preserves_siblings_own_deadline(tmp_pat
 async def test_v12_migration_rebuilds_checks_preserving_requests_and_foreign_keys(
     tmp_path: Path,
 ) -> None:
+    from carl._tests.legacy_schema import remove_fair_schema
+
     path = tmp_path / "db.sqlite3"
     async with Database.managed(path, initialize=True) as database:
         await _enqueue(database, "root")
         await _enqueue(database, "child", "root")
     # Existing table constraints are stricter in v12; emulate them without relying on git.
     with sqlite3.connect(path) as connection:
+        remove_fair_schema(connection)
         connection.execute("DROP TABLE work_cancellation_requests")
         connection.execute("DROP TABLE work_dependencies")
         for name in ("work_items", "work_events"):

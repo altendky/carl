@@ -113,6 +113,7 @@ async def _enqueue(
     enqueued = await dependencies.database.enqueue_work(
         definition,
         WorkRequester(
+            parent_work_identifier=context.work_item_identifier,
             request_identifier=dependencies.new_identifier(),
             kind=("carl", "ebay", "search_refresh", stage),
             identifier=requester_identifier,
@@ -125,6 +126,7 @@ async def _enqueue(
         await dependencies.database.attach_work_request(
             enqueued.work_item_identifier,
             WorkRequester(
+                parent_work_identifier=context.work_item_identifier,
                 request_identifier=dependencies.new_identifier(),
                 kind=("carl", "ebay", "search_refresh", stage),
                 identifier=context.work_item_identifier,

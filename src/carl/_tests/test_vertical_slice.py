@@ -10,6 +10,7 @@ import anyio
 import httpx
 import pytest
 
+from carl._tests.legacy_schema import remove_fair_schema
 from carl._tests.test_facebook import HTML
 from carl.app import collect_listing, extract_acquisition
 from carl.core.components import Component, ComponentId
@@ -78,6 +79,7 @@ async def test_version_two_database_adds_external_artifacts_table(tmp_path: Path
 
     version_two_identity = DATABASE_SCHEMA.model_copy(update={"version": 2})
     with closing(sqlite3.connect(path)) as connection:
+        remove_fair_schema(connection)
         connection.execute("DROP TABLE external_artifacts")
         connection.execute(
             "UPDATE schema_metadata SET value = ? WHERE key = 'schema_identity_json'",
@@ -121,6 +123,7 @@ async def test_version_three_database_adds_bounded_lookup_indexes(tmp_path: Path
     }
     version_three_identity = DATABASE_SCHEMA.model_copy(update={"version": 3})
     with closing(sqlite3.connect(path)) as connection:
+        remove_fair_schema(connection)
         for index_name in index_names:
             connection.execute(f"DROP INDEX {index_name}")
         connection.execute(
@@ -162,6 +165,7 @@ async def test_version_four_database_adds_composed_projection_indexes(tmp_path: 
     }
     version_four_identity = DATABASE_SCHEMA.model_copy(update={"version": 4})
     with closing(sqlite3.connect(path)) as connection:
+        remove_fair_schema(connection)
         for index_name in index_names:
             connection.execute(f"DROP INDEX {index_name}")
         connection.execute(
@@ -198,6 +202,7 @@ async def test_version_five_database_adds_review_claim_tables(tmp_path: Path) ->
 
     version_five_identity = DATABASE_SCHEMA.model_copy(update={"version": 5})
     with closing(sqlite3.connect(path)) as connection:
+        remove_fair_schema(connection)
         connection.execute("DROP TABLE review_mutation_requests")
         connection.execute("DROP TABLE review_listing_claims")
         connection.execute(
@@ -233,6 +238,7 @@ async def test_version_six_database_adds_work_requester_index(tmp_path: Path) ->
 
     version_six_identity = DATABASE_SCHEMA.model_copy(update={"version": 6})
     with closing(sqlite3.connect(path)) as connection:
+        remove_fair_schema(connection)
         connection.execute("DROP INDEX work_requests_requester")
         connection.execute(
             "UPDATE schema_metadata SET value = ? WHERE key = 'schema_identity_json'",
@@ -267,6 +273,7 @@ async def test_version_seven_database_adds_bulk_review_storage(tmp_path: Path) -
 
     version_seven_identity = DATABASE_SCHEMA.model_copy(update={"version": 7})
     with closing(sqlite3.connect(path)) as connection:
+        remove_fair_schema(connection)
         connection.execute(
             """
             INSERT INTO operations(

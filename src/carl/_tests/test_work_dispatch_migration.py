@@ -95,7 +95,12 @@ def _rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
                         + ",".join(
                             '"' + row[1].replace('"', '""') + '"'
                             for row in connection.execute(f'PRAGMA table_info("{name}")')
-                            if row[1] != "acquisition_resource_identity_json"
+                            if row[1]
+                            not in {
+                                "acquisition_resource_identity_json",
+                                "parent_work_identifier",
+                                "scheduling_json",
+                            }
                         )
                         + ' FROM "'
                         + name.replace('"', '""')
@@ -107,6 +112,7 @@ def _rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
             for (name,) in connection.execute(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name!='schema_metadata'"
             )
+            if name != "work_scheduling" and not name.startswith("fair_")
         }
 
 
@@ -114,8 +120,8 @@ def _assert_current_schema(path: Path) -> None:
     with closing(sqlite3.connect(path)) as connection:
         actual = dict(connection.execute("SELECT key, value FROM schema_metadata"))
         assert actual == Database._expected_metadata()
-        assert sqlite.DATABASE_SCHEMA.version == 19
-        assert actual["schema_version"] == "19"
+        assert sqlite.DATABASE_SCHEMA.version == 20
+        assert actual["schema_version"] == "20"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         for name, expected in _INDEX_COLUMNS.items():
             # Verify key order and descending priority, not just index names.
@@ -257,10 +263,11 @@ def _copy_seed_to_legacy(seed: Path, path: Path) -> None:
             assert columns
             available = {row[1] for row in source.execute(f'PRAGMA table_info("{name}")')}
             assert set(columns) <= available
-            if name == "work_items":
-                assert available - set(columns) == {"acquisition_resource_identity_json"}
-            else:
-                assert set(columns) == available
+            added_columns = {
+                "work_items": {"acquisition_resource_identity_json"},
+                "work_requests": {"parent_work_identifier", "scheduling_json"},
+            }.get(name, set())
+            assert available - set(columns) == added_columns - set(columns)
             quoted = ",".join('"' + column.replace('"', '""') + '"' for column in columns)
             if name == "sqlite_sequence":
                 _ = target.execute("DELETE FROM sqlite_sequence")

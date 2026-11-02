@@ -65,7 +65,9 @@ class _SkippingApplication:
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
         requester_context: object | None,
+        parent_work_identifier: str | None = None,
     ) -> RequestAnalysisResult:
+        assert parent_work_identifier == requester_identifier
         _ = requester_kind, requester_identifier, requester_context
         raise ReviewInputError(
             f"No complete gallery for {request.listing_observation_record_identifier}"

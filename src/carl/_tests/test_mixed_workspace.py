@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from carl._tests.legacy_schema import remove_fair_schema
 from carl._tests.test_marketplace_listing import _publish, _record
 from carl._tests.test_review_workspace import _provenance, _search_run_value
 from carl.core.analysis_batch import SelectionAnalysesRequest
@@ -529,6 +530,7 @@ async def test_v8_claim_migration_preserves_existing_rows(tmp_path: Path) -> Non
     async with Database.managed(path, initialize=True) as database:
         await _publish(database, (_record("workspace", "workspace"), _record("batch", "batch")))
     with sqlite3.connect(path) as connection:
+        remove_fair_schema(connection)
         connection.execute("ALTER TABLE review_listing_claims RENAME TO new_claims")
         connection.execute("""CREATE TABLE review_listing_claims (
             workspace_record_id TEXT NOT NULL, listing_identifier TEXT NOT NULL CHECK (
