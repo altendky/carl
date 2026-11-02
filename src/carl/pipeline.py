@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from carl.core.ebay import COLLECT_EBAY_SEARCH_WORK_KIND
 from carl.core.facebook_work import COLLECT_SEARCH_WORK_KIND
+from carl.core.fair_scheduling import SchedulingContext, SchedulingServiceClass
 from carl.core.json import encode_json
 from carl.core.marketplace_search import MARKETPLACE_SEARCH_KIND, CreateMarketplaceSearchRequest
 from carl.core.models import JsonValue, NamedInput, NamedOutput, RecordDraft
@@ -102,7 +103,11 @@ async def request_search_pipeline(
         inputs: list[NamedInput] = []
         if isinstance(source, NewSearchPipelineSource):
             search = await application.create_marketplace_search(
-                CreateMarketplaceSearchRequest(targets=source.targets)
+                CreateMarketplaceSearchRequest(targets=source.targets),
+                scheduling=SchedulingContext(
+                    root_request_identifier=work_identifier,
+                    service_class=SchedulingServiceClass.BACKGROUND,
+                ),
             )
             search_identifier = search.record_identifier
             works.extend(target.executions[-1].work_identifier for target in search.targets)
@@ -222,6 +227,11 @@ async def request_search_pipeline(
         enqueued = await database.enqueue_work(
             search_pipeline_work(identifier=work_identifier, payload=payload),
             WorkRequester(
+                scheduling=SchedulingContext(
+                    root_request_identifier=work_identifier,
+                    workspace_identifier=workspace_identifier,
+                    service_class=SchedulingServiceClass.BACKGROUND,
+                ),
                 request_identifier=application.new_identifier(),
                 kind=("carl", "mcp", "request_search_pipeline"),
                 identifier=workspace_identifier or work_identifier,

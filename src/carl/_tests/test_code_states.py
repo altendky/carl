@@ -8,6 +8,7 @@ from typing import Literal
 
 import pytest
 
+from carl._tests.legacy_schema import remove_fair_schema, without_fair_schema
 from carl.core.components import Component, ComponentId
 from carl.core.json import decode_json, encode_json
 from carl.core.models import BytesDraft, CodeProvenance, NamedOutput, RecordDraft
@@ -60,7 +61,7 @@ def _version_ten_database(path: Path) -> None:
     ).replace("CREATE INDEX IF NOT EXISTS operations_code_state ON operations(code_state_id);", "")
     assert "code_state" not in schema
     with closing(sqlite3.connect(path)) as connection:
-        connection.executescript(schema)
+        connection.executescript(without_fair_schema(schema))
         connection.executemany(
             "INSERT INTO schema_metadata(key, value) VALUES (?, ?)",
             Database._v10_metadata().items(),
@@ -280,6 +281,7 @@ async def test_backfill_leaves_existing_normalized_code_state_unchanged(tmp_path
         await _begin(database, "normalized", _provenance(worktree_state="dirty"))
         before = await database.operation("normalized")
     with closing(sqlite3.connect(path)) as connection:
+        remove_fair_schema(connection)
         _legacy_operation(connection, "legacy", "{}")
         connection.executemany(
             "UPDATE schema_metadata SET value = ? WHERE key = ?",

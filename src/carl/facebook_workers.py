@@ -242,6 +242,7 @@ def item_acquisition_outcome(
         not_before_utc_ns=0,
     )
     extraction_requester = WorkRequester(
+        parent_work_identifier=context.work_item_identifier,
         request_identifier=new_identifier(),
         kind=("carl", "http", "acquisition"),
         identifier=acquisition_record_identifier,
@@ -583,6 +584,7 @@ async def prepare_item_collection(
                     FollowOnWork(
                         definition=extraction,
                         requester=WorkRequester(
+                            parent_work_identifier=context.work_item_identifier,
                             request_identifier=dependencies.new_identifier(),
                             kind=("carl", "http", "acquisition"),
                             identifier=acquisition_identifier,

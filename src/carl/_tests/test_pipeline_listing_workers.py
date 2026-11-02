@@ -104,7 +104,9 @@ class _Application:
         *,
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
+        parent_work_identifier: str | None = None,
     ) -> RequestListingDetailsResult:
+        assert parent_work_identifier == requester_identifier
         assert requester_identifier is not None
         self.detail_requests.append(request)
         identifier = await self._enqueue_owned(
@@ -126,7 +128,9 @@ class _Application:
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
         requester_context: JsonValue | None,
+        parent_work_identifier: str | None = None,
     ) -> RequestAnalysisResult:
+        assert parent_work_identifier == requester_identifier
         _ = requester_context
         assert requester_identifier is not None
         self.analysis_requests.append(request)
@@ -320,6 +324,7 @@ async def test_ready_listing_starts_analysis_while_another_listing_is_pending(
             ),
             requester_kind=("test", "other"),
             requester_identifier="listing-b",
+            parent_work_identifier="listing-b",
         )
         _ = await _run_next(
             database, application.registry(), identifiers, LISTING_PIPELINE_WORK_KIND

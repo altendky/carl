@@ -7,6 +7,7 @@ from uuid import uuid4
 import anyio
 import pytest
 
+from carl._tests.legacy_schema import remove_fair_schema
 from carl._tests.test_worker import _async_provenance, _definition, _requester, _settings
 from carl.core.components import Component, ComponentId
 from carl.core.connectivity import connectivity_failure
@@ -180,6 +181,7 @@ async def test_v9_migration_retains_work_and_adds_connectivity_state(tmp_path: P
             enqueued_at_utc_ns=1,
         )
     with closing(sqlite3.connect(path)) as connection:
+        remove_fair_schema(connection)
         connection.execute("DROP TABLE network_connectivity")
         connection.executemany(
             "UPDATE schema_metadata SET value = ? WHERE key = ?",

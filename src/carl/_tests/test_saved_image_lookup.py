@@ -9,6 +9,7 @@ from pathlib import Path
 import anyio
 import pytest
 
+from carl._tests.legacy_schema import remove_fair_schema
 from carl._tests.test_ebay_item_workers import _identifiers, _retain_records
 from carl._tests.test_facebook_acquisition_reuse import OTHER, URL, _reference
 from carl.core.models import JsonValue, RecordDraft
@@ -42,6 +43,7 @@ def _restore_version_eleven(path: Path) -> None:
     """Remove only v12 additions to leave the genuine preceding schema layout."""
 
     with sqlite3.connect(path) as connection:
+        remove_fair_schema(connection)
         connection.execute("DROP TABLE saved_image_lookup")
         connection.execute("DROP INDEX records_ebay_gallery_observation")
         connection.executemany(

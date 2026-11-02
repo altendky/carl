@@ -62,6 +62,7 @@ from carl.core.facebook_work import (
     legacy_facebook_network_constraint_identifiers,
     plan_item_page_followups,
 )
+from carl.core.fair_scheduling import SchedulingContext, SchedulingServiceClass
 from carl.core.http import RequestPlan
 from carl.core.item_analysis import (
     ANALYSIS_RECIPE_VERSION,
@@ -701,6 +702,10 @@ def collect(
                     not_before_utc_ns=0,
                 ),
                 WorkRequester(
+                    scheduling=SchedulingContext(
+                        root_request_identifier=collection_identifier,
+                        service_class=SchedulingServiceClass.INTERACTIVE,
+                    ),
                     request_identifier=_identifier(),
                     kind=("carl", "cli", "item_request"),
                     identifier=_identifier(),
@@ -753,6 +758,7 @@ def collect_search_items(
         if maximum_items is not None and maximum_items < 1:
             raise ValueError("The maximum item count must be positive")
         network_path = (network_provider.value, "personal", network_route)
+        scheduling_root_identifier = _identifier()
         async with Database.managed(database) as evidence_database:
             search_runs: list[SearchRunListingCandidates] = []
             for search_run_record_identifier in search_run_record_identifiers:
@@ -927,6 +933,10 @@ def collect_search_items(
                     enqueued = await evidence_database.enqueue_work(
                         definition,
                         WorkRequester(
+                            scheduling=SchedulingContext(
+                                root_request_identifier=scheduling_root_identifier,
+                                service_class=SchedulingServiceClass.BACKGROUND,
+                            ),
                             request_identifier=_identifier(),
                             kind=("carl", "facebook", "search_run"),
                             identifier=search_run_record_identifier,
@@ -949,6 +959,10 @@ def collect_search_items(
                 plan_request = await evidence_database.enqueue_work(
                     definition,
                     WorkRequester(
+                        scheduling=SchedulingContext(
+                            root_request_identifier=scheduling_root_identifier,
+                            service_class=SchedulingServiceClass.BACKGROUND,
+                        ),
                         request_identifier=_identifier(),
                         kind=("carl", "facebook", "item_page_followup_plan"),
                         identifier=followup_plan_record_identifier,
@@ -1074,6 +1088,7 @@ def collect_images(
             "personal",
             selected_route,
         )
+        scheduling_root_identifier = _identifier()
         async with Database.managed(database) as evidence_database:
             listing_ids: list[str] = []
             for search_run_identifier in search_run_record_identifiers:
@@ -1398,6 +1413,10 @@ def collect_images(
                     enqueued = await evidence_database.enqueue_work(
                         definition,
                         WorkRequester(
+                            scheduling=SchedulingContext(
+                                root_request_identifier=scheduling_root_identifier,
+                                service_class=SchedulingServiceClass.BACKGROUND,
+                            ),
                             request_identifier=_identifier(),
                             kind=("carl", "facebook", "gallery_image_reference"),
                             identifier=requester_identifier,
@@ -1469,6 +1488,7 @@ def analyze_items(
         if any(not identifier.isdecimal() for identifier in listing_identifiers):
             raise ValueError("Listing IDs must be decimal strings")
         claude = ClaudeCli(claude_executable)
+        scheduling_root_identifier = _identifier()
         async with Database.managed(database) as evidence_database:
             guide_record_identifier = await _ensure_product_guide(
                 evidence_database, product_guide_definition(product_guide)
@@ -1662,6 +1682,10 @@ def analyze_items(
                 enqueued = await evidence_database.enqueue_work(
                     analyze_item_work(identifier=_identifier(), payload=payload),
                     WorkRequester(
+                        scheduling=SchedulingContext(
+                            root_request_identifier=scheduling_root_identifier,
+                            service_class=SchedulingServiceClass.BACKGROUND,
+                        ),
                         request_identifier=_identifier(),
                         kind=("carl", "cli", "analyze_items_request"),
                         identifier=payload.evidence_set_record_identifier,
@@ -1856,6 +1880,7 @@ def extract_image(acquisition_record_id: str, *, database: Path = _DEFAULT_DATAB
     """Validate a saved image response again without making an HTTP request."""
 
     async def perform() -> dict[str, JsonValue]:
+        scheduling_root_identifier = _identifier()
         async with Database.managed(database) as evidence_database:
             kind, _, acquisition = await evidence_database.get_record(acquisition_record_id)
             if kind != ("carl", "http", "acquisition") or not isinstance(acquisition, dict):
@@ -1873,6 +1898,10 @@ def extract_image(acquisition_record_id: str, *, database: Path = _DEFAULT_DATAB
             enqueued = await evidence_database.enqueue_work(
                 extract_image_work(identifier=_identifier(), payload=payload, not_before_utc_ns=0),
                 WorkRequester(
+                    scheduling=SchedulingContext(
+                        root_request_identifier=scheduling_root_identifier,
+                        service_class=SchedulingServiceClass.INTERACTIVE,
+                    ),
                     request_identifier=_identifier(),
                     kind=("carl", "cli", "offline_image_extraction"),
                     identifier=acquisition_record_id,

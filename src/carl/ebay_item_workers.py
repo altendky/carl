@@ -112,6 +112,7 @@ def _follow(
     return FollowOnWork(
         definition=definition,
         requester=WorkRequester(
+            parent_work_identifier=context.work_item_identifier,
             request_identifier=dependencies.new_identifier(),
             kind=("carl", "ebay", "followup"),
             identifier=context.work_item_identifier,

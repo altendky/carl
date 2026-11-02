@@ -96,6 +96,14 @@ class ResidentSessionPool:
 
         return identifier in self._actors or identifier in self._quarantined
 
+    @property
+    def owned_work_identifiers(self) -> tuple[str, ...]:
+        """Bounded local owners that need no dispatcher handoff."""
+        return tuple(
+            actor.lease.definition.work_item_identifier
+            for actor in (*self._actors.values(), *self._quarantined.values())
+        )
+
     async def wait_idle(self) -> None:
         """Wait for currently admitted actors; queued database work has no task."""
 

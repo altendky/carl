@@ -5,9 +5,11 @@ from dataclasses import dataclass, field
 
 import anyio
 
+from carl.core.fair_scheduling import FairDispatchCursor
 from carl.core.models import CodeProvenance, JsonValue
+from carl.core.resources import ResourceRequest
 from carl.core.work import WorkCancellationRequestedError, WorkCapability
-from carl.core.work_dispatch import DispatchCandidate, DispatchCursor, ExpiryCursor
+from carl.core.work_dispatch import DispatchCandidate, ExpiryCursor
 from carl.io.resident_sessions import ResidentSessionPool
 from carl.io.resource_permits import ResourceLeaseLost
 from carl.io.sqlite import LeaseLostError
@@ -31,10 +33,15 @@ class StageDispatcher:
     page_size: int = 32
     poll_seconds: float = 0.25
     _queued: set[str] = field(default_factory=set, init=False)
-    _after: DispatchCursor | None = field(default=None, init=False)
+    _after: FairDispatchCursor | None = field(default=None, init=False)
     _pass_time: int | None = field(default=None, init=False)
     _expired_after: ExpiryCursor | None = field(default=None, init=False)
     _expired_time: int | None = field(default=None, init=False)
+
+    def _requirements(self, candidate: DispatchCandidate) -> tuple[ResourceRequest, ...]:
+        if candidate.stage_identifier is not None:
+            return candidate.stage_resources
+        return self.registry.require_adapter(candidate.capability).initial_resources or ()
 
     async def _recover(self) -> None:
         await self.manager.recover()
@@ -149,9 +156,12 @@ class StageDispatcher:
 
     async def run(self) -> None:
         capacities = self.manager.resources.capacities
-        count = self.execution_count
-        if count is None:
-            count = sum(capacities.get(name, 0) for name in ("cpu", "http", "analysis"))
+        capacity_count = sum(capacities.get(name, 0) for name in ("cpu", "http", "analysis"))
+        count = (
+            capacity_count
+            if self.execution_count is None
+            else min(self.execution_count, capacity_count)
+        )
         if count < 1 or self.metadata_count < 1:
             raise ValueError("Dispatcher runner counts must be positive")
         # Zero-buffer channels reserve an idle runner without creating per-row
@@ -170,7 +180,8 @@ class StageDispatcher:
                 await self._recover()
                 if self._pass_time is None:
                     self._pass_time = self.manager.utc_now_ns()
-                page = await self.manager.database.dispatch_candidates(
+                page = await self.manager.database.fair_dispatch_candidates(
+                    scope=self.manager.resources.scope,
                     supported_capabilities=tuple(
                         adapter.capability for adapter in self.registry.adapters
                     ),
@@ -178,10 +189,30 @@ class StageDispatcher:
                     limit=self.page_size,
                     after=self._after,
                     eligible_identifiers=self.eligible_identifiers,
+                    excluded_identifiers=tuple(self._queued)
+                    + self.residents.owned_work_identifiers,
                 )
+                execution_ready = execution_send.statistics().tasks_waiting_receive > 0
+                metadata_ready = metadata_send.statistics().tasks_waiting_receive > 0
+                offers = tuple(
+                    candidate.work_item_identifier
+                    for candidate in page.items
+                    if (execution_ready if self._requirements(candidate) else metadata_ready)
+                    and (candidate.stage_kind is None or not self.is_owned(candidate.stage_kind))
+                )
+                if offers:
+                    # Advertise the alternatives this idle driver can execute
+                    # before a stale page can bypass the current fair winner.
+                    # Busy lanes do not renew speculative readiness leases.
+                    await self.manager.database.offer_fair_dispatch_candidates(
+                        scope=self.manager.resources.scope,
+                        work_identifiers=offers,
+                        now_utc_ns=self.manager.utc_now_ns(),
+                    )
                 occupied = await self.manager.database.resource_occupancy(
                     self.manager.resources.scope
                 )
+                handed_off = False
                 for candidate in page.items:
                     if candidate.work_item_identifier in self._queued:
                         continue
@@ -189,14 +220,15 @@ class StageDispatcher:
                         candidate.resident_session_identifier
                     ):
                         continue
-                    adapter = self.registry.require_adapter(candidate.capability)
-                    requirements = (
-                        candidate.stage_resources
-                        if candidate.stage_identifier is not None
-                        else adapter.initial_resources
+                    requirements = self._requirements(candidate)
+                    if not (execution_ready if requirements else metadata_ready):
+                        # A receiver can become idle during the occupancy read.
+                        # Refresh and advertise that lane before handing it work.
+                        continue
+                    weighted_cpu = any(
+                        request.name == "cpu" and request.units > 1 for request in requirements
                     )
-                    requirements = () if requirements is None else requirements
-                    if any(
+                    if not weighted_cpu and any(
                         occupied.get(request.name, 0) + request.units
                         > capacities.get(request.name, 0)
                         for request in requirements
@@ -212,12 +244,16 @@ class StageDispatcher:
                     self._queued.add(candidate.work_item_identifier)
                     try:
                         channel.send_nowait(candidate)
+                        handed_off = True
                     except anyio.WouldBlock:
                         self._queued.remove(candidate.work_item_identifier)
                 self._after = page.next_cursor
                 if not page.has_more:
                     self._after = None
                     self._pass_time = None
-                    await anyio.sleep(self.poll_seconds)
+                    if handed_off:
+                        await anyio.lowlevel.checkpoint()
+                    else:
+                        await anyio.sleep(self.poll_seconds)
                 else:
                     await anyio.lowlevel.checkpoint()

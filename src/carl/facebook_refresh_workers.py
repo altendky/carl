@@ -236,6 +236,7 @@ async def _search_phase(
                 not_before_utc_ns=0,
             ),
             WorkRequester(
+                parent_work_identifier=context.work_item_identifier,
                 request_identifier=dependencies.new_identifier(),
                 kind=requester_kind,
                 identifier=context.work_item_identifier,
@@ -453,6 +454,7 @@ async def _item_phase(
         )
         existing = await _work_or_none(database, requested_identifier)
         requester = WorkRequester(
+            parent_work_identifier=context.work_item_identifier,
             request_identifier=dependencies.new_identifier(),
             kind=("carl", "facebook", "search_refresh", "item"),
             identifier=requester_identifier,
@@ -1265,6 +1267,7 @@ async def _image_phase(
             enqueued = await database.enqueue_work(
                 definition,
                 WorkRequester(
+                    parent_work_identifier=context.work_item_identifier,
                     request_identifier=dependencies.new_identifier(),
                     kind=("carl", "facebook", "search_refresh", "image"),
                     identifier=requester_identifier,
@@ -1282,6 +1285,7 @@ async def _image_phase(
                 _ = await database.enqueue_work(
                     definition,
                     WorkRequester(
+                        parent_work_identifier=context.work_item_identifier,
                         request_identifier=dependencies.new_identifier(),
                         kind=("carl", "facebook", "gallery_image_reference"),
                         identifier=gallery_reference_identifier,

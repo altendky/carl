@@ -739,8 +739,8 @@ existing origin-change policy, route record schema and cache identities remain
 compatible.
 
 The shared production runtime dispatches marketplace, analysis, coordinator,
-travel and dataset stages. Discovery reads at most 32 metadata rows per page,
-advances past blocked candidates, and point-loads only selected work. Atomic
+travel and dataset stages. Discovery returns at most 32 work candidates per page
+using bounded group-head queries, advances past blocked candidates, and point-loads only selected work. Atomic
 SQLite admission reserves every stage resource together; unavailable resources,
 time gates and child dependencies leave durable pending stages. Those waits
 hold no execution permit. A continuation keeps its logical operation and attempt;
@@ -774,9 +774,42 @@ workers implicitly. Legacy queued payload versions remain supported; expired leg
 claims are recovered in bounded pages before stage registration. Shutdown stops
 discovery, joins execution and session owners, and closes provider transports last.
 
-Priority and eligibility ordering still apply. Request/workspace fairness and
-event-driven dependency wakeups are separate follow-ups; this runtime uses bounded
-polling. Coordinator image-validation phases reserve CPU before reading saved
+Admission uses shared fairness state within the same database and host scope.
+HTTP, CPU, analysis and metadata stages have separate service lanes; resident
+incarnations have a separate admission lane. Among live, admissible contenders,
+at most three interactive admissions precede a background turn. An unused
+turn is lent immediately. Each class rotates workspaces, then root requests within
+a workspace. Roots without a workspace form their own groups. A single root may
+use all otherwise available capacity; these turns do not partition resource slots.
+Only successful admission advances service counters, including actor and dataset
+phases. Declined resource, dependency, rate, ownership and logical-policy gates
+spend no turn. Counters survive worker and database reentry. Idle drivers advertise
+only a bounded selected page; readiness offers expire after one second and retain
+their exact stage binding through registration. Filesystem-owned dataset phases
+advertise through their actual owner rather than an idle general runner.
+
+Scheduling intent is separate from requester evidence and cancellation ancestry.
+Direct searches, details, single analyses and route refreshes default to interactive.
+Workspace refreshes, pipelines, analysis batches, dataset setup and bulk CLI jobs
+default to background. A grouped search or bulk invocation has one root intent,
+and children inherit their actual parent's owner. A shared work item's first owner
+and class remain fixed: adding consumers neither adds scheduling weight nor
+promotes already queued background work. Legacy ownership is backfilled only from
+recognized request/parent forms; otherwise work shares one legacy bucket.
+
+Within a root, priority and eligibility ordering apply until a ready item has
+waited 30 seconds, when the oldest aged work takes precedence. Resource polling
+does not reset that age. An aged weighted CPU contender may stop lending
+newly free CPU units so its complete allocation can form. This drain holds no
+partial permit, expires without a live contender, and ends after admission,
+cancellation or changed ownership. It does not preempt running work. Unconfirmed
+held guards reduce known usable capacity; an unfulfillable drain yields and can
+retry after five seconds. Other resource lanes continue throughout.
+
+Service bounds describe admission turns, not wall-clock latency through long
+executions, provider policies or unconfirmed physical cleanup. Existing work-kind
+and network policy caps remain eligibility gates. Dependency wakeups are separate
+work; this runtime still uses bounded polling. Coordinator image-validation phases reserve CPU before reading saved
 bytes. Analysis-batch and listing-pipeline turns conservatively reserve CPU because
 their guide lookup reads retained text. A large refresh/history can still make one
 CPU turn long or materialize large metadata sets; fixed dispatcher task counts do

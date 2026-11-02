@@ -75,6 +75,13 @@ from carl.core.facebook_work import (
     facebook_effective_search_work_constraint,
     facebook_search_work_constraint,
 )
+from carl.core.fair_scheduling import (
+    FairAdmission,
+    FairDispatchCursor,
+    FairDispatchPage,
+    FairLane,
+    SchedulingContext,
+)
 from carl.core.item_analysis import (
     ANALYZE_ITEM_WORK_SCHEMA_VERSION,
     LEGACY_ANALYZE_ITEM_WORK_SCHEMA_VERSION,
@@ -186,6 +193,7 @@ from carl.core.work_dispatch import (
     WorkSnapshotStale,
 )
 from carl.core.worker import FollowOnWork
+from carl.io import fair_scheduling as fair_sql
 from carl.io.db import DEFAULT_BUSY_TIMEOUT_MS, DatabaseConnections
 from carl.route_cutover import rebuild_work_definition
 
@@ -214,9 +222,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=19,
+    version=20,
 )
 
+_V19_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 19})
+_V19_SCHEMA_DEFINITION_SHA256 = "e4cba8442c0eb6405811b2e61bc9133f9c0f83593de86331b7c10167452d8845"
 _V18_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 18})
 _V18_SCHEMA_DEFINITION_SHA256 = "e1451850f5bd245e419c06b205c2d4f7b2193220dbdf54b8ce122271f3bffc45"
 _V17_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 17})
@@ -254,7 +264,8 @@ _V2_SCHEMA_DEFINITION_SHA256 = "bdd3d1b6a8dc041e7bf86e6c5881a06df910c0efe72612bb
 _V1_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 1})
 _V1_SCHEMA_DEFINITION_SHA256 = "b3fa83413034992e01f84abf8ffe4993864cfad23b4792442b38b60a47b8dca6"
 
-_SCHEMA = """
+_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS stage_attempts (
     operation_id TEXT PRIMARY KEY,
     work_item_id TEXT NOT NULL,
@@ -674,6 +685,8 @@ CREATE TABLE IF NOT EXISTS work_requests (
     requester_identifier TEXT NOT NULL,
     requested_at_utc_ns INTEGER NOT NULL CHECK (requested_at_utc_ns >= 0),
     context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+    scheduling_json TEXT CHECK(scheduling_json IS NULL OR json_valid(scheduling_json)),
+    parent_work_identifier TEXT REFERENCES work_items(id),
     FOREIGN KEY (work_item_id) REFERENCES work_items(id)
 ) STRICT;
 
@@ -911,6 +924,8 @@ ON records(json_extract(value_json, '$.item_identifier'),
 CREATE INDEX IF NOT EXISTS records_marketplace_source_run
 ON records(json_extract(value_json, '$.search_run_record_identifier'), object_id);
 """
+    + fair_sql.FAIR_SCHEMA
+)
 
 _SCHEMA_DEFINITION_SHA256 = hashlib.sha256(_SCHEMA.encode()).hexdigest()
 
@@ -1246,6 +1261,14 @@ class Database:
                     for item in definition.checkpoint_inputs
                 ],
             )
+        if not continuation:
+            await fair_sql.promote_initial_offers(
+                connection,
+                work_identifier=definition.work_item_identifier,
+                stage_identifier=definition.identifier,
+                serialized_definition=serialized,
+                resources=definition.resources,
+            )
         await self._append_stage_event(
             connection,
             definition.identifier,
@@ -1331,9 +1354,12 @@ class Database:
         for capability in supported_capabilities:
             bindings.extend((_json(list(capability.kind)), capability.payload_schema_version))
         scope = ""
+        source = "work_items AS w"
         if eligible_identifiers is not None:
-            scope = "AND w.id IN (SELECT value FROM json_each(?))"
-            bindings.append(_json(list(eligible_identifiers)))
+            # Drive exact/scoped metadata reads from their IDs. An IN filter can
+            # otherwise make SQLite walk a large sibling queue in dispatch order.
+            source = "(SELECT DISTINCT value AS id FROM json_each(?)) AS selected CROSS JOIN work_items AS w ON w.id=selected.id"
+            bindings.insert(0, _json(list(eligible_identifiers)))
         frontier = ""
         if after is not None:
             frontier = "AND (w.priority<? OR (w.priority=? AND (w.eligible_at_utc_ns,w.created_at_utc_ns,w.id)>(?,?,?)))"
@@ -1356,7 +1382,7 @@ class Database:
                        json_extract(s.definition_json,'$.schema_version'),
                        json_extract(s.definition_json,'$.resident_session_identifier'),
                        json_extract(s.definition_json,'$.resources')
-                FROM work_items AS w
+                FROM {source}
                 LEFT JOIN stage_attempts AS a ON a.work_item_id=w.id AND a.state IN ('pending','active')
                 LEFT JOIN work_stages AS s ON s.work_item_id=w.id AND s.state IN ('pending','running')
                 WHERE w.state IN ('pending','leased') AND w.eligible_at_utc_ns<=?
@@ -1401,6 +1427,618 @@ class Database:
         return DispatchPage(
             items=items, has_more=more, next_cursor=items[-1].cursor if more else None
         )
+
+    async def work_scheduling(self, work_identifier: str) -> SchedulingContext:
+        """Read the immutable first owner's scheduling context, without work history."""
+        async with self._connections.reader() as connection:
+            return await fair_sql.scheduling(connection, work_identifier)
+
+    @staticmethod
+    async def _backfill_work_scheduling(
+        connection: AsyncConnection, *, one_batch: bool = False
+    ) -> int:
+        """Resolve strong legacy parent/workspace edges in bounded work pages."""
+        after = ""
+        count = 0
+        while True:
+            cursor = await connection.execute(
+                "SELECT work_item_id FROM fair_unowned WHERE work_item_id>? ORDER BY work_item_id LIMIT 128",
+                (after,),
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return count
+            for row in rows:
+                identifier = _text(row[0])
+                await fair_sql.backfill_owner(connection, identifier)
+                await connection.execute(fair_sql._refresh_sql("?"), (identifier,))
+                after = identifier
+                count += 1
+            if one_batch:
+                return count
+
+    async def enable_fair_scheduling(
+        self,
+        scope: str,
+        now_utc_ns: int,
+        *,
+        initial_resources: Sequence[tuple[WorkCapability, tuple[ResourceRequest, ...]]] = (),
+        resident_capabilities: Sequence[WorkCapability] = (),
+        resident_state_bytes: int = 4 * 1024 * 1024,
+    ) -> None:
+        """Enable fair admission for this DB/host resource scope; opt-in harnesses stay legacy."""
+        if type(resident_state_bytes) is not int or resident_state_bytes < 1:
+            raise ValueError("Resident scheduling requires a positive state bound")
+        while True:
+            async with self._connections.writer() as connection:
+                count = await self._backfill_work_scheduling(connection, one_batch=True)
+            if count == 0:
+                break
+            await anyio.lowlevel.checkpoint()
+        resident_keys = {
+            (capability.kind, capability.payload_schema_version)
+            for capability in resident_capabilities
+        }
+        for capability, resources in initial_resources:
+            async with self._connections.writer() as connection:
+                key = (_json(list(capability.kind)), capability.payload_schema_version)
+                is_resident = int(
+                    (capability.kind, capability.payload_schema_version) in resident_keys
+                )
+                values = (
+                    *key,
+                    fair_sql.lane_for(resources).value,
+                    _json(
+                        [
+                            request.model_dump(mode="json")
+                            for request in (
+                                (
+                                    ResourceRequest(name="resident_sessions"),
+                                    ResourceRequest(
+                                        name="resident_state_bytes", units=resident_state_bytes
+                                    ),
+                                )
+                                if is_resident
+                                else resources
+                            )
+                        ]
+                    ),
+                    is_resident,
+                )
+                previous = await (
+                    await connection.execute(
+                        "SELECT kind_parts_json,payload_schema_version,lane,resources_json,resident FROM fair_initial_resources WHERE kind_parts_json=? AND payload_schema_version=?",
+                        key,
+                    )
+                ).fetchone()
+                if previous is None or tuple(previous) != values:
+                    await connection.execute(
+                        "INSERT INTO fair_initial_resources VALUES (?,?,?,?,?) ON CONFLICT(kind_parts_json,payload_schema_version) DO UPDATE SET lane=excluded.lane,resources_json=excluded.resources_json,resident=excluded.resident",
+                        values,
+                    )
+                else:
+                    continue
+            after = ""
+            while True:
+                async with self._connections.writer() as connection:
+                    rows = await (
+                        await connection.execute(
+                            "SELECT work_item_id FROM fair_ready INDEXED BY fair_ready_initial WHERE active=1 AND stage_id IS NULL AND kind_parts_json=? AND payload_schema_version=? AND work_item_id>? ORDER BY work_item_id LIMIT 128",
+                            (*key, after),
+                        )
+                    ).fetchall()
+                    if not rows:
+                        break
+                    await connection.execute(
+                        "UPDATE fair_ready SET lane=? WHERE active=1 AND stage_id IS NULL AND work_item_id IN (SELECT value FROM json_each(?))",
+                        (
+                            "resident" if is_resident else fair_sql.lane_for(resources).value,
+                            _json([_text(row[0]) for row in rows]),
+                        ),
+                    )
+                    after = _text(rows[-1][0])
+                await anyio.lowlevel.checkpoint()
+        async with self._connections.writer() as connection:
+            already = await fair_sql.enabled(connection, scope)
+            await fair_sql.enable(connection, scope, now_utc_ns)
+        if not already:
+            after = ""
+            while True:
+                async with self._connections.writer() as connection:
+                    rows = await (
+                        await connection.execute(
+                            "SELECT root_request_identifier,workspace_key,scheduling_json FROM fair_roots WHERE root_request_identifier>? ORDER BY root_request_identifier LIMIT 128",
+                            (after,),
+                        )
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for row in rows:
+                        await fair_sql.ensure_services(
+                            connection,
+                            SchedulingContext.model_validate_json(_text(row[2])),
+                            _text(row[0]),
+                            _text(row[1]),
+                        )
+                    after = _text(rows[-1][0])
+                await anyio.lowlevel.checkpoint()
+            async with self._connections.writer() as connection:
+                await connection.execute("UPDATE fair_scopes SET enabled=1 WHERE scope=?", (scope,))
+
+    async def fair_dispatch_candidates(
+        self,
+        *,
+        scope: str,
+        supported_capabilities: Sequence[WorkCapability],
+        now_utc_ns: int,
+        limit: int,
+        after: FairDispatchCursor | None = None,
+        eligible_identifiers: Sequence[str] | None = None,
+        excluded_identifiers: Sequence[str] = (),
+    ) -> FairDispatchPage[DispatchCandidate]:
+        self._dispatch_limit(limit, now_utc_ns)
+        if not 1 <= len(supported_capabilities) <= 256 or len(excluded_identifiers) > 1024:
+            raise ValueError("Fair discovery scope exceeds its bound")
+        async with self._connections.reader() as connection:
+            if not await fair_sql.enabled(connection, scope):
+                raise ValueError("Fair scheduling has not been enabled for this scope")
+            identifiers, cursor, more = await fair_sql.discover(
+                connection,
+                scope=scope,
+                now=now_utc_ns,
+                limit=limit,
+                capabilities=_json(
+                    [
+                        [_json(list(capability.kind)), capability.payload_schema_version]
+                        for capability in supported_capabilities
+                    ]
+                ),
+                eligible=None
+                if eligible_identifiers is None
+                else _json(list(eligible_identifiers)),
+                excluded=tuple(excluded_identifiers),
+                after=after,
+            )
+            if not identifiers:
+                return FairDispatchPage(items=(), next_cursor=cursor, has_more=more)
+            page = await self.dispatch_candidates(
+                supported_capabilities=supported_capabilities,
+                now_utc_ns=now_utc_ns,
+                limit=len(identifiers),
+                eligible_identifiers=identifiers,
+            )
+            selected = {item.work_item_identifier: item for item in page.items}
+            return FairDispatchPage(
+                items=tuple(
+                    selected[identifier] for identifier in identifiers if identifier in selected
+                ),
+                next_cursor=cursor,
+                has_more=more,
+            )
+
+    async def offer_fair_dispatch_candidates(
+        self,
+        *,
+        scope: str,
+        work_identifiers: Sequence[str],
+        now_utc_ns: int,
+    ) -> None:
+        """Advertise a bounded page only while its driver has a matching idle runner.
+
+        Discovery alone is read-only. These short-lived offers make actual driver
+        readiness visible across processes, including before initial adaptation.
+        """
+        self._dispatch_limit(max(1, len(work_identifiers)), now_utc_ns)
+        async with self._connections.writer() as connection:
+            if not await fair_sql.enabled(connection, scope):
+                raise ValueError("Fair scheduling has not been enabled for this scope")
+            for identifier in dict.fromkeys(work_identifiers):
+                row = await (
+                    await connection.execute(
+                        """SELECT f.active,f.available_at_utc_ns,f.stage_id,s.definition_json,
+                    h.resources_json,h.resident,w.kind_parts_json,w.payload_schema_version,w.attempt
+                    FROM work_items w JOIN fair_ready f ON f.work_item_id=w.id
+                    LEFT JOIN work_stages s ON s.id=f.stage_id
+                    LEFT JOIN fair_initial_resources h ON h.kind_parts_json=w.kind_parts_json
+                        AND h.payload_schema_version=w.payload_schema_version
+                    WHERE w.id=?""",
+                        (identifier,),
+                    )
+                ).fetchone()
+                if row is None or row[0] != 1 or _integer(row[1]) > now_utc_ns:
+                    continue
+                stage_identifier = None if row[2] is None else _text(row[2])
+                resident = False
+                if stage_identifier is not None:
+                    definition = StageDefinition.model_validate_json(_text(row[3]))
+                    if definition.resident_session_identifier is not None:
+                        active = await (
+                            await connection.execute(
+                                "SELECT 1 FROM resident_sessions WHERE work_item_id=? AND state IN ('opening','ready','closing','quarantined') LIMIT 1",
+                                (identifier,),
+                            )
+                        ).fetchone()
+                        if active is not None:
+                            # The owning actor advertises its own exact executions.
+                            continue
+                        resident = True
+                    signature = definition.model_dump_json()
+                    resources = definition.resources
+                else:
+                    resident = row[5] == 1
+                    signature = fair_sql.initial_offer_signature(
+                        _text(row[6]), _integer(row[7]), _integer(row[8])
+                    )
+                    resources = ()
+                if stage_identifier is None or resident:
+                    if row[4] is None:
+                        continue
+                    resources = tuple(
+                        ResourceRequest.model_validate(value)
+                        for value in cast(list[JsonValue], decode_json(_text(row[4])))
+                    )
+                await fair_sql.offer(
+                    connection,
+                    scope=scope,
+                    lane=fair_sql.lane_for(resources, resident=resident),
+                    work_identifier=identifier,
+                    stage_identifier=stage_identifier,
+                    signature=signature,
+                    resources=resources,
+                    now=now_utc_ns,
+                    initial=stage_identifier is None,
+                )
+
+    async def fair_admissions(self, scope: str, *, limit: int = 100) -> tuple[FairAdmission, ...]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("Fair admission history requires a bounded limit")
+        async with self._connections.reader() as connection:
+            rows = await (
+                await connection.execute(
+                    "SELECT scope,lane,sequence,work_item_id,token,scheduling_json,admitted_at_utc_ns FROM fair_admissions WHERE scope=? ORDER BY admitted_at_utc_ns DESC,lane,sequence DESC LIMIT ?",
+                    (scope, limit),
+                )
+            ).fetchall()
+        return tuple(
+            FairAdmission(
+                scope=_text(row[0]),
+                lane=FairLane(_text(row[1])),
+                sequence=_integer(row[2]),
+                work_item_identifier=_text(row[3]),
+                token=_text(row[4]),
+                scheduling=SchedulingContext.model_validate_json(_text(row[5])),
+                admitted_at_utc_ns=_integer(row[6]),
+            )
+            for row in rows
+        )
+
+    async def _fair_offer_eligible(
+        self,
+        connection: AsyncConnection,
+        *,
+        scope: str,
+        work_identifier: str,
+        stage_identifier: str | None,
+        lane: FairLane,
+        now_utc_ns: int,
+    ) -> bool:
+        """Check only an offered head; do not create operations or reservations."""
+        row = await (
+            await connection.execute(
+                """SELECT state,lease_expires_at_utc_ns,kind_parts_json,
+                CASE WHEN kind_parts_json=? THEN json_extract(payload_json,'$.request.stack_identifier') END,
+                CASE WHEN kind_parts_json=? THEN json_extract(payload_json,'$.routing') END,
+                acquisition_resource_identity_json,eligible_at_utc_ns,payload_schema_version,attempt
+                FROM work_items WHERE id=?""",
+                (
+                    _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)),
+                    _json(list(COLLECT_SEARCH_WORK_KIND)),
+                    work_identifier,
+                ),
+            )
+        ).fetchone()
+        if row is None or row[0] not in ("pending", "leased"):
+            return False
+        stored_offer = await (
+            await connection.execute(
+                """SELECT o.signature,o.resources_json,f.stage_id,h.resources_json FROM fair_offers o
+            JOIN fair_ready f ON f.work_item_id=o.work_item_id
+            LEFT JOIN fair_initial_resources h ON h.kind_parts_json=f.kind_parts_json
+                AND h.payload_schema_version=f.payload_schema_version
+            WHERE o.scope=? AND o.lane=? AND o.work_item_id=?""",
+                (scope, lane.value, work_identifier),
+            )
+        ).fetchone()
+        initial = stored_offer is not None and _text(stored_offer[0]).startswith("initial:")
+        if initial:
+            expected = (
+                "initial:"
+                + hashlib.sha256(
+                    fair_sql.initial_offer_signature(
+                        _text(row[2]), _integer(row[7]), _integer(row[8])
+                    ).encode()
+                ).hexdigest()
+            )
+            if (
+                stored_offer is None
+                or stored_offer[0] != expected
+                or stored_offer[2] is not None
+                or stored_offer[1] != stored_offer[3]
+                or row[0] != "pending"
+                or _integer(row[6]) > now_utc_ns
+            ):
+                return False
+        if lane is FairLane.RESIDENT:
+            if _integer(row[6]) > now_utc_ns:
+                return False
+            pending = await (
+                await connection.execute(
+                    "SELECT json_extract(definition_json,'$.not_before_utc_ns') FROM work_stages WHERE work_item_id=? AND state='pending'",
+                    (work_identifier,),
+                )
+            ).fetchone()
+            if pending is not None and _integer(pending[0]) > now_utc_ns:
+                return False
+            if stage_identifier is not None:
+                stage_row = await (
+                    await connection.execute(
+                        "SELECT definition_json FROM work_stages WHERE id=? AND work_item_id=? AND state='pending'",
+                        (stage_identifier, work_identifier),
+                    )
+                ).fetchone()
+                if (
+                    stage_row is None
+                    or stored_offer is None
+                    or stored_offer[0] != hashlib.sha256(_text(stage_row[0]).encode()).hexdigest()
+                ):
+                    return False
+            if initial:
+                available, _, _ = await self._constraint_availability(
+                    connection,
+                    work_item_identifier=work_identifier,
+                    now_utc_ns=now_utc_ns,
+                    check_rates=True,
+                )
+                if not available:
+                    return False
+            if row[2] == _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)):
+                cooldowns = await self._ebay_search_stack_cooldowns(connection, now_utc_ns)
+                if (
+                    cooldowns.get("ebay_anonymous" if row[3] is None else _text(row[3]), 0)
+                    > now_utc_ns
+                ):
+                    return False
+            elif row[2] == _json(list(COLLECT_SEARCH_WORK_KIND)):
+                cooldowns = await self._facebook_search_route_cooldowns(connection, now_utc_ns)
+                if cooldowns.get("null" if row[4] is None else _text(row[4]), 0) > now_utc_ns:
+                    return False
+            return (
+                await (
+                    await connection.execute(
+                        "SELECT 1 FROM resident_sessions WHERE work_item_id=? AND state IN ('opening','ready','closing','quarantined') LIMIT 1",
+                        (work_identifier,),
+                    )
+                ).fetchone()
+                is None
+            )
+        if stage_identifier is None:
+            fresh = await (
+                await connection.execute(
+                    """SELECT f.stage_id,o.signature FROM fair_ready f JOIN fair_offers o ON o.work_item_id=f.work_item_id
+                WHERE f.work_item_id=? AND o.scope=? AND o.lane=?""",
+                    (work_identifier, scope, lane.value),
+                )
+            ).fetchone()
+            expected = (
+                "initial:"
+                + hashlib.sha256(
+                    fair_sql.initial_offer_signature(
+                        _text(row[2]), _integer(row[7]), _integer(row[8])
+                    ).encode()
+                ).hexdigest()
+            )
+            if (
+                row[0] != "pending"
+                or _integer(row[6]) > now_utc_ns
+                or fresh is None
+                or fresh[0] is not None
+                or fresh[1] != expected
+            ):
+                return False
+            active = await (
+                await connection.execute(
+                    "SELECT 1 FROM stage_attempts WHERE work_item_id=? AND state IN ('pending','active') LIMIT 1",
+                    (work_identifier,),
+                )
+            ).fetchone()
+            available, _, _ = await self._constraint_availability(
+                connection,
+                work_item_identifier=work_identifier,
+                now_utc_ns=now_utc_ns,
+                check_rates=True,
+            )
+            return active is None and available
+        if row[0] == "leased" and row[1] is not None and _integer(row[1]) > now_utc_ns:
+            return False
+        stage = await (
+            await connection.execute(
+                "SELECT definition_json,execution,created_at_utc_ns FROM work_stages WHERE id=? AND work_item_id=? AND state='pending'",
+                (stage_identifier, work_identifier),
+            )
+        ).fetchone()
+        if stage is None:
+            return False
+        definition = StageDefinition.model_validate_json(_text(stage[0]))
+        if definition.not_before_utc_ns > now_utc_ns:
+            return False
+        stored = await (
+            await connection.execute(
+                "SELECT signature FROM fair_offers WHERE scope=? AND lane=? AND work_item_id=?",
+                (scope, lane.value, work_identifier),
+            )
+        ).fetchone()
+        if (
+            stored is None
+            or stored[0] != hashlib.sha256(definition.model_dump_json().encode()).hexdigest()
+        ):
+            return False
+        dependency = await (
+            await connection.execute(
+                "SELECT 1 FROM stage_dependencies d JOIN work_items w ON w.id=d.dependency_work_id WHERE d.stage_id=? AND w.state NOT IN ('completed','terminal_failure','cancelled') LIMIT 1",
+                (stage_identifier,),
+            )
+        ).fetchone()
+        if dependency is not None:
+            return False
+        attempt = await (
+            await connection.execute(
+                "SELECT state FROM stage_attempts WHERE operation_id=?",
+                (definition.operation_identifier,),
+            )
+        ).fetchone()
+        available, _, _ = await self._constraint_availability(
+            connection,
+            work_item_identifier=work_identifier,
+            now_utc_ns=now_utc_ns,
+            check_rates=attempt is not None and attempt[0] == "pending",
+        )
+        if not available:
+            return False
+        if row[5] is not None:
+            peer = await (
+                await connection.execute(
+                    """SELECT 1 FROM work_items WHERE kind_parts_json=? AND acquisition_resource_identity_json=? AND id!=? AND state IN ('leased','cancelling') AND (lease_expires_at_utc_ns>? OR EXISTS(SELECT 1 FROM stage_attempts WHERE work_item_id=work_items.id AND state='active')) LIMIT 1""",
+                    (row[2], row[5], work_identifier, now_utc_ns),
+                )
+            ).fetchone()
+            if peer is not None:
+                return False
+        network = definition.network_activity is not None or any(
+            request.name == "http" for request in definition.resources
+        )
+        if not network:
+            return True
+        connectivity = await (
+            await connection.execute("SELECT paused FROM network_connectivity WHERE singleton=1")
+        ).fetchone()
+        if connectivity is not None and connectivity[0] == 1:
+            return False
+        if row[2] == _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)):
+            cooldowns = await self._ebay_search_stack_cooldowns(connection, now_utc_ns)
+            stack = "ebay_anonymous" if row[3] is None else _text(row[3])
+            if cooldowns.get(stack, 0) > now_utc_ns:
+                return False
+        elif row[2] == _json(list(COLLECT_SEARCH_WORK_KIND)):
+            cooldowns = await self._facebook_search_route_cooldowns(connection, now_utc_ns)
+            routing = "null" if row[4] is None else _text(row[4])
+            if cooldowns.get(routing, 0) > now_utc_ns:
+                return False
+        template = definition.network_activity
+        if template is None:
+            return True
+        if template.not_before_utc_ns > now_utc_ns:
+            return False
+        constraints = await (
+            await connection.execute(
+                """SELECT DISTINCT c.definition_json FROM scheduling_constraints c
+            JOIN json_each(?) s ON c.scope_kind=json_extract(s.value,'$[0]') AND c.scope_identity_json=json_extract(s.value,'$[1]')
+            WHERE c.subject_kind='network_activity' AND NOT EXISTS(SELECT 1 FROM scheduling_constraint_retirements r WHERE r.identifier_parts_json=c.identifier_parts_json)""",
+                (
+                    _json(
+                        [
+                            [scope.kind.value, _json(list(scope.identity))]
+                            for scope in template.scopes
+                        ]
+                    ),
+                ),
+            )
+        ).fetchall()
+        for stored_constraint in constraints:
+            constraint = CONSTRAINT_ADAPTER.validate_json(_text(stored_constraint[0]))
+            identifier = _json(list(constraint.identifier))
+            if isinstance(constraint, UniformHoldoffConstraint):
+                delay = constraint.minimum_ns + int(
+                    hashlib.sha256(
+                        f"{stage_identifier}:{_integer(stage[1]) + 1}:{constraint.minimum_ns}:{constraint.maximum_ns}".encode()
+                    ).hexdigest(),
+                    16,
+                ) % (constraint.maximum_ns - constraint.minimum_ns + 1)
+                if _integer(stage[2]) + delay > now_utc_ns:
+                    return False
+            elif isinstance(constraint, SlidingWindowRateConstraint):
+                count = await (
+                    await connection.execute(
+                        "SELECT count(*) FROM rate_starts WHERE constraint_identifier_parts_json=? AND reserved_at_utc_ns>?",
+                        (identifier, now_utc_ns - constraint.period_ns),
+                    )
+                ).fetchone()
+                assert count is not None
+                if _integer(count[0]) >= constraint.maximum_starts:
+                    return False
+            elif isinstance(constraint, ConcurrencyConstraint):
+                count = await (
+                    await connection.execute(
+                        """SELECT count(*) FROM network_activities a JOIN network_activity_scopes s ON s.network_activity_id=a.id
+                    WHERE a.state='admitted' AND a.permit_expires_at_utc_ns>? AND s.scope_kind=? AND s.scope_identity_json=?""",
+                        (
+                            now_utc_ns,
+                            constraint.scope.kind.value,
+                            _json(list(constraint.scope.identity)),
+                        ),
+                    )
+                ).fetchone()
+                assert count is not None
+                if _integer(count[0]) >= constraint.maximum_active:
+                    return False
+        return True
+
+    async def _fair_gate(
+        self,
+        connection: AsyncConnection,
+        *,
+        scope: str,
+        work_identifier: str,
+        stage_identifier: str | None,
+        signature: str,
+        resources: tuple[ResourceRequest, ...],
+        capacities: dict[str, int],
+        now_utc_ns: int,
+        resident: bool = False,
+    ) -> tuple[bool, FairLane | None]:
+        if not await fair_sql.enabled(connection, scope):
+            return True, None
+        lane = fair_sql.lane_for(resources, resident=resident)
+        await fair_sql.offer(
+            connection,
+            scope=scope,
+            lane=lane,
+            work_identifier=work_identifier,
+            stage_identifier=stage_identifier,
+            signature=signature,
+            resources=resources,
+            now=now_utc_ns,
+        )
+
+        async def eligible(work: str, stage: str | None, offered_lane: FairLane) -> bool:
+            return await self._fair_offer_eligible(
+                connection,
+                scope=scope,
+                work_identifier=work,
+                stage_identifier=stage,
+                lane=offered_lane,
+                now_utc_ns=now_utc_ns,
+            )
+
+        allowed = await fair_sql.admission_allowed(
+            connection,
+            scope=scope,
+            lane=lane,
+            work_identifier=work_identifier,
+            capacities=capacities,
+            now=now_utc_ns,
+            eligible=eligible,
+        )
+        return allowed, lane
 
     async def _work_dispatch_snapshot(
         self, connection: AsyncConnection, identifier: str
@@ -1965,6 +2603,27 @@ class Database:
                         now_utc_ns,
                     )
             execution = _integer(stage[2]) + 1
+            fair_allowed, fair_lane = await self._fair_gate(
+                connection,
+                scope=resource_scope,
+                work_identifier=definition.work_item_identifier,
+                stage_identifier=stage_identifier,
+                signature=definition.model_dump_json(),
+                resources=definition.resources,
+                capacities=capacities,
+                now_utc_ns=now_utc_ns,
+            )
+            if not fair_allowed:
+                return await self._stage_wait(
+                    connection,
+                    stage_identifier,
+                    StageClaimResult(
+                        lease=None,
+                        wait_kind=StageWaitKind.OWNERSHIP,
+                        next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
+                    ),
+                    now_utc_ns,
+                )
             try:
                 # Nested writer is a savepoint: unavailable HTTP/resource admission
                 # rolls back work attempts, operations and all reservations together.
@@ -2211,8 +2870,24 @@ class Database:
                             "invocation": invocation,
                         },
                     )
+                    if fair_lane is not None:
+                        await fair_sql.charge(
+                            connection,
+                            scope=resource_scope,
+                            lane=fair_lane,
+                            work_identifier=definition.work_item_identifier,
+                            token=token,
+                            now=now_utc_ns,
+                        )
                     return StageClaimResult(lease=lease)
             except _StageAdmissionDeferred as deferred:
+                if (
+                    fair_lane is not None
+                    and deferred.result.wait_kind is not StageWaitKind.RESOURCE
+                ):
+                    await fair_sql.clear_offer(
+                        connection, resource_scope, fair_lane, definition.work_item_identifier
+                    )
                 return await self._stage_wait(
                     connection, stage_identifier, deferred.result, now_utc_ns
                 )
@@ -2965,14 +3640,28 @@ class Database:
             )
             if await cursor.fetchone() is not None:
                 return None
+            requests = (
+                ResourceRequest(name="resident_sessions"),
+                ResourceRequest(name="resident_state_bytes", units=definition.state_bytes),
+            )
+            allowed, fair_lane = await self._fair_gate(
+                connection,
+                scope=scope,
+                work_identifier=definition.work_item_identifier,
+                stage_identifier=None,
+                signature=definition.model_dump_json(),
+                resources=requests,
+                capacities=capacities,
+                now_utc_ns=now_utc_ns,
+                resident=True,
+            )
+            if not allowed:
+                return None
             resource = await self.try_acquire_resource_permit(
                 scope=scope,
                 token=token,
                 owner=owner,
-                requests=(
-                    ResourceRequest(name="resident_sessions"),
-                    ResourceRequest(name="resident_state_bytes", units=definition.state_bytes),
-                ),
+                requests=requests,
                 capacities=capacities,
                 now_utc_ns=now_utc_ns,
                 lease_duration_ns=lease_duration_ns,
@@ -3006,6 +3695,15 @@ class Database:
                 ),
             )
             await self._resident_event(connection, lease, "acquired", now_utc_ns)
+            if fair_lane is not None:
+                await fair_sql.charge(
+                    connection,
+                    scope=scope,
+                    lane=fair_lane,
+                    work_identifier=definition.work_item_identifier,
+                    token=token,
+                    now=now_utc_ns,
+                )
             return lease
 
     async def validate_resident_session(self, lease: ResidentLease, *, now_utc_ns: int) -> bool:
@@ -3584,6 +4282,14 @@ class Database:
         }
 
     @staticmethod
+    def _v19_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V19_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "19",
+            "schema_definition_sha256": _V19_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v18_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V18_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -3764,6 +4470,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v19_metadata())
                 and not await cls._metadata_matches(connection, cls._v18_metadata())
                 and not await cls._metadata_matches(connection, cls._v17_metadata())
                 and not await cls._metadata_matches(connection, cls._v16_metadata())
@@ -4229,6 +4936,16 @@ class Database:
             if await self._metadata_matches(connection, self._v18_metadata()):
                 await self._apply_schema(connection)
                 await self._migrate_acquisition_resource_identities(connection)
+                for key, value in self._v19_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v19_metadata()):
+                await self._apply_schema(connection)
+                await connection.execute(
+                    "INSERT OR IGNORE INTO fair_unowned SELECT id FROM work_items WHERE NOT EXISTS(SELECT 1 FROM work_scheduling WHERE work_item_id=work_items.id)"
+                )
+                await self._backfill_work_scheduling(connection)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
@@ -4248,6 +4965,20 @@ class Database:
                 "ALTER TABLE work_items ADD COLUMN acquisition_resource_identity_json TEXT "
                 "CHECK (acquisition_resource_identity_json IS NULL OR "
                 "json_valid(acquisition_resource_identity_json))"
+            )
+        request_columns = {
+            _text(row[1])
+            for row in await (
+                await connection.execute("PRAGMA table_info(work_requests)")
+            ).fetchall()
+        }
+        if request_columns and "scheduling_json" not in request_columns:
+            await connection.execute(
+                "ALTER TABLE work_requests ADD COLUMN scheduling_json TEXT CHECK(scheduling_json IS NULL OR json_valid(scheduling_json))"
+            )
+        if request_columns and "parent_work_identifier" not in request_columns:
+            await connection.execute(
+                "ALTER TABLE work_requests ADD COLUMN parent_work_identifier TEXT REFERENCES work_items(id)"
             )
         await connection.execute(_SCHEMA)
 
@@ -5385,8 +6116,9 @@ class Database:
                 """
                 INSERT INTO work_requests(
                     id, work_item_id, requester_kind_parts_json,
-                    requester_identifier, requested_at_utc_ns, context_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    requester_identifier, requested_at_utc_ns, context_json,
+                    scheduling_json,parent_work_identifier
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     requester.request_identifier,
@@ -5395,9 +6127,14 @@ class Database:
                     requester.identifier,
                     enqueued_at_utc_ns,
                     _json(requester.context),
+                    None
+                    if requester.scheduling is None
+                    else requester.scheduling.model_dump_json(),
+                    requester.parent_work_identifier,
                 ),
             )
             await self._publish_work_request_dependencies(connection, requester.request_identifier)
+            await fair_sql.assign_owner(connection, work_item_identifier, requester)
             await self._require_requester_not_cancelled(connection, requester.request_identifier)
             await self._append_work_event(
                 connection,
@@ -5460,8 +6197,9 @@ class Database:
                 """
                 INSERT INTO work_requests(
                     id, work_item_id, requester_kind_parts_json,
-                    requester_identifier, requested_at_utc_ns, context_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    requester_identifier, requested_at_utc_ns, context_json,
+                    scheduling_json,parent_work_identifier
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     requester.request_identifier,
@@ -5470,9 +6208,14 @@ class Database:
                     requester.identifier,
                     requested_at_utc_ns,
                     _json(requester.context),
+                    None
+                    if requester.scheduling is None
+                    else requester.scheduling.model_dump_json(),
+                    requester.parent_work_identifier,
                 ),
             )
             await self._publish_work_request_dependencies(connection, requester.request_identifier)
+            await fair_sql.assign_owner(connection, work_item_identifier, requester)
             await self._require_requester_not_cancelled(connection, requester.request_identifier)
             await self._append_work_event(
                 connection,

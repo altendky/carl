@@ -43,6 +43,7 @@ class ListingPipelineApplication(Protocol):
         *,
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
+        parent_work_identifier: str | None = None,
     ) -> RequestListingDetailsResult: ...
 
     async def request_listing_analysis(
@@ -52,6 +53,7 @@ class ListingPipelineApplication(Protocol):
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
         requester_context: JsonValue | None,
+        parent_work_identifier: str | None = None,
     ) -> RequestAnalysisResult: ...
 
     async def pipeline_analysis_reuse(
@@ -196,6 +198,7 @@ async def _run_listing_pipeline(
                     if payload.marketplace is Marketplace.FACEBOOK
                     else DEFAULT_DATACENTER_NETWORK_PATH,
                 ),
+                parent_work_identifier=context.work_item_identifier,
                 requester_kind=_DETAIL_REQUESTER,
                 requester_identifier=context.work_item_identifier,
             )
@@ -315,6 +318,7 @@ async def _run_listing_pipeline(
                         product_guide_record_identifier=guide,
                         allow_incomplete_gallery=options.allow_incomplete_gallery,
                     ),
+                    parent_work_identifier=context.work_item_identifier,
                     requester_kind=_ANALYSIS_REQUESTER,
                     requester_identifier=context.work_item_identifier,
                     requester_context={

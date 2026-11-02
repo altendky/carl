@@ -13,6 +13,7 @@ import anyio
 import apsw
 import pytest
 
+from carl._tests.legacy_schema import without_fair_schema
 from carl._tests.test_worker import _provenance
 from carl.core.components import Component, ComponentId
 from carl.core.models import CodeProvenance, JsonValue, NamedInput, NamedOutput, RecordDraft
@@ -544,7 +545,7 @@ async def test_v14_migration_preserves_evidence_and_existing_resource_permits(
     digest = hashlib.sha256(content).hexdigest()
     legacy_schema = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS resource_budgets (") :]
     with sqlite3.connect(path) as connection:
-        connection.executescript(legacy_schema)
+        connection.executescript(without_fair_schema(legacy_schema))
         connection.executemany(
             "INSERT INTO schema_metadata(key,value) VALUES (?,?)", Database._v14_metadata().items()
         )

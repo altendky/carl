@@ -227,7 +227,7 @@ async def test_ten_thousand_cpu_blocked_rows_have_fixed_tasks_and_no_payload_rea
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(work_runtime, "user_directories", lambda: _directories(tmp_path))
-    original = Database.dispatch_candidates
+    original = Database.fair_dispatch_candidates
     scanned = anyio.Event()
     task_counts: list[int] = []
     snapshot_reads = 0
@@ -236,7 +236,7 @@ async def test_ten_thousand_cpu_blocked_rows_have_fixed_tasks_and_no_payload_rea
         page = await original(self, **kwargs)
         task_counts.append(len(anyio.get_running_tasks()))
         assert len(page.items) <= 32
-        if page.items and not page.has_more:
+        if len(task_counts) >= 3:
             scanned.set()
         return page
 
@@ -245,7 +245,7 @@ async def test_ten_thousand_cpu_blocked_rows_have_fixed_tasks_and_no_payload_rea
         snapshot_reads += 1
         raise AssertionError(f"Blocked discovery loaded payload {identifier}")
 
-    monkeypatch.setattr(Database, "dispatch_candidates", discover)
+    monkeypatch.setattr(Database, "fair_dispatch_candidates", discover)
     monkeypatch.setattr(Database, "work_dispatch_snapshot", snapshot)
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         template = _definition(
@@ -277,7 +277,10 @@ async def test_ten_thousand_cpu_blocked_rows_have_fixed_tasks_and_no_payload_rea
                     with anyio.fail_after(30):
                         await scanned.wait()
                     assert snapshot_reads == 0
-                    assert len(task_counts) >= 313
+                    # Fair discovery seeks group heads rather than visiting
+                    # every blocked sibling. Sample repeated turns for a fixed
+                    # task bound as the entire 10k backlog remains queued.
+                    assert len(task_counts) >= 3
                     assert max(task_counts) < 80
                     assert max(task_counts) - min(task_counts) <= 2
                     occupied = await database.resource_occupancy(

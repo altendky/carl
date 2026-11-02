@@ -28,6 +28,7 @@ from carl.core.ebay_analysis import (
     EbayAnalyzeItemPayload,
     analyze_ebay_item_work,
 )
+from carl.core.fair_scheduling import SchedulingContext, SchedulingServiceClass
 from carl.core.item_analysis import (
     ANALYSIS_TIMEOUT_MAXIMUM_ATTEMPTS,
     ANALYSIS_TIMEOUT_RETRY_BASE_DELAY_NS,
@@ -272,6 +273,8 @@ async def request_ebay_listing_analysis(
     requester_kind: tuple[str, ...] = ("carl", "mcp", "request_listing_analysis"),
     requester_identifier: str | None = None,
     requester_context: JsonValue | None = None,
+    scheduling: SchedulingContext | None = None,
+    parent_work_identifier: str | None = None,
 ) -> RequestAnalysisResult:
     """Publish a stable selection and enqueue the same durable analysis workflow."""
 
@@ -342,8 +345,19 @@ async def request_ebay_listing_analysis(
         product_guide_record_identifier=request.product_guide_record_identifier,
         maximum_turns=max(8, len(selection.included) + 5),
     )
+    requester_edge_identifier = application.new_identifier()
     work_requester = WorkRequester(
-        request_identifier=application.new_identifier(),
+        scheduling=scheduling
+        if parent_work_identifier is not None
+        else (
+            scheduling
+            or SchedulingContext(
+                root_request_identifier=requester_edge_identifier,
+                service_class=SchedulingServiceClass.INTERACTIVE,
+            )
+        ),
+        parent_work_identifier=parent_work_identifier,
+        request_identifier=requester_edge_identifier,
         kind=requester_kind,
         identifier=requester_identifier or request.listing_observation_record_identifier,
         context=requester_context

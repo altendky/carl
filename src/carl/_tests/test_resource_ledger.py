@@ -13,6 +13,7 @@ import anyio
 import pytest
 from pydantic import ValidationError
 
+from carl._tests.legacy_schema import without_fair_schema
 from carl.core.resources import ResourceLease, ResourceRequest
 from carl.io.sqlite import _SCHEMA, DATABASE_SCHEMA, Database
 
@@ -240,7 +241,7 @@ async def test_version_13_migration_adds_resource_ledger_without_changing_eviden
     # Resource tables are the only schema addition relative to the exact known v13 identity.
     legacy_schema = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS network_connectivity (") :]
     with sqlite3.connect(path) as connection:
-        connection.executescript(legacy_schema)
+        connection.executescript(without_fair_schema(legacy_schema))
         connection.executemany(
             "INSERT INTO schema_metadata(key, value) VALUES (?, ?)",
             Database._v13_metadata().items(),

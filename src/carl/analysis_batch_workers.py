@@ -54,6 +54,7 @@ class AnalysisRequestApplication(Protocol):
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
         requester_context: JsonValue | None,
+        parent_work_identifier: str | None = None,
     ) -> RequestAnalysisResult: ...
 
 
@@ -118,6 +119,7 @@ async def _request_missing_analyses(
                     product_guide_record_identifier=payload.product_guide_record_identifier,
                     allow_incomplete_gallery=payload.allow_incomplete_gallery,
                 ),
+                parent_work_identifier=context.work_item_identifier,
                 requester_kind=("carl", "facebook", "analysis_batch"),
                 requester_identifier=context.work_item_identifier,
                 requester_context={

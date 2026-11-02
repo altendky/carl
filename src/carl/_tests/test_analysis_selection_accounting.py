@@ -55,9 +55,11 @@ class _RejectingApplication:
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
         requester_context: JsonValue | None,
+        parent_work_identifier: str | None = None,
     ) -> RequestAnalysisResult:
         assert requester_kind == ("carl", "facebook", "analysis_batch")
         assert requester_identifier == "batch"
+        assert parent_work_identifier == "batch"
         assert isinstance(requester_context, dict)
         self.requests.append(request.listing_observation_record_identifier)
         # The message deliberately contains no listing ID. The batch must attach

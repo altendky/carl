@@ -144,6 +144,7 @@ from carl.core.facebook_work import (
     collect_search_work,
     is_transient_search_failure,
 )
+from carl.core.fair_scheduling import SchedulingContext, SchedulingServiceClass
 from carl.core.item_analysis import (
     AnalysisImageSelection,
     AnalyzeItemPayload,
@@ -634,6 +635,10 @@ class ReviewApplication:
             enqueued = await self.database.enqueue_work(
                 travel_data_work(request),
                 WorkRequester(
+                    scheduling=SchedulingContext(
+                        root_request_identifier=identifier,
+                        service_class=SchedulingServiceClass.BACKGROUND,
+                    ),
                     request_identifier=self.new_identifier(),
                     kind=("carl", "mcp", "request_travel_data_setup"),
                     identifier=request.provider,
@@ -835,6 +840,13 @@ class ReviewApplication:
             enqueued = await self.database.enqueue_work(
                 refresh_listing_route_work(payload),
                 WorkRequester(
+                    scheduling=SchedulingContext(
+                        root_request_identifier=travel_refresh_work_identifier(
+                            request.request_identifier
+                        ),
+                        workspace_identifier=request.workspace_record_identifier,
+                        service_class=SchedulingServiceClass.INTERACTIVE,
+                    ),
                     request_identifier=self.new_identifier(),
                     kind=("carl", "mcp", "request_listing_route_refresh"),
                     identifier=request.workspace_record_identifier or request.listing_identifier,
@@ -5212,6 +5224,7 @@ class ReviewApplication:
         *,
         search_record_identifier: str,
         target: MarketplaceSearchTargetRecord,
+        scheduling: SchedulingContext,
     ) -> None:
         requester_kind = ("carl", "marketplace", "search_target")
         specification = target.specification
@@ -5219,12 +5232,14 @@ class ReviewApplication:
             queued = await self._create_search(
                 specification.search,
                 requester_kind=requester_kind,
+                scheduling=scheduling,
                 requester_identifier=target.record_identifier,
             )
         else:
             queued = await self._create_ebay_search(
                 specification.search,
                 requester_kind=requester_kind,
+                scheduling=scheduling,
                 requester_identifier=target.record_identifier,
             )
 
@@ -5264,7 +5279,10 @@ class ReviewApplication:
         )
 
     async def create_marketplace_search(
-        self, request: CreateMarketplaceSearchRequest
+        self,
+        request: CreateMarketplaceSearchRequest,
+        *,
+        scheduling: SchedulingContext | None = None,
     ) -> MarketplaceSearch:
         """Create a search group and queue each initial target once."""
 
@@ -5274,6 +5292,10 @@ class ReviewApplication:
             else:
                 _require_facebook_search_acquisition(specification.search)
         search_identifier = self.new_identifier()
+        scheduling = scheduling or SchedulingContext(
+            root_request_identifier=search_identifier,
+            service_class=SchedulingServiceClass.INTERACTIVE,
+        )
         created_at_utc = _utc_text(self.utc_now_ns())
         search = MarketplaceSearchRecord(
             record_identifier=search_identifier,
@@ -5325,6 +5347,7 @@ class ReviewApplication:
             await self._request_marketplace_target_execution(
                 search_record_identifier=search_identifier,
                 target=target,
+                scheduling=scheduling,
             )
         return await self.get_marketplace_search(search_identifier)
 
@@ -5367,6 +5390,10 @@ class ReviewApplication:
         await self._request_marketplace_target_execution(
             search_record_identifier=request.search_record_identifier,
             target=target,
+            scheduling=SchedulingContext(
+                root_request_identifier=target.record_identifier,
+                service_class=SchedulingServiceClass.INTERACTIVE,
+            ),
         )
         return await self.get_marketplace_search(request.search_record_identifier)
 
@@ -5440,11 +5467,16 @@ class ReviewApplication:
                     _require_ebay_search_acquisition(target.specification.search)
                 else:
                     _require_facebook_search_acquisition(target.specification.search)
+        scheduling = SchedulingContext(
+            root_request_identifier=self.new_identifier(),
+            service_class=SchedulingServiceClass.INTERACTIVE,
+        )
         for target in records:
             if target.record_identifier in enabled_identifiers:
                 await self._request_marketplace_target_execution(
                     search_record_identifier=request.search_record_identifier,
                     target=target,
+                    scheduling=scheduling,
                 )
         return await self.get_marketplace_search(request.search_record_identifier)
 
@@ -5473,6 +5505,8 @@ class ReviewApplication:
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
         requester_context: dict[str, JsonValue] | None = None,
+        scheduling: SchedulingContext | None = None,
+        workspace_identifier: str | None = None,
     ) -> CreateSearchResult:
         _require_ebay_search_acquisition(request)
         payload = CollectEbaySearchPayload(request=request)
@@ -5484,6 +5518,12 @@ class ReviewApplication:
                 not_before_utc_ns=0,
             ),
             WorkRequester(
+                scheduling=scheduling
+                or SchedulingContext(
+                    root_request_identifier=requested_identifier,
+                    workspace_identifier=workspace_identifier,
+                    service_class=SchedulingServiceClass.INTERACTIVE,
+                ),
                 request_identifier=self.new_identifier(),
                 kind=requester_kind,
                 identifier=requester_identifier or requested_identifier,
@@ -5509,6 +5549,8 @@ class ReviewApplication:
         requester_kind: tuple[str, ...],
         requester_identifier: str | None,
         requester_context: dict[str, JsonValue] | None = None,
+        scheduling: SchedulingContext | None = None,
+        workspace_identifier: str | None = None,
     ) -> CreateSearchResult:
         _require_facebook_search_acquisition(request)
         payload = CollectSearchPayload(
@@ -5525,6 +5567,12 @@ class ReviewApplication:
                 not_before_utc_ns=0,
             ),
             WorkRequester(
+                scheduling=scheduling
+                or SchedulingContext(
+                    root_request_identifier=requested_identifier,
+                    workspace_identifier=workspace_identifier,
+                    service_class=SchedulingServiceClass.INTERACTIVE,
+                ),
                 request_identifier=self.new_identifier(),
                 kind=requester_kind,
                 identifier=requester_identifier or requested_identifier,
@@ -5551,12 +5599,14 @@ class ReviewApplication:
                 search.search,
                 requester_kind=("carl", "mcp", "create_workspace_search"),
                 requester_identifier=workspace.record_identifier,
+                workspace_identifier=workspace.record_identifier,
             )
         else:
             result = await self._create_search(
                 search.search if isinstance(search, FacebookSearchTargetSpecification) else search,
                 requester_kind=("carl", "mcp", "create_workspace_search"),
                 requester_identifier=workspace.record_identifier,
+                workspace_identifier=workspace.record_identifier,
             )
         return CreateWorkspaceSearchResult(
             workspace_record_identifier=workspace.record_identifier,
@@ -5632,6 +5682,7 @@ class ReviewApplication:
                     specification.search,
                     requester_kind=("carl", "mcp", "create_workspace_search_revision"),
                     requester_identifier=workspace.record_identifier,
+                    workspace_identifier=workspace.record_identifier,
                     requester_context=context,
                 )
             else:
@@ -5641,6 +5692,7 @@ class ReviewApplication:
                     specification.search,
                     requester_kind=("carl", "mcp", "create_workspace_search_revision"),
                     requester_identifier=workspace.record_identifier,
+                    workspace_identifier=workspace.record_identifier,
                     requester_context=context,
                 )
             return RetryWorkspaceSearchTrackResult(
@@ -5740,12 +5792,16 @@ class ReviewApplication:
         requester_identifier: str,
         requester_context: JsonValue,
         search_specification: SearchTargetSpecification | None = None,
+        scheduling: SchedulingContext | None = None,
+        workspace_identifier: str | None = None,
     ) -> SearchRefreshRequestResult:
         kind, _, base = await self.database.get_record(request.base_search_run_record_identifier)
         if kind == ("carl", "ebay", "search_run") and isinstance(base, dict):
             return await self._request_ebay_search_refresh(
                 request,
                 base=base,
+                scheduling=scheduling,
+                workspace_identifier=workspace_identifier,
                 requester_kind=requester_kind,
                 requester_identifier=requester_identifier,
                 requester_context=requester_context,
@@ -5814,6 +5870,12 @@ class ReviewApplication:
                 not_before_utc_ns=0,
             ),
             WorkRequester(
+                scheduling=scheduling
+                or SchedulingContext(
+                    root_request_identifier=refresh_identifier,
+                    workspace_identifier=workspace_identifier,
+                    service_class=SchedulingServiceClass.BACKGROUND,
+                ),
                 request_identifier=self.new_identifier(),
                 kind=requester_kind,
                 identifier=requester_identifier,
@@ -5838,6 +5900,8 @@ class ReviewApplication:
         requester_identifier: str,
         requester_context: JsonValue,
         search_specification: SearchTargetSpecification | None = None,
+        scheduling: SchedulingContext | None = None,
+        workspace_identifier: str | None = None,
     ) -> SearchRefreshRequestResult:
         if request.traversal is not None or request.traversal_strategy is not None:
             raise ReviewInputError("Facebook traversal overrides do not apply to eBay")
@@ -5876,11 +5940,18 @@ class ReviewApplication:
             await self.database.register_constraint(
                 constraint, registered_at_utc_ns=self.utc_now_ns()
             )
+        refresh_identifier = self.new_identifier()
         enqueued = await self.database.enqueue_work(
             refresh_ebay_search_work(
-                identifier=self.new_identifier(), payload=payload, not_before_utc_ns=0
+                identifier=refresh_identifier, payload=payload, not_before_utc_ns=0
             ),
             WorkRequester(
+                scheduling=scheduling
+                or SchedulingContext(
+                    root_request_identifier=refresh_identifier,
+                    workspace_identifier=workspace_identifier,
+                    service_class=SchedulingServiceClass.BACKGROUND,
+                ),
                 request_identifier=self.new_identifier(),
                 kind=requester_kind,
                 identifier=requester_identifier,
@@ -5955,6 +6026,7 @@ class ReviewApplication:
             refresh_request,
             requester_kind=("carl", "mcp", "request_workspace_refresh"),
             requester_identifier=workspace.record_identifier,
+            workspace_identifier=workspace.record_identifier,
             requester_context={
                 "track_identifier": track.track_identifier,
                 "search_specification_version": track.search_specification_version,
@@ -6661,6 +6733,11 @@ class ReviewApplication:
         enqueued = await self.database.enqueue_work(
             request_missing_analyses_work(identifier=self.new_identifier(), payload=payload),
             WorkRequester(
+                scheduling=SchedulingContext(
+                    root_request_identifier=payload.request_identifier,
+                    workspace_identifier=workspace.record_identifier,
+                    service_class=SchedulingServiceClass.BACKGROUND,
+                ),
                 request_identifier=self.new_identifier(),
                 kind=("carl", "mcp", "request_selection_analyses"),
                 identifier=workspace.record_identifier,
@@ -6726,6 +6803,10 @@ class ReviewApplication:
         enqueued = await self.database.enqueue_work(
             request_missing_analyses_work(identifier=work_identifier, payload=payload),
             WorkRequester(
+                scheduling=SchedulingContext(
+                    root_request_identifier=request_identifier,
+                    service_class=SchedulingServiceClass.BACKGROUND,
+                ),
                 request_identifier=self.new_identifier(),
                 kind=("carl", "mcp", "request_missing_listing_analyses"),
                 identifier=request.search_refresh_work_identifier,
@@ -7184,6 +7265,8 @@ class ReviewApplication:
         *,
         requester_kind: tuple[str, ...] = ("carl", "marketplace", "request_listing_details"),
         requester_identifier: str | None = None,
+        scheduling: SchedulingContext | None = None,
+        parent_work_identifier: str | None = None,
     ) -> RequestListingDetailsResult:
         if request.marketplace is Marketplace.FACEBOOK:
             reused = not request.refresh and bool(
@@ -7204,6 +7287,16 @@ class ReviewApplication:
             enqueued = await self.database.enqueue_work(
                 definition,
                 WorkRequester(
+                    scheduling=scheduling
+                    if parent_work_identifier is not None
+                    else (
+                        scheduling
+                        or SchedulingContext(
+                            root_request_identifier=definition.identifier,
+                            service_class=SchedulingServiceClass.INTERACTIVE,
+                        )
+                    ),
+                    parent_work_identifier=parent_work_identifier,
                     request_identifier=self.new_identifier(),
                     kind=requester_kind,
                     identifier=requester_identifier or definition.identifier,
@@ -7248,6 +7341,16 @@ class ReviewApplication:
         enqueued = await self.database.enqueue_work(
             definition,
             WorkRequester(
+                scheduling=scheduling
+                if parent_work_identifier is not None
+                else (
+                    scheduling
+                    or SchedulingContext(
+                        root_request_identifier=definition.identifier,
+                        service_class=SchedulingServiceClass.INTERACTIVE,
+                    )
+                ),
+                parent_work_identifier=parent_work_identifier,
                 request_identifier=self.new_identifier(),
                 kind=requester_kind,
                 identifier=requester_identifier or definition.identifier,
@@ -7375,6 +7478,8 @@ class ReviewApplication:
         *,
         requester_kind: tuple[str, ...] = ("carl", "mcp", "request_listing_analysis"),
         requester_identifier: str | None = None,
+        scheduling: SchedulingContext | None = None,
+        parent_work_identifier: str | None = None,
         requester_context: JsonValue | None = None,
     ) -> RequestAnalysisResult:
         kind, _, observation = await self.database.get_record(
@@ -7387,6 +7492,8 @@ class ReviewApplication:
                 requester_kind=requester_kind,
                 requester_identifier=requester_identifier,
                 requester_context=requester_context,
+                scheduling=scheduling,
+                parent_work_identifier=parent_work_identifier,
             )
         if kind != ("carl", "facebook", "listing_observation") or not isinstance(observation, dict):
             raise ReviewInputError("Analysis input is not a listing observation")
@@ -7548,8 +7655,19 @@ class ReviewApplication:
         existing_work_identifier = await self.database.facebook_item_analysis_work_identifier(
             payload
         )
+        requester_edge_identifier = self.new_identifier()
         work_requester = WorkRequester(
-            request_identifier=self.new_identifier(),
+            scheduling=scheduling
+            if parent_work_identifier is not None
+            else (
+                scheduling
+                or SchedulingContext(
+                    root_request_identifier=requester_edge_identifier,
+                    service_class=SchedulingServiceClass.INTERACTIVE,
+                )
+            ),
+            parent_work_identifier=parent_work_identifier,
+            request_identifier=requester_edge_identifier,
             kind=requester_kind,
             identifier=(
                 requester_identifier

@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, TypeAdapter, field_validator, model_validator
 
+from carl.core.fair_scheduling import SchedulingContext
 from carl.core.models import JsonStringEnumeration, JsonValue, StrictModel
 
 
@@ -102,6 +103,8 @@ class WorkRequester(StrictModel):
     kind: tuple[str, ...]
     identifier: str = Field(min_length=1)
     context: JsonValue
+    scheduling: SchedulingContext | None = None
+    parent_work_identifier: str | None = Field(default=None, min_length=1)
 
     @field_validator("kind")
     @classmethod

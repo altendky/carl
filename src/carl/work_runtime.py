@@ -307,6 +307,14 @@ async def managed_worker_pool(
     residents = ResidentSessionPool(manager, StageHandlerRegistry((), ()), provenance, invocation)
     engine = DatasetSetupEngine(directories, manager=TravelDataManager(directories))
     policy = StagePolicy(ConnectivityMonitor(database, _identifier, time_ns))
+    session_registry = build_session_stage_registry(
+        facebook=FacebookSessionStageDependencies(
+            database, directories, _identifier, proton_manager, residents
+        ),
+        ebay=EbaySessionStageDependencies(
+            database, directories, _identifier, proton_manager, residents
+        ),
+    )
     stage_registries = (
         build_stateless_stage_registry(
             facebook=FacebookStatelessStageDependencies(
@@ -316,14 +324,7 @@ async def managed_worker_pool(
                 database, directories, _identifier, proton_manager=proton_manager
             ),
         ),
-        build_session_stage_registry(
-            facebook=FacebookSessionStageDependencies(
-                database, directories, _identifier, proton_manager, residents
-            ),
-            ebay=EbaySessionStageDependencies(
-                database, directories, _identifier, proton_manager, residents
-            ),
-        ),
+        session_registry,
         build_facebook_analysis_stage_registry(
             AnalysisWorkerDependencies(database, claude, _identifier)
         ),
@@ -364,6 +365,15 @@ async def managed_worker_pool(
         (capability.kind, capability.payload_schema_version) for capability in registry.capabilities
     }:
         raise ValueError("The stage runtime must cover every supported work capability")
+    await database.enable_fair_scheduling(
+        scope=manager.resources.scope,
+        now_utc_ns=manager.utc_now_ns(),
+        initial_resources=tuple(
+            (adapter.capability, adapter.initial_resources or ()) for adapter in stages.adapters
+        ),
+        resident_capabilities=tuple(adapter.capability for adapter in session_registry.adapters),
+        resident_state_bytes=residents.state_bytes,
+    )
     residents.registry = stages
     async with proton_manager, anyio.create_task_group() as provider_tasks:
         proton_manager.watcher_task_group = provider_tasks
