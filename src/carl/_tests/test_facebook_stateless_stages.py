@@ -161,10 +161,12 @@ class _Sessions:
         *,
         cleanup_failure: bool = False,
         cleanup_acquisition_failure: bool = False,
+        unexpected_cleanup: str | None = None,
     ):
         self.acquirer = acquirer
         self.cleanup_failure = cleanup_failure
         self.cleanup_acquisition_failure = cleanup_acquisition_failure
+        self.unexpected_cleanup = unexpected_cleanup
         self.sessions: list[_Session] = []
 
     @asynccontextmanager
@@ -178,6 +180,9 @@ class _Sessions:
             session.closed = True
         if self.cleanup_failure:
             raise FacebookImageSessionFailure("wireproxy_cleanup_failed", {"fixture": True})
+        if self.unexpected_cleanup is not None:
+            exception = RuntimeError if self.unexpected_cleanup == "runtime" else OSError
+            raise exception("secret fixture /private/credential-file")
         if self.cleanup_acquisition_failure:
             # Decodo's manager raises this type with empty bodies after a
             # completed capture when closing its HTTP client fails.
@@ -563,6 +568,25 @@ async def test_provider_teardown_failure_keeps_a_completed_response(tmp_path: Pa
         value = cast(dict[str, JsonValue], captured.records[0].value)
         acquisition = cast(dict[str, JsonValue], value["acquisition"])
         assert "session_cleanup_failure" in acquisition
+        outcome = await _run(registry, stage_manager(database), captured.continuation, adapter)
+        assert isinstance(outcome, CompletedWork)
+        assert capture.captures == 1 and sessions.sessions[0].closed
+
+
+@pytest.mark.parametrize("cleanup", ("runtime", "os"))
+async def test_unexpected_provider_cleanup_preserves_paid_image_without_secret_diagnostics(
+    tmp_path: Path,
+    cleanup: str,
+) -> None:
+    capture = _Capture()
+    sessions = _Sessions(capture, unexpected_cleanup=cleanup)
+    async with Database.managed(tmp_path / "evidence.sqlite", initialize=True) as database:
+        registry = _registry(database, tmp_path, capture, sessions=sessions)
+        stage, adapter = await _capture_stage(database, registry)
+        captured = await _run(registry, stage_manager(database), stage, adapter)
+        assert isinstance(captured, WaitWork)
+        diagnostic = captured.records[0].value["acquisition"]["session_cleanup_failure"]
+        assert diagnostic == {"type": "RuntimeError" if cleanup == "runtime" else "OSError"}
         outcome = await _run(registry, stage_manager(database), captured.continuation, adapter)
         assert isinstance(outcome, CompletedWork)
         assert capture.captures == 1 and sessions.sessions[0].closed

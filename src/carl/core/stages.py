@@ -39,6 +39,13 @@ class StageWaitKind(JsonStringEnumeration):
     OWNERSHIP = "ownership"
 
 
+class StageRequestCharge(StrictModel):
+    """Only a newly committed charge permits one physical request invocation."""
+
+    ordinal: int = Field(ge=1)
+    newly_charged: bool
+
+
 class StageDefinition(StrictModel):
     """A bounded persisted continuation; secrets and response buffers stay elsewhere."""
 

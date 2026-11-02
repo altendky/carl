@@ -200,7 +200,7 @@ def _body_artifacts(bodies: tuple[AcquiredBody, ...]) -> tuple[BytesDraft, ...]:
     )
 
 
-def _acquisition_outcome(
+def item_acquisition_outcome(
     *,
     acquisition: Acquisition,
     payload: CollectItemPayload,
@@ -267,7 +267,7 @@ def _acquisition_outcome(
     )
 
 
-def _acquisition_failure_outcome(
+def item_acquisition_failure_outcome(
     *, error: AcquisitionFailure, context: AttemptContext
 ) -> RetryWork | TerminalFailureWork:
     stopping_condition = error.result.get("stopping_condition")
@@ -539,6 +539,67 @@ async def _usable_retained_item_acquisition(
     }
 
 
+async def prepare_item_collection(
+    payload: CollectItemPayload,
+    context: AttemptContext,
+    dependencies: FacebookWorkerDependencies,
+) -> CompletedWork | None:
+    """Reuse only complete, usable evidence acquired during this work intent."""
+
+    extract_component = build_component_registry().require(EXTRACT_FACEBOOK)
+    resource = acquisition_resource_identity(COLLECT_ITEM_WORK_KIND, payload.as_json())
+    if resource is not None:
+        candidates = await dependencies.database.completed_acquisition_candidates(
+            COLLECT_ITEM_WORK_KIND,
+            resource,
+            work_identifier=context.work_item_identifier,
+            since_work_created=True,
+        )
+        for candidate in candidates:
+            result = candidate.get("result")
+            acquisition_identifier = (
+                result.get("acquisition_record_identifier") if isinstance(result, dict) else None
+            )
+            if not isinstance(acquisition_identifier, str):
+                continue
+            if not await _usable_retained_item_acquisition(
+                dependencies.database, acquisition_identifier, payload.listing_id
+            ):
+                continue
+            extraction = extract_item_work(
+                identifier=dependencies.new_identifier(),
+                payload=ExtractItemPayload(acquisition_record_identifier=acquisition_identifier),
+                extractor_identifier=EXTRACT_FACEBOOK.parts,
+                extractor_schema_version=extract_component.output_schema_version,
+                not_before_utc_ns=0,
+            )
+            return CompletedWork(
+                inputs=(
+                    NamedInput(
+                        name=("reused_acquisition",), object_identifier=acquisition_identifier
+                    ),
+                ),
+                follow_on_work=(
+                    FollowOnWork(
+                        definition=extraction,
+                        requester=WorkRequester(
+                            request_identifier=dependencies.new_identifier(),
+                            kind=("carl", "http", "acquisition"),
+                            identifier=acquisition_identifier,
+                            context={"operation_identifier": context.operation_identifier},
+                        ),
+                        event_identifier=dependencies.new_identifier(),
+                    ),
+                ),
+                result={
+                    "acquisition_record_identifier": acquisition_identifier,
+                    "extraction_work_identifier": extraction.identifier,
+                    "reused_acquisition": True,
+                },
+            )
+    return None
+
+
 def build_facebook_worker_registry(
     dependencies: FacebookWorkerDependencies,
     search_dependencies: FacebookSearchWorkerDependencies | None = None,
@@ -548,60 +609,9 @@ def build_facebook_worker_registry(
     extract_component = components.require(EXTRACT_FACEBOOK)
 
     async def acquire(payload: CollectItemPayload, context: AttemptContext) -> WorkOutcome:
-        resource = acquisition_resource_identity(COLLECT_ITEM_WORK_KIND, payload.as_json())
-        if resource is not None:
-            candidates = await dependencies.database.completed_acquisition_candidates(
-                COLLECT_ITEM_WORK_KIND,
-                resource,
-                work_identifier=context.work_item_identifier,
-                since_work_created=True,
-            )
-            for candidate in candidates:
-                result = candidate.get("result")
-                acquisition_identifier = (
-                    result.get("acquisition_record_identifier")
-                    if isinstance(result, dict)
-                    else None
-                )
-                if not isinstance(acquisition_identifier, str):
-                    continue
-                if not await _usable_retained_item_acquisition(
-                    dependencies.database, acquisition_identifier, payload.listing_id
-                ):
-                    continue
-                extraction = extract_item_work(
-                    identifier=dependencies.new_identifier(),
-                    payload=ExtractItemPayload(
-                        acquisition_record_identifier=acquisition_identifier
-                    ),
-                    extractor_identifier=EXTRACT_FACEBOOK.parts,
-                    extractor_schema_version=extract_component.output_schema_version,
-                    not_before_utc_ns=0,
-                )
-                return CompletedWork(
-                    inputs=(
-                        NamedInput(
-                            name=("reused_acquisition",), object_identifier=acquisition_identifier
-                        ),
-                    ),
-                    follow_on_work=(
-                        FollowOnWork(
-                            definition=extraction,
-                            requester=WorkRequester(
-                                request_identifier=dependencies.new_identifier(),
-                                kind=("carl", "http", "acquisition"),
-                                identifier=acquisition_identifier,
-                                context={"operation_identifier": context.operation_identifier},
-                            ),
-                            event_identifier=dependencies.new_identifier(),
-                        ),
-                    ),
-                    result={
-                        "acquisition_record_identifier": acquisition_identifier,
-                        "extraction_work_identifier": extraction.identifier,
-                        "reused_acquisition": True,
-                    },
-                )
+        prepared = await prepare_item_collection(payload, context, dependencies)
+        if prepared is not None:
+            return prepared
         try:
             if dependencies.network_activity_scheduler is None:
                 acquisition = await dependencies.acquirer.acquire(
@@ -632,8 +642,8 @@ def build_facebook_worker_registry(
                 result={"state": "route_configuration_failed"},
             )
         except AcquisitionFailure as error:
-            return _acquisition_failure_outcome(error=error, context=context)
-        return _acquisition_outcome(
+            return item_acquisition_failure_outcome(error=error, context=context)
+        return item_acquisition_outcome(
             acquisition=acquisition,
             payload=payload,
             context=context,

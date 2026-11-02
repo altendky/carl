@@ -476,8 +476,9 @@ replacement execution, and publication plus stage completion share one
 transaction. Unadmitted polls discard their unused guard files; admitted token
 guards remain stable.
 
-The stateless adapter registry now supplies Facebook/eBay gallery collection,
-eBay descriptions, and offline item/image extraction stages. Collection first
+The stateless adapter registry now supplies Facebook detail and Facebook/eBay
+gallery collection, eBay descriptions, and offline item/image extraction stages.
+Collection first
 checks reusable evidence under CPU admission, captures HTTP with a separate
 permit, and commits a bounded response checkpoint before waiting for CPU
 validation/publication. Provider sessions close before that wait. Checkpoints
@@ -539,7 +540,10 @@ the previous session's private Fetch token is discarded. Real acquisition
 retries retain their existing budgets;
 parking and execution continuations do not start another attempt.
 
-HTTP dispatch charges its request allowance durably before starting transport.
+HTTP dispatch, including stateless collection, charges its request allowance
+durably before starting transport. The exact execution token can authorize one
+invocation; a repeated authorization cannot start another request. Existing
+resident allowances remain authoritative after the schema upgrade.
 An interrupted request with an unknown outcome therefore still consumes its
 allowance after recovery. Facebook limits a bootstrap at each progress frontier
 and each bucket request within the logical attempt; exhaustion follows the

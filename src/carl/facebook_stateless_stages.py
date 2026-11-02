@@ -1,4 +1,4 @@
-"""Durable Facebook image capture followed by offline validation/publication."""
+"""Durable Facebook image/detail capture followed by offline publication."""
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -16,9 +16,16 @@ from carl.core.facebook_images import (
     image_network_constraints,
     legacy_image_network_constraint_identifiers,
 )
-from carl.core.facebook_work import EXTRACT_ITEM_WORK_KIND
+from carl.core.facebook_work import (
+    COLLECT_ITEM_WORK_KIND,
+    EXTRACT_ITEM_WORK_KIND,
+    CollectItemPayload,
+    facebook_item_network_activity,
+    facebook_item_network_constraints,
+    legacy_facebook_network_constraint_identifiers,
+)
 from carl.core.json import encode_json
-from carl.core.models import JsonValue, NamedInput, StrictModel
+from carl.core.models import JsonValue, NamedInput, NamedOutput, StrictModel
 from carl.core.resources import ResourceRequest
 from carl.core.stages import (
     StageAttemptContext,
@@ -39,7 +46,15 @@ from carl.facebook_image_workers import (
     image_session_failure_work,
     prepare_image_collection,
 )
-from carl.facebook_workers import FacebookWorkerDependencies, build_facebook_worker_registry
+from carl.facebook_workers import (
+    EXTRACT_FACEBOOK,
+    FacebookWorkerDependencies,
+    build_component_registry,
+    build_facebook_worker_registry,
+    item_acquisition_failure_outcome,
+    item_acquisition_outcome,
+    prepare_item_collection,
+)
 from carl.io.configuration import (
     ConfigurationFailure,
     decodo_settings,
@@ -78,6 +93,9 @@ from carl.io.worker import WorkHandler
 _PREPARE = ("carl", "facebook", "stage", "image", "prepare")
 _CAPTURE = ("carl", "facebook", "stage", "image", "capture")
 _PUBLISH = ("carl", "facebook", "stage", "image", "publish")
+_ITEM_PREPARE = ("carl", "facebook", "stage", "item", "prepare")
+_ITEM_CAPTURE = ("carl", "facebook", "stage", "item", "capture")
+_ITEM_PUBLISH = ("carl", "facebook", "stage", "item", "publish")
 
 
 class ImageCaptureSession(Protocol):
@@ -95,6 +113,10 @@ class FacebookStatelessStageDependencies:
     acquirer: HttpCaptureAcquirer | None = None
     session_factory: Callable[[str], AbstractAsyncContextManager[ImageCaptureSession]] | None = None
     utc_now_ns: Callable[[], int] = time_ns
+    item_acquirer: HttpCaptureAcquirer | None = None
+    item_session_factory: (
+        Callable[[str], AbstractAsyncContextManager[ImageCaptureSession]] | None
+    ) = None
 
 
 class RetainedWorkPayload(StrictModel):
@@ -111,6 +133,42 @@ class CaptureImagePayload(StrictModel):
 class PublishImagePayload(StrictModel):
     image: CollectImagePayload
     checkpoint_identifier: str = Field(min_length=1)
+
+
+class CaptureItemPayload(StrictModel):
+    item: CollectItemPayload
+    session_identifier: str = Field(min_length=1)
+
+
+class PublishItemPayload(StrictModel):
+    item: CollectItemPayload
+    checkpoint_identifier: str = Field(min_length=1)
+    acquisition_failed: bool = False
+
+
+def _uncertain_dispatch() -> AcquisitionFailure:
+    return AcquisitionFailure(
+        "A previous request in this logical attempt has an uncertain outcome",
+        result={
+            "kind": "uncertain_previous_dispatch",
+            "stopping_condition": "transport_failure",
+            "failure_phase": "uncertain_previous_dispatch",
+        },
+    )
+
+
+async def _charge(
+    dependencies: FacebookStatelessStageDependencies,
+    context: StageAttemptContext,
+    request_kind: str,
+) -> bool:
+    charge = await dependencies.database.charge_stage_request(
+        context,
+        request_identity=("facebook", request_kind),
+        maximum_attempts=1,
+        now_utc_ns=dependencies.utc_now_ns(),
+    )
+    return charge is not None and charge.newly_charged
 
 
 def _image_dependencies(
@@ -158,6 +216,21 @@ def _factory(
     )
 
 
+def _item_factory(
+    dependencies: FacebookStatelessStageDependencies, item: CollectItemPayload
+) -> Callable[[str], AbstractAsyncContextManager[ImageCaptureSession]]:
+    if dependencies.item_session_factory is not None:
+        return dependencies.item_session_factory
+    loaded = load_configuration(dependencies.directories.configuration_file)
+    routing = item.request_plan.routing
+    if loaded.configuration.resolve_network_path(routing) != routing:
+        raise RouteConfigurationFailure("stage_route_changed_before_capture")
+    settings, credentials = decodo_settings(loaded, dependencies.directories, routing)
+    return DecodoFacebookImageSessionFactory(
+        manager=DecodoSessionManager(), settings=settings, credential_source=credentials
+    )
+
+
 async def _retain_failure(
     outcome: WorkOutcome,
     error: AcquisitionFailure,
@@ -182,7 +255,9 @@ async def _retain_failure(
     )
 
 
-def _checkpoint_failure(error: Exception, acquisition: JsonValue) -> TerminalFailureWork:
+def _checkpoint_failure(
+    error: Exception, acquisition: JsonValue, *, purpose: str = "image"
+) -> TerminalFailureWork:
     summary: dict[str, JsonValue] = {}
     if isinstance(acquisition, dict):
         for key in (
@@ -198,7 +273,7 @@ def _checkpoint_failure(error: Exception, acquisition: JsonValue) -> TerminalFai
             elif isinstance(value, int) and not isinstance(value, bool):
                 summary[key] = value
     return TerminalFailureWork(
-        error={"kind": "image_checkpoint_storage_failure", "type": type(error).__name__},
+        error={"kind": f"{purpose}_checkpoint_storage_failure", "type": type(error).__name__},
         result={"state": "checkpoint_failed", "acquisition": summary},
     )
 
@@ -232,6 +307,11 @@ def build_facebook_stateless_stage_registry(
 ) -> StageHandlerRegistry:
     image_dependencies = _image_dependencies(dependencies)
     image_registry = build_image_worker_registry(image_dependencies)
+    item_dependencies = FacebookWorkerDependencies(
+        database=dependencies.database,
+        acquirer=dependencies.item_acquirer or DirectHttpxAcquirer(),
+        new_identifier=dependencies.new_identifier,
+    )
 
     async def prepare(payload: RetainedWorkPayload, context: StageAttemptContext) -> StageOutcome:
         if payload.work_kind != COLLECT_IMAGE_WORK_KIND:
@@ -300,6 +380,8 @@ def build_facebook_stateless_stage_registry(
         session: ImageCaptureSession | None = None
         try:
             if dependencies.acquirer is not None:
+                if not await _charge(dependencies, context, "image"):
+                    return image_acquisition_failure_work(_uncertain_dispatch(), context)
                 acquisition = await acquire_for_network_activity(
                     dependencies.acquirer.capture(
                         payload.image.request_plan, dependencies.new_identifier
@@ -313,6 +395,8 @@ def build_facebook_stateless_stage_registry(
                     expired = image_expired_outcome(payload.image, image_dependencies)
                     if expired is not None:
                         return expired
+                    if not await _charge(dependencies, context, "image"):
+                        return image_acquisition_failure_work(_uncertain_dispatch(), context)
                     acquisition = await acquire_for_network_activity(
                         session.acquirer.capture(
                             payload.image.request_plan, dependencies.new_identifier
@@ -360,10 +444,16 @@ def build_facebook_stateless_stage_registry(
                     return await _retain_failure(outcome, error, dependencies)
                 return outcome
         except ConfigurationFailure as error:
-            return TerminalFailureWork(
-                error={"kind": "route_configuration_failure", "code": error.code},
-                result={"state": "route_configuration_failed"},
-            )
+            if acquisition is None:
+                return TerminalFailureWork(
+                    error={"kind": "route_configuration_failure", "code": error.code},
+                    result={"state": "route_configuration_failed"},
+                )
+            acquisition.record["session_cleanup_failure"] = {"type": type(error).__name__[:128]}
+        except Exception as error:
+            if acquisition is None:
+                raise
+            acquisition.record["session_cleanup_failure"] = {"type": type(error).__name__[:128]}
         assert acquisition is not None
         try:
             checkpoint = await checkpoint_acquisition(
@@ -429,8 +519,301 @@ def build_facebook_stateless_stage_registry(
             }
         )
 
+    async def item_prepare(
+        payload: RetainedWorkPayload, context: StageAttemptContext
+    ) -> StageOutcome:
+        if payload.work_kind != COLLECT_ITEM_WORK_KIND:
+            raise ValueError("Not a retained Facebook detail collection")
+        item = CollectItemPayload.model_validate_json(encode_json(payload.payload))
+        reused = await prepare_item_collection(item, context, item_dependencies)
+        if reused is not None:
+            return reused
+        try:
+            if dependencies.item_acquirer is None and dependencies.item_session_factory is None:
+                loaded = load_configuration(dependencies.directories.configuration_file)
+                item = item.model_copy(
+                    update={
+                        "request_plan": item.request_plan.model_copy(
+                            update={
+                                "routing": loaded.configuration.resolve_network_path(
+                                    item.request_plan.routing
+                                )
+                            }
+                        )
+                    }
+                )
+            routing = item.request_plan.routing
+            await dependencies.database.supersede_constraints(
+                retired_identifiers=legacy_facebook_network_constraint_identifiers(routing),
+                replacements=facebook_item_network_constraints(routing),
+                operation_identifier=context.operation_identifier,
+                at_utc_ns=dependencies.utc_now_ns(),
+                reason="Apply detail request policy before durable HTTP admission",
+            )
+        except (ConfigurationFailure, RouteConfigurationFailure) as error:
+            return TerminalFailureWork(
+                error={
+                    "kind": "route_configuration_failure",
+                    "code": error.code,
+                    "decision": "terminal",
+                },
+                result={"state": "route_configuration_failed"},
+            )
+        session = dependencies.new_identifier()
+        return WaitWork(
+            continuation=StageDefinition(
+                identifier=dependencies.new_identifier(),
+                work_item_identifier=context.work_item_identifier,
+                operation_identifier=context.operation_identifier,
+                kind=_ITEM_CAPTURE,
+                payload=CaptureItemPayload(item=item, session_identifier=session).model_dump(
+                    mode="json"
+                ),
+                resources=(ResourceRequest(name="http"),),
+                network_activity=facebook_item_network_activity(
+                    identifier=dependencies.new_identifier(),
+                    operation_identifier=context.operation_identifier,
+                    network_session_identifier=session,
+                    attempt=context.attempt,
+                    routing=item.request_plan.routing,
+                ),
+            ),
+            wait_kind=StageWaitKind.RESOURCE,
+            result={"state": "waiting_for_item_capture"},
+        )
+
+    async def item_capture(
+        payload: CaptureItemPayload, context: StageAttemptContext
+    ) -> StageOutcome:
+        admission = context.network_admission
+        if admission is None:
+            raise ValueError("Detail capture requires its exact network admission")
+        acquisition: Acquisition | None = None
+        failed = False
+        try:
+            if dependencies.item_acquirer is not None:
+                if not await _charge(dependencies, context, "item"):
+                    return item_acquisition_failure_outcome(
+                        error=_uncertain_dispatch(), context=context
+                    )
+                acquisition = await acquire_for_network_activity(
+                    dependencies.item_acquirer.capture(
+                        payload.item.request_plan, dependencies.new_identifier
+                    ),
+                    admission,
+                )
+            else:
+                async with _item_factory(dependencies, payload.item)(
+                    payload.session_identifier
+                ) as session:
+                    if not await _charge(dependencies, context, "item"):
+                        return item_acquisition_failure_outcome(
+                            error=_uncertain_dispatch(), context=context
+                        )
+                    acquisition = await acquire_for_network_activity(
+                        session.acquirer.capture(
+                            payload.item.request_plan, dependencies.new_identifier
+                        ),
+                        admission,
+                    )
+                acquisition.record["routing"] = {
+                    "configured": list(payload.item.request_plan.routing),
+                    "observed": session.completed_observation(),
+                }
+        except ConfigurationFailure as error:
+            if acquisition is None:
+                return TerminalFailureWork(
+                    error={
+                        "kind": "route_configuration_failure",
+                        "code": error.code,
+                        "decision": "terminal",
+                    },
+                    result={"state": "route_configuration_failed"},
+                )
+            acquisition.record["session_cleanup_failure"] = {"type": type(error).__name__[:128]}
+        except RouteConfigurationFailure as error:
+            if acquisition is None:
+                return TerminalFailureWork(
+                    error={
+                        "kind": "route_configuration_failure",
+                        "code": error.code,
+                        "decision": "terminal",
+                    },
+                    result={"state": "route_configuration_failed"},
+                )
+            acquisition.record["session_cleanup_failure"] = {
+                "type": type(error).__name__,
+                "code": error.code,
+            }
+        except FacebookImageSessionFailure as error:
+            if acquisition is None:
+                return item_acquisition_failure_outcome(
+                    error=AcquisitionFailure(
+                        "Detail provider failed",
+                        result={"stopping_condition": "transport_failure", "code": error.code},
+                    ),
+                    context=context,
+                )
+            acquisition.record["session_cleanup_failure"] = {
+                "type": type(error).__name__,
+                "code": error.code,
+            }
+        except TimeoutError:
+            if acquisition is None:
+                return item_acquisition_failure_outcome(
+                    error=AcquisitionFailure(
+                        "Detail transport timed out",
+                        result={
+                            "stopping_condition": "transport_failure",
+                            "exception_type": "TimeoutError",
+                        },
+                    ),
+                    context=context,
+                )
+            acquisition.record["session_cleanup_failure"] = {"type": "TimeoutError"}
+        except AcquisitionFailure as error:
+            if acquisition is None:
+                acquisition = completed_capture_after_close_failure(
+                    error, plan=payload.item.request_plan
+                )
+            if acquisition is not None:
+                acquisition.record["session_cleanup_failure"] = {
+                    "type": type(error).__name__,
+                    "failure_phase": error.result.get("failure_phase"),
+                }
+            elif not error.bodies:
+                return item_acquisition_failure_outcome(error=error, context=context)
+            else:
+                acquisition = Acquisition(error.result, error.bodies)
+                failed = True
+        except Exception as error:
+            if acquisition is None:
+                raise
+            acquisition.record["session_cleanup_failure"] = {"type": type(error).__name__[:128]}
+        assert acquisition is not None
+        try:
+            checkpoint = await checkpoint_acquisition(
+                acquisition,
+                data_directory=dependencies.database.path.parent,
+                new_identifier=dependencies.new_identifier,
+            )
+        except (OSError, ValueError) as error:
+            return _checkpoint_failure(error, acquisition.record, purpose="item")
+        return WaitWork(
+            continuation=StageDefinition(
+                identifier=dependencies.new_identifier(),
+                work_item_identifier=context.work_item_identifier,
+                operation_identifier=context.operation_identifier,
+                kind=_ITEM_PUBLISH,
+                payload=PublishItemPayload(
+                    item=payload.item,
+                    checkpoint_identifier=checkpoint.record_identifier,
+                    acquisition_failed=failed,
+                ).model_dump(mode="json"),
+                resources=(ResourceRequest(name="cpu"),),
+                checkpoint_inputs=(
+                    NamedInput(
+                        name=("http_checkpoint",), object_identifier=checkpoint.record_identifier
+                    ),
+                ),
+            ),
+            wait_kind=StageWaitKind.RESOURCE,
+            records=checkpoint.records,
+            artifacts=checkpoint.artifacts,
+            outputs=(
+                *(
+                    output
+                    for output in checkpoint.outputs
+                    if output.object_identifier
+                    not in {body.identifier for body in acquisition.bodies}
+                ),
+                *(
+                    NamedOutput(
+                        name=("response", str(index), "body"), object_identifier=body.identifier
+                    )
+                    for index, body in enumerate(acquisition.bodies)
+                ),
+            ),
+            result={
+                "state": "waiting_for_item_publication",
+                "http_checkpoint_identifier": checkpoint.record_identifier,
+            },
+        )
+
+    async def item_publish(
+        payload: PublishItemPayload, context: StageAttemptContext
+    ) -> StageOutcome:
+        try:
+            acquisition = await restore_acquisition(
+                dependencies.database, payload.checkpoint_identifier
+            )
+        except (OSError, KeyError, ValueError) as error:
+            return TerminalFailureWork(
+                inputs=(
+                    NamedInput(
+                        name=("http_checkpoint",), object_identifier=payload.checkpoint_identifier
+                    ),
+                ),
+                error={"kind": "item_checkpoint_unavailable", "type": type(error).__name__},
+                result={"state": "publication_failed"},
+            )
+        if payload.acquisition_failed:
+            outcome = item_acquisition_failure_outcome(
+                error=AcquisitionFailure(
+                    "Detail capture failed", result=acquisition.record, bodies=acquisition.bodies
+                ),
+                context=context,
+            )
+        else:
+            outcome = item_acquisition_outcome(
+                acquisition=acquisition,
+                payload=payload.item,
+                context=context,
+                component=build_component_registry().require(EXTRACT_FACEBOOK),
+                new_identifier=dependencies.new_identifier,
+            )
+        body_identifiers = {body.identifier for body in acquisition.bodies}
+        return outcome.model_copy(
+            update={
+                "artifacts": tuple(
+                    artifact
+                    for artifact in outcome.artifacts
+                    if artifact.identifier not in body_identifiers
+                ),
+                "outputs": tuple(
+                    output
+                    for output in outcome.outputs
+                    if output.object_identifier not in body_identifiers
+                ),
+                "inputs": (
+                    *outcome.inputs,
+                    NamedInput(
+                        name=("http_checkpoint",), object_identifier=payload.checkpoint_identifier
+                    ),
+                ),
+            }
+        )
+
     adapters: list[WorkStageAdapter] = []
     handlers: list[StageHandler] = [
+        TypedStageHandler(
+            kind=_ITEM_PREPARE,
+            schema_version=1,
+            payload_type=RetainedWorkPayload,
+            handler=item_prepare,
+        ),
+        TypedStageHandler(
+            kind=_ITEM_CAPTURE,
+            schema_version=1,
+            payload_type=CaptureItemPayload,
+            handler=item_capture,
+        ),
+        TypedStageHandler(
+            kind=_ITEM_PUBLISH,
+            schema_version=1,
+            payload_type=PublishItemPayload,
+            handler=item_publish,
+        ),
         TypedStageHandler(
             kind=_PREPARE, schema_version=1, payload_type=RetainedWorkPayload, handler=prepare
         ),
@@ -458,7 +841,11 @@ def build_facebook_stateless_stage_registry(
         )
     )
     for handler in facebook_registry.handlers:
-        if handler.capability.kind == EXTRACT_ITEM_WORK_KIND:
+        if handler.capability.kind == COLLECT_ITEM_WORK_KIND:
+            adapters.append(
+                WorkStageAdapter(handler.capability, handler.component, _initial(_ITEM_PREPARE))
+            )
+        elif handler.capability.kind == EXTRACT_ITEM_WORK_KIND:
             adapter, stage_handler = _cpu_adapter(handler)
             adapters.append(adapter)
             handlers.append(stage_handler)
