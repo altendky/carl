@@ -10,6 +10,7 @@ from carl.core.models import JsonValue, StrictModel
 from carl.core.stages import StageAttemptContext, StageDefinition, StageOutcome
 from carl.core.work import WorkCapability, WorkDefinition
 from carl.io.connectivity import work_retry_budget
+from carl.io.stage_publication import StageHandlerResult, StagePublication
 from carl.io.stages import StageExecution
 
 
@@ -24,7 +25,9 @@ class StageHandler(Protocol):
     kind: tuple[str, ...]
     schema_version: int
 
-    async def execute(self, payload: JsonValue, context: StageAttemptContext) -> StageOutcome: ...
+    async def execute(
+        self, payload: JsonValue, context: StageAttemptContext
+    ) -> StageHandlerResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +35,7 @@ class TypedStageHandler[PayloadT: StrictModel](StageHandler):
     kind: tuple[str, ...]
     schema_version: int
     payload_type: type[PayloadT]
-    handler: Callable[[PayloadT, StageAttemptContext], Awaitable[StageOutcome]]
+    handler: Callable[[PayloadT, StageAttemptContext], Awaitable[StageHandlerResult]]
 
     def __post_init__(self) -> None:
         if not self.kind or any(not part for part in self.kind):
@@ -40,7 +43,7 @@ class TypedStageHandler[PayloadT: StrictModel](StageHandler):
         if self.schema_version < 1:
             raise ValueError("Stage handler schema versions must be positive")
 
-    async def execute(self, payload: JsonValue, context: StageAttemptContext) -> StageOutcome:
+    async def execute(self, payload: JsonValue, context: StageAttemptContext) -> StageHandlerResult:
         decoded = self.payload_type.model_validate_json(encode_json(payload))
         return await self.handler(decoded, context)
 
@@ -78,8 +81,8 @@ class StageHandlerRegistry:
                 return handler
         raise KeyError((definition.kind, definition.schema_version))
 
-    async def execute(self, execution: StageExecution) -> StageOutcome:
-        """Run one continuation with its logical attempt's retained retry budget."""
+    async def run(self, execution: StageExecution) -> StageHandlerResult:
+        """Build one outcome; dispatch policy can inspect it before publication."""
 
         lease = execution.lease
         definition = lease.definition
@@ -99,7 +102,13 @@ class StageHandlerRegistry:
             stage_identifier=definition.identifier,
             execution=lease.execution,
             network_admission=lease.network_admission,
+            resident_session_identifier=definition.resident_session_identifier,
         )
-        outcome = await handler.execute(definition.payload, context)
+        return await handler.execute(definition.payload, context)
+
+    async def execute(self, execution: StageExecution) -> StageOutcome:
+        """Run and publish one continuation through its current execution fence."""
+
+        outcome = await self.run(execution)
         await execution.apply(outcome)
-        return outcome
+        return outcome.outcome if isinstance(outcome, StagePublication) else outcome

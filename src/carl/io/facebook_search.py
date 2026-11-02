@@ -45,6 +45,17 @@ class ManagedFacebookSearchHttpSession:
     identifier: str
     acquirer: HttpFormAcquirer
     provider_session: ProtonSession | ManagedDecodoSession
+    _close_completed: bool = False
+
+    def is_closed(self) -> bool:
+        if isinstance(self.provider_session, ManagedDecodoSession):
+            return self.provider_session.is_closed()
+        return self._close_completed
+
+    def retained_bytes(self) -> int:
+        if isinstance(self.acquirer, (ClientHttpxAcquirer, ManagedDecodoSession)):
+            return self.acquirer.retained_bytes()
+        raise ValueError("Search session does not expose bounded retained state")
 
     def active_observation(self) -> dict[str, JsonValue]:
         return {
@@ -106,8 +117,9 @@ class ProtonFacebookSearchSessionFactory:
                     follow_redirects=False,
                     trust_env=False,
                 )
+                session: ManagedFacebookSearchHttpSession | None = None
                 try:
-                    yield ManagedFacebookSearchHttpSession(
+                    session = ManagedFacebookSearchHttpSession(
                         identifier=identifier,
                         acquirer=ClientHttpxAcquirer(
                             client=client,
@@ -124,9 +136,12 @@ class ProtonFacebookSearchSessionFactory:
                         ),
                         provider_session=provider_session,
                     )
+                    yield session
                 finally:
                     try:
-                        await close_httpx_client(client, primary_error=sys.exception())
+                        closed = await close_httpx_client(client, primary_error=sys.exception())
+                        if session is not None:
+                            session._close_completed = closed
                     except Exception as error:
                         raise AcquisitionFailure(
                             "HTTP transport failed while closing a search client",

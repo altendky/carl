@@ -145,57 +145,75 @@ async def _collect(
             result={"state": "configuration_failed"},
         )
     except AcquisitionFailure as error:
-        homepage_inputs = (
-            *_homepage_inputs(error.result.get("homepage_acquisition")),
-            *_attempt_inputs(
-                error.result.get("homepage_attempts"), ("search", "homepage", "attempt")
-            ),
-            *_attempt_inputs(
-                error.result.get("search_page_attempts"), ("search", "page", "attempt")
-            ),
-        )
-        timeout = (
-            error.result.get("stopping_condition") == "transport_failure"
-            and error.result.get("exception_type") == "TimeoutError"
-        ) or (
-            error.result.get("stopping_condition") == "network_activity_failure"
-            and error.result.get("failure_phase") == "network_activity_finalization_timeout"
-        )
-        if error.result.get("stopping_condition") == "transport_failure" or timeout:
-            maximum_attempts = EBAY_BLOCKED_MAXIMUM_ATTEMPTS if timeout else 3
-            delay_ns = ebay_response_retry_delay_ns(policy_attempt, blocked=timeout)
-            reason: dict[str, JsonValue] = {
-                "kind": "ebay_search_acquisition_failure",
-                "attempt": context.attempt,
-                "policy_attempt": policy_attempt,
-                "retry_attempt_offset": payload.retry_attempt_offset,
-                "maximum_attempts": maximum_attempts,
-            }
-            if timeout:
-                reason.update(
-                    {
-                        "exception_type": error.result.get("exception_type"),
-                        "failure_phase": error.result.get("failure_phase"),
-                    }
-                )
-                _set_retry_cooldown(reason, error.result, payload, delay_ns, dependencies)
-            if policy_attempt < maximum_attempts:
-                return RetryWork(
-                    inputs=homepage_inputs,
-                    delay_ns=delay_ns,
-                    reason=reason,
-                    result={"state": "retryable_failure", "acquisition": error.result},
-                )
-            return TerminalFailureWork(
+        return search_acquisition_failure_work(payload, context, dependencies, error)
+    return search_result_work(payload, context, dependencies, result)
+
+
+def search_acquisition_failure_work(
+    payload: CollectEbaySearchPayload,
+    context: AttemptContext,
+    dependencies: EbaySearchWorkerDependencies,
+    error: AcquisitionFailure,
+) -> WorkOutcome:
+    """Apply the retained search retry policy without starting a collector."""
+    policy_attempt = context.retry_attempt(payload.retry_attempt_offset)
+    homepage_inputs = (
+        *_homepage_inputs(error.result.get("homepage_acquisition")),
+        *_attempt_inputs(error.result.get("homepage_attempts"), ("search", "homepage", "attempt")),
+        *_attempt_inputs(error.result.get("search_page_attempts"), ("search", "page", "attempt")),
+    )
+    timeout = (
+        error.result.get("stopping_condition") == "transport_failure"
+        and error.result.get("exception_type") == "TimeoutError"
+    ) or (
+        error.result.get("stopping_condition") == "network_activity_failure"
+        and error.result.get("failure_phase") == "network_activity_finalization_timeout"
+    )
+    if error.result.get("stopping_condition") == "transport_failure" or timeout:
+        maximum_attempts = EBAY_BLOCKED_MAXIMUM_ATTEMPTS if timeout else 3
+        delay_ns = ebay_response_retry_delay_ns(policy_attempt, blocked=timeout)
+        reason: dict[str, JsonValue] = {
+            "kind": "ebay_search_acquisition_failure",
+            "attempt": context.attempt,
+            "policy_attempt": policy_attempt,
+            "retry_attempt_offset": payload.retry_attempt_offset,
+            "maximum_attempts": maximum_attempts,
+        }
+        if timeout:
+            reason.update(
+                {
+                    "exception_type": error.result.get("exception_type"),
+                    "failure_phase": error.result.get("failure_phase"),
+                }
+            )
+            _set_retry_cooldown(reason, error.result, payload, delay_ns, dependencies)
+        if policy_attempt < maximum_attempts:
+            return RetryWork(
                 inputs=homepage_inputs,
-                error=reason,
-                result={"state": "acquisition_failed", "acquisition": error.result},
+                delay_ns=delay_ns,
+                reason=reason,
+                result={"state": "retryable_failure", "acquisition": error.result},
             )
         return TerminalFailureWork(
             inputs=homepage_inputs,
-            error={"kind": "ebay_search_acquisition_failure"},
+            error=reason,
             result={"state": "acquisition_failed", "acquisition": error.result},
         )
+    return TerminalFailureWork(
+        inputs=homepage_inputs,
+        error={"kind": "ebay_search_acquisition_failure"},
+        result={"state": "acquisition_failed", "acquisition": error.result},
+    )
+
+
+def search_result_work(
+    payload: CollectEbaySearchPayload,
+    context: AttemptContext,
+    dependencies: EbaySearchWorkerDependencies,
+    result: dict[str, JsonValue],
+) -> WorkOutcome:
+    """Classify already-published search evidence using the existing retry policy."""
+    policy_attempt = context.retry_attempt(payload.retry_attempt_offset)
 
     # The collector's child operations already own these records. Link their
     # evidence into this work operation without publishing it a second time.

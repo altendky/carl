@@ -2,9 +2,11 @@
 
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import time_ns
+from typing import Protocol
 from uuid import uuid4
 
 import anyio
@@ -19,7 +21,8 @@ from carl.core.models import (
     NamedOutput,
     RecordDraft,
 )
-from carl.core.stages import StageClaimResult, StageLease, StageOutcome, WaitWork
+from carl.core.residents import ResidentLease
+from carl.core.stages import StageClaimResult, StageLease, WaitWork
 from carl.core.worker import CompletedWork, RetryWork, TerminalFailureWork
 from carl.io.resource_permits import (
     ExecutionGuard,
@@ -28,6 +31,7 @@ from carl.io.resource_permits import (
     current_resource_manager,
 )
 from carl.io.sqlite import Database
+from carl.io.stage_publication import StageHandlerResult, StagePublication
 
 
 def _identifier() -> str:
@@ -39,11 +43,17 @@ class StageExecution:
     manager: "StageManager"
     lease: StageLease
     guard: ExecutionGuard
+    provenance: CodeProvenance
+    invocation: dict[str, JsonValue]
     finalized: bool = False
+    finalizing: bool = False
 
-    async def apply(self, outcome: StageOutcome) -> None:
+    async def apply(self, outcome: StageHandlerResult) -> None:
         """Publish an outcome through this execution's continuation or final fence."""
 
+        if isinstance(outcome, StagePublication):
+            await self._publish_children(outcome)
+            return
         if isinstance(outcome, WaitWork):
             await self.suspend(
                 outcome,
@@ -55,11 +65,59 @@ class StageExecution:
         else:
             await self.finish(outcome)
 
+    async def _publish_children(self, publication: StagePublication) -> None:
+        self._seal()
+        database = self.manager.database
+        committed = False
+        try:
+            async with database.transaction():
+                if not await database.validate_stage(
+                    self.lease, now_utc_ns=self.manager.utc_now_ns()
+                ):
+                    raise ResourceLeaseLost("Cannot publish children through an expired stage")
+                for child in publication.children:
+                    await database.begin_operation(
+                        operation_id=child.identifier,
+                        component=child.component,
+                        provenance=self.provenance,
+                        invocation=self.invocation,
+                        configuration=child.configuration,
+                        started_at_utc=child.started_at_utc,
+                        inputs=tuple((item.name, item.object_identifier) for item in child.inputs),
+                    )
+                    if child.error is None:
+                        await database.complete_operation(
+                            operation_id=child.identifier,
+                            records=child.records,
+                            artifacts=child.artifacts,
+                            outputs=child.outputs,
+                            result=child.result,
+                            ended_at_utc=child.ended_at_utc,
+                            duration_ns=child.duration_ns,
+                        )
+                    else:
+                        await database.fail_operation(
+                            operation_id=child.identifier,
+                            error=child.error,
+                            result=child.result,
+                            ended_at_utc=child.ended_at_utc,
+                            duration_ns=child.duration_ns,
+                            records=child.records,
+                            artifacts=child.artifacts,
+                            outputs=child.outputs,
+                        )
+                await self.apply(publication.outcome)
+            committed = True
+        finally:
+            if not committed:
+                self.finalized = False
+
     def _seal(self) -> None:
         if self.finalized:
             raise ResourceLeaseLost("Stage execution was already finalized")
         if not self.guard.seal():
             raise ResourceLeaseLost("Stage still has an inherited physical executor")
+        self.finalizing = True
 
     async def suspend(
         self,
@@ -162,6 +220,14 @@ class StageAdmission:
     execution: StageExecution | None
 
 
+class StageHeartbeat(Protocol):
+    """A pool-owned heartbeat avoids nesting task scopes around resident clients."""
+
+    def register(self, execution: StageExecution) -> None: ...
+
+    def unregister(self, execution: StageExecution) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class StageManager:
     database: Database
@@ -196,7 +262,7 @@ class StageManager:
     async def _renew(self, execution: StageExecution) -> None:
         while True:
             await stage_sleep(self.renewal_interval_ns / 1_000_000_000)
-            if execution.finalized:
+            if execution.finalizing:
                 return
             lease = await self.database.renew_stage(
                 execution.lease,
@@ -204,7 +270,7 @@ class StageManager:
                 lease_duration_ns=self.lease_duration_ns,
             )
             if lease is None:
-                if execution.finalized:
+                if execution.finalizing:
                     return
                 raise ResourceLeaseLost("Stage execution ownership expired or changed")
             execution.lease = lease
@@ -218,6 +284,8 @@ class StageManager:
         provenance: CodeProvenance,
         invocation: dict[str, JsonValue],
         worker_identifier: str | None = None,
+        resident_lease: ResidentLease | None = None,
+        heartbeat: StageHeartbeat | None = None,
     ) -> AsyncIterator[StageAdmission]:
         """Try once; a blocked stage remains durable and consumes no execution task."""
 
@@ -243,6 +311,7 @@ class StageManager:
                         component=component,
                         provenance=provenance,
                         invocation=invocation,
+                        resident_lease=resident_lease,
                     )
                     lease = result.lease
                 if result is None:
@@ -251,24 +320,32 @@ class StageManager:
                     guard.discard_unadmitted = True
                     yield StageAdmission(result, None)
                     return
-                execution = StageExecution(self, lease, guard)
+                execution = StageExecution(self, lease, guard, provenance, deepcopy(invocation))
                 body_error: BaseException | None = None
                 async with AsyncExitStack() as stack:
                     if lease.resource_lease is not None:
                         await stack.enter_async_context(
                             self.resources.adopt(lease.resource_lease, guard)
                         )
-                    async with anyio.create_task_group() as tasks:
-                        tasks.start_soon(self._renew, execution)
+                    if heartbeat is not None:
+                        heartbeat.register(execution)
                         try:
                             await anyio.lowlevel.checkpoint()
                             yield StageAdmission(result, execution)
-                        except BaseException as error:
-                            body_error = error
                         finally:
-                            tasks.cancel_scope.cancel()
-                    if body_error is not None:
-                        raise body_error
+                            heartbeat.unregister(execution)
+                    else:
+                        async with anyio.create_task_group() as tasks:
+                            tasks.start_soon(self._renew, execution)
+                            try:
+                                await anyio.lowlevel.checkpoint()
+                                yield StageAdmission(result, execution)
+                            except BaseException as error:
+                                body_error = error
+                            finally:
+                                tasks.cancel_scope.cancel()
+                        if body_error is not None:
+                            raise body_error
             finally:
                 await guard.wait_idle()
                 if (

@@ -283,11 +283,11 @@ async def _acquisition_candidates(
         raise
 
 
-async def _collect_item(
+async def prepare_item_collection(
     payload: CollectEbayItemPayload,
     context: AttemptContext,
     dependencies: EbayItemWorkerDependencies,
-) -> WorkOutcome:
+) -> WorkOutcome | tuple[str, ...]:
     resource = acquisition_resource_identity(COLLECT_EBAY_ITEM_WORK_KIND, payload.as_json())
     assert resource is not None
     for source in await _acquisition_candidates(
@@ -416,6 +416,22 @@ async def _collect_item(
                         "reused": True,
                     },
                 )
+    return tuple(identifiers)
+
+
+async def _collect_item(
+    payload: CollectEbayItemPayload,
+    context: AttemptContext,
+    dependencies: EbayItemWorkerDependencies,
+) -> WorkOutcome:
+    prepared = await prepare_item_collection(payload, context, dependencies)
+    if not isinstance(prepared, tuple):
+        return prepared
+    identifiers = list(prepared)
+    inputs = tuple(
+        NamedInput(name=("previous_acquisition", str(index)), object_identifier=identifier)
+        for index, identifier in enumerate(identifiers)
+    )
     extracted: EbayItemExtraction | None = None
     blocked = False
     identifier: str | None = None
@@ -537,6 +553,24 @@ async def _collect_item(
                 }
             }
         )
+    return complete_item_collection(
+        payload, context, dependencies, identifiers, extracted, blocked, policy, inputs=inputs
+    )
+
+
+def complete_item_collection(
+    payload: CollectEbayItemPayload,
+    context: AttemptContext,
+    dependencies: EbayItemWorkerDependencies,
+    identifiers: list[str],
+    extracted: EbayItemExtraction | None,
+    blocked: bool,
+    policy: EbayItemConfiguration,
+    *,
+    inputs: tuple[NamedInput, ...] = (),
+) -> WorkOutcome:
+    """Finish a captured same-session item sequence without issuing requests."""
+    identifier = identifiers[-1] if identifiers else None
     assert identifier is not None
     if extracted is None or extracted.classification not in {
         EbayItemResponseKind.DETAIL,

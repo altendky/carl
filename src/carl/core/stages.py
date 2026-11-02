@@ -153,6 +153,7 @@ class StageAttemptContext(AttemptContext):
     stage_identifier: str = Field(min_length=1)
     execution: int = Field(ge=1)
     network_admission: NetworkActivityAdmission | None = None
+    resident_session_identifier: str | None = Field(default=None, min_length=1)
 
 
 def stage_network_activity(

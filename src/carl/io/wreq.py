@@ -942,6 +942,7 @@ class ProxyWreqAcquirer:
         self._client_plan: RequestPlan | None = None
         self._client_hints = _ClientHints()
         self._closed = False
+        self._close_completed = False
         self._failed = False
         self._lock = anyio.Lock()
 
@@ -949,6 +950,31 @@ class ProxyWreqAcquirer:
     def cookie_jar(self) -> wreq.Jar | None:
         """Canonical native cookie provider, without reading cookie values."""
         return self._cookie_jar
+
+    def is_closed(self) -> bool:
+        return self._close_completed
+
+    def retained_bytes(self) -> int:
+        cookies = () if self._cookie_jar is None else self._cookie_jar.get_all()
+        cookie_bytes = sum(
+            1024
+            + sum(
+                len(value.encode("utf-8"))
+                for value in (cookie.name, cookie.value, cookie.domain or "", cookie.path or "")
+            )
+            for cookie in cookies
+        )
+        hints_bytes = sum(
+            512
+            + len(scheme.encode())
+            + len(host.encode())
+            + sum(len(name.encode()) for name in names)
+            for (scheme, host, _port), names in self._client_hints.requested.items()
+        )
+        plan_bytes = (
+            0 if self._client_plan is None else len(self._client_plan.model_dump_json().encode())
+        )
+        return cookie_bytes + hints_bytes + plan_bytes
 
     def _sync_open_session_client(self, plan: RequestPlan) -> None:
         if self._client_proxy is None:
@@ -988,6 +1014,7 @@ class ProxyWreqAcquirer:
                     if client is not None:
                         try:
                             await anyio.to_thread.run_sync(client.close, abandon_on_cancel=False)
+                            session._close_completed = True
                         except Exception as error:
                             report_cleanup_failure(primary_error, error, "wreq_client_close")
                             if primary_error is None:
@@ -1001,6 +1028,8 @@ class ProxyWreqAcquirer:
                                         "transport_error": _transport_error_diagnostics(error),
                                     },
                                 ) from None
+                    else:
+                        session._close_completed = True
 
     def _sync_session_acquire(self, plan: RequestPlan) -> _SyncResult:
         if self._managed_session and self._client is None:
