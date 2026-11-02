@@ -362,8 +362,14 @@ async def test_pipeline_transaction_rolls_back_and_work_rows_follow_caller_order
         rows = await database.pipeline_work_rows(("second", "first", "second"))
         assert [row["identifier"] for row in rows] == ["second", "first", "second"]
         assert all(
-            set(row) == {"identifier", "state", "payload", "result", "error"} for row in rows
+            set(row) == {"identifier", "state", "payload", "result", "error", "progress_revision"}
+            for row in rows
         )
+        assert all(
+            isinstance(row["progress_revision"], int) and row["progress_revision"] >= 0
+            for row in rows
+        )
+        assert rows[0]["progress_revision"] == rows[2]["progress_revision"]
         with pytest.raises(KeyError):
             await database.pipeline_work_rows(("missing",))
 
