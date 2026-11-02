@@ -1,5 +1,6 @@
 """Subprocess output has byte budgets and reaching one reaps the child."""
 
+import json
 import os
 import signal
 import sys
@@ -71,8 +72,16 @@ async def test_output_overflow_keeps_bounded_evidence_and_reaps_child(
         assert len(run.stdout) + len(run.stderr) == cli.maximum_output_bytes
     else:
         assert len(run.stdout if stream == "stdout" else run.stderr) == 1024
-    assert run.version == "fixture-version"
-    assert run.tool_calls == ("Read",)
+    # Separate OS pipes have no shared delivery order: stderr may consume the
+    # combined budget before stdout's initial events are received. Metadata must
+    # reflect the complete events actually retained within that budget.
+    events = [json.loads(line) for line in run.stdout.split(b"\n")[:-1] if line]
+    assert run.version == (
+        "fixture-version" if any(event.get("type") == "system" for event in events) else None
+    )
+    assert run.tool_calls == (
+        ("Read",) if any(event.get("type") == "assistant" for event in events) else ()
+    )
     _assert_child_reaped(tmp_path)
 
 

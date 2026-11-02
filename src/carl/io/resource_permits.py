@@ -13,14 +13,14 @@ import shutil
 import signal
 import socket
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from time import time_ns
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 import anyio
@@ -113,6 +113,10 @@ class ResourcePermit:
     lease: ResourceLease
     guard_descriptor: int
     release_on_exit: bool = True
+    local_limiters: dict[str, anyio.Semaphore] = field(default_factory=dict)
+    borrowers: dict[tuple[int, str], int] = field(default_factory=dict)
+    execution_guard: ExecutionGuard | None = None
+    closed: bool = False
 
     @asynccontextmanager
     async def publishing(self) -> AsyncIterator[None]:
@@ -131,6 +135,92 @@ class ResourcePermit:
 
 
 @dataclass(slots=True)
+class ExecutionGuard:
+    """Own an execution token before atomic admission and through physical cleanup."""
+
+    manager: ResourceManager
+    token: str
+    owner: str
+    descriptor: int | None
+    sealed: bool = False
+    closed: bool = False
+    closing: bool = False
+    active_borrowers: int = 0
+    adopted: bool = False
+    discard_unadmitted: bool = False
+    _idle: anyio.Event = field(default_factory=anyio.Event)
+
+    def __post_init__(self) -> None:
+        self._idle.set()
+
+    def begin_borrow(self) -> None:
+        if self.closing or self.sealed or self.closed:
+            raise ResourceLeaseLost("Cannot execute after its stage guard began closing")
+        if self.active_borrowers == 0:
+            self._idle = anyio.Event()
+        self.active_borrowers += 1
+
+    def end_borrow(self) -> None:
+        self.active_borrowers -= 1
+        if self.active_borrowers == 0:
+            self._idle.set()
+
+    async def wait_idle(self) -> None:
+        """Stop new local operations and retain capacity through actual cleanup."""
+
+        self.closing = True
+        with anyio.CancelScope(shield=True):
+            await self._idle.wait()
+
+    def seal(self) -> bool:
+        """Stop launching children and prove all inherited executors have exited."""
+
+        if self.closed:
+            raise ResourceLeaseLost("Execution guard is closed")
+        self.closing = True
+        if self.active_borrowers:
+            return False
+        if self.sealed:
+            return True
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+        descriptor = self.manager._guard(self.token)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            return False
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self.descriptor = descriptor
+        self.sealed = True
+        return True
+
+    async def aclose(self) -> None:
+        if self.closed:
+            return
+        try:
+            await self.wait_idle()
+            if self.seal():
+                with anyio.fail_after(40, shield=True):
+                    await self.manager.database.release_resource_permit(
+                        token=self.token, owner=self.owner
+                    )
+        finally:
+            if self.descriptor is not None:
+                os.close(self.descriptor)
+                self.descriptor = None
+            self.closed = True
+            if self.discard_unadmitted and self.sealed:
+                # No execution/token was committed or handed to an adapter.
+                # Blocked nonblocking polls must not consume an inode each time.
+                with suppress(FileNotFoundError):
+                    (self.manager.guard_directory / f"{self.token}.lock").unlink()
+
+
+@dataclass(slots=True)
 class ResourceManager:
     database: ResourceDatabase
     capacities: dict[str, int]
@@ -141,8 +231,8 @@ class ResourceManager:
     poll_seconds: float = 0.1
 
     def _guard(self, token: str) -> int:
-        # Tokens are generated UUIDs, never supplied paths. Never unlink these
-        # files: replacing a locked inode would create a second independent lock.
+        # Tokens are generated UUIDs, never supplied paths. Keep admitted-token
+        # files: replacing a locked inode creates a second independent lock.
         if len(token) != 36 or any(c not in "0123456789abcdef-" for c in token):
             raise ValueError("Invalid resource guard token")
         self.guard_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -181,12 +271,65 @@ class ResourceManager:
             permit.lease = lease
 
     @asynccontextmanager
+    async def execution_guard(self, token: str, *, owner: str) -> AsyncIterator[ExecutionGuard]:
+        """Acquire the physical guard before a caller's atomic nonblocking admission."""
+
+        descriptor = self._guard(token)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        guard = ExecutionGuard(self, token, owner, descriptor)
+        try:
+            yield guard
+        finally:
+            await guard.aclose()
+
+    @asynccontextmanager
+    async def adopt(
+        self, lease: ResourceLease, guard: ExecutionGuard
+    ) -> AsyncIterator[ResourcePermit]:
+        """Use an atomically admitted lease; its stage owner renews and finalizes it."""
+
+        if (
+            guard.manager is not self
+            or lease.token != guard.token
+            or lease.owner != guard.owner
+            or lease.scope != self.scope
+        ):
+            raise ValueError("Adopted resource lease must match its execution guard and scope")
+        if guard.sealed or guard.closing or guard.closed or guard.descriptor is None:
+            raise ResourceLeaseLost("Cannot execute through a sealed execution guard")
+        if guard.adopted or guard.active_borrowers:
+            raise ValueError("An execution guard can have only one active resource adopter")
+        guard.adopted = True
+        try:
+            if not await self.database.validate_resource_permit(
+                token=lease.token, owner=lease.owner, now_utc_ns=time_ns()
+            ):
+                raise ResourceLeaseLost("Cannot adopt an expired resource permit")
+            permit = ResourcePermit(self, lease, guard.descriptor, execution_guard=guard)
+            context_token = _CURRENT_PERMITS.set((*_CURRENT_PERMITS.get(), permit))
+            try:
+                yield permit
+            finally:
+                permit.closed = True
+                _CURRENT_PERMITS.reset(context_token)
+        finally:
+            guard.adopted = False
+
+    @asynccontextmanager
     async def admit(self, *requests: ResourceRequest) -> AsyncIterator[ResourcePermit]:
         """Reserve every requested budget together; hold no SQLite lock while waiting."""
 
         token = str(uuid4())
         descriptor = self._guard(token)
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(descriptor)
+            raise
         lease: ResourceLease | None = None
         permit: ResourcePermit | None = None
         try:
@@ -281,18 +424,99 @@ def current_resource_manager() -> ResourceManager | None:
     return _CURRENT_MANAGER.get()
 
 
+def _current_permit(
+    manager: ResourceManager, name: str, *, include_reserved: bool = False
+) -> ResourcePermit | None:
+    borrower = (anyio.get_current_task().id, name)
+    for permit in reversed(_CURRENT_PERMITS.get()):
+        if (
+            permit.manager is manager
+            and any(request.name == name for request in permit.lease.allocations)
+            and (
+                include_reserved
+                or permit.execution_guard is not None
+                or borrower in permit.borrowers
+            )
+        ):
+            return permit
+    return None
+
+
+@asynccontextmanager
+async def _borrow_resource(
+    manager: ResourceManager, name: str, *, include_reserved: bool = False
+) -> AsyncIterator[bool]:
+    permit = _current_permit(manager, name, include_reserved=include_reserved)
+    if permit is None:
+        yield False
+        return
+    if permit.closed:
+        raise ResourceLeaseLost("Cannot execute after resource adoption ended")
+    if permit.execution_guard is not None and (
+        permit.execution_guard.sealed or permit.execution_guard.closed
+    ):
+        raise ResourceLeaseLost("Cannot execute after its stage guard was sealed")
+    borrower = (anyio.get_current_task().id, name)
+    if borrower in permit.borrowers:
+        guard = permit.execution_guard
+        if guard is not None:
+            guard.begin_borrow()
+        permit.borrowers[borrower] += 1
+        try:
+            if not await manager.database.validate_resource_permit(
+                token=permit.lease.token, owner=permit.lease.owner, now_utc_ns=time_ns()
+            ):
+                raise ResourceLeaseLost("The current operation no longer owns its resource")
+            yield True
+        finally:
+            permit.borrowers[borrower] -= 1
+            if guard is not None:
+                guard.end_borrow()
+        return
+    # Context variables are inherited by child tasks. Serialize their physical
+    # operations within this reservation instead of letting each reuse one unit.
+    limiter = permit.local_limiters.get(name)
+    if limiter is None:
+        units = next(request.units for request in permit.lease.allocations if request.name == name)
+        limiter = anyio.Semaphore(units)
+        permit.local_limiters[name] = limiter
+    async with limiter:
+        if permit.closed:
+            raise ResourceLeaseLost("Cannot execute after resource adoption ended")
+        guard = permit.execution_guard
+        if guard is not None:
+            guard.begin_borrow()
+        permit.borrowers[borrower] = 1
+        try:
+            if not await manager.database.validate_resource_permit(
+                token=permit.lease.token, owner=permit.lease.owner, now_utc_ns=time_ns()
+            ):
+                raise ResourceLeaseLost("The current operation no longer owns its resource")
+            yield True
+        finally:
+            del permit.borrowers[borrower]
+            if guard is not None:
+                guard.end_borrow()
+
+
 def resource_operation[**P, T](
     name: str,
-) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Awaitable[T]]]:
+) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Coroutine[Any, Any, T]]]:
     """Admit an adapter operation when invoked inside an evidence database scope."""
 
-    def decorate(function: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+    def decorate(function: Callable[P, Awaitable[T]]) -> Callable[P, Coroutine[Any, Any, T]]:
         @wraps(function)
         async def admitted(*args: P.args, **kwargs: P.kwargs) -> T:
             manager = _CURRENT_MANAGER.get()
             if manager is None:
                 return await function(*args, **kwargs)
-            async with manager.admit(ResourceRequest(name=name)):
+            async with _borrow_resource(manager, name) as borrowed:
+                if borrowed:
+                    return await function(*args, **kwargs)
+            async with (
+                manager.admit(ResourceRequest(name=name)),
+                _borrow_resource(manager, name, include_reserved=True),
+            ):
                 return await function(*args, **kwargs)
 
         return admitted
@@ -300,14 +524,11 @@ def resource_operation[**P, T](
     return decorate
 
 
+@resource_operation("cpu")
 async def run_cpu[T](function: Callable[..., T], *args: object) -> T:
     """Keep capacity until the physical thread finishes, including cancellation."""
 
-    manager = _CURRENT_MANAGER.get()
-    if manager is None:
-        return await anyio.to_thread.run_sync(function, *args, abandon_on_cancel=False)
-    async with manager.admit(ResourceRequest(name="cpu")):
-        return await anyio.to_thread.run_sync(function, *args, abandon_on_cancel=False)
+    return await anyio.to_thread.run_sync(function, *args, abandon_on_cancel=False)
 
 
 def guarded_process_arguments(
@@ -315,11 +536,9 @@ def guarded_process_arguments(
 ) -> tuple[tuple[str, ...], tuple[int, ...]]:
     """Retain analysis capacity in an owned supervisor if Carl itself dies."""
 
-    permits = _CURRENT_PERMITS.get()
-    if not permits:
-        return argv, ()
-    permit = permits[-1]
-    if not any(request.name == "analysis" for request in permit.lease.allocations):
+    manager = _CURRENT_MANAGER.get()
+    permit = None if manager is None else _current_permit(manager, "analysis")
+    if permit is None:
         return argv, ()
     executable = argv[0]
     if os.sep in executable and not Path(executable).is_absolute():
