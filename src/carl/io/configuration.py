@@ -3,6 +3,7 @@
 import hashlib
 import io
 import os
+import re
 import secrets
 import stat
 import tomllib
@@ -507,9 +508,17 @@ def openrouteservice_api_key(
     configuration = loaded.configuration.openrouteservice
     if configuration is None:
         raise ConfigurationLoadFailure("openrouteservice_not_configured")
+    return openrouteservice_api_key_from_reference(configuration.credential_id, directories)
+
+
+def openrouteservice_api_key_from_reference(
+    credential_id: str, directories: CarlDirectories
+) -> SecretStr:
+    """Read bounded private key material after CPU preparation selected its public reference."""
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", credential_id) is None:
+        raise ConfigurationLoadFailure("invalid_openrouteservice_credential_reference")
     raw = _read_regular_file(
-        directories.openrouteservice_credential_directory
-        / f"{configuration.credential_id}.api-key",
+        directories.openrouteservice_credential_directory / f"{credential_id}.api-key",
         maximum_bytes=16 * 1024,
         require_private=True,
         failure=ConfigurationLoadFailure,

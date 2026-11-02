@@ -498,8 +498,10 @@ also survives provider teardown failure; a signed image URL expiring after
 capture does not invalidate those retained bytes.
 
 HTTP adapters expose additive `capture`/`capture_form` methods for these stages.
-HTTPX capture retains encoded message content, while Wreq retains its native
-decoded representation. Legacy `acquire` still returns decoded content, but
+HTTPX capture retains encoded message content from raw streams and marks
+already-decoded custom-transport responses explicitly; original encoding headers
+remain available. Wreq retains its native decoded representation. Legacy
+`acquire` still returns decoded content, but
 releases each HTTP hop before requesting CPU admission. It decodes a redirect
 body before following the next hop, preserving malformed-body stopping rules.
 HTTPX received and retained body aggregates are each limited to 100 MB across
@@ -601,7 +603,37 @@ Standalone routing outside `Database.managed` uses an eagerly closed supervised
 worker and a process-local limit of one; it does not share a durable host budget
 or retain a warm graph between calls.
 
-The marketplace and analysis stage adapters are opt-in. Production dispatcher
+Travel estimates use one replayable phase engine for direct service calls and
+queued route refreshes. CPU preparation resolves cache entries and plans each
+individual hosted or local query. GeoNames lookups use CPU admission; local
+matrices borrow a bounded warm OSRM engine. The native gate waits without CPU
+and rechecks availability before dispatch. Hosted requests use HTTP admission,
+then release it before response decoding and CPU publication. No execution
+permit is held while waiting for a persisted pacing deadline.
+
+The private routing cache shares the existing 0.65-second geocode and
+1.6-second matrix pacing across service instances and processes. Its start gate
+rechecks the current lane after HTTP admission; denied polls do not reserve
+additional future starts. Network failures retain a shared 30-second cooldown,
+and selected HTTP failures retain 60 seconds. Cooldown failures still produce
+unavailable estimates immediately. Cache values are bounded at 64 KiB;
+malformed or oversized entries become misses and consume the appropriate
+lookup allowance.
+
+Travel stages retain state in verified external JSON artifacts bounded at
+1 MiB, with small records and identifier continuations. Hosted request plans and
+JSON matrix bodies are prepared under CPU admission. Only a public credential
+reference is retained; key material is read from its private file at dispatch,
+and authorization/cookie headers are redacted from acquisition metadata.
+Transport-exposed and decoded travel bodies are each limited to 1 MiB. Dispatch is charged once
+before the request, so recovery of an unknown outcome cannot repeat it. Saved
+responses resume without another query, retaining their original observation
+timestamps and cache expiry through delayed parsing or publication replay.
+Configuration changes are rechecked before a request and publication; the
+existing origin-change policy, route record schema and cache identities remain
+compatible.
+
+The marketplace, analysis and travel stage adapters are opt-in. Production dispatcher
 cutover is tracked separately;
 the existing foreground runtime remains the default until integration is ready.
 The adapter registry starts no workers, and the resident pool creates no task

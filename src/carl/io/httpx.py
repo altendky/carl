@@ -21,6 +21,8 @@ from carl.io.cleanup import shielded_cleanup
 from carl.io.resource_permits import resource_operation, run_cpu
 
 MAX_ACQUISITION_BODY_BYTES = 100_000_000
+MAX_JSON_REQUEST_BYTES = 1024 * 1024
+_JSON_PROTECTED_REQUEST_HEADERS = frozenset({b"authorization", b"cookie", b"proxy-authorization"})
 
 
 async def close_httpx_client(
@@ -110,6 +112,15 @@ class HttpFormCaptureAcquirer(HttpCaptureAcquirer, HttpFormAcquirer, Protocol):
         plan: RequestPlan,
         fields: tuple[FormField, ...],
         new_identifier: IdentifierFactory,
+    ) -> Acquisition: ...
+
+
+@runtime_checkable
+class HttpJsonCaptureAcquirer(HttpCaptureAcquirer, Protocol):
+    """Capture raw responses to already validated, CPU-prepared JSON request bytes."""
+
+    async def capture_json(
+        self, plan: RequestPlan, content: bytes, new_identifier: IdentifierFactory
     ) -> Acquisition: ...
 
 
@@ -313,6 +324,27 @@ class _HttpxAcquirer:
             raise ValueError("Form acquisition requires POST")
         return await self._execute(plan, new_identifier, form_fields=fields, decode=False)
 
+    async def capture_json(
+        self, plan: RequestPlan, content: bytes, new_identifier: IdentifierFactory
+    ) -> Acquisition:
+        """Send bounded serialized JSON without parsing or retaining its values."""
+
+        content_types = header_values(plan.headers, b"content-type")
+        if plan.method != "POST":
+            raise ValueError("JSON capture requires POST")
+        if (
+            len(content_types) != 1
+            or content_types[0].partition(b";")[0].strip().lower() != b"application/json"
+        ):
+            raise ValueError("JSON capture requires one application/json Content-Type")
+        if not isinstance(content, bytes) or not 0 < len(content) <= MAX_JSON_REQUEST_BYTES:
+            raise ValueError(
+                "JSON capture requires between one byte and 1 MiB of serialized content"
+            )
+        return await self._execute(
+            plan, new_identifier, form_fields=(), decode=False, json_content=content
+        )
+
     async def _execute(
         self,
         plan: RequestPlan,
@@ -320,11 +352,18 @@ class _HttpxAcquirer:
         *,
         form_fields: tuple[FormField, ...],
         decode: bool,
+        json_content: bytes | None = None,
     ) -> Acquisition:
         if self.expected_routing is not None and plan.routing != self.expected_routing:
             raise RouteConfigurationFailure("request_route_does_not_match_acquirer")
         try:
-            return await self._acquire(plan, new_identifier, form_fields=form_fields, decode=decode)
+            return await self._acquire(
+                plan,
+                new_identifier,
+                form_fields=form_fields,
+                decode=decode,
+                json_content=json_content,
+            )
         except AcquisitionFailure as error:
             error.result["routing"] = {
                 "configured": list(plan.routing),
@@ -344,7 +383,13 @@ class _HttpxAcquirer:
         bodies: list[AcquiredBody],
         maximum_bytes: int,
         new_identifier: IdentifierFactory,
-    ) -> tuple[httpx.Response, bytes, int, str]:
+    ) -> tuple[httpx.Response, bytes, int, str, bool]:
+        request_protection = self.protected_request_headers
+        if (
+            request_body_evidence is not None
+            and request_body_evidence.get("kind") == "application/json"
+        ):
+            request_protection |= _JSON_PROTECTED_REQUEST_HEADERS
         actual_headers = _headers(request.headers.raw)
         started_at_utc = datetime.now(UTC).isoformat()
         started = perf_counter_ns()
@@ -352,9 +397,13 @@ class _HttpxAcquirer:
         response: httpx.Response | None = None
         stream: _CompletionTrackingStream | None = None
         body = bytearray()
+        predecoded = False
+        buffered_complete = False
 
         def close_failure(error: Exception) -> AcquisitionFailure:
-            if response is not None and stream is not None and stream.complete:
+            if response is not None and (
+                buffered_complete or (stream is not None and stream.complete)
+            ):
                 headers = _headers(response.headers.raw)
                 encodings = [
                     value.decode("latin-1") for value in header_values(headers, b"content-encoding")
@@ -376,10 +425,12 @@ class _HttpxAcquirer:
                         identifier=identifier,
                         media_type=_content_type(headers),
                         representation={
-                            "kind": "http_message_content",
+                            "kind": "content_decoded_http_body"
+                            if predecoded
+                            else "http_message_content",
                             "http_hop_index": len(hops),
                             "transfer_framing_removed": True,
-                            "content_decoded": False,
+                            "content_decoded": predecoded,
                             "exact_wire_bytes": False,
                             "content_encoding_headers": encodings,
                             "storage_compression": {"kind": "none"},
@@ -392,9 +443,7 @@ class _HttpxAcquirer:
                         "request": {
                             "method": plan.method,
                             "url": str(request.url),
-                            "headers": _header_evidence(
-                                actual_headers, self.protected_request_headers
-                            ),
+                            "headers": _header_evidence(actual_headers, request_protection),
                             "started_at_utc": started_at_utc,
                             "ended_at_utc": datetime.now(UTC).isoformat(),
                             "body": request_body_evidence,
@@ -416,16 +465,29 @@ class _HttpxAcquirer:
 
         try:
             response = await client.send(request, stream=True, follow_redirects=False)
-            if not isinstance(response.stream, httpx.AsyncByteStream):
-                raise RuntimeError("HTTPX returned a synchronous response stream")
-            stream = _CompletionTrackingStream(response.stream)
-            response.stream = stream
+            predecoded = response.is_stream_consumed
+            if not predecoded:
+                if not isinstance(response.stream, httpx.AsyncByteStream):
+                    raise RuntimeError("HTTPX returned a synchronous response stream")
+                stream = _CompletionTrackingStream(response.stream)
+                response.stream = stream
             incomplete_response = _response_metadata(
                 response,
                 0,
                 protected_headers=self.protected_response_headers,
             )
-            async for chunk in response.aiter_raw():
+
+            async def chunks() -> AsyncIterator[bytes]:
+                if predecoded:
+                    # Custom transports may return an already-read Response.
+                    # HTTPX has decoded its content; original encoding headers
+                    # remain evidence, not instructions to decode these bytes.
+                    yield response.content
+                else:
+                    async for chunk in response.aiter_raw():
+                        yield chunk
+
+            async for chunk in chunks():
                 if len(body) + len(chunk) > maximum_bytes:
                     metadata = _response_metadata(
                         response,
@@ -446,9 +508,7 @@ class _HttpxAcquirer:
                             "request": {
                                 "method": plan.method,
                                 "url": str(request.url),
-                                "headers": _header_evidence(
-                                    actual_headers, self.protected_request_headers
-                                ),
+                                "headers": _header_evidence(actual_headers, request_protection),
                                 "started_at_utc": started_at_utc,
                                 "ended_at_utc": datetime.now(UTC).isoformat(),
                                 "body": request_body_evidence,
@@ -465,6 +525,7 @@ class _HttpxAcquirer:
                         bodies=tuple(bodies),
                     )
                 body.extend(chunk)
+            buffered_complete = predecoded
         except AcquisitionFailure:
             raise
         except (
@@ -474,7 +535,7 @@ class _HttpxAcquirer:
             httpcore.ProxyError,
             httpcore.TimeoutException,
         ) as error:
-            if stream is not None and stream.complete:
+            if buffered_complete or (stream is not None and stream.complete):
                 raise close_failure(error) from error
             if incomplete_response is not None:
                 incomplete_response["duration_ns"] = perf_counter_ns() - started
@@ -487,9 +548,7 @@ class _HttpxAcquirer:
                         "request": {
                             "method": plan.method,
                             "url": str(request.url),
-                            "headers": _header_evidence(
-                                actual_headers, self.protected_request_headers
-                            ),
+                            "headers": _header_evidence(actual_headers, request_protection),
                             "started_at_utc": started_at_utc,
                             "ended_at_utc": datetime.now(UTC).isoformat(),
                             "body": request_body_evidence,
@@ -511,7 +570,7 @@ class _HttpxAcquirer:
                 bodies=tuple(bodies),
             ) from error
         except Exception as error:
-            if stream is not None and stream.complete:
+            if buffered_complete or (stream is not None and stream.complete):
                 raise close_failure(error) from error
             raise
         finally:
@@ -526,7 +585,7 @@ class _HttpxAcquirer:
 
         if response is None:
             raise AssertionError("HTTPX returned no response")
-        return response, bytes(body), perf_counter_ns() - started, started_at_utc
+        return response, bytes(body), perf_counter_ns() - started, started_at_utc, predecoded
 
     async def _acquire(
         self,
@@ -535,6 +594,7 @@ class _HttpxAcquirer:
         *,
         form_fields: tuple[FormField, ...],
         decode: bool,
+        json_content: bytes | None = None,
     ) -> Acquisition:
         timeout = httpx.Timeout(
             connect=plan.timeout.connect_seconds,
@@ -542,6 +602,9 @@ class _HttpxAcquirer:
             write=plan.timeout.write_seconds,
             pool=plan.timeout.pool_seconds,
         )
+        request_protection = self.protected_request_headers
+        if json_content is not None:
+            request_protection |= _JSON_PROTECTED_REQUEST_HEADERS
         supplied_headers = [(header.name, header.value) for header in plan.headers]
         if not any(name.lower() == b"accept-encoding" for name, _ in supplied_headers):
             supplied_headers.append(
@@ -549,6 +612,11 @@ class _HttpxAcquirer:
             )
         request_content: bytes | None = None
         request_body_evidence: dict[str, JsonValue] | None = None
+        if json_content is not None:
+            if form_fields:
+                raise ValueError("JSON and form request bodies are mutually exclusive")
+            request_content = json_content
+            request_body_evidence = {"kind": "application/json", "bytes": len(json_content)}
         if form_fields:
             if not any(name.lower() == b"content-type" for name, _ in supplied_headers):
                 supplied_headers.append((b"Content-Type", b"application/x-www-form-urlencoded"))
@@ -583,7 +651,7 @@ class _HttpxAcquirer:
                     content=request_content,
                     timeout=timeout,
                 )
-                response, body, duration_ns, started_at_utc = await self._capture_hop(
+                response, body, duration_ns, started_at_utc, predecoded = await self._capture_hop(
                     client,
                     request,
                     plan=plan,
@@ -633,7 +701,7 @@ class _HttpxAcquirer:
                                 maximum_bytes=MAX_ACQUISITION_BODY_BYTES - total_bytes,
                             )
                         )
-                        if decode
+                        if decode and not predecoded
                         else body
                     )
                 except ContentDecodingError as error:
@@ -648,9 +716,7 @@ class _HttpxAcquirer:
                             "request": {
                                 "method": plan.method,
                                 "url": str(request.url),
-                                "headers": _header_evidence(
-                                    actual_headers, self.protected_request_headers
-                                ),
+                                "headers": _header_evidence(actual_headers, request_protection),
                                 "started_at_utc": started_at_utc,
                                 "ended_at_utc": datetime.now(UTC).isoformat(),
                                 "body": request_body_evidence,
@@ -681,9 +747,7 @@ class _HttpxAcquirer:
                         "request": {
                             "method": plan.method,
                             "url": str(request.url),
-                            "headers": _header_evidence(
-                                actual_headers, self.protected_request_headers
-                            ),
+                            "headers": _header_evidence(actual_headers, request_protection),
                             "started_at_utc": started_at_utc,
                             "ended_at_utc": datetime.now(UTC).isoformat(),
                             "body": request_body_evidence,
@@ -697,11 +761,11 @@ class _HttpxAcquirer:
                         media_type=_content_type(response_headers),
                         representation={
                             "kind": "content_decoded_http_body"
-                            if decode
+                            if decode or predecoded
                             else "http_message_content",
                             "http_hop_index": hop_index,
                             "transfer_framing_removed": True,
-                            "content_decoded": decode,
+                            "content_decoded": decode or predecoded,
                             "exact_wire_bytes": False,
                             "content_encoding_headers": content_encoding_headers,
                             "storage_compression": {"kind": "none"},
@@ -726,7 +790,7 @@ class _HttpxAcquirer:
         if not isinstance(final_response, dict):
             raise AssertionError("Response metadata must be an object")
         record: dict[str, JsonValue] = {
-            "request_plan": plan.as_json(protected_header_names=self.protected_request_headers),
+            "request_plan": plan.as_json(protected_header_names=request_protection),
             "authentication": self.authentication,
             "routing": {
                 "configured": list(plan.routing),

@@ -25,6 +25,7 @@ import anyio
 import httpx
 
 from carl.core.travel import TravelCoordinate
+from carl.io.resource_permits import run_cpu
 
 _SCHEMA_VERSION = 2
 _DATABASE_NAME = "places.sqlite3"
@@ -77,7 +78,7 @@ class LocalGeonamesGeocoder:
         self.database_path = database_path
 
     async def geocode(self, label: str, country_code: str | None) -> TravelCoordinate:
-        return await anyio.to_thread.run_sync(self._geocode, label, country_code)
+        return await run_cpu(self._geocode, label, country_code)
 
     def _geocode(self, label: str, country_code: str | None) -> TravelCoordinate:
         if country_code is not None and _normalize(country_code) not in _COUNTRY_NAMES:
