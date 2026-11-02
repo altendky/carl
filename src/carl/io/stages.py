@@ -3,7 +3,7 @@
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import time_ns
 from typing import Protocol
@@ -23,6 +23,7 @@ from carl.core.models import (
 )
 from carl.core.residents import ResidentLease
 from carl.core.stages import StageClaimResult, StageLease, WaitWork
+from carl.core.work_dispatch import ExpiryCursor
 from carl.core.worker import CompletedWork, RetryWork, TerminalFailureWork
 from carl.io.resource_permits import (
     ExecutionGuard,
@@ -228,6 +229,16 @@ class StageHeartbeat(Protocol):
     def unregister(self, execution: StageExecution) -> None: ...
 
 
+_RECOVERY_PAGE_SIZE = 32
+
+
+@dataclass(slots=True)
+class _StageRecovery:
+    lock: anyio.Lock = field(default_factory=anyio.Lock)
+    after: ExpiryCursor | None = None
+    now_utc_ns: int | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class StageManager:
     database: Database
@@ -244,19 +255,50 @@ class StageManager:
             raise ValueError("Stage renewal interval must precede expiry")
 
     async def recover(self) -> None:
-        """Recover only expired executions whose physical guard can be obtained."""
+        """Advance one bounded recovery page; a busy guard cannot pin the frontier."""
 
-        expired = await self.database.expired_stage_executions(
-            coordination_scope=self.resources.scope, now_utc_ns=self.utc_now_ns()
-        )
-        for lease in expired:
-            try:
-                async with self.resources.execution_guard(
-                    lease.token, owner=lease.work_lease.worker_identifier
-                ):
-                    await self.database.recover_stage_execution(lease, now_utc_ns=self.utc_now_ns())
-            except BlockingIOError:
-                continue
+        state = self.resources.get_or_create_service("stage-expiry-recovery", _StageRecovery)
+        try:
+            state.lock.acquire_nowait()
+        except anyio.WouldBlock:
+            # Another caller owns this short sweep. Admission need not wait for it.
+            await self.resources._recover()
+            return
+        try:
+            if state.now_utc_ns is None:
+                state.now_utc_ns = self.utc_now_ns()
+            page = await self.database.expired_stage_candidates(
+                coordination_scope=self.resources.scope,
+                now_utc_ns=state.now_utc_ns,
+                limit=_RECOVERY_PAGE_SIZE,
+                after=state.after,
+            )
+            for candidate in page.items:
+                try:
+                    async with self.resources.execution_guard(
+                        candidate.token, owner=candidate.worker_identifier
+                    ):
+                        # A lease contains the original work payload. Load it only
+                        # after the matching physical executor has relinquished it.
+                        lease = await self.database.stage_execution_lease(
+                            candidate.stage_identifier,
+                            expected_token=candidate.token,
+                            expected_execution=candidate.execution,
+                            coordination_scope=self.resources.scope,
+                        )
+                        if lease is not None:
+                            await self.database.recover_stage_execution(
+                                lease, now_utc_ns=self.utc_now_ns()
+                            )
+                except BlockingIOError:
+                    pass
+                finally:
+                    state.after = candidate.cursor
+            if not page.has_more:
+                state.after = None
+                state.now_utc_ns = None
+        finally:
+            state.lock.release()
         await self.resources._recover()
 
     async def _renew(self, execution: StageExecution) -> None:
