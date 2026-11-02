@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from getpass import getpass
 from pathlib import Path
-from secrets import randbelow
 from time import perf_counter_ns, time_ns
 from uuid import uuid4
 
@@ -30,10 +29,6 @@ from carl.core.composed_projection import (
 from carl.core.ebay import EbaySearchRequest
 from carl.core.facebook import listing_id_from_url
 from carl.core.facebook_images import (
-    COLLECT_IMAGE_WORK_KIND,
-    COLLECT_IMAGE_WORK_SCHEMA_VERSION,
-    EXTRACT_IMAGE_WORK_KIND,
-    EXTRACT_IMAGE_WORK_SCHEMA_VERSION,
     IMAGE_RATE_MAXIMUM_STARTS,
     CollectImagePayload,
     ExtractImagePayload,
@@ -54,10 +49,6 @@ from carl.core.facebook_search import (
     SearchTraversalPolicy,
 )
 from carl.core.facebook_work import (
-    COLLECT_ITEM_PAYLOAD_SCHEMA_VERSION,
-    COLLECT_ITEM_WORK_KIND,
-    EXTRACT_ITEM_PAYLOAD_SCHEMA_VERSION,
-    EXTRACT_ITEM_WORK_KIND,
     CollectItemPayload,
     CreateSearchRequest,
     FacebookSearchRequest,
@@ -74,8 +65,6 @@ from carl.core.facebook_work import (
 from carl.core.http import RequestPlan
 from carl.core.item_analysis import (
     ANALYSIS_RECIPE_VERSION,
-    ANALYZE_ITEM_WORK_KIND,
-    ANALYZE_ITEM_WORK_SCHEMA_VERSION,
     AnalyzeItemPayload,
     ClaudeEffort,
     ProductGuideDefinition,
@@ -89,68 +78,46 @@ from carl.core.json import encode_json
 from carl.core.models import Header, JsonValue, NamedOutput, RecordDraft
 from carl.core.refresh_recovery import RetryItemFailuresRequest
 from carl.core.routing import BatchItemNetworkProvider, ItemNetworkProvider, NetworkProvider
-from carl.core.work import WorkCapability, WorkRequester, WorkState
-from carl.core.worker import WorkerSettings
-from carl.ebay import collect_configured_ebay_search
+from carl.core.work import WorkRequester, WorkState
 from carl.facebook_analysis_workers import (
     PLAN_FACEBOOK_LISTING_ANALYSIS_EVIDENCE,
     REGISTER_PRODUCT_GUIDE,
-    AnalysisWorkerDependencies,
     build_analysis_component_registry,
-    build_analysis_worker_registry,
 )
 from carl.facebook_image_workers import (
     EXTRACT_FACEBOOK_GALLERY_REFERENCES,
     PLAN_FACEBOOK_IMAGE_FOLLOWUPS,
     REUSE_FACEBOOK_GALLERY_IMAGE,
-    ImageWorkerDependencies,
     build_image_component_registry,
-    build_image_worker_registry,
 )
-from carl.facebook_routed_workers import build_routed_facebook_worker_registry
 from carl.facebook_workers import (
     PLAN_FACEBOOK_ITEM_PAGE_FOLLOWUPS,
-    FacebookWorkerDependencies,
     build_component_registry,
-    build_facebook_worker_registry,
 )
 from carl.io.activity import activity_dashboard
 from carl.io.browser_identity import brave_navigation_headers
 from carl.io.claude import ClaudeCli
 from carl.io.configuration import (
     ConfigurationFailure,
-    decodo_settings,
     import_mullvad_configuration_archive,
     import_proton_configuration,
     load_configuration,
-    mullvad_settings,
-    proton_settings,
 )
 from carl.io.configuration import (
     configure_decodo_credential as store_decodo_credential,
 )
-from carl.io.decodo import DecodoSessionManager, ManagedDecodoHttpAcquirer
-from carl.io.facebook_items import (
-    DecodoFacebookItemSessionFactory,
-    FacebookItemSessionFactory,
-    MullvadFacebookItemSessionFactory,
-)
-from carl.io.httpx import AcquisitionFailure, DirectHttpxAcquirer
+from carl.io.httpx import AcquisitionFailure
 from carl.io.image_files import ImageFileStore
 from carl.io.image_migration import (
     MIGRATE_EXTERNAL_IMAGE_FILES,
     build_image_migration_component_registry,
     externalize_saved_images,
 )
-from carl.io.mullvad import ManagedMullvadHttpAcquirer, MullvadWireproxyManager
-from carl.io.network_activity import NetworkActivityScheduler
 from carl.io.paths import user_directories
 from carl.io.processes import database_process_activity
-from carl.io.proton import ManagedProtonHttpAcquirer, ProtonWireproxyManager
 from carl.io.provenance import collect_code_provenance_async, process_invocation
 from carl.io.route_cutover import cutover_route_overrides as perform_route_cutover
 from carl.io.sqlite import Database
-from carl.io.worker import WorkerRuntimeServices, execute_lease
 from carl.mcp_server import serve_stdio
 from carl.review import ReviewApplication
 from carl.travel_cli import travel_app
@@ -180,10 +147,6 @@ def _saved_image_candidates(
         )
         for identifier, value in results
     )
-
-
-def _sample_uniform_holdoff_ns(minimum_ns: int, maximum_ns: int) -> int:
-    return minimum_ns + randbelow(maximum_ns - minimum_ns + 1)
 
 
 def _repository_root() -> Path:
@@ -655,6 +618,48 @@ def migrate_image_files(*, database: Path = _DEFAULT_DATABASE) -> None:
     _print_work_result(anyio.run(perform, backend="trio"))
 
 
+async def _run_foreground_work(
+    database: Database,
+    identifiers: tuple[str, ...],
+    *,
+    worker_count: int = 1,
+    claude: ClaudeCli | None = None,
+    progress_label: str | None = None,
+) -> list[dict[str, JsonValue]]:
+    """Drive only selected queue work through the common stage runtime."""
+
+    selected = tuple(dict.fromkeys(identifiers))
+    finished = failed = 0
+    for offset in range(0, len(selected), 1000):
+        batch = selected[offset : offset + 1000]
+        remaining = set(batch)
+        async with managed_worker_pool(
+            database,
+            _repository_root(),
+            eligible_identifiers=batch,
+            claude=claude,
+            worker_count=worker_count,
+        ):
+            while remaining:
+                for identifier in tuple(remaining):
+                    state = await database.work_state(identifier)
+                    if state in {WorkState.PENDING, WorkState.LEASED, WorkState.CANCELLING}:
+                        continue
+                    remaining.remove(identifier)
+                    finished += 1
+                    failed += state is not WorkState.COMPLETED
+                    if progress_label is not None and finished % 100 == 0:
+                        print(
+                            f"{progress_label}: {finished}/{len(selected)} "
+                            f"finished, {failed} failed",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                if remaining:
+                    await anyio.sleep(0.1)
+    return [await database.work(identifier) for identifier in identifiers]
+
+
 @app.command
 def collect(
     url: str,
@@ -672,29 +677,6 @@ def collect(
         if not network_route or network_route != network_route.strip():
             raise ValueError("The network route identifier must be nonempty and trimmed")
         network_path = (network_provider.value, "personal", network_route)
-        directories = user_directories()
-        loaded = load_configuration(directories.configuration_file)
-        if network_provider is ItemNetworkProvider.PROTON:
-            route_settings = proton_settings(loaded, directories, network_path)
-            acquirer = ManagedProtonHttpAcquirer(
-                manager=ProtonWireproxyManager(),
-                settings=route_settings,
-            )
-        elif network_provider is ItemNetworkProvider.MULLVAD:
-            mullvad_route_settings = mullvad_settings(loaded, directories, network_path)
-            acquirer = ManagedMullvadHttpAcquirer(
-                manager=MullvadWireproxyManager(),
-                settings=mullvad_route_settings,
-            )
-        else:
-            decodo_route_settings, credential_source = decodo_settings(
-                loaded, directories, network_path
-            )
-            acquirer = ManagedDecodoHttpAcquirer(
-                manager=DecodoSessionManager(),
-                settings=decodo_route_settings,
-                credential_source=credential_source,
-            )
         request_headers = await anyio.to_thread.run_sync(
             _headers,
             headers_json,
@@ -710,29 +692,8 @@ def collect(
             ),
         )
         collection_identifier = _identifier()
-        settings = WorkerSettings(
-            worker_count=1,
-            lease_duration_ns=600_000_000_000,
-            renewal_interval_ns=30_000_000_000,
-            idle_poll_interval_ns=100_000_000,
-        )
         async with Database.managed(database, initialize=True) as evidence_database:
             await _activate_facebook_page_network_policy(evidence_database, network_path)
-            network_activity_scheduler = NetworkActivityScheduler(
-                database=evidence_database,
-                new_identifier=_identifier,
-                utc_now_ns=time_ns,
-                sample_uniform_holdoff_ns=_sample_uniform_holdoff_ns,
-                permit_duration_ns=settings.lease_duration_ns,
-            )
-            registry = build_facebook_worker_registry(
-                FacebookWorkerDependencies(
-                    database=evidence_database,
-                    acquirer=acquirer,
-                    new_identifier=_identifier,
-                    network_activity_scheduler=network_activity_scheduler,
-                )
-            )
             enqueued = await evidence_database.enqueue_work(
                 collect_item_work(
                     identifier=collection_identifier,
@@ -749,54 +710,10 @@ def collect(
                 enqueued_at_utc_ns=time_ns(),
             )
             collection_identifier = enqueued.work_item_identifier
-            services = WorkerRuntimeServices(
-                new_identifier=_identifier,
-                utc_now_ns=time_ns,
-                monotonic_ns=perf_counter_ns,
-                code_provenance=lambda: collect_code_provenance_async(_repository_root()),
-                invocation=process_invocation,
-            )
-            capabilities = (
-                WorkCapability(
-                    kind=COLLECT_ITEM_WORK_KIND,
-                    payload_schema_version=COLLECT_ITEM_PAYLOAD_SCHEMA_VERSION,
-                ),
-                WorkCapability(
-                    kind=EXTRACT_ITEM_WORK_KIND,
-                    payload_schema_version=EXTRACT_ITEM_PAYLOAD_SCHEMA_VERSION,
-                ),
-            )
 
             async def run_until_terminal(identifier: str) -> dict[str, JsonValue]:
-                while await evidence_database.work_state(identifier) in {
-                    WorkState.PENDING,
-                    WorkState.LEASED,
-                }:
-                    claim = await evidence_database.claim_work(
-                        supported_capabilities=capabilities,
-                        worker_identifier=_identifier(),
-                        lease_token=_identifier(),
-                        lease_duration_ns=settings.lease_duration_ns,
-                        utc_now_ns=time_ns,
-                        event_identifier=_identifier(),
-                    )
-                    if claim.lease is not None:
-                        await execute_lease(
-                            database=evidence_database,
-                            registry=registry,
-                            settings=settings,
-                            services=services,
-                            lease=claim.lease,
-                        )
-                        continue
-                    delay_ns = settings.idle_poll_interval_ns
-                    if claim.next_eligible_at_utc_ns is not None:
-                        delay_ns = min(
-                            delay_ns,
-                            max(0, claim.next_eligible_at_utc_ns - time_ns()),
-                        )
-                    await anyio.sleep(delay_ns / 1_000_000_000)
-                return await evidence_database.work(identifier)
+                (work,) = await _run_foreground_work(evidence_database, (identifier,))
+                return work
 
             collection = await run_until_terminal(collection_identifier)
             extraction: dict[str, JsonValue] | None = None
@@ -836,12 +753,6 @@ def collect_search_items(
         if maximum_items is not None and maximum_items < 1:
             raise ValueError("The maximum item count must be positive")
         network_path = (network_provider.value, "personal", network_route)
-        settings = WorkerSettings(
-            worker_count=1,
-            lease_duration_ns=600_000_000_000,
-            renewal_interval_ns=30_000_000_000,
-            idle_poll_interval_ns=100_000_000,
-        )
         async with Database.managed(database) as evidence_database:
             search_runs: list[SearchRunListingCandidates] = []
             for search_run_record_identifier in search_run_record_identifiers:
@@ -991,192 +902,89 @@ def collect_search_items(
                     "reused_classifications": reused_classifications,
                     "new_classifications": {},
                 }
-            directories = user_directories()
-            loaded = load_configuration(directories.configuration_file)
-            factory: FacebookItemSessionFactory
-            if network_provider is BatchItemNetworkProvider.DECODO:
-                route_settings, credential_source = decodo_settings(
-                    loaded, directories, network_path
-                )
-                factory = DecodoFacebookItemSessionFactory(
-                    manager=DecodoSessionManager(),
-                    settings=route_settings,
-                    credential_source=credential_source,
-                )
-            else:
-                mullvad_route_settings = mullvad_settings(loaded, directories, network_path)
-                factory = MullvadFacebookItemSessionFactory(
-                    manager=MullvadWireproxyManager(),
-                    settings=mullvad_route_settings,
-                )
             request_headers = await anyio.to_thread.run_sync(
                 brave_navigation_headers,
                 abandon_on_cancel=True,
             )
             await _activate_facebook_page_network_policy(evidence_database, network_path)
-            network_activity_scheduler = NetworkActivityScheduler(
-                database=evidence_database,
-                new_identifier=_identifier,
-                utc_now_ns=time_ns,
-                sample_uniform_holdoff_ns=_sample_uniform_holdoff_ns,
-                permit_duration_ns=settings.lease_duration_ns,
-            )
-            network_session_identifier = _identifier()
-            async with factory(network_session_identifier) as session:
-                registry = build_facebook_worker_registry(
-                    FacebookWorkerDependencies(
-                        database=evidence_database,
-                        acquirer=session.acquirer,
-                        new_identifier=_identifier,
-                        network_activity_scheduler=network_activity_scheduler,
-                        network_session_identifier=network_session_identifier,
-                    )
+            collection_identifiers: list[str] = []
+            for decision in collection_decisions:
+                payload = CollectItemPayload(
+                    listing_id=decision.listing_id,
+                    request_plan=RequestPlan(
+                        url=(f"https://www.facebook.com/marketplace/item/{decision.listing_id}/"),
+                        headers=request_headers,
+                        routing=network_path,
+                    ),
                 )
-                collection_identifiers: list[str] = []
-                for decision in collection_decisions:
-                    payload = CollectItemPayload(
-                        listing_id=decision.listing_id,
-                        request_plan=RequestPlan(
-                            url=(
-                                f"https://www.facebook.com/marketplace/item/{decision.listing_id}/"
-                            ),
-                            headers=request_headers,
-                            routing=network_path,
-                        ),
-                    )
-                    definition = collect_item_work(
-                        identifier=_identifier(),
-                        payload=payload,
-                        not_before_utc_ns=0,
-                    )
-                    collection_identifier: str | None = None
-                    for search_run_record_identifier in decision.search_run_record_identifiers:
-                        enqueued = await evidence_database.enqueue_work(
-                            definition,
-                            WorkRequester(
-                                request_identifier=_identifier(),
-                                kind=("carl", "facebook", "search_run"),
-                                identifier=search_run_record_identifier,
-                                context={
-                                    "listing_identifier": decision.listing_id,
-                                    "selection": "no_successful_item_page_result",
-                                    "followup_plan_record_identifier": (
-                                        followup_plan_record_identifier
-                                    ),
-                                    "invocation": process_invocation(),
-                                },
-                            ),
-                            event_identifier=_identifier(),
-                            enqueued_at_utc_ns=time_ns(),
-                        )
-                        if collection_identifier is None:
-                            collection_identifier = enqueued.work_item_identifier
-                        elif collection_identifier != enqueued.work_item_identifier:
-                            raise RuntimeError("Item-page requesters did not share one work item")
-                    plan_request = await evidence_database.enqueue_work(
+                definition = collect_item_work(
+                    identifier=_identifier(),
+                    payload=payload,
+                    not_before_utc_ns=0,
+                )
+                collection_identifier: str | None = None
+                for search_run_record_identifier in decision.search_run_record_identifiers:
+                    enqueued = await evidence_database.enqueue_work(
                         definition,
                         WorkRequester(
                             request_identifier=_identifier(),
-                            kind=("carl", "facebook", "item_page_followup_plan"),
-                            identifier=followup_plan_record_identifier,
+                            kind=("carl", "facebook", "search_run"),
+                            identifier=search_run_record_identifier,
                             context={
                                 "listing_identifier": decision.listing_id,
-                                "search_run_record_identifiers": list(
-                                    decision.search_run_record_identifiers
+                                "selection": "no_successful_item_page_result",
+                                "followup_plan_record_identifier": (
+                                    followup_plan_record_identifier
                                 ),
+                                "invocation": process_invocation(),
                             },
                         ),
                         event_identifier=_identifier(),
                         enqueued_at_utc_ns=time_ns(),
                     )
-                    if (
-                        collection_identifier is not None
-                        and collection_identifier != plan_request.work_item_identifier
-                    ):
-                        raise RuntimeError("Follow-up plan did not share the item work")
-                    collection_identifier = plan_request.work_item_identifier
                     if collection_identifier is None:
-                        raise AssertionError("A listing decision has no search-run requester")
-                    collection_identifiers.append(collection_identifier)
-
-                services = WorkerRuntimeServices(
-                    new_identifier=_identifier,
-                    utc_now_ns=time_ns,
-                    monotonic_ns=perf_counter_ns,
-                    code_provenance=lambda: collect_code_provenance_async(_repository_root()),
-                    invocation=process_invocation,
-                )
-
-                async def run_until_terminal(
-                    identifiers: list[str], capability: WorkCapability
-                ) -> list[dict[str, JsonValue]]:
-                    remaining = {
-                        identifier
-                        for identifier in identifiers
-                        if await evidence_database.work_state(identifier)
-                        in {WorkState.PENDING, WorkState.LEASED}
-                    }
-                    while remaining:
-                        claim = await evidence_database.claim_work(
-                            supported_capabilities=(capability,),
-                            worker_identifier=_identifier(),
-                            lease_token=_identifier(),
-                            lease_duration_ns=settings.lease_duration_ns,
-                            utc_now_ns=time_ns,
-                            event_identifier=_identifier(),
-                            eligible_identifiers=tuple(remaining),
-                        )
-                        if claim.lease is not None:
-                            await execute_lease(
-                                database=evidence_database,
-                                registry=registry,
-                                settings=settings,
-                                services=services,
-                                lease=claim.lease,
-                            )
-                            if (
-                                claim.lease.work_item_identifier in remaining
-                                and await evidence_database.work_state(
-                                    claim.lease.work_item_identifier
-                                )
-                                not in {WorkState.PENDING, WorkState.LEASED}
-                            ):
-                                remaining.remove(claim.lease.work_item_identifier)
-                            continue
-                        delay_ns = settings.idle_poll_interval_ns
-                        if claim.next_eligible_at_utc_ns is not None:
-                            delay_ns = min(
-                                delay_ns,
-                                max(0, claim.next_eligible_at_utc_ns - time_ns()),
-                            )
-                        await anyio.sleep(delay_ns / 1_000_000_000)
-                    return [await evidence_database.work(identifier) for identifier in identifiers]
-
-                collections = await run_until_terminal(
-                    collection_identifiers,
-                    WorkCapability(
-                        kind=COLLECT_ITEM_WORK_KIND,
-                        payload_schema_version=COLLECT_ITEM_PAYLOAD_SCHEMA_VERSION,
+                        collection_identifier = enqueued.work_item_identifier
+                    elif collection_identifier != enqueued.work_item_identifier:
+                        raise RuntimeError("Item-page requesters did not share one work item")
+                plan_request = await evidence_database.enqueue_work(
+                    definition,
+                    WorkRequester(
+                        request_identifier=_identifier(),
+                        kind=("carl", "facebook", "item_page_followup_plan"),
+                        identifier=followup_plan_record_identifier,
+                        context={
+                            "listing_identifier": decision.listing_id,
+                            "search_run_record_identifiers": list(
+                                decision.search_run_record_identifiers
+                            ),
+                        },
                     ),
+                    event_identifier=_identifier(),
+                    enqueued_at_utc_ns=time_ns(),
                 )
-                extraction_identifiers = [
-                    extraction_identifier
-                    for collection in collections
-                    if isinstance(collection.get("result"), dict)
-                    and isinstance(
-                        extraction_identifier := collection["result"].get(
-                            "extraction_work_identifier"
-                        ),
-                        str,
-                    )
-                ]
-                extractions = await run_until_terminal(
-                    extraction_identifiers,
-                    WorkCapability(
-                        kind=EXTRACT_ITEM_WORK_KIND,
-                        payload_schema_version=EXTRACT_ITEM_PAYLOAD_SCHEMA_VERSION,
-                    ),
+                if (
+                    collection_identifier is not None
+                    and collection_identifier != plan_request.work_item_identifier
+                ):
+                    raise RuntimeError("Follow-up plan did not share the item work")
+                collection_identifier = plan_request.work_item_identifier
+                if collection_identifier is None:
+                    raise AssertionError("A listing decision has no search-run requester")
+                collection_identifiers.append(collection_identifier)
+
+            collections = await _run_foreground_work(
+                evidence_database, tuple(collection_identifiers)
+            )
+            extraction_identifiers = tuple(
+                extraction_identifier
+                for collection in collections
+                if isinstance(collection.get("result"), dict)
+                and isinstance(
+                    extraction_identifier := collection["result"].get("extraction_work_identifier"),
+                    str,
                 )
+            )
+            extractions = await _run_foreground_work(evidence_database, extraction_identifiers)
             new_classifications: dict[str, int] = {}
             for extraction in extractions:
                 result = extraction.get("result")
@@ -1197,7 +1005,7 @@ def collect_search_items(
                 "followup_plan_record_identifier": followup_plan_record_identifier,
                 "search_run_record_identifiers": list(search_run_record_identifiers),
                 "network_path": list(network_path),
-                "network_session_identifier": network_session_identifier,
+                "network_session_identifier": None,
                 "listing_references": plan.listing_references,
                 "unique_listings": plan.unique_listings,
                 "selected_items": len(plan.decisions),
@@ -1266,12 +1074,6 @@ def collect_images(
             "personal",
             selected_route,
         )
-        settings = WorkerSettings(
-            worker_count=8,
-            lease_duration_ns=600_000_000_000,
-            renewal_interval_ns=30_000_000_000,
-            idle_poll_interval_ns=100_000_000,
-        )
         async with Database.managed(database) as evidence_database:
             listing_ids: list[str] = []
             for search_run_identifier in search_run_record_identifiers:
@@ -1330,56 +1132,9 @@ def collect_images(
                 resumed_identifiers.extend(pending_extractions[key])
             resumed_results: list[dict[str, JsonValue]] = []
             if resumed_identifiers:
-                offline_registry = build_image_worker_registry(
-                    ImageWorkerDependencies(
-                        database=evidence_database,
-                        acquirer=DirectHttpxAcquirer(),
-                        image_files=ImageFileStore(evidence_database.path.parent),
-                        new_identifier=_identifier,
-                    )
+                resumed_results = await _run_foreground_work(
+                    evidence_database, tuple(resumed_identifiers), worker_count=8
                 )
-                offline_services = WorkerRuntimeServices(
-                    new_identifier=_identifier,
-                    utc_now_ns=time_ns,
-                    monotonic_ns=perf_counter_ns,
-                    code_provenance=lambda: collect_code_provenance_async(_repository_root()),
-                    invocation=process_invocation,
-                )
-                remaining_resumptions = set(resumed_identifiers)
-                while remaining_resumptions:
-                    claim = await evidence_database.claim_work(
-                        supported_capabilities=(
-                            WorkCapability(
-                                kind=EXTRACT_IMAGE_WORK_KIND,
-                                payload_schema_version=EXTRACT_IMAGE_WORK_SCHEMA_VERSION,
-                            ),
-                        ),
-                        worker_identifier=_identifier(),
-                        lease_token=_identifier(),
-                        lease_duration_ns=settings.lease_duration_ns,
-                        utc_now_ns=time_ns,
-                        event_identifier=_identifier(),
-                        eligible_identifiers=tuple(remaining_resumptions),
-                    )
-                    if claim.lease is not None:
-                        await execute_lease(
-                            database=evidence_database,
-                            registry=offline_registry,
-                            settings=settings,
-                            services=offline_services,
-                            lease=claim.lease,
-                        )
-                    else:
-                        await anyio.sleep(settings.idle_poll_interval_ns / 1_000_000_000)
-                    remaining_resumptions = {
-                        identifier
-                        for identifier in remaining_resumptions
-                        if await evidence_database.work_state(identifier)
-                        in {WorkState.PENDING, WorkState.LEASED}
-                    }
-                resumed_results = [
-                    await evidence_database.work(identifier) for identifier in resumed_identifiers
-                ]
             resumed_saved = sum(
                 result["state"] == WorkState.COMPLETED.value for result in resumed_results
             )
@@ -1615,11 +1370,6 @@ def collect_images(
                 at_utc_ns=time_ns(),
                 reason="Apply bounded image sessions and retain network pacing",
             )
-            registry = build_routed_facebook_worker_registry(
-                database=evidence_database,
-                directories=user_directories(),
-                new_identifier=_identifier,
-            )
             collection_identifiers: list[str] = []
             for entries in selected:
                 reference_identifier, reference = entries[0]
@@ -1663,92 +1413,11 @@ def collect_images(
                 if collection_identifier is None:
                     raise AssertionError("Selected image has no reference")
                 collection_identifiers.append(collection_identifier)
-            services = WorkerRuntimeServices(
-                new_identifier=_identifier,
-                utc_now_ns=time_ns,
-                monotonic_ns=perf_counter_ns,
-                code_provenance=lambda: collect_code_provenance_async(_repository_root()),
-                invocation=process_invocation,
-            )
-
-            async def run_until_terminal(
-                identifiers: list[str], capability: WorkCapability
-            ) -> list[dict[str, JsonValue]]:
-                remaining = {
-                    identifier
-                    for identifier in identifiers
-                    if await evidence_database.work_state(identifier)
-                    in {WorkState.PENDING, WorkState.LEASED}
-                }
-                finished = 0
-                failed = 0
-
-                async def observe_finished_elsewhere() -> None:
-                    nonlocal finished, failed
-                    for identifier in tuple(remaining):
-                        state = await evidence_database.work_state(identifier)
-                        if state in {WorkState.PENDING, WorkState.LEASED}:
-                            continue
-                        if identifier not in remaining:
-                            continue
-                        remaining.remove(identifier)
-                        finished += 1
-                        if state is not WorkState.COMPLETED:
-                            failed += 1
-
-                async def worker() -> None:
-                    nonlocal finished, failed
-                    while remaining:
-                        await observe_finished_elsewhere()
-                        if not remaining:
-                            return
-                        claim = await evidence_database.claim_work(
-                            supported_capabilities=(capability,),
-                            worker_identifier=_identifier(),
-                            lease_token=_identifier(),
-                            lease_duration_ns=settings.lease_duration_ns,
-                            utc_now_ns=time_ns,
-                            event_identifier=_identifier(),
-                            eligible_identifiers=tuple(remaining),
-                        )
-                        if claim.lease is None:
-                            await anyio.sleep(settings.idle_poll_interval_ns / 1_000_000_000)
-                            continue
-                        await execute_lease(
-                            database=evidence_database,
-                            registry=registry,
-                            settings=settings,
-                            services=services,
-                            lease=claim.lease,
-                        )
-                        state = await evidence_database.work_state(claim.lease.work_item_identifier)
-                        if (
-                            state not in {WorkState.PENDING, WorkState.LEASED}
-                            and claim.lease.work_item_identifier in remaining
-                        ):
-                            remaining.remove(claim.lease.work_item_identifier)
-                            finished += 1
-                            if state is not WorkState.COMPLETED:
-                                failed += 1
-                            if finished % 100 == 0:
-                                print(
-                                    f"{capability.kind[-1]}: {finished}/{len(identifiers)} "
-                                    f"finished, {failed} failed",
-                                    file=sys.stderr,
-                                    flush=True,
-                                )
-
-                async with anyio.create_task_group() as group:
-                    for _ in range(min(settings.worker_count, len(remaining))):
-                        group.start_soon(worker)
-                return [await evidence_database.work(identifier) for identifier in identifiers]
-
-            collections = await run_until_terminal(
-                collection_identifiers,
-                WorkCapability(
-                    kind=COLLECT_IMAGE_WORK_KIND,
-                    payload_schema_version=COLLECT_IMAGE_WORK_SCHEMA_VERSION,
-                ),
+            collections = await _run_foreground_work(
+                evidence_database,
+                tuple(collection_identifiers),
+                worker_count=8,
+                progress_label="collect_image",
             )
             saved_count = sum(
                 collection.get("state") == WorkState.COMPLETED.value
@@ -1800,12 +1469,6 @@ def analyze_items(
         if any(not identifier.isdecimal() for identifier in listing_identifiers):
             raise ValueError("Listing IDs must be decimal strings")
         claude = ClaudeCli(claude_executable)
-        settings = WorkerSettings(
-            worker_count=worker_count,
-            lease_duration_ns=900_000_000_000,
-            renewal_interval_ns=30_000_000_000,
-            idle_poll_interval_ns=100_000_000,
-        )
         async with Database.managed(database) as evidence_database:
             guide_record_identifier = await _ensure_product_guide(
                 evidence_database, product_guide_definition(product_guide)
@@ -2018,68 +1681,12 @@ def analyze_items(
                     "skipped_missing_images": skipped_missing_images,
                     "skipped_unavailable": skipped_unavailable,
                 }
-            registry = build_analysis_worker_registry(
-                AnalysisWorkerDependencies(
-                    database=evidence_database,
-                    claude=claude,
-                    new_identifier=_identifier,
-                )
+            completed = await _run_foreground_work(
+                evidence_database,
+                tuple(work_identifiers),
+                worker_count=worker_count,
+                claude=claude,
             )
-            services = WorkerRuntimeServices(
-                new_identifier=_identifier,
-                utc_now_ns=time_ns,
-                monotonic_ns=perf_counter_ns,
-                code_provenance=lambda: collect_code_provenance_async(_repository_root()),
-                invocation=process_invocation,
-            )
-            remaining = set(work_identifiers)
-
-            async def worker() -> None:
-                worker_identifier = _identifier()
-                while remaining:
-                    claim = await evidence_database.claim_work(
-                        supported_capabilities=(
-                            WorkCapability(
-                                kind=ANALYZE_ITEM_WORK_KIND,
-                                payload_schema_version=ANALYZE_ITEM_WORK_SCHEMA_VERSION,
-                            ),
-                        ),
-                        worker_identifier=worker_identifier,
-                        lease_token=_identifier(),
-                        lease_duration_ns=settings.lease_duration_ns,
-                        utc_now_ns=time_ns,
-                        event_identifier=_identifier(),
-                        eligible_identifiers=tuple(remaining),
-                    )
-                    if claim.lease is not None:
-                        await execute_lease(
-                            database=evidence_database,
-                            registry=registry,
-                            settings=settings,
-                            services=services,
-                            lease=claim.lease,
-                        )
-                        state = await evidence_database.work_state(claim.lease.work_item_identifier)
-                        if state not in {WorkState.PENDING, WorkState.LEASED}:
-                            remaining.discard(claim.lease.work_item_identifier)
-                        continue
-                    remaining.intersection_update(
-                        {
-                            identifier
-                            for identifier in tuple(remaining)
-                            if await evidence_database.work_state(identifier)
-                            in {WorkState.PENDING, WorkState.LEASED}
-                        }
-                    )
-                    if remaining:
-                        await anyio.sleep(settings.idle_poll_interval_ns / 1_000_000_000)
-
-            async with anyio.create_task_group() as task_group:
-                for _ in range(min(settings.worker_count, len(remaining))):
-                    task_group.start_soon(worker)
-            completed = [
-                await evidence_database.work(identifier) for identifier in work_identifiers
-            ]
             failures = sum(work["state"] != WorkState.COMPLETED.value for work in completed)
             return {
                 "state": "completed" if failures == 0 else "terminal_failure",
@@ -2108,19 +1715,29 @@ def ebay_search(
     """Collect and extract a bounded eBay search traversal through a configured stack."""
 
     async def perform() -> dict[str, JsonValue]:
-        directories = user_directories()
         async with Database.managed(database, initialize=True) as evidence_database:
-            return await collect_configured_ebay_search(
-                evidence_database,
-                directories=directories,
-                request=EbaySearchRequest(
+            application = ReviewApplication(
+                database=evidence_database,
+                repository_root=_repository_root(),
+            )
+            queued = await application.create_ebay_search(
+                EbaySearchRequest(
                     query=query,
                     stack_identifier=stack,
                     maximum_pages=maximum_pages,
-                ),
+                )
             )
+            (work,) = await _run_foreground_work(evidence_database, (queued.work_identifier,))
+            result = work.get("result")
+            if work.get("state") != WorkState.COMPLETED.value or not isinstance(result, dict):
+                return work
+            return result
 
-    _print_json(anyio.run(perform, backend="trio"))
+    result = anyio.run(perform, backend="trio")
+    if result.get("state") in {"terminal_failure", "cancelled"}:
+        _print_work_result(result)
+    else:
+        _print_json(result)
 
 
 @app.command
@@ -2239,12 +1856,6 @@ def extract_image(acquisition_record_id: str, *, database: Path = _DEFAULT_DATAB
     """Validate a saved image response again without making an HTTP request."""
 
     async def perform() -> dict[str, JsonValue]:
-        settings = WorkerSettings(
-            worker_count=1,
-            lease_duration_ns=600_000_000_000,
-            renewal_interval_ns=30_000_000_000,
-            idle_poll_interval_ns=100_000_000,
-        )
         async with Database.managed(database) as evidence_database:
             kind, _, acquisition = await evidence_database.get_record(acquisition_record_id)
             if kind != ("carl", "http", "acquisition") or not isinstance(acquisition, dict):
@@ -2270,49 +1881,10 @@ def extract_image(acquisition_record_id: str, *, database: Path = _DEFAULT_DATAB
                 event_identifier=_identifier(),
                 enqueued_at_utc_ns=time_ns(),
             )
-            registry = build_image_worker_registry(
-                ImageWorkerDependencies(
-                    database=evidence_database,
-                    acquirer=DirectHttpxAcquirer(),
-                    image_files=ImageFileStore(evidence_database.path.parent),
-                    new_identifier=_identifier,
-                )
+            (work,) = await _run_foreground_work(
+                evidence_database, (enqueued.work_item_identifier,)
             )
-            services = WorkerRuntimeServices(
-                new_identifier=_identifier,
-                utc_now_ns=time_ns,
-                monotonic_ns=perf_counter_ns,
-                code_provenance=lambda: collect_code_provenance_async(_repository_root()),
-                invocation=process_invocation,
-            )
-            while await evidence_database.work_state(enqueued.work_item_identifier) in {
-                WorkState.PENDING,
-                WorkState.LEASED,
-            }:
-                claim = await evidence_database.claim_work(
-                    supported_capabilities=(
-                        WorkCapability(
-                            kind=EXTRACT_IMAGE_WORK_KIND,
-                            payload_schema_version=EXTRACT_IMAGE_WORK_SCHEMA_VERSION,
-                        ),
-                    ),
-                    worker_identifier=_identifier(),
-                    lease_token=_identifier(),
-                    lease_duration_ns=settings.lease_duration_ns,
-                    utc_now_ns=time_ns,
-                    event_identifier=_identifier(),
-                )
-                if claim.lease is not None:
-                    await execute_lease(
-                        database=evidence_database,
-                        registry=registry,
-                        settings=settings,
-                        services=services,
-                        lease=claim.lease,
-                    )
-                else:
-                    await anyio.sleep(settings.idle_poll_interval_ns / 1_000_000_000)
-            return await evidence_database.work(enqueued.work_item_identifier)
+            return work
 
     _print_work_result(anyio.run(perform, backend="trio"))
 

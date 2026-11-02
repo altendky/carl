@@ -655,9 +655,9 @@ validation before activation. Unknown cleanup quarantines the owner and guards
 and invalidates its CPU borrow. A root task releases quarantined handles only
 after physical exit is proven. Abrupt supervisor death protects the direct
 command with a parent-death signal but cannot prove arbitrary descendants have
-exited, so admission remains occupied. Explicit dataset setup now uses these
-owned phases. Its runnable-stage adapter remains opt-in until the shared worker
-runtime cutover.
+exited, so admission remains occupied. Explicit and queued dataset setup use these
+owned phases. Each worker-pool lifetime owns a fresh queued dataset service and
+closes it while the database and provider transports remain available.
 
 Dataset workflow ownership uses the existing global travel-data build lock
 across providers, foreground commands, workers and activation. A private bounded
@@ -738,11 +738,49 @@ Configuration changes are rechecked before a request and publication; the
 existing origin-change policy, route record schema and cache identities remain
 compatible.
 
-The marketplace, analysis and travel stage adapters are opt-in. Production dispatcher
-cutover is tracked separately;
-the existing foreground runtime remains the default until integration is ready.
-The adapter registry starts no workers, and the resident pool creates no task
-for work that fails nonblocking admission.
+The shared production runtime dispatches marketplace, analysis, coordinator,
+travel and dataset stages. Discovery reads at most 32 metadata rows per page,
+advances past blocked candidates, and point-loads only selected work. Atomic
+SQLite admission reserves every stage resource together; unavailable resources,
+time gates and child dependencies leave durable pending stages. Those waits
+hold no execution permit. A continuation keeps its logical operation and attempt;
+a real acquisition retry starts a new attempt and retains the existing request
+budget and outage exemptions. Captured responses and model output are checkpointed
+before later CPU admission, so offline replay does not repeat a paid request.
+
+Default shared capacities per database and host coordination scope are 25 HTTP
+requests, 4 CPU units and 10 analysis processes. The dispatcher has 39 fixed
+execution runners plus 4 resource-free coordinator runners; an explicit foreground
+worker count can reduce the execution runners. Zero-buffer handoffs and a bounded
+in-flight identifier set prevent queue length from creating tasks. Capacity snapshots
+only delay candidates; atomic admission and physical execution guards remain
+authoritative. Recovery runs even when the snapshots show every resource occupied.
+Existing durable work-kind, route, rate and sharing constraints still apply as
+additional admission policy. These capacities are upper bounds; a legacy whole-work
+cap can also defer an offline continuation of the same kind while peer work is live.
+
+Stateful marketplace requests run in separate serial actors, bounded by 32 resident
+sessions and 128 MiB of reserved state, with at most 4 MiB per actor. They retain
+session ownership between phases while releasing HTTP and CPU permits. Idle actors
+park after 30 seconds; uncertain transport cleanup remains quarantined and charged.
+Transport failures publish their evidence before a resource-free review stage asks
+one coalescing background task to probe connectivity. Durable outage pauses resume
+after restart without holding HTTP or CPU while probing.
+
+`carl work`, `carl monitor --work` and explicit foreground collection/analysis
+commands own this same scoped runtime. Foreground commands drive only their selected
+work identifiers and explicitly selected follow-on phases. MCP servers start no
+workers implicitly. Legacy queued payload versions remain supported; expired legacy
+claims are recovered in bounded pages before stage registration. Shutdown stops
+discovery, joins execution and session owners, and closes provider transports last.
+
+Priority and eligibility ordering still apply. Request/workspace fairness and
+event-driven dependency wakeups are separate follow-ups; this runtime uses bounded
+polling. Coordinator image-validation phases reserve CPU before reading saved
+bytes. Analysis-batch and listing-pipeline turns conservatively reserve CPU because
+their guide lookup reads retained text. A large refresh/history can still make one
+CPU turn long or materialize large metadata sets; fixed dispatcher task counts do
+not imply a hard whole-process memory bound or bounded CPU-turn duration.
 
 SQLite is the durable source of pending work. A claim uses a short transaction
 to assign a lease token, worker identity, and expiration time. Processing occurs
@@ -1658,20 +1696,19 @@ An image-reference record comes only from the target listing's gallery fragment
 and retains listing ID, source acquisition and block path, original URL, role,
 gallery order, source photo ID, and declared dimensions. The bounded
 `collect-images` command selects references from the latest usable item-page
-result per listing and consumes selected references using a mandatory Proton
-activity. It retains the request, response status, headers, timing, routing, and
-transfer outcome for every attempt. Response bytes remain transient until
-content decoding and image validation succeed.
+result per listing and consumes selected references through the configured
+Decodo (default) or Proton route. It retains the request, response status,
+headers, timing, routing, and transfer outcome for every attempt. Captured response
+bytes are checkpointed before CPU admission for decoding and image validation.
 
 The initial image policy allowed one active image activity, 12 starts per
 minute, and a persisted random 2–5 second holdoff. Its definitions and past
-admissions remain retained after supersession. The current policy admits only
-one image collection work item at a time across all Carl processes before it
-opens an exclusive Proton session. This prevents independent worker processes
-from racing on the WireGuard device and port-allocation locks. Network activity
-has a separate upper bound of eight, caps starts at three per second and 180 per
-minute across CDN hosts, and records a 0–100 ms random holdoff; the serialized
-per-item session path currently makes the work limit authoritative. The per-path
+admissions remain retained after supersession. Current Facebook image work and
+image network activity each have an upper bound of 25, while shared HTTP resource
+admission also caps active requests across Facebook, eBay and other stages at 25.
+The runtime owns shared provider transports through shutdown. Image activity caps
+starts at three per second and 180 per minute across CDN hosts, and records a
+0–100 ms random holdoff. The per-path
 limit is also 180 per minute and is shared with other traffic on that route. Earlier search
 and item-page limits were scoped to the whole route and inadvertently slowed
 CDN requests; they are retired. Marketplace pages now have a separate

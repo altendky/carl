@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import Field
 
 from carl.core.models import StrictModel
+from carl.core.resources import ResourceRequest
 from carl.core.work import WorkCapability, WorkDefinition, WorkState
 
 
@@ -28,6 +29,7 @@ class DispatchCandidate(StrictModel):
     stage_kind: tuple[str, ...] | None = None
     stage_schema_version: int | None = None
     resident_session_identifier: str | None = None
+    stage_resources: tuple[ResourceRequest, ...] = ()
 
     @property
     def cursor(self) -> DispatchCursor:

@@ -50,6 +50,7 @@ __all__ = [
     "DatasetWorkflowOwner",
     "DatasetWorkflowService",
     "get_dataset_workflow_service",
+    "managed_dataset_workflow_service",
     "open_dataset_workflow",
 ]
 
@@ -282,6 +283,8 @@ class DatasetWorkflowService:
         registry_for_owner: Callable[[DatasetWorkflowOwner], StageHandlerRegistry],
         provenance: CodeProvenance,
         invocation: dict[str, JsonValue],
+        *,
+        _register_root_closer: bool = True,
     ) -> None:
         self.manager = manager
         self.directories = directories
@@ -293,7 +296,8 @@ class DatasetWorkflowService:
         self._done = anyio.Event()
         self._done.set()
         self._closing = False
-        manager.resources.register_closer("dataset-workflow", self.aclose)
+        if _register_root_closer:
+            manager.resources.register_closer("dataset-workflow", self.aclose)
 
     async def submit(
         self,
@@ -511,3 +515,30 @@ def get_dataset_workflow_service(
             manager, directories, registry_for_owner, provenance, invocation
         ),
     )
+
+
+@asynccontextmanager
+async def managed_dataset_workflow_service(
+    manager: StageManager,
+    directories: CarlDirectories,
+    registry_for_owner: Callable[[DatasetWorkflowOwner], StageHandlerRegistry],
+    provenance: CodeProvenance,
+    invocation: dict[str, JsonValue],
+) -> AsyncGenerator[DatasetWorkflowService]:
+    """Own a fresh queued dataset service for one worker runtime lifetime."""
+
+    if current_resource_manager() is not manager.resources:
+        raise DatasetWorkflowError("Dataset workflow service requires its managed database scope")
+    service = DatasetWorkflowService(
+        manager,
+        directories,
+        registry_for_owner,
+        provenance,
+        invocation,
+        _register_root_closer=False,
+    )
+    try:
+        yield service
+    finally:
+        with anyio.CancelScope(shield=True):
+            await service.aclose()

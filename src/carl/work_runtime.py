@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from functools import partial
 from pathlib import Path
 from time import perf_counter_ns, time_ns
 from uuid import uuid4
@@ -17,6 +16,7 @@ from carl.analysis_batch_workers import (
     AnalysisBatchWorkerDependencies,
     build_analysis_batch_worker_registry,
 )
+from carl.coordinator_stages import build_coordinator_stage_registry
 from carl.core.analysis_batch import request_missing_analyses_work_constraints
 from carl.core.components import Component, ComponentId
 from carl.core.ebay import ebay_search_work_constraint
@@ -39,14 +39,23 @@ from carl.core.facebook_work import (
 from carl.core.item_analysis import analysis_work_constraints
 from carl.core.marketplace_images import marketplace_image_network_constraint
 from carl.core.pipeline import pipeline_work_constraints
-from carl.core.worker import WorkerSettings
+from carl.core.resources import ResourceRequest
+from carl.dataset_setup_stages import (
+    OWNED_STAGE_KIND,
+    build_dataset_setup_owned_registry,
+    build_dataset_setup_prepare_registry,
+    submit_dataset_setup_stage,
+)
+from carl.ebay_analysis_stages import build_ebay_analysis_stage_registry
 from carl.ebay_analysis_workers import build_ebay_analysis_worker_registry
 from carl.ebay_item_workers import EbayItemWorkerDependencies, build_ebay_item_worker_registry
 from carl.ebay_refresh_workers import (
     EbayRefreshWorkerDependencies,
     build_ebay_refresh_worker_registry,
 )
+from carl.ebay_session_stages import EbaySessionStageDependencies
 from carl.ebay_workers import EbaySearchWorkerDependencies, build_ebay_worker_registry
+from carl.facebook_analysis_stages import build_facebook_analysis_stage_registry
 from carl.facebook_analysis_workers import (
     AnalysisWorkerDependencies,
     build_analysis_worker_registry,
@@ -60,22 +69,34 @@ from carl.facebook_refresh_workers import (
     build_refresh_worker_registry,
 )
 from carl.facebook_routed_workers import build_routed_facebook_worker_registry
+from carl.facebook_session_stages import FacebookSessionStageDependencies
+from carl.facebook_stateless_stages import FacebookStatelessStageDependencies
 from carl.io.claude import ClaudeCli
 from carl.io.connectivity import ConnectivityMonitor
+from carl.io.dataset_setup import DatasetSetupEngine
+from carl.io.dataset_workflow_owner import managed_dataset_workflow_service
 from carl.io.paths import user_directories
 from carl.io.proton import SharedProtonWireproxyManager
 from carl.io.provenance import collect_code_provenance_async, process_invocation
+from carl.io.resident_sessions import ResidentSessionPool
 from carl.io.routing import ConfiguredTravelService
 from carl.io.sqlite import Database
+from carl.io.stage_dispatcher import StageDispatcher
+from carl.io.stage_policy import PolicyStageRegistry, StagePolicy, invalid_initial_handler
+from carl.io.stage_workers import StageHandlerRegistry
+from carl.io.stages import stage_manager
 from carl.io.travel_data import TravelDataManager
-from carl.io.worker import WorkerRuntimeServices, WorkHandlerRegistry, run_worker_pool
+from carl.io.worker import WorkHandlerRegistry
 from carl.pipeline_listing_workers import (
     PipelineListingWorkerDependencies,
     build_pipeline_listing_worker_registry,
 )
 from carl.pipeline_workers import PipelineWorkerDependencies, build_pipeline_worker_registry
 from carl.review import ReviewApplication
+from carl.session_stages import build_session_stage_registry
+from carl.stateless_stages import build_stateless_stage_registry
 from carl.travel_data_workers import build_travel_data_worker_registry
+from carl.travel_stages import TravelStageDependencies, build_travel_stage_registry
 from carl.travel_workers import TravelWorkerDependencies, build_travel_worker_registry
 
 
@@ -89,6 +110,7 @@ class WorkRuntime:
 
     database: Database
     registry: WorkHandlerRegistry
+    stages: StageHandlerRegistry
 
 
 async def prepare_worker_constraints(database: Database, repository_root: Path) -> None:
@@ -177,18 +199,16 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
 async def managed_worker_pool(
     database: Database,
     repository_root: Path,
+    *,
+    eligible_identifiers: tuple[str, ...] | None = None,
+    claude: ClaudeCli | None = None,
+    worker_count: int | None = None,
 ) -> AsyncGenerator[WorkRuntime]:
     """Run bounded workers against one shared durable queue."""
 
-    settings = WorkerSettings(
-        worker_count=30,
-        lease_duration_ns=600_000_000_000,
-        renewal_interval_ns=30_000_000_000,
-        idle_poll_interval_ns=1_000_000_000,
-    )
     await prepare_worker_constraints(database, repository_root)
     await database.reconcile_terminal_network_activities(recorded_at_utc_ns=time_ns())
-    claude = ClaudeCli()
+    claude = ClaudeCli() if claude is None else claude
     analysis_registry = build_analysis_worker_registry(
         AnalysisWorkerDependencies(
             database=database,
@@ -280,34 +300,127 @@ async def managed_worker_pool(
             *build_travel_data_worker_registry(TravelDataManager(user_directories())).handlers,
         )
     )
-    services = WorkerRuntimeServices(
-        new_identifier=_identifier,
-        utc_now_ns=time_ns,
-        monotonic_ns=perf_counter_ns,
-        code_provenance=lambda: collect_code_provenance_async(repository_root),
-        invocation=process_invocation,
-        connectivity_monitor=ConnectivityMonitor(
-            database=database, new_identifier=_identifier, utc_now_ns=time_ns
+    manager = stage_manager(database)
+    provenance = await collect_code_provenance_async(repository_root)
+    invocation = process_invocation()
+    directories = user_directories()
+    residents = ResidentSessionPool(manager, StageHandlerRegistry((), ()), provenance, invocation)
+    engine = DatasetSetupEngine(directories, manager=TravelDataManager(directories))
+    policy = StagePolicy(ConnectivityMonitor(database, _identifier, time_ns))
+    stage_registries = (
+        build_stateless_stage_registry(
+            facebook=FacebookStatelessStageDependencies(
+                database, directories, _identifier, proton_manager
+            ),
+            ebay=EbayItemWorkerDependencies(
+                database, directories, _identifier, proton_manager=proton_manager
+            ),
         ),
-    )
-    stop = anyio.Event()
-    async with proton_manager, anyio.create_task_group() as task_group:
-        proton_manager.watcher_task_group = task_group
-        task_group.start_soon(
-            partial(
-                run_worker_pool,
-                database=database,
-                registry=registry,
-                settings=settings,
-                services=services,
-                stop=stop,
+        build_session_stage_registry(
+            facebook=FacebookSessionStageDependencies(
+                database, directories, _identifier, proton_manager, residents
+            ),
+            ebay=EbaySessionStageDependencies(
+                database, directories, _identifier, proton_manager, residents
+            ),
+        ),
+        build_facebook_analysis_stage_registry(
+            AnalysisWorkerDependencies(database, claude, _identifier)
+        ),
+        build_ebay_analysis_stage_registry(
+            AnalysisWorkerDependencies(database, claude, _identifier)
+        ),
+        build_coordinator_stage_registry(database, registry),
+        build_travel_stage_registry(
+            TravelStageDependencies(
+                database, ConfiguredTravelService(directories=directories), _identifier
             )
-        )
+        ),
+        build_dataset_setup_prepare_registry(database, engine),
+    )
+    stages = PolicyStageRegistry(
+        adapters=tuple(
+            replace(adapter, initial_resources=(ResourceRequest(name="cpu"),))
+            if adapter.initial_resources is None
+            else adapter
+            for stage_registry in stage_registries
+            for adapter in stage_registry.adapters
+        ),
+        handlers=(
+            *(
+                handler
+                for stage_registry in stage_registries
+                for handler in stage_registry.handlers
+            ),
+            policy.handler(),
+            invalid_initial_handler(),
+        ),
+        policy=policy,
+    )
+    if {
+        (adapter.capability.kind, adapter.capability.payload_schema_version)
+        for adapter in stages.adapters
+    } != {
+        (capability.kind, capability.payload_schema_version) for capability in registry.capabilities
+    }:
+        raise ValueError("The stage runtime must cover every supported work capability")
+    residents.registry = stages
+    async with proton_manager, anyio.create_task_group() as provider_tasks:
+        proton_manager.watcher_task_group = provider_tasks
         try:
-            yield WorkRuntime(database=database, registry=registry)
+            async with (
+                residents.managed(),
+                managed_dataset_workflow_service(
+                    manager,
+                    directories,
+                    lambda owner: build_dataset_setup_owned_registry(database, engine, owner),
+                    provenance,
+                    invocation,
+                ) as datasets,
+                anyio.create_task_group() as task_group,
+            ):
+
+                async def submit_owned(identifier: str) -> bool:
+                    stage = await database.stage(identifier)
+                    definition = await database.work_definition(stage.work_item_identifier)
+                    adapter = next(
+                        adapter
+                        for adapter in stages.adapters
+                        if adapter.capability.kind == definition.kind
+                        and adapter.capability.payload_schema_version
+                        == definition.payload_schema_version
+                    )
+                    return await submit_dataset_setup_stage(
+                        manager,
+                        engine,
+                        stage,
+                        adapter.component,
+                        provenance,
+                        invocation,
+                        service=datasets,
+                    )
+
+                dispatcher = StageDispatcher(
+                    manager,
+                    stages,
+                    residents,
+                    provenance,
+                    invocation,
+                    submit_owned,
+                    lambda kind: kind == OWNED_STAGE_KIND,
+                    eligible_identifiers=eligible_identifiers,
+                    execution_count=worker_count,
+                )
+                # Pool tasks own independent admission, even if a caller opens
+                # this scope while holding an unrelated resource reservation.
+                task_group.start_soon(manager.resources._run_background, policy.run, ())  # pyright: ignore[reportPrivateUsage]
+                task_group.start_soon(manager.resources._run_background, dispatcher.run, ())  # pyright: ignore[reportPrivateUsage]
+                try:
+                    yield WorkRuntime(database=database, registry=registry, stages=stages)
+                finally:
+                    task_group.cancel_scope.cancel()
         finally:
-            stop.set()
-            task_group.cancel_scope.cancel()
+            provider_tasks.cancel_scope.cancel()
 
 
 @asynccontextmanager

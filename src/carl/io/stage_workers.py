@@ -7,6 +7,7 @@ from typing import Protocol
 from carl.core.components import Component
 from carl.core.json import encode_json
 from carl.core.models import JsonValue, StrictModel
+from carl.core.resources import ResourceRequest
 from carl.core.stages import StageAttemptContext, StageDefinition, StageOutcome
 from carl.core.work import WorkCapability, WorkDefinition
 from carl.io.connectivity import work_retry_budget
@@ -19,6 +20,7 @@ class WorkStageAdapter:
     capability: WorkCapability
     component: Component
     initial_stage: Callable[[WorkDefinition, str, str], StageDefinition]
+    initial_resources: tuple[ResourceRequest, ...] | None = None
 
 
 class StageHandler(Protocol):
