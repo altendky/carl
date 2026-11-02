@@ -140,9 +140,12 @@ async def test_expired_gallery_checks_batch_listings_and_validate_shared_bytes_o
             candidate_sizes.append(len(references))
             return await original_candidates(references)
 
-        async def artifact(identifier: str) -> tuple[dict[str, JsonValue], bytes]:
+        async def artifact(
+            identifier: str, *, maximum_bytes: int | None = None
+        ) -> tuple[dict[str, JsonValue], bytes]:
+            assert maximum_bytes == 100_000_000
             artifact_reads.append(identifier)
-            return await original_artifact(identifier)
+            return await original_artifact(identifier, maximum_bytes=maximum_bytes)
 
         monkeypatch.setattr(database, "saved_facebook_image_candidates_for_references", candidates)
         monkeypatch.setattr(database, "get_artifact", artifact)
@@ -225,14 +228,17 @@ async def test_stored_image_plan_resumes_without_global_history_and_replays_reus
         original_artifact = database.get_artifact
         artifact_reads: list[str] = []
 
-        async def artifact(identifier: str) -> tuple[dict[str, JsonValue], bytes]:
+        async def artifact(
+            identifier: str, *, maximum_bytes: int | None = None
+        ) -> tuple[dict[str, JsonValue], bytes]:
+            assert maximum_bytes == 100_000_000
             artifact_reads.append(identifier)
             assert identifier == "shared-image-bytes"
             if artifact_failure == "missing":
                 raise FileNotFoundError("Saved image file disappeared after the plan checkpoint")
             if artifact_failure == "corrupt":
                 raise ValueError("Saved image file failed its stored hash verification")
-            return await original_artifact(identifier)
+            return await original_artifact(identifier, maximum_bytes=maximum_bytes)
 
         monkeypatch.setattr(database, "get_artifact", artifact)
 
@@ -319,10 +325,13 @@ async def test_later_saved_budget_exclusion_cannot_mask_lost_legacy_reuse(
         )
         original_artifact = database.get_artifact
 
-        async def artifact(identifier: str) -> tuple[dict[str, JsonValue], bytes]:
+        async def artifact(
+            identifier: str, *, maximum_bytes: int | None = None
+        ) -> tuple[dict[str, JsonValue], bytes]:
+            assert maximum_bytes == 100_000_000
             if identifier == "shared-image-bytes":
                 raise FileNotFoundError("The originally reused image disappeared")
-            return await original_artifact(identifier)
+            return await original_artifact(identifier, maximum_bytes=maximum_bytes)
 
         monkeypatch.setattr(database, "get_artifact", artifact)
         context = await _attempt(

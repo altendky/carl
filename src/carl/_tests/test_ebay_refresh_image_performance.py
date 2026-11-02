@@ -254,7 +254,10 @@ async def test_planning_checks_only_newest_valid_artifact_for_each_saved_renditi
         registry = await _seed_checkpoint(database, identifiers)
         checked: list[str] = []
 
-        async def verify_selected_artifact(identifier: str) -> tuple[dict[str, JsonValue], bytes]:
+        async def verify_selected_artifact(
+            identifier: str, *, maximum_bytes: int | None = None
+        ) -> tuple[dict[str, JsonValue], bytes]:
+            assert maximum_bytes == 100_000_000
             checked.append(identifier)
             assert identifier != "artifact-oldest", (
                 "Planning must stop checking historical candidates once this rendition is valid"

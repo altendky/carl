@@ -34,6 +34,7 @@ from carl.core.worker import (
     TerminalFailureWork,
     WorkOutcome,
 )
+from carl.io.image_reuse import image_artifact_available
 from carl.io.sqlite import Database
 from carl.io.worker import TypedWorkHandler, WorkHandlerRegistry
 from carl.marketplace_listing import ebay_observations
@@ -386,12 +387,7 @@ async def _image_artifact_available(
     if not isinstance(artifact, str):
         return False
     if artifact not in validated_artifacts:
-        try:
-            _ = await database.get_artifact(artifact)
-        except (KeyError, ValueError, OSError):
-            validated_artifacts[artifact] = False
-        else:
-            validated_artifacts[artifact] = True
+        validated_artifacts[artifact] = await image_artifact_available(database, artifact)
     return validated_artifacts[artifact]
 
 

@@ -43,6 +43,7 @@ from carl.io.httpx import (
     RouteConfigurationFailure,
 )
 from carl.io.image_files import ImageFileStore
+from carl.io.image_reuse import image_artifact_available
 from carl.io.network_activity import NetworkActivityScheduler
 from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
@@ -108,12 +109,9 @@ async def validate_saved_image_results(
         if not isinstance(artifact_identifier, str):
             continue
         if artifact_identifier not in verified:
-            try:
-                await database.get_artifact(artifact_identifier)
-            except (KeyError, ValueError, OSError):
-                verified[artifact_identifier] = False
-            else:
-                verified[artifact_identifier] = True
+            verified[artifact_identifier] = await image_artifact_available(
+                database, artifact_identifier
+            )
         if verified[artifact_identifier]:
             available.append((identifier, value))
     return tuple(available)

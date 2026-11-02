@@ -181,9 +181,12 @@ async def test_large_cached_gallery_batches_integrity_and_provenance(
         get_artifact = database.get_artifact
         checked: list[str] = []
 
-        async def verify(identifier: str) -> tuple[dict[str, JsonValue], bytes]:
+        async def verify(
+            identifier: str, *, maximum_bytes: int | None = None
+        ) -> tuple[dict[str, JsonValue], bytes]:
+            assert maximum_bytes == 100_000_000
             checked.append(identifier)
-            return await get_artifact(identifier)
+            return await get_artifact(identifier, maximum_bytes=maximum_bytes)
 
         publish = database.publish_leased_operation_checkpoint
         batches: list[int] = []

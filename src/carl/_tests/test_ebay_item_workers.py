@@ -436,7 +436,9 @@ async def test_durable_item_pipeline_retains_html_and_schedules_description_and_
 
 
 @pytest.mark.anyio
-async def test_exact_url_image_reuse_preserves_new_listing_reference(tmp_path: Path) -> None:
+async def test_exact_url_image_reuse_preserves_new_listing_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     identifiers = _identifiers()
     images = _Acquirer({IMAGE_URL: _Response(_png(), "image/png")})
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
@@ -456,6 +458,17 @@ async def test_exact_url_image_reuse_preserves_new_listing_reference(tmp_path: P
         )
         first = await _run_next(database, registry, identifiers, COLLECT_EBAY_IMAGE_WORK_KIND)
         assert first["state"] == WorkState.COMPLETED.value
+        get_artifact = database.get_artifact
+        checked: list[str] = []
+
+        async def bounded_reuse_read(
+            identifier: str, *, maximum_bytes: int | None = None
+        ) -> tuple[dict[str, JsonValue], bytes]:
+            assert maximum_bytes == 100_000_000
+            checked.append(identifier)
+            return await get_artifact(identifier, maximum_bytes=maximum_bytes)
+
+        monkeypatch.setattr(database, "get_artifact", bounded_reuse_read)
         await _enqueue(
             database,
             collect_ebay_image_work(
@@ -479,6 +492,7 @@ async def test_exact_url_image_reuse_preserves_new_listing_reference(tmp_path: P
         assert first_value["reference_record_identifier"] == "reference-1"
         assert first_value["item_identifier"] == ITEM
         assert first_value["image_artifact_identifier"] == second_value["image_artifact_identifier"]
+        assert checked == [first_value["image_artifact_identifier"]]
         assert len(images.plans) == 1
         assert len(tuple((tmp_path / "images").rglob("*.png"))) == 1
 
