@@ -11,7 +11,7 @@ from decimal import Decimal
 from itertools import count
 from pathlib import Path
 from time import perf_counter_ns
-from typing import cast, final
+from typing import Literal, cast, final
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -220,9 +220,16 @@ class _PartitionSessionFactory:
 
 @final
 class _Harness:
-    def __init__(self, path: Path, factory: FacebookSearchSessionFactory):
+    def __init__(
+        self,
+        path: Path,
+        factory: FacebookSearchSessionFactory,
+        *,
+        retry_scope: Literal["stack", "independent_session"] = "stack",
+    ):
         self.path = path
         self.factory = factory
+        self.retry_scope: Literal["stack", "independent_session"] = retry_scope
         self.clock = _Clock()
         self.identifiers = count()
 
@@ -285,6 +292,7 @@ class _Harness:
             FacebookSearchWorkerDependencies(
                 database=database,
                 session_factory=self.factory,
+                retry_scope=self.retry_scope,
                 navigation_headers=(Header(name=b"User-Agent", value=b"test-browser"),),
                 new_identifier=self.new_identifier,
                 utc_now_ns=self.clock,

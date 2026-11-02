@@ -370,8 +370,13 @@ For either source
 refresh, poll the returned coordinator until item, description, and image follow-ups settle. Refresh reuses the latest usable retained item page for each exact listing
 ID and spends Decodo only on listings without one.
 Transient search and image transport/session failures retry with exponential backoff; a failed
-shared Proton transport (when selected) is replaced before another attempt. Decodo search bootstrap
-and pagination share a cookie-preserving client; use a static datacenter port to preserve the exit.
+shared Proton transport (when selected) is replaced before another attempt. Facebook search retries
+retain their own bounded backoff. Verified independent Decodo sessions do not impose route-wide
+challenge cooldowns or transport backoff on sibling searches; fixed exits and unknown collectors
+retain shared route protection. Retry reasons retain retry_scope. Independence is classified from
+resolved provider settings before port selection and does not guarantee distinct exit IPs.
+Decodo search bootstrap and price buckets share a cookie-preserving client; use a static datacenter
+port to preserve the exit.
 Use retry_image_failures with an exact search
 run or refresh identifier to requeue older terminal image work after checking or correcting its
 failure cause. The retry is one bounded database transaction and upgrades selected image work to

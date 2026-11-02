@@ -168,10 +168,12 @@ same configured Decodo browser transport as item pages; a renamed stack on the s
 is not an alternative acquisition path. The override applies to the retried work, not the original
 search-group target specification. When a refresh's search acquisition failed, request a new
 `request_workspace_refresh` with `acquisition_stack` instead; item-only transport recovery uses
-`retry_item_failures` below. Search challenges and HTTP 403/429 defer searches on the same stack for
-10, 20, 40, then 60 minutes across five attempts; the terminal fifth failure retains the 60-minute cap.
-The durable cooldown also applies to new work and operator retries, without consuming attempts
-while waiting. Blocked eBay item pages use the same five-attempt backoff policy. A refresh parent
+`retry_item_failures` below. Facebook challenges and interrupted guest access back off the failed
+search for 10, 20, 40, then 60 minutes across five attempts. Verified independent Decodo sessions
+(mobile, residential, or a datacenter port pool) keep that job's backoff without pausing sibling
+searches. Fixed exits and unknown collectors retain shared route cooldowns, including after the
+terminal fifth failure. Inspect the persisted `retry_scope`; independently selected ports can repeat
+and do not prove distinct exit IPs. eBay retains its source-specific retry policy. A refresh parent
 defers until its pending child is eligible, rather than repeatedly polling a delayed acquisition.
 Retries and refreshes spend provider calls: inspect retained evidence and select a
 justified change before queueing; do not make repeated paid probe calls.

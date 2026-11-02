@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextlib import AsyncExitStack
 from secrets import randbelow
 from time import perf_counter_ns, time_ns
+from typing import Literal
 
 import anyio
 
@@ -210,8 +211,13 @@ def build_routed_facebook_worker_registry(
                 reason="Apply the current Marketplace page-request policy",
             )
             session_factory: FacebookSearchSessionFactory
+            retry_scope: Literal["stack", "independent_session"] = "stack"
             if routing[0] == "decodo":
                 settings, credential_source = decodo_settings(loaded, directories, routing)
+                # Classify before session setup selects a port and discards the
+                # configured pool, including when opening the session fails.
+                if settings.session_retry_scope() == "independent_session":
+                    retry_scope = "independent_session"
                 session_factory = DecodoFacebookSearchSessionFactory(
                     manager=DecodoSessionManager(),
                     settings=settings,
@@ -239,6 +245,7 @@ def build_routed_facebook_worker_registry(
                     utc_now_ns=time_ns,
                     monotonic_ns=perf_counter_ns,
                     network_activity_scheduler=_scheduler(database, new_identifier),
+                    retry_scope=retry_scope,
                 ),
             )
             return await _execute(registry, search_capability, payload, context)

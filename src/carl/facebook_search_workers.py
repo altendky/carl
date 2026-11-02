@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from functools import partial
+from typing import Literal
 
 import anyio
 
@@ -197,6 +198,7 @@ def _response_failure_work(
     routing: tuple[str, ...],
     now_utc_ns: int,
     guest_session_established: bool = False,
+    retry_scope: Literal["stack", "independent_session"] = "stack",
 ) -> RetryWork | TerminalFailureWork:
     """Recover login walls after a valid guest bootstrap or completed partition."""
     interrupted_guest_access = error.get("response_kind") == "login_page" and (
@@ -205,6 +207,7 @@ def _response_failure_work(
     )
     if error.get("response_kind") != "bot_challenge" and not interrupted_guest_access:
         return TerminalFailureWork(error=error, result=result)
+    result = {**result, "retry_scope": retry_scope}
     attempt = policy_attempt if checkpoint is None else checkpoint.challenge_attempts + 1
     if checkpoint is not None:
         checkpoint = checkpoint.model_copy(
@@ -219,11 +222,13 @@ def _response_failure_work(
         "challenge_attempt": attempt,
         "maximum_attempts": FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS,
         "guest_access_interrupted": interrupted_guest_access,
-        "facebook_search_cooldown": {
+        "retry_scope": retry_scope,
+    }
+    if retry_scope != "independent_session":
+        diagnostic["facebook_search_cooldown"] = {
             "network_path": list(routing),
             "until_utc_ns": now_utc_ns + facebook_challenge_retry_delay_ns(attempt),
-        },
-    }
+        }
     if attempt < FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS:
         return RetryWork(
             delay_ns=facebook_challenge_retry_delay_ns(attempt),
@@ -239,6 +244,7 @@ def search_session_failure_work(
     context: AttemptContext,
     routing: tuple[str, ...],
     policy_attempt: int | None = None,
+    retry_scope: Literal["stack", "independent_session"] = "stack",
 ) -> RetryWork | TerminalFailureWork:
     """Classify a failure opening or closing a routed search session."""
 
@@ -249,11 +255,13 @@ def search_session_failure_work(
         "code": error.code,
         "exit_code": error.exit_code,
         "diagnostic": error.diagnostic,
+        "retry_scope": retry_scope,
     }
     result: dict[str, JsonValue] = {
         "state": "transport_failed",
         "attempt": context.attempt,
         "network_path": list(routing),
+        "retry_scope": retry_scope,
     }
     effective_attempt = context.retry_attempt() if policy_attempt is None else policy_attempt
     if retryable and effective_attempt < SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS:
@@ -276,16 +284,19 @@ def search_acquisition_failure_work(
     error: AcquisitionFailure,
     context: AttemptContext,
     policy_attempt: int | None = None,
+    retry_scope: Literal["stack", "independent_session"] = "stack",
 ) -> RetryWork | TerminalFailureWork:
     """Classify a failed search request while retaining its transport evidence."""
 
     failure = {
         "kind": "search_acquisition_failure",
+        "retry_scope": retry_scope,
         "stopping_condition": error.result.get("stopping_condition"),
         "exception_type": error.result.get("exception_type"),
     }
     result: dict[str, JsonValue] = {
         "state": "acquisition_failed",
+        "retry_scope": retry_scope,
         "attempt": context.attempt,
         "acquisition": error.result,
     }
@@ -324,6 +335,7 @@ class FacebookSearchWorkerDependencies:
     utc_now_ns: Callable[[], int]
     monotonic_ns: Callable[[], int]
     network_activity_scheduler: NetworkActivityScheduler
+    retry_scope: Literal["stack", "independent_session"] = "stack"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1140,6 +1152,7 @@ def build_search_handler(
                         policy_attempt=policy_attempt,
                         routing=payload.routing,
                         now_utc_ns=dependencies.utc_now_ns(),
+                        retry_scope=dependencies.retry_scope,
                         error={
                             "kind": "search_session_bootstrap_response_failure",
                             "response_kind": session_bootstrap_classification.kind.value,
@@ -1245,6 +1258,7 @@ def build_search_handler(
                         policy_attempt=policy_attempt,
                         routing=payload.routing,
                         now_utc_ns=dependencies.utc_now_ns(),
+                        retry_scope=dependencies.retry_scope,
                         error={
                             "kind": (
                                 "search_route_definition_extraction_failure"
@@ -1454,6 +1468,7 @@ def build_search_handler(
                                 policy_attempt=policy_attempt,
                                 routing=payload.routing,
                                 now_utc_ns=dependencies.utc_now_ns(),
+                                retry_scope=dependencies.retry_scope,
                                 error={
                                     "kind": "search_price_partition_extraction_failure",
                                     "response_kind": response_classification.kind.value,
@@ -1690,7 +1705,10 @@ def build_search_handler(
                 policy_attempt
                 - (0 if retry_checkpoint is None else retry_checkpoint.challenge_retry_attempts),
             )
-            if error.result.get("stopping_condition") == "transport_failure":
+            if (
+                error.result.get("stopping_condition") == "transport_failure"
+                and dependencies.retry_scope != "independent_session"
+            ):
                 delay_ns = _search_retry_delay_ns(transport_attempt)
                 now_utc_ns = dependencies.utc_now_ns()
                 await dependencies.database.defer_pending_collect_search_work_for_route(
@@ -1708,6 +1726,7 @@ def build_search_handler(
                 error=error,
                 context=context,
                 policy_attempt=transport_attempt,
+                retry_scope=dependencies.retry_scope,
             )
             if isinstance(outcome, RetryWork) and retry_checkpoint is not None:
                 outcome = outcome.model_copy(
@@ -1729,7 +1748,10 @@ def build_search_handler(
                 policy_attempt
                 - (0 if retry_checkpoint is None else retry_checkpoint.challenge_retry_attempts),
             )
-            if error.code in RETRYABLE_SEARCH_SESSION_FAILURE_CODES:
+            if (
+                error.code in RETRYABLE_SEARCH_SESSION_FAILURE_CODES
+                and dependencies.retry_scope != "independent_session"
+            ):
                 delay_ns = _search_retry_delay_ns(transport_attempt)
                 now_utc_ns = dependencies.utc_now_ns()
                 await dependencies.database.defer_pending_collect_search_work_for_route(
@@ -1748,6 +1770,7 @@ def build_search_handler(
                 context=context,
                 routing=payload.routing,
                 policy_attempt=transport_attempt,
+                retry_scope=dependencies.retry_scope,
             )
             if isinstance(outcome, RetryWork) and retry_checkpoint is not None:
                 outcome = outcome.model_copy(
