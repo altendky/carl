@@ -1220,7 +1220,14 @@ class Database:
         resource = acquisition_resource_identity(kind, payload)
         if resource is not None:
             cursor = await connection.execute(
-                "SELECT payload_json FROM work_items WHERE kind_parts_json = ? AND id != ? AND state IN ('leased','cancelling') AND lease_expires_at_utc_ns > ?",
+                """
+                SELECT payload_json FROM work_items
+                WHERE kind_parts_json = ? AND id != ? AND state IN ('leased','cancelling')
+                  AND (lease_expires_at_utc_ns > ? OR EXISTS (
+                      SELECT 1 FROM stage_attempts
+                      WHERE work_item_id = work_items.id AND state = 'active'
+                  ))
+                """,
                 (_text(work[3]), definition.work_item_identifier, now_utc_ns),
             )
             if any(
@@ -4883,11 +4890,17 @@ class Database:
                     if kind_json not in resource_leases:
                         leases_cursor = await connection.execute(
                             """
-                            SELECT payload_json, lease_expires_at_utc_ns FROM work_items
-                            WHERE kind_parts_json = ? AND state = 'leased'
-                              AND lease_expires_at_utc_ns > ?
+                            SELECT payload_json,
+                                   CASE WHEN lease_expires_at_utc_ns > ?
+                                        THEN lease_expires_at_utc_ns ELSE ? END
+                            FROM work_items
+                            WHERE kind_parts_json = ? AND state IN ('leased','cancelling')
+                              AND (lease_expires_at_utc_ns > ? OR EXISTS (
+                                  SELECT 1 FROM stage_attempts
+                                  WHERE work_item_id = work_items.id AND state = 'active'
+                              ))
                             """,
-                            (kind_json, now_utc_ns),
+                            (now_utc_ns, now_utc_ns + 100_000_000, kind_json, now_utc_ns),
                         )
                         resource_leases[kind_json] = tuple(
                             (decode_json(_text(lease[0])), _integer(lease[1]))
@@ -12450,6 +12463,29 @@ class Database:
             "storage": storage,
         }
         return metadata, value
+
+    async def get_external_artifact_metadata(self, identifier: str) -> dict[str, JsonValue] | None:
+        """Read external metadata before bounded I/O, without materializing bytes."""
+
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT sha256, size, media_type, representation_json, locator
+                FROM external_artifacts WHERE object_id = ?
+                """,
+                (identifier,),
+            )
+            rows = await cursor.fetchall()
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "sha256": row[0],
+            "size": row[1],
+            "media_type": row[2],
+            "representation": decode_json(_text(row[3])),
+            "storage": {"backend": "filesystem", "locator": _text(row[4])},
+        }
 
     async def get_external_artifact_path(
         self, identifier: str

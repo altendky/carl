@@ -321,7 +321,8 @@ async def test_range_session_reconnect_preserves_selected_port_provider_and_cook
 
 
 @pytest.mark.anyio
-async def test_one_acquisition_uses_fresh_sticky_session_and_redacts_secrets() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_one_acquisition_uses_fresh_sticky_session_and_redacts_secrets(capture: bool) -> None:
     seen_proxy_auth: list[tuple[str | bytes, str | bytes] | None] = []
 
     def client_factory(*, proxy: httpx.Proxy, verify: object) -> httpx.AsyncClient:
@@ -354,8 +355,8 @@ async def test_one_acquisition_uses_fresh_sticky_session_and_redacts_secrets() -
         routing=("decodo", "personal", "carl"),
     )
 
-    first = await acquirer.acquire(plan, identifiers)
-    second = await acquirer.acquire(plan, identifiers)
+    first = await (acquirer.capture if capture else acquirer.acquire)(plan, identifiers)
+    second = await (acquirer.capture if capture else acquirer.acquire)(plan, identifiers)
 
     assert seen_proxy_auth == [
         (
@@ -724,7 +725,8 @@ def test_datacenter_rejects_ports_outside_supported_pool(port: int) -> None:
 
 
 @pytest.mark.anyio
-async def test_managed_decodo_form_shares_cookies_counters_and_redaction() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_managed_decodo_form_shares_cookies_counters_and_redaction(capture: bool) -> None:
     settings = _datacenter_settings(10001)
     seen_requests: list[httpx.Request] = []
 
@@ -749,11 +751,11 @@ async def test_managed_decodo_form_shares_cookies_counters_and_redaction() -> No
         new_identifier=identifiers,
         target_authentication="anonymous_guest_session",
     ) as session:
-        first = await session.acquire(
+        first = await (session.capture if capture else session.acquire)(
             RequestPlan(url="https://www.facebook.com/", routing=settings.route.network_path),
             identifiers,
         )
-        second = await session.acquire_form(
+        second = await (session.capture_form if capture else session.acquire_form)(
             RequestPlan(
                 method="POST",
                 url="https://www.facebook.com/api/graphql/",
@@ -780,7 +782,8 @@ async def test_managed_decodo_form_shares_cookies_counters_and_redaction() -> No
 
 
 @pytest.mark.anyio
-async def test_managed_decodo_form_failure_uses_same_session_failure_guard() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_managed_decodo_form_failure_uses_same_session_failure_guard(capture: bool) -> None:
     settings = _datacenter_settings(10001)
 
     def fail(request: httpx.Request) -> httpx.Response:
@@ -799,7 +802,7 @@ async def test_managed_decodo_form_failure_uses_same_session_failure_guard() -> 
         new_identifier=identifiers,
     ) as session:
         with pytest.raises(AcquisitionFailure) as raised:
-            _ = await session.acquire_form(
+            _ = await (session.capture_form if capture else session.acquire_form)(
                 RequestPlan(
                     method="POST",
                     url="https://example.com/",
@@ -814,7 +817,7 @@ async def test_managed_decodo_form_failure_uses_same_session_failure_guard() -> 
         assert "proxy-secret" not in repr(raised.value.result)
         assert raised.value.result["network_provider_result"]["provider"] == "decodo"
         with pytest.raises(RouteConfigurationFailure, match="decodo_session_failed"):
-            _ = await session.acquire(
+            _ = await (session.capture if capture else session.acquire)(
                 RequestPlan(url="https://example.com/", routing=settings.route.network_path),
                 identifiers,
             )

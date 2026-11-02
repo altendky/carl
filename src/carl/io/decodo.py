@@ -310,6 +310,19 @@ class ManagedDecodoSession:
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         return await self._acquire(plan, new_identifier, form_fields=None)
 
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire(plan, new_identifier, form_fields=None, capture=True)
+
+    async def capture_form(
+        self,
+        plan: RequestPlan,
+        fields: tuple[FormField, ...],
+        new_identifier: IdentifierFactory,
+    ) -> Acquisition:
+        if plan.method != "POST":
+            raise ValueError("Form acquisition requires POST")
+        return await self._acquire(plan, new_identifier, form_fields=fields, capture=True)
+
     async def acquire_form(
         self,
         plan: RequestPlan,
@@ -326,6 +339,7 @@ class ManagedDecodoSession:
         new_identifier: IdentifierFactory,
         *,
         form_fields: tuple[FormField, ...] | None,
+        capture: bool = False,
     ) -> Acquisition:
         if plan.routing != self.settings.route.network_path:
             raise RouteConfigurationFailure("request_route_does_not_match_decodo_route")
@@ -354,11 +368,18 @@ class ManagedDecodoSession:
                 protected_response_headers=_PROTECTED_RESPONSE_HEADERS,
             )
             try:
-                acquisition = (
-                    await acquirer.acquire(plan, new_identifier)
-                    if form_fields is None
-                    else await acquirer.acquire_form(plan, form_fields, new_identifier)
-                )
+                if capture:
+                    acquisition = (
+                        await acquirer.capture(plan, new_identifier)
+                        if form_fields is None
+                        else await acquirer.capture_form(plan, form_fields, new_identifier)
+                    )
+                else:
+                    acquisition = (
+                        await acquirer.acquire(plan, new_identifier)
+                        if form_fields is None
+                        else await acquirer.acquire_form(plan, form_fields, new_identifier)
+                    )
             except AcquisitionFailure as error:
                 self.failed = True
                 self.requests_completed += 1
@@ -495,6 +516,18 @@ class ManagedDecodoHttpAcquirer:
         self.credential_source = credential_source
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire_mode(plan, new_identifier, capture=False)
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire_mode(plan, new_identifier, capture=True)
+
+    async def _acquire_mode(
+        self,
+        plan: RequestPlan,
+        new_identifier: IdentifierFactory,
+        *,
+        capture: bool,
+    ) -> Acquisition:
         acquisition: Acquisition | None = None
         failure: AcquisitionFailure | None = None
         session: ManagedDecodoSession | None = None
@@ -505,7 +538,11 @@ class ManagedDecodoHttpAcquirer:
         ) as opened_session:
             session = opened_session
             try:
-                acquisition = await opened_session.acquire(plan, new_identifier)
+                acquisition = (
+                    await opened_session.capture(plan, new_identifier)
+                    if capture
+                    else await opened_session.acquire(plan, new_identifier)
+                )
             except AcquisitionFailure as error:
                 failure = error
         if session is None:
@@ -586,6 +623,9 @@ class ManagedDecodoWreqSession:
             requests_completed=self.requests_completed,
             shared_session=True,
         )
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self.acquire(plan, new_identifier)
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         if plan.routing != self.settings.route.network_path:
@@ -713,6 +753,9 @@ class ManagedDecodoWreqAcquirer:
                 finally:
                     if session is not None:
                         session.ended_at_utc = datetime.now(UTC).isoformat()
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self.acquire(plan, new_identifier)
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         if plan.routing != self.settings.route.network_path:

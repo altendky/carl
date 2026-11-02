@@ -69,7 +69,8 @@ def _identifiers() -> Callable[[], str]:
 
 
 @pytest.mark.anyio
-async def test_session_preserves_cookies_but_redacts_session_material() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_session_preserves_cookies_but_redacts_session_material(capture: bool) -> None:
     requests = 0
     secret_cookie = "guest-session-secret"
 
@@ -117,11 +118,11 @@ async def test_session_preserves_cookies_but_redacts_session_material() -> None:
         credential_source=source,
         new_identifier=identifiers,
     ) as session:
-        first = await session.acquire(
+        first = await (session.capture if capture else session.acquire)(
             RequestPlan(url="https://www.facebook.com/bootstrap", routing=route.network_path),
             identifiers,
         )
-        second = await session.acquire(
+        second = await (session.capture if capture else session.acquire)(
             RequestPlan(url="https://www.facebook.com/page-two", routing=route.network_path),
             identifiers,
         )
@@ -145,7 +146,8 @@ async def test_session_preserves_cookies_but_redacts_session_material() -> None:
 
 
 @pytest.mark.anyio
-async def test_provider_error_is_classified_without_retaining_message() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_provider_error_is_classified_without_retaining_message(capture: bool) -> None:
     def client_factory(*, proxy: httpx.Proxy, verify: object) -> httpx.AsyncClient:
         del proxy, verify
         return httpx.AsyncClient(
@@ -178,12 +180,12 @@ async def test_provider_error_is_classified_without_retaining_message() -> None:
         new_identifier=identifiers,
     ) as session:
         with pytest.raises(AcquisitionFailure) as raised:
-            await session.acquire(
+            await (session.capture if capture else session.acquire)(
                 RequestPlan(url="https://www.facebook.com/", routing=route.network_path),
                 identifiers,
             )
         with pytest.raises(RouteConfigurationFailure) as poisoned:
-            await session.acquire(
+            await (session.capture if capture else session.acquire)(
                 RequestPlan(url="https://www.facebook.com/again", routing=route.network_path),
                 identifiers,
             )
@@ -309,7 +311,8 @@ async def test_session_rejects_wrong_route_and_expired_idle_context(
 
 
 @pytest.mark.anyio
-async def test_managed_single_request_records_closed_session() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_managed_single_request_records_closed_session(capture: bool) -> None:
     def client_factory(*, proxy: httpx.Proxy, verify: object) -> httpx.AsyncClient:
         del proxy, verify
         return httpx.AsyncClient(
@@ -332,7 +335,7 @@ async def test_managed_single_request_records_closed_session() -> None:
         ),
     )
 
-    acquisition = await acquirer.acquire(
+    acquisition = await (acquirer.capture if capture else acquirer.acquire)(
         RequestPlan(url="https://example.com/", routing=route.network_path),
         _identifiers(),
     )

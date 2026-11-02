@@ -123,6 +123,9 @@ class _Acquirer:
         self.plans: list[RequestPlan] = []
         self.body_identifiers: list[str] = []
 
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self.acquire(plan, new_identifier)
+
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         self.plans.append(plan)
         response = self.responses[plan.url]

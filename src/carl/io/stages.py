@@ -19,7 +19,7 @@ from carl.core.models import (
     NamedOutput,
     RecordDraft,
 )
-from carl.core.stages import StageClaimResult, StageLease, WaitWork
+from carl.core.stages import StageClaimResult, StageLease, StageOutcome, WaitWork
 from carl.core.worker import CompletedWork, RetryWork, TerminalFailureWork
 from carl.io.resource_permits import (
     ExecutionGuard,
@@ -40,6 +40,20 @@ class StageExecution:
     lease: StageLease
     guard: ExecutionGuard
     finalized: bool = False
+
+    async def apply(self, outcome: StageOutcome) -> None:
+        """Publish an outcome through this execution's continuation or final fence."""
+
+        if isinstance(outcome, WaitWork):
+            await self.suspend(
+                outcome,
+                records=outcome.records,
+                artifacts=outcome.artifacts,
+                outputs=outcome.outputs,
+                inputs=outcome.inputs,
+            )
+        else:
+            await self.finish(outcome)
 
     def _seal(self) -> None:
         if self.finalized:
