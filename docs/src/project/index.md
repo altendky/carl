@@ -631,8 +631,9 @@ validation before activation. Unknown cleanup quarantines the owner and guards
 and invalidates its CPU borrow. A root task releases quarantined handles only
 after physical exit is proven. Abrupt supervisor death protects the direct
 command with a parent-death signal but cannot prove arbitrary descendants have
-exited, so admission remains occupied. This foundation does not yet switch the
-dataset setup workflow to staged execution.
+exited, so admission remains occupied. Explicit dataset setup now uses these
+owned phases. Its runnable-stage adapter remains opt-in until the shared worker
+runtime cutover.
 
 Dataset workflow ownership uses the existing global travel-data build lock
 across providers, foreground commands, workers and activation. A private bounded
@@ -660,7 +661,28 @@ limits are explicit and may be absent for large map files. Such files bypass
 small HTTP response checkpoints and never become SQLite blobs. Bounded file
 receipts record SHA-256, optional MD5 and transport metadata; reuse rechecks the
 actual file and frozen source identity before accepting a completed download.
-The GeoNames and OSRM algorithm conversion remains separate from these helpers.
+GeoNames and OSRM share these phases between foreground setup and queued stage
+adapters. Source plans, UTC snapshot dates, configuration inputs and tool/profile
+identities are frozen before their dependent work. Dataset identifiers preserve
+the original source/checksum serialization; transport timestamps and file
+locators do not change them. GeoNames constructs a fresh SQLite candidate.
+OSRM seals one final graph inventory after its mutable native command sequence.
+Completed file/native receipts replay without repeating completed work; uncertain
+scratch requires physical recovery and a fresh attempt, with at most three
+attempt directories. A failed verification or native build leaves the selected
+dataset intact.
+
+Foreground setup opens the standard evidence database when needed and shares
+HTTP and weighted CPU admission with workers. It keeps its own workflow rather
+than inventing queued work. The CLI prints its request identifier; pass it again
+with `--request-identifier` to resume after process loss. Ctrl-C is explicit
+cancellation. Setup and activation share the global gate, including across waits
+and restarts. Activation/publication replay verifies the existing destination
+before accepting a completed rename. Final cleanup removes owned source and
+intermediate scratch after verifying publication, while retaining the journal
+and bounded command evidence. Failed or interrupted workflows retain completed
+files for recovery or inspection. Native build thread limits do not cap build
+RSS; dataset setup remains an explicit operation.
 
 Travel estimates use one replayable phase engine for direct service calls and
 queued route refreshes. CPU preparation resolves cache entries and plans each

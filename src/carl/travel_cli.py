@@ -65,14 +65,18 @@ def setup(
     activate: bool = True,
     radius_miles: float = 250,
     threads: int = 4,
+    request_identifier: str | None = None,
 ) -> None:
     """Download/build and verify data now, without a worker; activate only after success.
 
     GeoNames covers US places and ZIPs. OSRM builds a buffered regional road map
     and requires osmium-tool on PATH, substantial memory, disk and build time.
+    Reuse the printed request identifier and original options after a process interruption.
     """
     request = TravelDataSetupRequest(
-        request_identifier="cli-" + str(uuid4()),
+        request_identifier="cli-" + str(uuid4())
+        if request_identifier is None
+        else request_identifier,
         provider=provider,
         activate=activate,
         radius_miles=radius_miles,
@@ -81,6 +85,9 @@ def setup(
     print(
         "Preparing "
         + provider
+        + " (request "
+        + json.dumps(request.request_identifier)
+        + "); reuse --request-identifier to resume"
         + "; inspect another terminal with carl travel status. Existing data remains active until verification and activation finish.",
         file=sys.stderr,
     )
@@ -99,9 +106,16 @@ def update(
     activate: bool = True,
     radius_miles: float = 250,
     threads: int = 4,
+    request_identifier: str | None = None,
 ) -> None:
     """Explicitly rebuild from current source data, retaining the old version for rollback."""
-    setup(provider, activate=activate, radius_miles=radius_miles, threads=threads)
+    setup(
+        provider,
+        activate=activate,
+        radius_miles=radius_miles,
+        threads=threads,
+        request_identifier=request_identifier,
+    )
 
 
 @travel_app.command

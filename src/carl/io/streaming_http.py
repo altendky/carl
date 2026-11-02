@@ -17,6 +17,7 @@ import httpx
 from carl.core.dataset_downloads import (
     MAX_DATASET_FILE_BYTES,
     DatasetFileError,
+    DatasetPreparation,
     DatasetSource,
     DatasetTransfer,
     dataset_source_fingerprint,
@@ -99,13 +100,14 @@ def _private_directory(descriptor: int) -> None:
         raise DatasetFileError("dataset_file_invalid")
 
 
-def _open_bucket(directory: Path, fingerprint: str) -> int:
-    parent = open_dataset_directory(directory, create=True)
+def _open_bucket(directory: Path, fingerprint: str, *, create: bool = True) -> int:
+    parent = open_dataset_directory(directory, create=create)
     try:
         for component in ("downloads", fingerprint):
-            with suppress(FileExistsError):
-                os.mkdir(component, mode=0o700, dir_fd=parent)
-                os.fsync(parent)
+            if create:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o700, dir_fd=parent)
+                    os.fsync(parent)
             child = os.open(
                 component,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -124,6 +126,15 @@ def _open_bucket(directory: Path, fingerprint: str) -> int:
         raise
 
 
+def open_dataset_bucket(directory: Path, fingerprint: str) -> int:
+    """Open existing private storage; callers derive the fingerprint from a source."""
+    if len(fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in fingerprint
+    ):
+        raise DatasetFileError("dataset_file_invalid")
+    return _open_bucket(directory, fingerprint, create=False)
+
+
 def _write(descriptor: int, content: bytes) -> None:
     remaining = memoryview(content)
     while remaining:
@@ -140,6 +151,32 @@ def _publish(descriptor: int, directory: int, temporary: str, final: str) -> Non
     except FileExistsError:
         raise DatasetFileError("dataset_transfer_exists") from None
     os.fsync(directory)
+
+
+def _prepare(directory: int, name: str, preparation: DatasetPreparation) -> None:
+    temporary = f".prepared-{secrets.token_hex(16)}.tmp"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory,
+    )
+    try:
+        try:
+            _write(descriptor, preparation.model_dump_json().encode())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(
+                temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False
+            )
+        except FileExistsError:
+            raise DatasetFileError("dataset_transfer_exists") from None
+        os.fsync(directory)
+    finally:
+        os.unlink(temporary, dir_fd=directory)
+        os.fsync(directory)
 
 
 def _cleanup_storage(descriptor: int | None, bucket: int, temporary: str) -> None:
@@ -201,18 +238,20 @@ async def _stream_dataset_source(
         raise DatasetFileError("dataset_storage_failure") from None
     temporary = f".{execution_identifier}.{secrets.token_hex(16)}.part"
     final = f"{execution_identifier}.data"
+    prepared_name = f"{execution_identifier}.prepared.json"
     descriptor = None
     transfer: DatasetTransfer | None = None
     response: httpx.Response | None = None
     cleanup_error: str | None = None
     client: httpx.AsyncClient | None = None
     try:
-        try:
-            _ = os.stat(final, dir_fd=bucket, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise DatasetFileError("dataset_transfer_exists")
+        for existing in (final, prepared_name):
+            try:
+                _ = os.stat(existing, dir_fd=bucket, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise DatasetFileError("dataset_transfer_exists")
         client = httpx.AsyncClient(
             transport=transport,
             timeout=120,
@@ -248,17 +287,19 @@ async def _stream_dataset_source(
         if any(value != "identity" for value in encodings):
             raise DatasetFileError("dataset_content_encoding_unsupported")
         # Validate all retained metadata before accepting body bytes or writing.
-        metadata = DatasetTransfer(
+        metadata = DatasetPreparation(
             source_identifier=source.identifier,
             source_fingerprint=fingerprint,
             execution_identifier=execution_identifier,
             locator=locator,
-            bytes=1,
             requested_url=source.url,
             response_url=str(response.url),
             downloaded_at_utc=datetime.now(UTC).isoformat(),
             last_modified=response.headers.get("last-modified"),
             etag=response.headers.get("etag"),
+        )
+        await anyio.to_thread.run_sync(
+            _prepare, bucket, prepared_name, metadata, abandon_on_cancel=False
         )
         descriptor = os.open(
             temporary,
@@ -297,8 +338,10 @@ async def _stream_dataset_source(
         await anyio.to_thread.run_sync(
             _publish, descriptor, bucket, temporary, final, abandon_on_cancel=False
         )
-        transfer = metadata.model_copy(
-            update={"bytes": observed, "cleanup_error_type": cleanup_error}
+        transfer = DatasetTransfer(
+            **metadata.model_dump(exclude={"kind", "cleanup_error_type"}),
+            bytes=observed,
+            cleanup_error_type=cleanup_error,
         )
     except httpx.HTTPError:
         raise DatasetFileError("dataset_download_failed") from None

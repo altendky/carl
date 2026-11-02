@@ -89,7 +89,6 @@ class _FileMetadata(StrictModel):
     source_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     execution_identifier: str = Field(min_length=1, max_length=200)
     locator: str = Field(min_length=1, max_length=1024)
-    bytes: int = Field(ge=1, le=MAX_DATASET_FILE_BYTES)
     requested_url: str = Field(min_length=1, max_length=4096)
     response_url: str = Field(min_length=1, max_length=4096)
     downloaded_at_utc: str = Field(min_length=1, max_length=64)
@@ -139,12 +138,18 @@ class _FileMetadata(StrictModel):
         return self
 
 
+class DatasetPreparation(_FileMetadata):
+    kind: Literal["dataset_prepared"] = "dataset_prepared"
+
+
 class DatasetTransfer(_FileMetadata):
     kind: Literal["dataset_transfer"] = "dataset_transfer"
+    bytes: int = Field(ge=1, le=MAX_DATASET_FILE_BYTES)
 
 
 class FileReceipt(_FileMetadata):
     kind: Literal["dataset_file"] = "dataset_file"
+    bytes: int = Field(ge=1, le=MAX_DATASET_FILE_BYTES)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     md5: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
