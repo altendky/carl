@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
@@ -12,6 +13,13 @@ from uuid import NAMESPACE_URL, uuid5
 import anyio
 import apsw
 
+from carl.core.analysis_stages import (
+    MAX_ANALYSIS_INPUT_BYTES,
+    MAX_ANALYSIS_INPUT_FILES,
+    MAX_ANALYSIS_TEXT_BYTES,
+    AnalysisImage,
+    PreparedAnalysis,
+)
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.ebay_analysis import (
     ANALYZE_EBAY_ITEM_WORK_KIND,
@@ -55,7 +63,7 @@ from carl.facebook_analysis_workers import (
     REGISTER_PRODUCT_GUIDE,
     AnalysisWorkerDependencies,
 )
-from carl.io.claude import temporary_analysis_directory
+from carl.io.claude import ClaudeRun, temporary_analysis_directory
 from carl.io.provenance import process_invocation
 from carl.io.sqlite import Database
 from carl.io.worker import TypedWorkHandler, WorkHandlerRegistry
@@ -376,7 +384,9 @@ async def request_ebay_listing_analysis(
     )
 
 
-async def _guide_prompt(database: Database, identifier: str) -> str:
+async def _guide_prompt(
+    database: Database, identifier: str, *, maximum_bytes: int | None = None
+) -> str:
     kind, version, value = await database.get_record(identifier)
     if kind != ("carl", "analysis", "product_guide") or version not in {1, 2}:
         raise ValueError("Input is not a supported product guide record")
@@ -393,7 +403,7 @@ async def _guide_prompt(database: Database, identifier: str) -> str:
     artifacts = [edge.object_identifier for edge in outputs if edge.name == ("guide_text",)]
     if len(artifacts) != 1:
         raise ValueError("Product guide has no unique exact-text artifact")
-    metadata, content = await database.get_artifact(artifacts[0])
+    metadata, content = await database.get_artifact(artifacts[0], maximum_bytes=maximum_bytes)
     if metadata.get("media_type") != "text/plain; charset=utf-8" or metadata.get(
         "representation"
     ) != {"exact_product_guide": True}:
@@ -407,9 +417,16 @@ async def _guide_prompt(database: Database, identifier: str) -> str:
     )
 
 
-async def _analysis_input(
-    database: Database, evidence_identifier: str
-) -> tuple[dict[str, JsonValue], tuple[tuple[str, bytes], ...]]:
+@dataclass(frozen=True, slots=True)
+class _ResolvedAnalysisInput:
+    brief: dict[str, JsonValue]
+    images: tuple[AnalysisImage, ...]
+    files: tuple[tuple[str, bytes], ...]
+
+
+async def _resolve_analysis_input(
+    database: Database, evidence_identifier: str, *, retain_image_bytes: bool
+) -> _ResolvedAnalysisInput:
     """Validate retained selection edges again before exposing anything to Claude."""
 
     kind, version, value = await database.get_record(evidence_identifier)
@@ -462,6 +479,8 @@ async def _analysis_input(
         for edge in edges
         if len(edge.name) == 2 and edge.name[0] == "image_result"
     }
+    if not retain_image_bytes and len(references) > MAX_ANALYSIS_INPUT_FILES:
+        raise ValueError("eBay analysis exceeds the image count budget")
     if not results.keys() <= references.keys():
         raise ValueError("eBay analysis evidence image edges are malformed")
     unavailable_raw = value["unavailable_gallery_images"]
@@ -480,6 +499,8 @@ async def _analysis_input(
         raise ValueError("eBay analysis evidence has incomplete gallery metadata")
     represented_orders: list[int] = []
     files: list[tuple[str, bytes]] = []
+    images: list[AnalysisImage] = []
+    image_bytes = 0
     for index, identifier in sorted(references.items()):
         kind, _, reference = await database.get_record(identifier)
         if kind != ("carl", "ebay", "gallery_image_reference") or not isinstance(reference, dict):
@@ -515,15 +536,35 @@ async def _analysis_input(
         artifact = result.get("image_artifact_identifier")
         if not isinstance(artifact, str):
             raise ValueError("eBay image result has no saved artifact")
-        metadata, content = await database.get_artifact(artifact)
+        maximum_bytes = None
+        if not retain_image_bytes:
+            metadata = await database.get_artifact_metadata(artifact)
+            size = metadata.get("size")
+            if type(size) is not int or not 0 <= size <= MAX_ANALYSIS_INPUT_BYTES - image_bytes:
+                raise ValueError("eBay analysis images exceed the input byte budget")
+            image_bytes += size
+            maximum_bytes = size
+        metadata, content = await database.get_artifact(artifact, maximum_bytes=maximum_bytes)
         media_type = metadata.get("media_type")
-        if (
-            not isinstance(media_type, str)
-            or media_type not in _EXTENSIONS
-            or hashlib.sha256(content).hexdigest() != metadata.get("sha256")
-        ):
+        if not isinstance(media_type, str) or media_type not in _EXTENSIONS:
             raise ValueError("Saved eBay image artifact has invalid media type or digest")
-        files.append((f"images/{order:03d}{_EXTENSIONS[media_type]}", content))
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != metadata.get("sha256"):
+            raise ValueError("Saved eBay image artifact has invalid media type or digest")
+        filename = f"images/{order:03d}{_EXTENSIONS[media_type]}"
+        if retain_image_bytes:
+            files.append((filename, content))
+        else:
+            images.append(
+                AnalysisImage(
+                    artifact_identifier=artifact,
+                    sha256=digest,
+                    media_type=media_type,
+                    byte_length=len(content),
+                    filename=filename,
+                    gallery_order=order,
+                )
+            )
     for missing in unretained:
         if not isinstance(missing, dict) or set(missing) != {"gallery_order", "url", "reason"}:
             raise ValueError("Unretained eBay image metadata is malformed")
@@ -570,7 +611,7 @@ async def _analysis_input(
                 raise ValueError("Saved eBay seller description has no usable text")
     elif description_state not in {"inline", "not_available"}:
         raise ValueError("eBay seller-description selection has no matching input edge")
-    return {
+    brief: dict[str, JsonValue] = {
         "marketplace": "ebay",
         "listing_id": observation.get("item_identifier"),
         "fields": {
@@ -581,10 +622,54 @@ async def _analysis_input(
             "condition": observation.get("condition"),
         },
         "description_state": description_state,
-        "gallery_images": [{"filename": filename} for filename, _ in files],
+        "gallery_images": [
+            {"filename": filename}
+            for filename in (
+                (filename for filename, _ in files)
+                if retain_image_bytes
+                else (image.filename for image in images)
+            )
+        ],
         "unavailable_gallery_images": [*unavailable_raw, *unretained],
         "gallery_absence_reason": absence,
-    }, tuple(files)
+    }
+    return _ResolvedAnalysisInput(brief, tuple(images), tuple(files))
+
+
+async def _analysis_input(
+    database: Database, evidence_identifier: str
+) -> tuple[dict[str, JsonValue], tuple[tuple[str, bytes], ...]]:
+    resolved = await _resolve_analysis_input(database, evidence_identifier, retain_image_bytes=True)
+    return resolved.brief, resolved.files
+
+
+async def prepare_ebay_analysis(
+    payload: EbayAnalyzeItemPayload, database: Database
+) -> PreparedAnalysis:
+    """Validate exact retained evidence under CPU admission without retaining image buffers."""
+
+    if payload.recipe_version != EBAY_ANALYSIS_RECIPE_VERSION:
+        raise ValueError("Queued eBay analysis recipe differs from registered recipe")
+    prompt = await _guide_prompt(
+        database, payload.product_guide_record_identifier, maximum_bytes=MAX_ANALYSIS_TEXT_BYTES
+    )
+    resolved = await _resolve_analysis_input(
+        database, payload.evidence_set_record_identifier, retain_image_bytes=False
+    )
+    return PreparedAnalysis(
+        listing_input=encode_json(resolved.brief, indent=2).encode(),
+        prompt=prompt.encode(),
+        images=resolved.images,
+        inputs=(
+            NamedInput(
+                name=("listing_analysis_evidence",),
+                object_identifier=payload.evidence_set_record_identifier,
+            ),
+            NamedInput(
+                name=("product_guide",), object_identifier=payload.product_guide_record_identifier
+            ),
+        ),
+    )
 
 
 async def _write(path: Path, value: bytes) -> None:
@@ -638,10 +723,8 @@ async def _analyze(
             },
             result={"state": "failed"},
         )
-    identifiers = [dependencies.new_identifier() for _ in range(5)]
-    brief_identifier, prompt_identifier, stdout_identifier, stderr_identifier, result_identifier = (
-        identifiers
-    )
+    identifiers = [dependencies.new_identifier() for _ in range(4)]
+    brief_identifier, prompt_identifier, stdout_identifier, stderr_identifier = identifiers
     artifacts = (
         BytesDraft(
             identifier=brief_identifier,
@@ -672,6 +755,29 @@ async def _analyze(
             content=run.stderr,
         ),
     )
+    outcome = ebay_analysis_outcome(payload, context, run, dependencies.new_identifier)
+    outputs = tuple(
+        NamedOutput(name=name, object_identifier=identifier)
+        for name, identifier in zip(
+            (("listing_input",), ("prompt",), ("claude", "stdout"), ("claude", "stderr")),
+            identifiers,
+            strict=True,
+        )
+    )
+    return outcome.model_copy(
+        update={"inputs": inputs, "artifacts": artifacts, "outputs": (*outputs, *outcome.outputs)}
+    )
+
+
+def ebay_analysis_outcome(
+    payload: EbayAnalyzeItemPayload,
+    context: AttemptContext,
+    run: ClaudeRun,
+    new_identifier: Callable[[], str],
+) -> WorkOutcome:
+    """Build the existing report and retry decision without republishing phase artifacts."""
+
+    result_identifier = new_identifier()
     failure = run.failure_kind
     state = "completed" if failure is None else "failed"
     raw_turns = run.output_metadata.get("num_turns") if run.output_metadata else None
@@ -712,20 +818,7 @@ async def _analyze(
             },
         },
     )
-    outputs = tuple(
-        NamedOutput(name=name, object_identifier=identifier)
-        for name, identifier in zip(
-            (
-                ("listing_input",),
-                ("prompt",),
-                ("claude", "stdout"),
-                ("claude", "stderr"),
-                ("item_analysis",),
-            ),
-            identifiers,
-            strict=True,
-        )
-    )
+    outputs = (NamedOutput(name=("item_analysis",), object_identifier=result_identifier),)
     result: dict[str, JsonValue] = {
         "state": state,
         "analysis_record_identifier": result_identifier,
@@ -733,9 +826,7 @@ async def _analyze(
     }
     if failure == "claude_timeout" and context.attempt < ANALYSIS_TIMEOUT_MAXIMUM_ATTEMPTS:
         return RetryWork(
-            inputs=inputs,
             records=(record,),
-            artifacts=artifacts,
             outputs=outputs,
             delay_ns=ANALYSIS_TIMEOUT_RETRY_BASE_DELAY_NS * 2 ** (context.attempt - 1),
             reason={
@@ -748,9 +839,7 @@ async def _analyze(
         )
     if failure is not None:
         return TerminalFailureWork(
-            inputs=inputs,
             records=(record,),
-            artifacts=artifacts,
             outputs=outputs,
             error={
                 "kind": failure,
@@ -762,9 +851,7 @@ async def _analyze(
             },
             result=result,
         )
-    return CompletedWork(
-        inputs=inputs, records=(record,), artifacts=artifacts, outputs=outputs, result=result
-    )
+    return CompletedWork(records=(record,), outputs=outputs, result=result)
 
 
 def build_ebay_analysis_worker_registry(

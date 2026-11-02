@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter_ns, time_ns
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
 import anyio
@@ -158,6 +158,8 @@ from carl.core.work import (
     NetworkActivityDefinition,
     NetworkActivityEventKind,
     NetworkActivityState,
+    SchedulingScope,
+    SchedulingScopeKind,
     SchedulingSubjectKind,
     SlidingWindowRateConstraint,
     UniformHoldoffConstraint,
@@ -998,16 +1000,31 @@ def _external_artifact_path(database_path: Path, locator: str) -> Path:
 
 
 def _read_external_artifact(
-    database_path: Path, locator: str, expected_sha256: str, expected_size: int
+    database_path: Path,
+    locator: str,
+    expected_sha256: str,
+    expected_size: int,
+    maximum_bytes: int | None = None,
 ) -> tuple[Path, bytes]:
+    if maximum_bytes is not None and expected_size > maximum_bytes:
+        raise ValueError("Artifact exceeds maximum_bytes")
     path = _external_artifact_path(database_path, locator)
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
+        if maximum_bytes is not None and os.fstat(descriptor).st_size > maximum_bytes:
+            raise ValueError("Artifact exceeds maximum_bytes")
         chunks = bytearray()
         while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+            read_size = (
+                1024 * 1024
+                if maximum_bytes is None
+                else min(1024 * 1024, maximum_bytes - len(chunks) + 1)
+            )
+            chunk = os.read(descriptor, read_size)
             if not chunk:
                 break
+            if maximum_bytes is not None and len(chunks) + len(chunk) > maximum_bytes:
+                raise ValueError("Artifact exceeds maximum_bytes")
             chunks.extend(chunk)
     finally:
         os.close(descriptor)
@@ -2185,6 +2202,44 @@ class Database:
         must not invoke HTTP again. An uncertain recovered execution has a fresh
         token and consumes another ordinal within the same logical budget.
         """
+        return await self._charge_stage_dispatch(
+            context,
+            request_identity=request_identity,
+            maximum_attempts=maximum_attempts,
+            now_utc_ns=now_utc_ns,
+            dispatch_resource="http",
+        )
+
+    async def charge_stage_invocation(
+        self,
+        context: StageAttemptContext,
+        *,
+        request_identity: tuple[str, ...],
+        maximum_attempts: int,
+        now_utc_ns: int,
+    ) -> StageRequestCharge | None:
+        """Commit an analysis invocation charge before starting its executor.
+
+        Only a newly charged invocation may start. Recovery uses a fresh stage
+        token and consumes another ordinal within the same logical budget.
+        """
+        return await self._charge_stage_dispatch(
+            context,
+            request_identity=request_identity,
+            maximum_attempts=maximum_attempts,
+            now_utc_ns=now_utc_ns,
+            dispatch_resource="analysis",
+        )
+
+    async def _charge_stage_dispatch(
+        self,
+        context: StageAttemptContext,
+        *,
+        request_identity: tuple[str, ...],
+        maximum_attempts: int,
+        now_utc_ns: int,
+        dispatch_resource: Literal["http", "analysis"],
+    ) -> StageRequestCharge | None:
         if (
             now_utc_ns < 0
             or type(maximum_attempts) is not int
@@ -2228,19 +2283,31 @@ class Database:
                 or not await self.validate_stage(lease, now_utc_ns=now_utc_ns)
             ):
                 raise LeaseLostError("Request charge lost its work or resident ownership")
-            if (
-                lease.definition.network_activity is None
-                or lease.network_admission is None
-                or not any(request.name == "http" for request in lease.definition.resources)
-            ):
-                raise ValueError("Request charges require an admitted HTTP/network stage")
-            if (
-                context.network_admission is None
-                or context.network_admission.activity_identifier
-                != lease.network_admission.activity_identifier
-                or context.network_admission.token != lease.token
-            ):
-                raise LeaseLostError("Request charge does not match its network admission")
+            if dispatch_resource == "http":
+                if (
+                    lease.definition.network_activity is None
+                    or lease.network_admission is None
+                    or not any(request.name == "http" for request in lease.definition.resources)
+                ):
+                    raise ValueError("Request charges require an admitted HTTP/network stage")
+                if (
+                    context.network_admission is None
+                    or context.network_admission.activity_identifier
+                    != lease.network_admission.activity_identifier
+                    or context.network_admission.token != lease.token
+                ):
+                    raise LeaseLostError("Request charge does not match its network admission")
+            else:
+                if (
+                    not any(request.name == "analysis" for request in lease.definition.resources)
+                    or lease.definition.network_activity is not None
+                    or lease.network_admission is not None
+                ):
+                    raise ValueError(
+                        "Invocation charges require an admitted offline analysis stage"
+                    )
+                if context.network_admission is not None:
+                    raise LeaseLostError("Analysis invocation does not match its offline admission")
             cursor = await connection.execute(
                 "SELECT maximum_attempts, max(ordinal) FROM resident_request_charges WHERE operation_id = ? AND request_identity_json = ? GROUP BY maximum_attempts",
                 (context.operation_identifier, identity),
@@ -5776,6 +5843,46 @@ class Database:
         if row is None:
             raise KeyError(work_item_identifier)
         return WorkState(_text(row[0]))
+
+    async def work_definition(self, work_item_identifier: str) -> WorkDefinition:
+        """Point-load retained work without history; not_before is current eligibility."""
+
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT kind_parts_json, payload_schema_version, payload_json,
+                       deduplication_identity_json, priority, eligible_at_utc_ns
+                FROM work_items WHERE id = ?
+                """,
+                (work_item_identifier,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(work_item_identifier)
+            cursor = await connection.execute(
+                """
+                SELECT scope_kind, scope_identity_json FROM work_scopes
+                WHERE work_item_id = ? ORDER BY scope_kind, scope_identity_json
+                """,
+                (work_item_identifier,),
+            )
+            scopes = tuple(
+                SchedulingScope(
+                    kind=SchedulingScopeKind(_text(scope[0])),
+                    identity=tuple(cast(list[str], decode_json(_text(scope[1])))),
+                )
+                for scope in await cursor.fetchall()
+            )
+        return WorkDefinition(
+            identifier=work_item_identifier,
+            kind=tuple(cast(list[str], decode_json(_text(row[0])))),
+            payload_schema_version=_integer(row[1]),
+            payload=decode_json(_text(row[2])),
+            deduplication_identity=tuple(cast(list[str], decode_json(_text(row[3])))),
+            priority=_integer(row[4]),
+            not_before_utc_ns=_integer(row[5]),
+            scopes=scopes,
+        )
 
     async def work(self, work_item_identifier: str) -> dict[str, JsonValue]:
         async with self._connections.reader() as connection:
@@ -13168,8 +13275,57 @@ class Database:
             )
         return tuple(candidates)
 
-    async def get_artifact(self, identifier: str) -> tuple[dict[str, JsonValue], bytes]:
+    async def get_artifact_metadata(self, identifier: str) -> dict[str, JsonValue]:
+        """Read inline or external artifact metadata without materializing content."""
+
         async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT sha256, size, media_type, representation_json, NULL
+                FROM artifacts WHERE object_id = ?
+                UNION ALL
+                SELECT sha256, size, media_type, representation_json, locator
+                FROM external_artifacts WHERE object_id = ?
+                """,
+                (identifier, identifier),
+            )
+            rows = await cursor.fetchall()
+        if not rows:
+            raise KeyError(identifier)
+        row = rows[0]
+        storage: dict[str, JsonValue] = (
+            {"backend": "sqlite"}
+            if row[4] is None
+            else {"backend": "filesystem", "locator": _text(row[4])}
+        )
+        return {
+            "sha256": row[0],
+            "size": row[1],
+            "media_type": row[2],
+            "representation": decode_json(_text(row[3])),
+            "storage": storage,
+        }
+
+    async def get_artifact(
+        self, identifier: str, *, maximum_bytes: int | None = None
+    ) -> tuple[dict[str, JsonValue], bytes]:
+        """Verify artifact content, optionally rejecting oversized data before loading."""
+
+        if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes < 0):
+            raise ValueError("maximum_bytes must be a nonnegative integer or None")
+        async with self._connections.reader() as connection:
+            if maximum_bytes is not None:
+                cursor = await connection.execute(
+                    """
+                    SELECT artifacts.size, length(content.inline_bytes)
+                    FROM artifacts JOIN content USING (sha256, size)
+                    WHERE artifacts.object_id = ?
+                    """,
+                    (identifier,),
+                )
+                sizes = await cursor.fetchall()
+                if sizes and any(_integer(size) > maximum_bytes for size in sizes[0]):
+                    raise ValueError("Artifact exceeds maximum_bytes")
             cursor = await connection.execute(
                 """
                 SELECT artifacts.sha256, artifacts.size, artifacts.media_type,
@@ -13213,6 +13369,7 @@ class Database:
                 _text(external_row[4]),
                 _text(external_row[0]),
                 _integer(external_row[1]),
+                maximum_bytes,
             )
             row = external_row
             storage = {"backend": "filesystem", "locator": _text(external_row[4])}
@@ -13251,10 +13408,12 @@ class Database:
         }
 
     async def get_external_artifact_path(
-        self, identifier: str
+        self, identifier: str, *, maximum_bytes: int | None = None
     ) -> tuple[dict[str, JsonValue], Path] | None:
         """Return a verified external path, or None for an inline artifact."""
 
+        if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes < 0):
+            raise ValueError("maximum_bytes must be a nonnegative integer or None")
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
                 """
@@ -13274,6 +13433,7 @@ class Database:
             _text(row[4]),
             _text(row[0]),
             _integer(row[1]),
+            maximum_bytes,
         )
         return (
             {
