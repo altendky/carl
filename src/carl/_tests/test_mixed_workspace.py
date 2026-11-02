@@ -122,6 +122,7 @@ async def test_mixed_review_batch_fills_across_reviewed_and_claimed_listings(
                 {
                     "request": _search_run_value("scope")["request"],
                     "traversal": {"maximum_pages": 1},
+                    "traversal_strategy": {"kind": "overlapping_price_partitions", "width": "600"},
                 }
             )
         )
@@ -273,6 +274,7 @@ async def test_mixed_group_workspace_keeps_colliding_ids_distinct(tmp_path: Path
                 {
                     "request": _search_run_value("scope")["request"],
                     "traversal": {"maximum_pages": 1},
+                    "traversal_strategy": {"kind": "overlapping_price_partitions", "width": "600"},
                 }
             )
         )

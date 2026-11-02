@@ -132,6 +132,10 @@ from carl.core.facebook_refresh import (
     SearchRunSummary,
     refresh_search_work,
 )
+from carl.core.facebook_search_support import (
+    UnsupportedFacebookSearchMode,
+    require_supported_facebook_search_acquisition,
+)
 from carl.core.facebook_work import (
     COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
     CollectSearchPayload,
@@ -553,6 +557,15 @@ def _require_ebay_search_acquisition(request: EbaySearchRequest) -> None:
         raise ReviewInputError(str(error)) from error
 
 
+def _require_facebook_search_acquisition(
+    request: CreateSearchRequest | CollectSearchPayload,
+) -> None:
+    try:
+        require_supported_facebook_search_acquisition(request.request, request.traversal_strategy)
+    except UnsupportedFacebookSearchMode as error:
+        raise ReviewInputError(str(error)) from error
+
+
 def _newest_value[T](
     candidates: tuple[_MarketplaceSearchResultCandidate, ...],
     getter: Callable[[_MarketplaceSearchResultCandidate], T | None],
@@ -864,10 +877,13 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=62),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=47),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=64),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=48),
+                ServerCapability(
+                    identity=("carl", "facebook", "price_partition_search_only"), version=1
+                ),
                 ServerCapability(identity=("carl", "review", "driving_estimates"), version=4),
-                ServerCapability(identity=("carl", "mcp", "response_pages"), version=3),
+                ServerCapability(identity=("carl", "mcp", "response_pages"), version=4),
                 ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
                 ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=3),
@@ -3124,6 +3140,7 @@ class ReviewApplication:
         if isinstance(search, EbaySearchTargetSpecification):
             _require_ebay_search_acquisition(search.search)
         else:
+            _require_facebook_search_acquisition(search.search)
             CollectSearchPayload(
                 request=search.search.request,
                 traversal=search.search.traversal,
@@ -5254,6 +5271,8 @@ class ReviewApplication:
         for specification in request.targets:
             if isinstance(specification, EbaySearchTargetSpecification):
                 _require_ebay_search_acquisition(specification.search)
+            else:
+                _require_facebook_search_acquisition(specification.search)
         search_identifier = self.new_identifier()
         created_at_utc = _utc_text(self.utc_now_ns())
         search = MarketplaceSearchRecord(
@@ -5316,6 +5335,8 @@ class ReviewApplication:
 
         if isinstance(request.target, EbaySearchTargetSpecification):
             _require_ebay_search_acquisition(request.target.search)
+        else:
+            _require_facebook_search_acquisition(request.target.search)
         _ = await self._require_marketplace_search_record(request.search_record_identifier)
         target = MarketplaceSearchTargetRecord(
             record_identifier=self.new_identifier(),
@@ -5414,10 +5435,11 @@ class ReviewApplication:
             raise ReviewInputError("The marketplace search has no enabled targets")
         records = await self._marketplace_search_target_records(request.search_record_identifier)
         for target in records:
-            if target.record_identifier in enabled_identifiers and isinstance(
-                target.specification, EbaySearchTargetSpecification
-            ):
-                _require_ebay_search_acquisition(target.specification.search)
+            if target.record_identifier in enabled_identifiers:
+                if isinstance(target.specification, EbaySearchTargetSpecification):
+                    _require_ebay_search_acquisition(target.specification.search)
+                else:
+                    _require_facebook_search_acquisition(target.specification.search)
         for target in records:
             if target.record_identifier in enabled_identifiers:
                 await self._request_marketplace_target_execution(
@@ -5488,6 +5510,7 @@ class ReviewApplication:
         requester_identifier: str | None,
         requester_context: dict[str, JsonValue] | None = None,
     ) -> CreateSearchResult:
+        _require_facebook_search_acquisition(request)
         payload = CollectSearchPayload(
             request=request.request,
             traversal=request.traversal,
@@ -5567,6 +5590,16 @@ class ReviewApplication:
                 else original_payload.request
             )
             _require_ebay_search_acquisition(current_search)
+        else:
+            original_facebook_payload = CollectSearchPayload.model_validate_json(
+                encode_json(work["payload"])
+            )
+            _require_facebook_search_acquisition(
+                track.search_specification.search
+                if track.search_specification_version > 1
+                and isinstance(track.search_specification, FacebookSearchTargetSpecification)
+                else original_facebook_payload
+            )
         if WorkState(str(work["state"])) is not WorkState.TERMINAL_FAILURE:
             raise ReviewInputError("The search track creation is not in terminal failure")
         if (
@@ -5763,6 +5796,7 @@ class ReviewApplication:
             )
         except ValueError as error:
             raise ReviewInputError(f"The retained search cannot be refreshed: {error}") from error
+        _require_facebook_search_acquisition(base_payload)
         refresh_identifier = self.new_identifier()
         payload = RefreshSearchPayload(
             base_search_run_record_identifier=request.base_search_run_record_identifier,

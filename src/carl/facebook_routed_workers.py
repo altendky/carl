@@ -21,6 +21,10 @@ from carl.core.facebook_images import (
     image_network_constraints,
     legacy_image_network_constraint_identifiers,
 )
+from carl.core.facebook_search_support import (
+    UnsupportedFacebookSearchMode,
+    require_supported_facebook_search_acquisition,
+)
 from carl.core.facebook_work import (
     COLLECT_ITEM_PAYLOAD_SCHEMA_VERSION,
     COLLECT_ITEM_WORK_KIND,
@@ -177,6 +181,15 @@ def build_routed_facebook_worker_registry(
     )
 
     async def collect_search(payload: CollectSearchPayload, context: AttemptContext) -> WorkOutcome:
+        try:
+            require_supported_facebook_search_acquisition(
+                payload.request, payload.traversal_strategy
+            )
+        except UnsupportedFacebookSearchMode as error:
+            return TerminalFailureWork(
+                error={"kind": "unsupported_facebook_search_mode", "message": str(error)},
+                result={"state": "unsupported"},
+            )
         try:
             loaded = load_configuration(directories.configuration_file)
             routing = loaded.configuration.resolve_network_path(payload.routing)

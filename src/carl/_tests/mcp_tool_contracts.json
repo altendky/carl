@@ -2458,7 +2458,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -2467,7 +2467,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -2488,6 +2489,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -3118,7 +3120,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -3127,7 +3129,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -3148,6 +3151,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -5554,7 +5558,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -5563,7 +5567,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -5584,6 +5589,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -6402,7 +6408,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -6411,7 +6417,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -6432,6 +6439,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -7062,7 +7070,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -7071,7 +7079,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -7092,6 +7101,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -8199,7 +8209,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -8208,7 +8218,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -8256,6 +8267,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -16369,7 +16381,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -16378,7 +16390,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -16399,6 +16412,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -17396,7 +17410,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -17405,7 +17419,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -17426,6 +17441,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -18805,7 +18821,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -18814,7 +18830,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -18835,6 +18852,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -26883,7 +26901,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -26892,7 +26910,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -26913,6 +26932,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -30773,7 +30793,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -30782,7 +30802,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -30803,6 +30824,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -33271,7 +33293,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -33280,7 +33302,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -33301,6 +33324,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -34810,7 +34834,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -34819,7 +34843,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -34840,6 +34865,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -35853,6 +35879,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -37091,6 +37118,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -38787,7 +38815,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -38796,7 +38824,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -38817,6 +38846,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -39615,7 +39645,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -39624,7 +39654,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -39645,6 +39676,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -40333,7 +40365,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -40342,7 +40374,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -40363,6 +40396,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -41448,7 +41482,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -41457,7 +41491,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -41478,6 +41513,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -42459,7 +42495,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -42468,7 +42504,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -42489,6 +42526,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -43377,7 +43415,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -43386,7 +43424,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -43407,6 +43446,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",
@@ -44517,7 +44557,7 @@
         },
         "CreateSearchRequest": {
           "additionalProperties": false,
-          "description": "Queue one new bounded Marketplace search.",
+          "description": "Facebook search intent, including historical cursor requests for retained reads.\n\nNew acquisitions require explicit price partitions and a maximum price.",
           "properties": {
             "request": {
               "$ref": "#/$defs/FacebookSearchRequest"
@@ -44526,7 +44566,8 @@
               "$ref": "#/$defs/SearchTraversalPolicy"
             },
             "traversal_strategy": {
-              "$ref": "#/$defs/SearchTraversalStrategy"
+              "$ref": "#/$defs/SearchTraversalStrategy",
+              "description": "New acquisition requires overlapping_price_partitions with an explicit width. The cursor default is retained only to deserialize historical intent and is rejected before acquisition."
             },
             "network_path": {
               "$ref": "#/$defs/AcquisitionNetworkPath",
@@ -44547,6 +44588,7 @@
         },
         "CursorSearchTraversalStrategy": {
           "additionalProperties": false,
+          "description": "Historical cursor intent; unsupported for new Facebook acquisition.",
           "properties": {
             "kind": {
               "const": "cursor",

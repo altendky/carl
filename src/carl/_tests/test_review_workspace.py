@@ -1,6 +1,7 @@
 """Review workspace state and optimistic grouping tests."""
 
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import anyio
@@ -28,6 +29,7 @@ from carl.core.composed_projection import (
     SearchRunCandidate,
     canonical_facebook_listing_url,
 )
+from carl.core.facebook_search import OverlappingPricePartitionSearchTraversalStrategy
 from carl.core.facebook_work import COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION, COLLECT_SEARCH_WORK_KIND
 from carl.core.json import encode_json
 from carl.core.models import CodeProvenance, NamedOutput, RecordDraft
@@ -221,15 +223,25 @@ async def test_workspace_search_and_refresh_are_tracks_and_workspace_work(
                                     "label": "Example City, PA",
                                 },
                                 "radius": {"value": 60, "unit": "miles"},
+                                "price": {"currency": "USD", "maximum": "600"},
                             },
                             "traversal": {"maximum_pages": 10},
+                            "traversal_strategy": {
+                                "kind": "overlapping_price_partitions",
+                                "width": "600",
+                            },
                         },
                     }
                 )
             )
         )
         refreshed = await application.request_workspace_refresh(
-            RequestWorkspaceRefreshRequest(workspace_record_identifier=workspace.record_identifier)
+            RequestWorkspaceRefreshRequest(
+                workspace_record_identifier=workspace.record_identifier,
+                traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(
+                    width=Decimal(600)
+                ),
+            )
         )
         updated = await application.get_review_workspace(workspace.record_identifier)
         status = await application.get_workspace_work_status(workspace.record_identifier)
@@ -314,8 +326,13 @@ async def test_failed_workspace_search_track_is_visible_and_retryable(tmp_path: 
                                     "identifier": "123",
                                 },
                                 "radius": {"value": 60, "unit": "miles"},
+                                "price": {"currency": "USD", "maximum": "600"},
                             },
                             "traversal": {"maximum_pages": 10},
+                            "traversal_strategy": {
+                                "kind": "overlapping_price_partitions",
+                                "width": "600",
+                            },
                         },
                     }
                 )

@@ -355,10 +355,14 @@ readable; ordinary items can still later be observed as sold.
 Facebook targets require explicit location, radius/unit, and finite traversal
 bounds. A numeric Facebook location ID is preferable to ambiguous text. These
 values express search intent; approximate location and server-applied radius do
-not establish exact distance or complete geographic coverage. Cursor traversal is
-the default. `overlapping_price_partitions` requests the first result page of each
-bucket instead; it is not exhaustive pagination. Bound its price range and number
-of partitions, and inspect stopping/coverage evidence before claiming completeness.
+not establish exact distance or complete geographic coverage. Facebook acquisition
+requires `traversal_strategy.kind="overlapping_price_partitions"`, an explicit
+`width`, and `request.price.maximum`; cursor pagination is disabled. The CLI
+requires `--price-partition-width` and `--maximum-price`. Each bucket collects its
+first result page. Bound the price range and number of partitions, and inspect
+stopping/coverage evidence before claiming completeness. Historical cursor runs
+remain readable. Revise cursor tracks to price buckets before refreshing or
+retrying them; old queued cursor acquisitions fail without making requests.
 
 For authorized end-to-end acquisition, use `request_search_pipeline` with a
 stable caller-generated request ID. Select `source.kind="new_search"` and targets,

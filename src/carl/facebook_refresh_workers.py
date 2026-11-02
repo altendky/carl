@@ -31,6 +31,10 @@ from carl.core.facebook_refresh import (
     REFRESH_SEARCH_WORK_KIND,
     RefreshSearchPayload,
 )
+from carl.core.facebook_search_support import (
+    UnsupportedFacebookSearchMode,
+    require_supported_facebook_search_acquisition,
+)
 from carl.core.facebook_work import (
     COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
     CollectItemPayload,
@@ -204,7 +208,6 @@ async def _search_phase(
     dependencies: RefreshWorkerDependencies,
 ) -> WorkOutcome:
     database = dependencies.database
-    await _activate_page_policy(dependencies, payload.search.routing, context.operation_identifier)
     requester_kind = ("carl", "facebook", "search_refresh", "search")
     requested = await database.requested_work_identifiers(
         requester_kind=requester_kind,
@@ -214,6 +217,17 @@ async def _search_phase(
         raise RuntimeError("Search refresh has more than one requested search work item")
     search_work_identifier = requested[0] if requested else payload.search_work_identifier
     work = await _work_or_none(database, search_work_identifier)
+    if work is None or work.get("state") != WorkState.COMPLETED.value:
+        try:
+            require_supported_facebook_search_acquisition(
+                payload.search.request, payload.search.traversal_strategy
+            )
+        except UnsupportedFacebookSearchMode as error:
+            return TerminalFailureWork(
+                error={"kind": "unsupported_facebook_search_mode", "message": str(error)},
+                result={"stage": "search_unsupported"},
+            )
+    await _activate_page_policy(dependencies, payload.search.routing, context.operation_identifier)
     if work is None:
         enqueued = await database.enqueue_work(
             collect_search_work(

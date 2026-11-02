@@ -6,6 +6,9 @@ This document preserves dated protocol research, not a current setup recipe.
 Use [setup and everyday usage](setup-and-usage.md) for the MCP/worker split and
 current routes. Earlier Proton experiments below remain historical evidence;
 new Facebook searches default directly to configured Decodo datacenter.
+Current Facebook acquisition requires explicit price partitions and a bounded maximum
+price. Cursor pagination is disabled at request and worker boundaries. Historical
+cursor records remain readable; revise their search tracks before another acquisition.
 
 The original findings came from offline inspection of temporary
 proof-of-concept artifacts under `/tmp/agents/OGYrj2TBqy/`. They support design
@@ -99,6 +102,15 @@ configured page or listing limit, deadline, transport exhaustion, invalid
 session material, persisted-query rejection, malformed response, and explicit
 cancellation. Exact listing IDs deduplicate scheduling of detail work, while
 every search-page observation and rank or position remains retained.
+
+Historical cursor attempts stopped by error code 1675004 can retain preceding
+successful pages as a partial search run with stopping reason `rate_limited`.
+Their work result includes
+the saved `search_run_record_identifier`, which can seed a review workspace even
+after collection stops. These partial runs remain independently reviewable.
+New cursor acquisitions and retries are disabled; price partitions are the
+supported acquisition flow. Failed attempts that do not save a run omit run
+identifiers from their work result.
 
 The proof script uses a broad recursive `page_info` search, regular expressions
 for session tokens, a fixed browser version, curl, and a shared header list with

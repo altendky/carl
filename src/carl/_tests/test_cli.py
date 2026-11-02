@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,8 @@ def test_search_queues_without_running_an_inline_worker(
         facebook_location="456",
         radius=60,
         maximum_pages=1,
+        maximum_price=Decimal("600"),
+        price_partition_width=Decimal("100"),
         database=database,
     )
 
@@ -84,6 +87,8 @@ def test_search_explicit_legacy_proton_option_requests_actual_proton(
         facebook_location="456",
         radius=60,
         maximum_pages=1,
+        maximum_price=Decimal("600"),
+        price_partition_width=Decimal("100"),
         proton_route="dedicated-proton",
         database=database,
     )

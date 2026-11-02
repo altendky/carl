@@ -24,6 +24,8 @@ class SearchPricePartitionOrder(JsonStringEnumeration):
 
 
 class CursorSearchTraversalStrategy(StrictModel):
+    """Historical cursor intent; unsupported for new Facebook acquisition."""
+
     kind: Literal[SearchTraversalStrategyKind.CURSOR] = SearchTraversalStrategyKind.CURSOR
 
 
@@ -68,6 +70,7 @@ type SearchTraversalStrategy = Annotated[
 
 
 class SearchStoppingReason(JsonStringEnumeration):
+    RATE_LIMITED = "rate_limited"
     NO_NEXT_PAGE = "no_next_page"
     MISSING_CURSOR = "missing_cursor"
     REPEATED_CURSOR = "repeated_cursor"

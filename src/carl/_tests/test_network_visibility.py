@@ -3,6 +3,7 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from decimal import Decimal
 from itertools import count
 from pathlib import Path
 from time import perf_counter_ns, time_ns
@@ -11,12 +12,16 @@ from typing import cast
 import pytest
 
 from carl.core.ebay import EbaySearchRequest
-from carl.core.facebook_search import SearchTraversalPolicy
+from carl.core.facebook_search import (
+    OverlappingPricePartitionSearchTraversalStrategy,
+    SearchTraversalPolicy,
+)
 from carl.core.facebook_work import (
     CollectSearchPayload,
     FacebookSearchRequest,
     SearchDistanceUnit,
     SearchFacebookLocation,
+    SearchPriceRange,
     SearchRadius,
 )
 from carl.core.http import RequestPlan
@@ -167,9 +172,13 @@ async def test_facebook_session_open_failure_is_counted(tmp_path: Path) -> None:
                     query="telescope",
                     location=SearchFacebookLocation(identifier="456"),
                     radius=SearchRadius(value=60, unit=SearchDistanceUnit.MILES),
+                    price=SearchPriceRange(currency="USD", maximum=Decimal("600")),
                 ),
                 routing=route,
                 traversal=SearchTraversalPolicy(maximum_pages=1),
+                traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(
+                    width=Decimal("600")
+                ),
             ).as_json(),
             AttemptContext(
                 work_item_identifier="work",

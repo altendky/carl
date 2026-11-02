@@ -108,6 +108,7 @@ async def _listing_records(database: Database, *, mixed: bool) -> None:
         {
             "request": run["request"],
             "traversal": {"maximum_pages": 1},
+            "traversal_strategy": {"kind": "overlapping_price_partitions", "width": "600"},
         }
     )
     application = ReviewApplication(database, database.path.parent)

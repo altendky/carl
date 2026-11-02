@@ -251,24 +251,22 @@ def test_search_session_lock_contention_retries_then_exhausts() -> None:
     retry = search_session_failure_work(
         error=error,
         context=context,
-        search_run_identifier="search-run",
         routing=("proton", "personal", "carl"),
     )
     exhausted = search_session_failure_work(
         error=error,
         context=context.model_copy(update={"attempt": 6}),
-        search_run_identifier="search-run",
         routing=("proton", "personal", "carl"),
     )
     operator_retry = search_session_failure_work(
         error=error,
         context=context.model_copy(update={"attempt": 7}),
-        search_run_identifier="search-run",
         routing=("proton", "personal", "carl"),
         policy_attempt=1,
     )
 
     assert isinstance(retry, RetryWork)
+    assert "search_run_identifier" not in retry.result
     assert retry.delay_ns == 1_000_000_000
     assert isinstance(operator_retry, RetryWork)
     assert operator_retry.delay_ns == 1_000_000_000
@@ -306,15 +304,14 @@ def test_search_transport_failure_uses_exponential_backoff_and_larger_budget() -
     retry = search_acquisition_failure_work(
         error=error,
         context=context,
-        search_run_identifier="search-run",
     )
     exhausted = search_acquisition_failure_work(
         error=error,
         context=context.model_copy(update={"attempt": 6}),
-        search_run_identifier="search-run",
     )
 
     assert isinstance(retry, RetryWork)
+    assert "search_run_identifier" not in retry.result
     assert retry.delay_ns == 8_000_000_000
     assert retry.reason["exception_type"] == "ConnectError"
     assert retry.result["acquisition"]["routing"]["observed"]["provider_session"] == {
@@ -339,7 +336,7 @@ def _provenance() -> CodeProvenance:
 
 
 @pytest.mark.anyio
-async def test_search_worker_uses_one_session_and_checkpoints_every_page(
+async def test_search_worker_uses_one_session_and_checkpoints_price_bucket(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "carl.sqlite3"
@@ -358,6 +355,7 @@ async def test_search_worker_uses_one_session_and_checkpoints_every_page(
             price=SearchPriceRange(currency="USD", maximum=Decimal("600")),
         ),
         traversal=SearchTraversalPolicy(maximum_pages=3, maximum_results=3),
+        traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(width=Decimal("600")),
         routing=("proton", "personal", "carl"),
     )
     settings = WorkerSettings(
@@ -444,25 +442,20 @@ async def test_search_worker_uses_one_session_and_checkpoints_every_page(
 
     assert isinstance(outcome, CompletedWork)
     assert factory.opens == 1
-    assert [request.method for request in requests] == ["GET", "POST", "POST"]
+    assert [request.method for request in requests] == ["GET", "POST"]
     assert requests[0].url.path == "/marketplace/"
     assert requests[1].headers["Cookie"] == "anonymous_session=value"
     assert requests[1].url.path == "/ajax/route-definition/"
     route_form = parse_qs(requests[1].content.decode("ascii"), strict_parsing=True)
     assert route_form["__req"] == ["1"]
     assert route_form["route_url"] == [
-        "/marketplace/456/search?query=telescope&maxPrice=600&exact=false&radius=97"
+        "/marketplace/456/search?query=telescope&minPrice=0&maxPrice=600&exact=false&radius=97"
     ]
-    pagination_form = parse_qs(requests[2].content.decode("ascii"), strict_parsing=True)
-    assert pagination_form["__req"] == ["2"]
-    pagination_variables = json.loads(pagination_form["variables"][0])
-    assert pagination_variables["cursor"] == "cursor-1"
-    assert pagination_variables["count"] == 24
     assert work["state"] == WorkState.COMPLETED
-    assert work["result"]["pages_processed"] == 2
-    assert work["result"]["listing_observations"] == 4
-    assert work["result"]["unique_listings"] == 3
-    assert work["result"]["stopping_reason"] == "maximum_results"
+    assert work["result"]["pages_processed"] == 1
+    assert work["result"]["listing_observations"] == 2
+    assert work["result"]["unique_listings"] == 2
+    assert work["result"]["stopping_reason"] == "price_partitions_exhausted"
     assert len(search_runs.search_runs) == 1
     fresh_summary = search_runs.search_runs[0]
     assert fresh_summary.origin is SearchRunOrigin.FRESH
@@ -515,9 +508,9 @@ async def test_search_worker_uses_one_session_and_checkpoints_every_page(
             ).fetchall()
         }
     counts = {kind: amount for kind, amount in rows}
-    assert counts['["carl","http","acquisition"]'] == 3
-    assert counts['["carl","facebook","search_listing_occurrence"]'] == 4
-    assert counts['["carl","facebook","search_page_extraction"]'] == 2
+    assert counts['["carl","http","acquisition"]'] == 2
+    assert counts['["carl","facebook","search_listing_occurrence"]'] == 2
+    assert counts['["carl","facebook","search_page_extraction"]'] == 1
     assert counts['["carl","facebook","route_definition_json_frame"]'] == 3
     assert counts['["carl","facebook","search_session_bootstrap_extraction"]'] == 1
     assert counts['["carl","facebook","search_run"]'] == 1
@@ -531,7 +524,6 @@ async def test_search_worker_uses_one_session_and_checkpoints_every_page(
         ("search_session_open", 1, "completed"),
         ("search_session_bootstrap", 1, "completed"),
         ("search_route_definition", 2, "completed"),
-        ("search_pagination", 3, "completed"),
     ]
     assert acquisition_activity_identifiers == {
         row[0] for row in activity_rows if json.loads(row[1])[-1] != "search_session_open"
@@ -539,7 +531,6 @@ async def test_search_worker_uses_one_session_and_checkpoints_every_page(
     extractions = [json.loads(row[0]) for row in extraction_rows]
     assert [value["extractor"]["component_parts"] for value in extractions] == [
         ["carl", "facebook", "extract", "search_route_definition"],
-        ["carl", "facebook", "extract", "search_pagination"],
     ]
 
 

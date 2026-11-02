@@ -1125,6 +1125,7 @@ _COMPLETE_STOPPING_REASONS = {
     SearchStoppingReason.PRICE_PARTITIONS_EXHAUSTED,
 }
 _INCOMPLETE_STOPPING_REASONS = {
+    SearchStoppingReason.RATE_LIMITED,
     SearchStoppingReason.MISSING_CURSOR,
     SearchStoppingReason.REPEATED_CURSOR,
     SearchStoppingReason.TRANSFERRED_BYTES_UNAVAILABLE,

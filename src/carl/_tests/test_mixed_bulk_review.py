@@ -36,7 +36,11 @@ from carl.review import ReviewApplication
 async def _workspace(app: ReviewApplication, count: int) -> ReviewWorkspace:
     run = _search_run_value("scope")
     facebook = CreateSearchRequest.model_validate(
-        {"request": run["request"], "traversal": {"maximum_pages": 1}}
+        {
+            "request": run["request"],
+            "traversal": {"maximum_pages": 1},
+            "traversal_strategy": {"kind": "overlapping_price_partitions", "width": "600"},
+        }
     )
     group = await app.create_marketplace_search(
         CreateMarketplaceSearchRequest(

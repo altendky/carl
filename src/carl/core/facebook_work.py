@@ -504,12 +504,20 @@ class CollectSearchPayload(StrictModel):
 
 
 class CreateSearchRequest(StrictModel):
-    """Queue one new bounded Marketplace search."""
+    """Facebook search intent, including historical cursor requests for retained reads.
+
+    New acquisitions require explicit price partitions and a maximum price.
+    """
 
     request: FacebookSearchRequest
     traversal: SearchTraversalPolicy
     traversal_strategy: SearchTraversalStrategy = Field(
-        default_factory=CursorSearchTraversalStrategy
+        default_factory=CursorSearchTraversalStrategy,
+        description=(
+            "New acquisition requires overlapping_price_partitions with an explicit width. "
+            "The cursor default is retained only to deserialize historical intent and is rejected "
+            "before acquisition."
+        ),
     )
     network_path: AcquisitionNetworkPath = Field(
         default=DEFAULT_DATACENTER_NETWORK_PATH,
@@ -545,6 +553,8 @@ def is_transient_search_failure(error: JsonValue) -> bool:
 
     if not isinstance(error, dict):
         return False
+    if error.get("kind") == "search_pagination_rate_limited":
+        return True
     if error.get("kind") in {
         "search_session_bootstrap_response_failure",
         "search_route_definition_response_failure",

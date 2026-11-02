@@ -473,6 +473,7 @@ def test_analysis_selection_uses_newest_per_guide_and_marks_assumed() -> None:
         (SearchStoppingReason.PRICE_PARTITIONS_EXHAUSTED, SearchComparisonCoverage.COMPLETE),
         (SearchStoppingReason.MAXIMUM_RESULTS, SearchComparisonCoverage.BOUNDED),
         (SearchStoppingReason.MISSING_CURSOR, SearchComparisonCoverage.INCOMPLETE),
+        (SearchStoppingReason.RATE_LIMITED, SearchComparisonCoverage.INCOMPLETE),
         (SearchStoppingReason.REPEATED_CURSOR, SearchComparisonCoverage.INCOMPLETE),
         (SearchStoppingReason.TRANSFERRED_BYTES_UNAVAILABLE, SearchComparisonCoverage.INCOMPLETE),
         (None, SearchComparisonCoverage.UNKNOWN),

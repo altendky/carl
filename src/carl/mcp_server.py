@@ -281,9 +281,15 @@ omits sibling output edges by default while reporting their count; request a bou
 needed. Create a durable search group with create_search and one or more marketplace-discriminated
 targets. Add targets with add_search_target, enable or disable future scheduling with
 set_search_target_enabled, and queue every enabled target with run_search. get_search always reports
-all targets and retained executions, including executions from disabled targets. Refresh an exact
-Facebook or eBay source run with request_search_refresh; retained provenance chooses its pipeline. To consume a
-search group, call list_search_results with only its search record identifier; Carl dispatches by
+all targets and retained executions, including executions from disabled targets.
+Facebook acquisition requires traversal_strategy.kind="overlapping_price_partitions", an explicit
+bucket width, and request.price.maximum. Cursor pagination is disabled, including one-page cursor
+requests. Retained cursor history remains readable; revise cursor tracks to price buckets before
+refreshing or retrying them. A direct historical-run refresh may override traversal_strategy with
+price buckets. Queued legacy cursor acquisitions stop without network requests or retries.
+Each price bucket collects its first page; saturated buckets mean coverage is incomplete.
+Refresh an exact Facebook or eBay source run with request_search_refresh; retained provenance chooses
+its pipeline. To consume a search group, call list_search_results with only its search record identifier; Carl dispatches by
 the retained source-run provenance, deduplicates within each marketplace, and keeps pagination at a
 fixed completion boundary. Check get_search execution collection_succeeded, response_classification,
 and stopping_reason, and list_search_results execution_warnings before interpreting zero cards as an
@@ -354,7 +360,9 @@ The request queues item acquisition, then offline extraction, then bounded galle
 Poll the returned work and its extraction_work_identifier, then the image_work_identifiers and
 description_work_identifiers in the extraction result. get_listing_details is read-only and accepts
 either marketplace; it reports retained detail, gallery download states, and image artifact IDs.
-Use get_listing_image with those artifact IDs. Repeated eBay requests reuse a retained usable item
+Use get_listing_image with those artifact IDs. Image-only results retain native image content and
+exact artifact bytes even above the text-response budget; they never use get_tool_response_page.
+Repeated eBay requests reuse a retained usable item
 page unless refresh=true; maximum_images defaults to twenty, is capped at fifty, and zero skips
 image downloads. request_listing_details also accepts marketplace="facebook" with route options;
 its coordinator waits for the item and bounded gallery work.

@@ -96,8 +96,10 @@ async def test_routed_search_configuration_failure_is_terminal_work_not_pool_fai
                 "query": "telescope",
                 "location": {"kind": "facebook_location", "identifier": "456"},
                 "radius": {"value": 60, "unit": "miles"},
+                "price": {"currency": "USD", "maximum": "600"},
             },
             "traversal": {"maximum_pages": 1},
+            "traversal_strategy": {"kind": "overlapping_price_partitions", "width": "600"},
             "routing": ("proton", "personal", "carl"),
         }
     )

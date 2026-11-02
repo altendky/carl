@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from time import time_ns
 from typing import cast
@@ -25,7 +26,10 @@ from carl._tests.test_facebook_images import URL, _reference
 from carl.core.configuration import CarlConfiguration
 from carl.core.ebay_items import COLLECT_EBAY_IMAGE_WORK_KIND, collect_ebay_image_work
 from carl.core.facebook_images import COLLECT_IMAGE_WORK_KIND, CollectImagePayload
-from carl.core.facebook_search import SearchTraversalPolicy
+from carl.core.facebook_search import (
+    OverlappingPricePartitionSearchTraversalStrategy,
+    SearchTraversalPolicy,
+)
 from carl.core.facebook_work import (
     COLLECT_ITEM_WORK_KIND,
     COLLECT_SEARCH_WORK_KIND,
@@ -34,6 +38,7 @@ from carl.core.facebook_work import (
     FacebookSearchRequest,
     SearchDistanceUnit,
     SearchFacebookLocation,
+    SearchPriceRange,
     SearchRadius,
     collect_search_work,
 )
@@ -170,8 +175,12 @@ async def test_facebook_runtime_resolves_legacy_routes_but_preserves_mobile_item
                 query="telescope",
                 location=SearchFacebookLocation(identifier="456"),
                 radius=SearchRadius(value=60, unit=SearchDistanceUnit.MILES),
+                price=SearchPriceRange(currency="USD", maximum=Decimal("600")),
             ),
             traversal=SearchTraversalPolicy(maximum_pages=2, maximum_results=10),
+            traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(
+                width=Decimal("600")
+            ),
             routing=requested,
         )
         kind = COLLECT_SEARCH_WORK_KIND
@@ -294,7 +303,7 @@ async def test_ebay_image_defaults_directly_to_datacenter_without_an_alias(
 
 
 @pytest.mark.anyio
-async def test_routed_facebook_search_retains_datacenter_route_for_bootstrap_and_pagination(
+async def test_routed_facebook_search_retains_datacenter_route_for_bootstrap_and_price_buckets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     loaded = _loaded(tmp_path, override=False)
@@ -345,8 +354,10 @@ async def test_routed_facebook_search_retains_datacenter_route_for_bootstrap_and
             query="telescope",
             location=SearchFacebookLocation(identifier="456"),
             radius=SearchRadius(value=60, unit=SearchDistanceUnit.MILES),
+            price=SearchPriceRange(currency="USD", maximum=Decimal("600")),
         ),
         traversal=SearchTraversalPolicy(maximum_pages=3, maximum_results=3),
+        traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(width=Decimal("600")),
         routing=DATACENTER,
     )
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
@@ -367,10 +378,9 @@ async def test_routed_facebook_search_retains_datacenter_route_for_bootstrap_and
         assert [(request.method, request.url.path) for request in requests] == [
             ("GET", "/marketplace/"),
             ("POST", "/ajax/route-definition/"),
-            ("POST", "/api/graphql/"),
         ]
         acquisitions = await database.records_by_kind(("carl", "http", "acquisition"))
-        assert len(acquisitions) == 3
+        assert len(acquisitions) == 2
         for _, acquisition in acquisitions:
             value = cast(dict[str, JsonValue], acquisition)
             routing = cast(dict[str, JsonValue], value["routing"])
@@ -378,5 +388,5 @@ async def test_routed_facebook_search_retains_datacenter_route_for_bootstrap_and
         snapshot = await database.activity_snapshot(
             captured_at_utc_ns=time_ns(), recent_window_ns=60_000_000_000, maximum_rows=10
         )
-        assert snapshot.network.recent_completed >= 3
+        assert snapshot.network.recent_completed >= 2
         assert {path.path for path in snapshot.network_paths} == {DATACENTER}
