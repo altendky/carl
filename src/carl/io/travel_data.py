@@ -1,19 +1,15 @@
 """Explicit, versioned local travel-data setup; startup never builds datasets."""
 
 import fcntl
-import hashlib
-import importlib.metadata
 import json
 import os
 import re
 import secrets
-import sqlite3
 import tomllib
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import time_ns
 from typing import Any
 
 import anyio
@@ -33,117 +29,19 @@ from carl.core.travel_data import (
 from carl.io.configuration import (
     ConfigurationFailure,
     _read_regular_file,
-    _require_private_directory,
     load_configuration,
 )
 from carl.io.dataset_workflow_files import (
     DatasetWorkflowBusy,
     DatasetWorkflowError,
+    active_journal,
     dataset_workflow_gate,
 )
 from carl.io.paths import CarlDirectories
+from carl.io.travel_manifest import read_travel_manifest as _manifest
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$")
 _PROVIDERS: tuple[TravelDataProvider, ...] = ("osrm", "geonames")
-
-
-def _manifest(path: Path, provider: str, identifier: str, *, verify: bool) -> dict[str, Any]:
-    try:
-        if path.is_symlink() or path.parent.is_symlink() or path.stat().st_size > 1_048_576:
-            raise ValueError
-        value = json.loads(path.read_bytes())
-        if not isinstance(value, dict):
-            raise ValueError
-        if value["dataset_identifier"] != identifier or value.get("provider", "osrm") != provider:
-            raise ValueError
-        files = value["files"]
-        if not isinstance(files, list) or not 1 <= len(files) <= 100:
-            raise ValueError
-        names = set()
-        for item in files:
-            if (
-                not isinstance(item, dict)
-                or not isinstance(item.get("bytes"), int)
-                or isinstance(item["bytes"], bool)
-                or item["bytes"] < 0
-                or not isinstance(item.get("sha256"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
-            ):
-                raise ValueError
-            name = item["name"]
-            if (
-                not isinstance(name, str)
-                or Path(name).name != name
-                or name in (".", "..")
-                or name in names
-            ):
-                raise ValueError
-            names.add(name)
-            target = path.parent / name
-            if (
-                target.is_symlink()
-                or not target.is_file()
-                or target.stat().st_size != item["bytes"]
-            ):
-                raise ValueError
-            if verify:
-                with target.open("rb") as stream:
-                    if hashlib.file_digest(stream, "sha256").hexdigest() != item["sha256"]:
-                        raise ValueError
-        if provider == "osrm":
-            version = importlib.metadata.version("osrm-bindings")
-            if (
-                str(value["osrm_version"]).removeprefix("v") != version
-                or value["algorithm"] != "MLD"
-            ):
-                raise TravelDataFailure(
-                    "osrm_incompatible",
-                    "Rebuild with carl travel update osrm using the installed OSRM version.",
-                )
-            if (
-                not {"region.osrm.mldgr", "region.osrm.partition", "region.osrm.cell_metrics"}
-                <= names
-            ):
-                raise ValueError
-        elif "places.sqlite3" not in names:
-            raise ValueError
-        else:
-            with closing(
-                sqlite3.connect((path.parent / "places.sqlite3").as_uri() + "?mode=ro", uri=True)
-            ) as connection:
-                metadata = dict(connection.execute("SELECT key,value FROM metadata"))
-                if (
-                    metadata.get("schema_version") not in ("1", "2")
-                    or metadata.get("country_code") != "US"
-                    or metadata.get("dataset_identifier") != identifier
-                ):
-                    raise ValueError
-                if metadata["schema_version"] == "2":
-                    connection.execute("SELECT is_canonical FROM names LIMIT 0")
-                for query in (
-                    "SELECT name,code FROM state_names LIMIT 0",
-                    "SELECT identifier,state_code,latitude,longitude FROM places LIMIT 0",
-                    "SELECT name,place_identifier FROM names LIMIT 0",
-                    "SELECT postal_code,name,state_code,latitude,longitude FROM postal LIMIT 0",
-                ):
-                    connection.execute(query)
-                if verify and connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
-                    raise ValueError
-        return value
-    except TravelDataFailure:
-        raise
-    except (
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-        sqlite3.Error,
-        importlib.metadata.PackageNotFoundError,
-    ):
-        raise TravelDataFailure(
-            "dataset_invalid",
-            f"Local {provider} data is missing or invalid. Run carl travel setup {provider}.",
-        ) from None
 
 
 class TravelDataManager:
@@ -181,103 +79,9 @@ class TravelDataManager:
         temporary.replace(path)
 
     async def setup(self, request: TravelDataSetupRequest) -> TravelDataSetupResult:
-        # The shared file lock also covers foreground CLI builds and activation.
-        with self._locked():
-            started_at_ns = time_ns()
-            self.directories.data.mkdir(parents=True, exist_ok=True)
-            _require_private_directory(self.directories.travel_data_directory, ConfigurationFailure)
-            _require_private_directory(self._root(request.provider), ConfigurationFailure)
-            self._progress(
-                provider=request.provider,
-                state="building",
-                stage="preparing",
-                request_identifier=request.request_identifier,
-            )
-            try:
-                if request.provider == "geonames":
-                    from carl.io.geonames import build_geonames_dataset
+        from carl.io.dataset_setup import setup_travel_data
 
-                    manifest = await build_geonames_dataset(self._root("geonames"))
-                else:
-                    from carl.io.osrm_data import build_osrm_dataset
-
-                    configuration = load_configuration(
-                        self.directories.configuration_file
-                    ).configuration
-                    settings = configuration.travel_settings()
-                    if settings is None or settings.origin is None:
-                        raise TravelDataFailure(
-                            "origin_coordinates_required",
-                            "Set travel.origin coordinates in your private Carl configuration before building a regional routing map.",
-                        )
-                    manifest = await build_osrm_dataset(
-                        self._root("osrm"),
-                        origin=settings.origin,
-                        radius_miles=request.radius_miles,
-                        threads=request.threads,
-                    )
-                identifier = json.loads(manifest.read_bytes())["dataset_identifier"]
-                await anyio.to_thread.run_sync(
-                    lambda: _manifest(manifest, request.provider, identifier, verify=True)
-                )
-                if request.activate:
-                    await anyio.to_thread.run_sync(self._activate, request.provider, identifier)
-                self._progress(
-                    provider=request.provider, state="completed", dataset_identifier=identifier
-                )
-                return TravelDataSetupResult(
-                    provider=request.provider,
-                    dataset_identifier=identifier,
-                    manifest_path=str(manifest),
-                    activated=request.activate,
-                    message="Dataset verified and activated; subsequent requests use it."
-                    if request.activate
-                    else "Dataset verified. Activate it with carl travel activate or activate_travel_dataset.",
-                )
-            except BaseException as error:
-                candidate_reason = getattr(error, "reason", None)
-                reason = (
-                    candidate_reason
-                    if isinstance(candidate_reason, str)
-                    and re.fullmatch(r"[a-z][a-z0-9_]{0,100}", candidate_reason)
-                    else "setup_interrupted"
-                    if isinstance(error, anyio.get_cancelled_exc_class())
-                    else "setup_failed"
-                )
-                detail = None
-                detail_path = self._root(request.provider) / "progress.json"
-                try:
-                    if (
-                        detail_path.stat().st_mtime_ns >= started_at_ns
-                        and detail_path.stat().st_size < 16_384
-                    ):
-                        candidate = json.loads(detail_path.read_bytes())
-                        if isinstance(candidate, dict):
-                            detail = candidate
-                except (OSError, ValueError):
-                    pass
-                self._progress(
-                    provider=request.provider,
-                    state="cancelled" if reason == "setup_interrupted" else "failed",
-                    reason=reason,
-                    detail=detail,
-                )
-                if isinstance(error, TravelDataFailure):
-                    raise
-                if isinstance(error, Exception):
-                    # Builder errors expose allowlisted codes; never copy raw native output.
-                    safe_reason = getattr(error, "reason", None)
-                    if not isinstance(safe_reason, str) or not re.fullmatch(
-                        r"[a-z][a-z0-9_]{0,100}", safe_reason
-                    ):
-                        safe_reason = "travel_data_setup_failed"
-                    raise TravelDataFailure(
-                        safe_reason,
-                        "Install the osmium-tool package and put osmium on PATH, then retry carl travel setup osrm. The previous active dataset is unchanged."
-                        if safe_reason == "osrm_osmium_tool_missing"
-                        else "Travel data setup failed; the previous active dataset is unchanged. Check carl travel status and the build progress/logs, correct prerequisites, then retry.",
-                    ) from None
-                raise
+        return await setup_travel_data(self, request)
 
     def _activate(self, provider: TravelDataProvider, identifier: str) -> None:
         if not _IDENTIFIER.fullmatch(identifier):
@@ -484,6 +288,41 @@ class TravelDataManager:
                         progress["detail"] = json.loads(detail.read_bytes())
         except (OSError, ValueError, KeyError):
             progress = None
+        try:
+            journal = active_journal(self.directories)
+            if journal is not None and (
+                progress is None
+                or progress.get("request_identifier")
+                != journal.definition.request.request_identifier
+                or journal.state not in ("completed", "failed", "cancelled")
+                or progress.get("state") != journal.state
+            ):
+                present = False
+                descriptor = os.open(state / "build.lock", os.O_RDWR | os.O_NOFOLLOW)
+                try:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        present = True
+                finally:
+                    os.close(descriptor)
+                journal_state = journal.state
+                if journal_state in ("running", "waiting") and not present:
+                    journal_state = "interrupted"
+                elif journal_state == "running":
+                    journal_state = "building"
+                progress = {
+                    "provider": journal.definition.request.provider,
+                    "request_identifier": journal.definition.request.request_identifier,
+                    "workflow_identifier": journal.definition.workflow_identifier,
+                    "state": journal_state,
+                    "stage": journal.phase,
+                    "running": present and journal.state in ("running", "waiting"),
+                    "physical_owner_present": present,
+                    "updated_at_utc_ns": journal.updated_at_utc_ns,
+                }
+        except (OSError, ValueError, DatasetWorkflowError):
+            pass
         return TravelDataStatus(
             routing_provider=settings.provider if settings else None,
             geocoding_provider=settings.geocoding_provider if settings else None,

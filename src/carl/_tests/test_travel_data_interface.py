@@ -88,11 +88,27 @@ def test_cli_setup_and_update_explicit_options_reach_manager(
     assert request.radius_miles == 180
     assert request.threads == 2
     assert request.activate is False
+    assert request.request_identifier in output.err
     _successful_cli(["travel", "update", "geonames"])
     result = json.loads(capsys.readouterr().out)
     assert result["provider"] == "geonames"
     assert manager.setup_calls[1].activate
     assert manager.setup_calls[1].request_identifier != request.request_identifier
+    _successful_cli(
+        [
+            "travel",
+            "setup",
+            "osrm",
+            "--no-activate",
+            "--radius-miles",
+            "180",
+            "--threads",
+            "2",
+            "--request-identifier",
+            request.request_identifier,
+        ]
+    )
+    assert manager.setup_calls[2] == request
 
 
 def test_cli_failed_setup_reports_action_and_exits_nonzero(

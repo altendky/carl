@@ -5,6 +5,7 @@ import importlib.metadata
 import json
 import sqlite3
 import stat
+from collections.abc import Awaitable, Callable
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,12 +15,39 @@ import anyio
 import pytest
 
 from carl._tests.test_configuration import _write_configuration
+from carl.core.dataset_setup import DatasetSetupState
 from carl.core.travel_data import TravelDataFailure, TravelDataSetupRequest
 from carl.io.configuration import load_configuration
+from carl.io.dataset_setup import DatasetSetupEngine
+from carl.io.dataset_workflow_owner import DatasetWorkflowOwner
 from carl.io.paths import CarlDirectories
 from carl.io.travel_data import TravelDataManager
 
 type Provider = Literal["osrm", "geonames"]
+
+
+def _controlled_builder(
+    monkeypatch: pytest.MonkeyPatch, builder: Callable[[Path], Awaitable[Path]]
+) -> None:
+    """Retain real workflow/resource/activation behavior around a fake provider."""
+    original = DatasetSetupEngine.step
+
+    async def step(
+        engine: DatasetSetupEngine, owner: DatasetWorkflowOwner, state: DatasetSetupState
+    ) -> DatasetSetupState:
+        if state.phase != "prepare":
+            return await original(engine, owner, state)
+        manifest = await builder(engine.directories.travel_data_directory / "geonames")
+        return DatasetSetupState(
+            definition=state.definition,
+            phase="activate",
+            value={
+                "manifest_path": str(manifest),
+                "dataset_identifier": json.loads(manifest.read_bytes())["dataset_identifier"],
+            },
+        )
+
+    monkeypatch.setattr(DatasetSetupEngine, "step", step)
 
 
 def _dataset(
@@ -368,7 +396,7 @@ async def test_setup_failure_keeps_previous_active_version(
         _ = (manifest.parent / "places.sqlite3").write_bytes(b"not sqlite")
         return manifest
 
-    monkeypatch.setattr("carl.io.geonames.build_geonames_dataset", builder)
+    _controlled_builder(monkeypatch, builder)
     with pytest.raises(TravelDataFailure) as failure:
         await manager.setup(
             TravelDataSetupRequest(request_identifier="failed-setup", provider="geonames")
@@ -392,7 +420,7 @@ async def test_setup_validates_builder_output_and_can_leave_dataset_inactive(
         assert root == directories.travel_data_directory / "geonames"
         return _dataset(directories, "prepared-localities")
 
-    monkeypatch.setattr("carl.io.geonames.build_geonames_dataset", builder)
+    _controlled_builder(monkeypatch, builder)
     manager = TravelDataManager(directories)
     result = await manager.setup(
         TravelDataSetupRequest(
@@ -427,7 +455,7 @@ async def test_cancelled_setup_preserves_active_data_and_releases_build_lock(
             TravelDataSetupRequest(request_identifier="cancel-build", provider="geonames")
         )
 
-    monkeypatch.setattr("carl.io.geonames.build_geonames_dataset", builder)
+    _controlled_builder(monkeypatch, builder)
     async with anyio.create_task_group() as group:
         group.start_soon(setup)
         await entered.wait()

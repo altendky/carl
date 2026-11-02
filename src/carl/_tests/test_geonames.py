@@ -4,6 +4,7 @@ import io
 import json
 import sqlite3
 import zipfile
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import anyio
@@ -12,6 +13,18 @@ import pytest
 
 from carl.core.travel import TravelCoordinate
 from carl.io.geonames import GeonamesFailure, LocalGeonamesGeocoder, build_geonames_dataset
+from carl.io.sqlite import Database
+
+
+@pytest.fixture(autouse=True)
+async def managed_build_resources(
+    tmp_path_factory: pytest.TempPathFactory, anyio_backend: str
+) -> AsyncGenerator[None]:
+    del anyio_backend
+    async with Database.managed(
+        tmp_path_factory.mktemp("geonames-resources") / "carl.sqlite3", initialize=True
+    ):
+        yield
 
 
 def _archive(contents: str, *, member: str = "US.txt") -> bytes:
