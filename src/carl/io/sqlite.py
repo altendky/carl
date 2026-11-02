@@ -1200,6 +1200,39 @@ class Database:
             raise KeyError(identifier)
         return StageDefinition.model_validate_json(_text(row[0]))
 
+    async def active_stage_for_work(
+        self, work_item_identifier: str, operation_identifier: str
+    ) -> StageDefinition | None:
+        """Point-read a continuation after filesystem/SQL publication interruption."""
+
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT definition_json FROM work_stages "
+                "WHERE work_item_id = ? AND operation_id = ? AND state IN ('pending', 'running')",
+                (work_item_identifier, operation_identifier),
+            )
+            row = await cursor.fetchone()
+        return None if row is None else StageDefinition.model_validate_json(_text(row[0]))
+
+    async def dataset_workflow_binding_state(
+        self, work_item_identifier: str, operation_identifier: str
+    ) -> tuple[str, str | None]:
+        """Read only the states of a real work row and its exact bound operation."""
+
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT work.state, operation.state FROM work_items AS work "
+                "LEFT JOIN work_operations AS binding ON binding.work_item_id=work.id "
+                "AND binding.operation_id=? "
+                "LEFT JOIN operations AS operation ON operation.id=binding.operation_id "
+                "WHERE work.id=?",
+                (operation_identifier, work_item_identifier),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise KeyError(work_item_identifier)
+        return _text(row[0]), None if row[1] is None else _text(row[1])
+
     async def _stage_wait(
         self,
         connection: AsyncConnection,

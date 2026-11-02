@@ -36,6 +36,11 @@ from carl.io.configuration import (
     _require_private_directory,
     load_configuration,
 )
+from carl.io.dataset_workflow_files import (
+    DatasetWorkflowBusy,
+    DatasetWorkflowError,
+    dataset_workflow_gate,
+)
 from carl.io.paths import CarlDirectories
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$")
@@ -150,27 +155,23 @@ class TravelDataManager:
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        state = self.directories.travel_data_state_directory
+        gate = dataset_workflow_gate(self.directories)
         try:
-            self.directories.state.mkdir(parents=True, exist_ok=True)
-            _require_private_directory(state, ConfigurationFailure)
-        except (OSError, ConfigurationFailure):
+            _ = gate.__enter__()
+        except DatasetWorkflowBusy:
+            raise TravelDataFailure(
+                "travel_data_busy",
+                "Another travel-data setup or activation is running. Check get_travel_data_status or carl travel status.",
+            ) from None
+        except (OSError, DatasetWorkflowError):
             raise TravelDataFailure(
                 "travel_state_unavailable",
                 "Travel-data state directory must be writable, private and owned by the current user. Check carl locations.",
             ) from None
-        descriptor = os.open(state / "build.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise TravelDataFailure(
-                    "travel_data_busy",
-                    "Another travel-data setup or activation is running. Check get_travel_data_status or carl travel status.",
-                ) from None
             yield
         finally:
-            os.close(descriptor)
+            _ = gate.__exit__(None, None, None)
 
     def _progress(self, **value: Any) -> None:
         path = self.directories.travel_data_state_directory / "progress.json"

@@ -634,6 +634,34 @@ command with a parent-death signal but cannot prove arbitrary descendants have
 exited, so admission remains occupied. This foundation does not yet switch the
 dataset setup workflow to staged execution.
 
+Dataset workflow ownership uses the existing global travel-data build lock
+across providers, foreground commands, workers and activation. A private bounded
+journal freezes the request, recipe and configuration identity, then freezes the
+source plan. It records phase progress and file references separately from large
+source files. Recovery requires the physical lock before advancing the journal
+generation; stale owners cannot write through an older generation or revision.
+A nonterminal reservation survives process shutdown and cannot be replaced by
+an unrelated setup or activation merely because its process disappeared.
+
+An admitted workflow retains one cheap owner across stage waits, with no idle
+HTTP or CPU reservation. Denied submissions do not create owner tasks. Queued
+work binds the journal to its real database, work and operation identifiers;
+foreground ownership requires no synthetic work rows. Cancellation stops the
+active phase before releasing ownership. Unknown native cleanup preserves the
+quarantined journal and inherited global guard. Completed files survive waits,
+shutdown and guarded recovery; the controller decides when uncommitted scratch
+can be removed.
+
+Dataset file helpers stream bounded chunks directly into private owned files
+under HTTP admission, then verify size and checksums separately under CPU
+admission. They request identity content encoding and reject unexpected HTTP
+content encoding; ZIP and PBF sources retain their original bytes. Source size
+limits are explicit and may be absent for large map files. Such files bypass
+small HTTP response checkpoints and never become SQLite blobs. Bounded file
+receipts record SHA-256, optional MD5 and transport metadata; reuse rechecks the
+actual file and frozen source identity before accepting a completed download.
+The GeoNames and OSRM algorithm conversion remains separate from these helpers.
+
 Travel estimates use one replayable phase engine for direct service calls and
 queued route refreshes. CPU preparation resolves cache entries and plans each
 individual hosted or local query. GeoNames lookups use CPU admission; local
