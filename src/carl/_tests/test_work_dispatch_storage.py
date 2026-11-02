@@ -357,10 +357,10 @@ async def test_two_connections_register_one_initial_and_decline_rolls_back_outer
             )
             results.append(result.status)
 
-        # Both connections observed the same snapshot. Simultaneous writers are
-        # covered by the process test; same-loop APSW contention is tracked in #125.
-        await contender(first, 0)
-        await contender(second, 1)
+        # Both independent connections race from the same retained snapshot.
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(contender, first, 0)
+            tasks.start_soon(contender, second, 1)
         assert results.count("registered") == 1 and set(results) <= {
             "registered",
             "existing",

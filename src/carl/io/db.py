@@ -31,6 +31,7 @@ class ReaderPoolClosedError(DatabaseWrapperError):
 
 DEFAULT_BUSY_TIMEOUT_MS = 30_000
 _CLEANUP_TIMEOUT_SECONDS = 35
+_BUSY_RETRY_SECONDS = 0.005
 
 
 @asynccontextmanager
@@ -67,6 +68,25 @@ async def _rows(
     return [tuple(row) async for row in cursor]
 
 
+def _cooperative_busy_handler(busy_timeout_ms: int) -> Callable[[int], Awaitable[bool]]:
+    """Yield during lock contention without blocking SQLite's current owner."""
+
+    deadline = 0.0
+
+    async def busy(count: int) -> bool:
+        nonlocal deadline
+        now = anyio.current_time()
+        if count == 0:
+            deadline = now + max(0, busy_timeout_ms) / 1000
+        remaining = deadline - now
+        if remaining <= 0:
+            return False
+        await anyio.sleep(min(_BUSY_RETRY_SECONDS, remaining))
+        return anyio.current_time() < deadline
+
+    return busy
+
+
 async def _configure_connection(
     connection: AsyncConnection,
     *,
@@ -74,7 +94,14 @@ async def _configure_connection(
     busy_timeout_ms: int,
 ) -> None:
     await connection.execute("PRAGMA foreign_keys = ON")
+    # Preserve APSW's argument validation, including signed integer bounds and
+    # nonpositive timeouts. The custom handler supersedes SQLite's timeout;
+    # PRAGMA busy_timeout consequently reports zero, not this effective bound.
     await connection.set_busy_timeout(busy_timeout_ms)
+    # APSW's context-manager sqlite3_exec retains the GIL during native busy
+    # waits. Its supported async callback bridge yields that GIL while waiting,
+    # letting another connection's owner make progress and release the lock.
+    await connection.set_busy_handler(_cooperative_busy_handler(busy_timeout_ms))
     await connection.execute(f"PRAGMA query_only = {'ON' if query_only else 'OFF'}")
 
     foreign_keys = await _rows(connection, "PRAGMA foreign_keys")
