@@ -75,6 +75,7 @@ from carl.io.facebook_images import (
 )
 from carl.io.httpx import Acquisition, AcquisitionFailure, HttpAcquirer, RouteConfigurationFailure
 from carl.io.image_files import ImageFileStore
+from carl.io.image_reuse import image_artifact_available
 from carl.io.network_activity import (
     acquire_for_network_activity,
     network_activity_definition,
@@ -951,9 +952,7 @@ async def prepare_image_collection(
                 artifact_identifier = result.get("image_artifact_identifier")
                 if not isinstance(artifact_identifier, str):
                     continue
-                try:
-                    await dependencies.database.get_artifact(artifact_identifier)
-                except (KeyError, ValueError, OSError):
+                if not await image_artifact_available(dependencies.database, artifact_identifier):
                     continue
                 identifier = dependencies.new_identifier()
                 return CompletedWork(

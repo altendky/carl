@@ -1365,7 +1365,10 @@ Recognized eBay and Facebook CDN renditions can share across hosts; Facebook sig
 are excluded from identity, while sizes, formats, crops, and unknown parameters remain distinct.
 Unknown URL layouts fall back to exact matching. Different signed fetch URLs retain separate jobs
 so a failed expired URL does not suppress a caller's valid alternative. Cached image bytes are
-validated before reuse; missing/corrupt storage is not reported as a successful cache hit.
+validated before reuse under shared CPU admission, using the existing 100 MB decoded-image byte
+limit. An already admitted CPU stage reuses its reservation, and external-file verification retains
+that reservation until its thread finishes. Missing, corrupt or oversized storage is not reported
+as a successful cache hit.
 
 The refresh itself is durable coordinator work and returns immediately. It enqueues ordinary search,
 item, image, and extraction work items, then returns its lease while those children run in the shared
