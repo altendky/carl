@@ -56,6 +56,7 @@ class _Actor:
     execution: StageExecution | None = None
     error: str | None = None
     parked: bool = False
+    closing: bool = False
     done: anyio.Event = field(default_factory=anyio.Event)
 
 
@@ -265,6 +266,7 @@ class ResidentSessionPool:
                 try:
                     await self._run_stages(actor)
                 finally:
+                    actor.closing = True
                     await self._close(actor)
         except BaseException as error:
             # Tracebacks can keep whole response buffers and cookie jars alive.
@@ -354,6 +356,11 @@ class ResidentSessionPool:
                         raise ValueError(
                             "Resident continuations must retain exact session affinity"
                         )
+                    if not isinstance(outcome, WaitWork):
+                        # The committed work can become terminal before the
+                        # publishing coroutine resumes from transaction exit.
+                        # Stop renewal before that window, through guard cleanup.
+                        actor.closing = True
                     await execution.apply(result)
                     if not isinstance(outcome, WaitWork):
                         return
@@ -384,6 +391,8 @@ class ResidentSessionPool:
         while True:
             await anyio.sleep(interval)
             for actor in tuple(self._actors.values()):
+                if actor.closing:
+                    continue
                 try:
                     lease = await self.manager.database.renew_resident_session(
                         actor.lease,
@@ -391,20 +400,24 @@ class ResidentSessionPool:
                         lease_duration_ns=self.manager.lease_duration_ns,
                     )
                     if lease is None:
+                        if actor.closing:
+                            continue
                         raise ResourceLeaseLost("Resident ownership expired or changed")
                     actor.lease = lease
                     execution = actor.execution
-                    if execution is not None and not execution.finalized:
+                    if execution is not None and not execution.finalizing:
                         renewed = await self.manager.database.renew_stage(
                             execution.lease,
                             now_utc_ns=self.manager.utc_now_ns(),
                             lease_duration_ns=self.manager.lease_duration_ns,
                         )
-                        if renewed is None and not execution.finalized:
+                        if renewed is None and not execution.finalizing:
                             raise ResourceLeaseLost("Resident stage ownership expired or changed")
                         if renewed is not None:
                             execution.lease = renewed
                 except Exception as error:
+                    if actor.closing:
+                        continue
                     actor.error = type(error).__name__
                     if actor.cancel_scope is not None:
                         actor.cancel_scope.cancel()

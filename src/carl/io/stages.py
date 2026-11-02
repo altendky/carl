@@ -46,6 +46,7 @@ class StageExecution:
     provenance: CodeProvenance
     invocation: dict[str, JsonValue]
     finalized: bool = False
+    finalizing: bool = False
 
     async def apply(self, outcome: StageHandlerResult) -> None:
         """Publish an outcome through this execution's continuation or final fence."""
@@ -116,6 +117,7 @@ class StageExecution:
             raise ResourceLeaseLost("Stage execution was already finalized")
         if not self.guard.seal():
             raise ResourceLeaseLost("Stage still has an inherited physical executor")
+        self.finalizing = True
 
     async def suspend(
         self,
@@ -260,7 +262,7 @@ class StageManager:
     async def _renew(self, execution: StageExecution) -> None:
         while True:
             await stage_sleep(self.renewal_interval_ns / 1_000_000_000)
-            if execution.finalized:
+            if execution.finalizing:
                 return
             lease = await self.database.renew_stage(
                 execution.lease,
@@ -268,7 +270,7 @@ class StageManager:
                 lease_duration_ns=self.lease_duration_ns,
             )
             if lease is None:
-                if execution.finalized:
+                if execution.finalizing:
                     return
                 raise ResourceLeaseLost("Stage execution ownership expired or changed")
             execution.lease = lease

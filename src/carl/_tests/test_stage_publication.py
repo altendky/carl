@@ -2,10 +2,12 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from time import time_ns
 from uuid import uuid4
 
+import anyio
 import apsw
 import pytest
 
@@ -150,3 +152,40 @@ async def test_outer_publication_rollback_releases_interrupted_stage(
         )
         operation = await database.operation(stage.operation_identifier)
         assert operation["state"] == "started"
+
+
+@pytest.mark.parametrize("terminal", (False, True))
+async def test_default_stage_heartbeat_tolerates_committed_publication_return_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal: bool
+) -> None:
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        stage = await _initial(database, resources=())
+        await database.register_stage(stage, created_at_utc_ns=time_ns())
+        manager = replace(
+            stage_manager(database), lease_duration_ns=5_000_000_000, renewal_interval_ns=10_000_000
+        )
+        async with manager.admit(
+            stage.identifier, component=_COMPONENT, provenance=_PROVENANCE, invocation={}
+        ) as admission:
+            execution = admission.execution
+            assert execution is not None
+            transaction = database.transaction
+
+            @asynccontextmanager
+            async def delayed_return() -> AsyncIterator[None]:
+                async with transaction():
+                    yield
+                await anyio.sleep(0.1)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(database, "transaction", delayed_return)
+                with anyio.fail_after(3):
+                    if terminal:
+                        await execution.finish(CompletedWork(result={}))
+                    else:
+                        await execution.suspend(
+                            WaitWork(
+                                continuation=stage, wait_kind=StageWaitKind.RESOURCE, result={}
+                            )
+                        )
+                assert execution.finalized

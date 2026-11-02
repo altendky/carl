@@ -377,3 +377,58 @@ async def test_admission_only_polls_do_not_extend_resident_idle_deadline(tmp_pat
             assert polls == 4 and pool.active_count == 0 and not pool.errors
         work = await database.work(initial.work_item_identifier)
         assert work["attempt"] == 1 and work["state"] == "leased"
+
+
+@pytest.mark.parametrize("suspend_first", (False, True))
+async def test_heartbeat_does_not_report_loss_between_commit_and_publication_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suspend_first: bool
+) -> None:
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        pool = ResidentSessionPool(
+            replace(
+                stage_manager(database),
+                lease_duration_ns=5_000_000_000,
+                renewal_interval_ns=10_000_000,
+            ),
+            StageHandlerRegistry((), ()),
+            _PROVENANCE,
+            {},
+        )
+        running, publish, committed = anyio.Event(), anyio.Event(), anyio.Event()
+
+        async def phase(
+            payload: _Payload, context: StageAttemptContext
+        ) -> CompletedWork | WaitWork:
+            if payload.step == 0:
+                running.set()
+                await publish.wait()
+                if suspend_first:
+                    return _next(context, step=1)
+            return CompletedWork(result={"done": True})
+
+        pool.registry = StageHandlerRegistry(
+            (), (TypedStageHandler(("test", "resident", "phase"), 1, _Payload, phase),)
+        )
+        initial = await _initial(database, resources=())
+        async with pool.managed():
+            assert await pool.submit(initial, component=_COMPONENT)
+            await running.wait()
+            transaction = database.transaction
+
+            @asynccontextmanager
+            async def delayed_return() -> AsyncIterator[None]:
+                async with transaction():
+                    yield
+                committed.set()
+                # Give the heartbeat many deterministic turns after the commit,
+                # before StageExecution.finish can set its finalized flag.
+                await anyio.sleep(0.1)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(database, "transaction", delayed_return)
+                publish.set()
+                with anyio.fail_after(3):
+                    await committed.wait()
+                    await pool.wait_idle()
+            assert pool.active_count == 0 and not pool.errors, pool.errors
+        assert (await database.work(initial.work_item_identifier))["state"] == "completed"
