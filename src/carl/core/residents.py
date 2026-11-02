@@ -4,6 +4,9 @@ from pydantic import Field, field_validator, model_validator
 
 from carl.core.models import JsonStringEnumeration, StrictModel
 from carl.core.resources import ResourceLease, ResourceRequest
+from carl.core.stages import StageRequestCharge
+
+ResidentRequestCharge = StageRequestCharge
 
 
 class ResidentState(JsonStringEnumeration):
@@ -14,13 +17,6 @@ class ResidentState(JsonStringEnumeration):
     PARKED = "parked"
     LOST = "lost"
     QUARANTINED = "quarantined"
-
-
-class ResidentRequestCharge(StrictModel):
-    """Only a newly committed charge permits one physical request invocation."""
-
-    ordinal: int = Field(ge=1)
-    newly_charged: bool
 
 
 class ResidentDefinition(StrictModel):

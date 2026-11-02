@@ -4,6 +4,7 @@
 # pyright: reportPrivateUsage=false
 
 from collections.abc import Awaitable, Callable
+from time import time_ns
 from typing import Literal
 
 from carl.core.ebay_items import (
@@ -318,6 +319,28 @@ def build_ebay_stateless_stage_registry(
         try:
             if context.network_admission is None:
                 raise ValueError("HTTP stage has no network admission")
+            identity = ("ebay", "image" if image else "description")
+            charge = await dependencies.database.charge_stage_request(
+                context,
+                request_identity=identity,
+                maximum_attempts=1,
+                now_utc_ns=time_ns(),
+            )
+            if charge is None or not charge.newly_charged:
+                return _failure(
+                    AcquisitionFailure(
+                        "A previous dispatch has an uncertain outcome",
+                        result={
+                            "kind": "uncertain_previous_dispatch",
+                            "stopping_condition": "transport_failure",
+                            "failure_phase": "uncertain_previous_dispatch",
+                            "request_identity": list(identity),
+                        },
+                    ),
+                    context,
+                    inputs=_source_inputs(prepared.payload),
+                    image=image,
+                )
             try:
                 captured = await acquire_for_network_activity(
                     acquisition(), context.network_admission

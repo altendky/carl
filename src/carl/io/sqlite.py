@@ -107,7 +107,6 @@ from carl.core.models import (
 from carl.core.residents import (
     ResidentDefinition,
     ResidentLease,
-    ResidentRequestCharge,
     ResidentState,
 )
 from carl.core.resources import ResourceLease, ResourceRequest
@@ -142,6 +141,7 @@ from carl.core.stages import (
     StageClaimResult,
     StageDefinition,
     StageLease,
+    StageRequestCharge,
     StageWaitKind,
     WaitWork,
     stage_network_activity,
@@ -198,9 +198,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=16,
+    version=17,
 )
 
+_V16_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 16})
+_V16_SCHEMA_DEFINITION_SHA256 = "9ca33db9613edfd7156e57cf9ef73c68b41f730101ccfcd65448adad93f3e9b6"
 _V15_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 15})
 _V15_SCHEMA_DEFINITION_SHA256 = "24911645cf1e3c228f6ec427a042f0723b1435f2688420b61a227bb90f29177c"
 _V14_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 14})
@@ -391,7 +393,7 @@ CREATE TABLE IF NOT EXISTS resident_request_charges (
     stage_token TEXT NOT NULL,
     stage_id TEXT NOT NULL,
     execution INTEGER NOT NULL CHECK (execution >= 1),
-    resident_id TEXT NOT NULL,
+    resident_id TEXT,
     ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
     maximum_attempts INTEGER NOT NULL CHECK (maximum_attempts >= 1 AND ordinal <= maximum_attempts),
     charged_at_utc_ns INTEGER NOT NULL CHECK (charged_at_utc_ns >= 0),
@@ -2156,7 +2158,26 @@ class Database:
         request_identity: tuple[str, ...],
         maximum_attempts: int,
         now_utc_ns: int,
-    ) -> ResidentRequestCharge | None:
+    ) -> StageRequestCharge | None:
+        """Keep the resident-only dispatch contract for existing collectors."""
+
+        if context.resident_session_identifier is None:
+            raise LeaseLostError("Request charge requires resident ownership")
+        return await self.charge_stage_request(
+            context,
+            request_identity=request_identity,
+            maximum_attempts=maximum_attempts,
+            now_utc_ns=now_utc_ns,
+        )
+
+    async def charge_stage_request(
+        self,
+        context: StageAttemptContext,
+        *,
+        request_identity: tuple[str, ...],
+        maximum_attempts: int,
+        now_utc_ns: int,
+    ) -> StageRequestCharge | None:
         """Commit a conservative dispatch charge before invoking HTTP.
 
         Budget identities contain only public request labels, never tokens or
@@ -2202,7 +2223,6 @@ class Database:
                 context.work_item_identifier != lease.definition.work_item_identifier
                 or context.operation_identifier != lease.definition.operation_identifier
                 or context.attempt != lease.work_lease.attempt
-                or context.resident_session_identifier is None
                 or context.resident_session_identifier
                 != lease.definition.resident_session_identifier
                 or not await self.validate_stage(lease, now_utc_ns=now_utc_ns)
@@ -2213,7 +2233,7 @@ class Database:
                 or lease.network_admission is None
                 or not any(request.name == "http" for request in lease.definition.resources)
             ):
-                raise ValueError("Request charges require an admitted resident HTTP/network stage")
+                raise ValueError("Request charges require an admitted HTTP/network stage")
             if (
                 context.network_admission is None
                 or context.network_admission.activity_identifier
@@ -2234,7 +2254,7 @@ class Database:
             )
             previous = await cursor.fetchone()
             if previous is not None:
-                return ResidentRequestCharge(ordinal=_integer(previous[0]), newly_charged=False)
+                return StageRequestCharge(ordinal=_integer(previous[0]), newly_charged=False)
             ordinal = 1 if budget is None else _integer(budget[1]) + 1
             if ordinal > maximum_attempts:
                 return None
@@ -2254,7 +2274,7 @@ class Database:
                     now_utc_ns,
                 ),
             )
-            return ResidentRequestCharge(ordinal=ordinal, newly_charged=True)
+            return StageRequestCharge(ordinal=ordinal, newly_charged=True)
 
     async def _resident_session(
         self,
@@ -3070,6 +3090,14 @@ class Database:
         }
 
     @staticmethod
+    def _v16_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V16_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "16",
+            "schema_definition_sha256": _V16_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v7_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V7_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -3122,6 +3150,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v16_metadata())
                 and not await cls._metadata_matches(connection, cls._v15_metadata())
                 and not await cls._metadata_matches(connection, cls._v14_metadata())
                 and not await cls._metadata_matches(connection, cls._v13_metadata())
@@ -3558,6 +3587,19 @@ class Database:
                     )
             if await self._metadata_matches(connection, self._v15_metadata()):
                 await connection.execute(_SCHEMA)
+                for key, value in self._expected_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v16_metadata()):
+                await connection.execute(
+                    "ALTER TABLE resident_request_charges RENAME TO resident_request_charges_v16"
+                )
+                await connection.execute(_SCHEMA)
+                await connection.execute(
+                    "INSERT INTO resident_request_charges SELECT * FROM resident_request_charges_v16"
+                )
+                await connection.execute("DROP TABLE resident_request_charges_v16")
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
