@@ -14,6 +14,11 @@ from time import perf_counter_ns, time_ns
 import anyio
 
 from carl.core.item_analysis import ClaudeEffort
+from carl.io.resource_permits import (
+    guarded_process_arguments,
+    resource_operation,
+    terminate_guarded_process,
+)
 
 CLAUDE_ANALYSIS_TOOLS = ("Read", "WebSearch", "WebFetch")
 CLAUDE_ANALYSIS_MAXIMUM_TURNS = 8
@@ -58,17 +63,24 @@ class ClaudeCli:
     executable: str = "claude"
     tools: tuple[str, ...] = CLAUDE_ANALYSIS_TOOLS
     maximum_turns: int = CLAUDE_ANALYSIS_MAXIMUM_TURNS
+    maximum_stdout_bytes: int = 8 * 1024 * 1024
+    maximum_stderr_bytes: int = 1024 * 1024
+    maximum_output_bytes: int = 8 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if min(self.maximum_stdout_bytes, self.maximum_stderr_bytes, self.maximum_output_bytes) < 1:
+            raise ValueError("Claude output byte limits must be positive")
 
     async def version(self, directory: Path | None = None) -> str:
-        with anyio.fail_after(10):
-            process = await anyio.run_process(
-                (self.executable, "--version"),
-                cwd=directory,
-                stdin=subprocess.DEVNULL,
-                check=False,
-            )
-        version = process.stdout.decode("utf-8", errors="replace").strip()
-        if process.returncode != 0 or not version:
+        exit_code, stdout, _stderr, timed_out, output_limited = await self._capture(
+            (self.executable, "--version"), directory, 10
+        )
+        if timed_out:
+            raise TimeoutError("Claude CLI version check timed out")
+        if output_limited:
+            raise RuntimeError("Claude CLI version output exceeded its byte limit")
+        version = stdout.decode("utf-8", errors="replace").strip()
+        if exit_code != 0 or not version:
             raise RuntimeError("Claude CLI version check failed")
         return version
 
@@ -107,40 +119,61 @@ class ClaudeCli:
             effort.value,
         )
 
+    @resource_operation("analysis")
     async def _capture(
-        self, argv: tuple[str, ...], directory: Path, timeout_seconds: int
-    ) -> tuple[int | None, bytes, bytes, bool]:
-        """Retain output received before a timeout while owning child cleanup."""
+        self, argv: tuple[str, ...], directory: Path | None, timeout_seconds: int
+    ) -> tuple[int | None, bytes, bytes, bool, bool]:
+        """Capture bounded output while retaining capacity through child cleanup."""
 
-        stdout_parts: list[bytes] = []
-        stderr_parts: list[bytes] = []
+        stdout = bytearray()
+        stderr = bytearray()
         timed_out = False
-        process = await anyio.open_process(argv, cwd=directory, stdin=subprocess.DEVNULL)
+        output_limited = False
+        guarded_argv, pass_fds = guarded_process_arguments(
+            argv, timeout_seconds, directory=directory
+        )
+        process = await anyio.open_process(
+            guarded_argv,
+            cwd=directory,
+            stdin=subprocess.DEVNULL,
+            pass_fds=pass_fds,
+            start_new_session=True,
+        )
 
-        async def drain(stream: anyio.abc.ByteReceiveStream, parts: list[bytes]) -> None:
+        async def drain(
+            stream: anyio.abc.ByteReceiveStream, output: bytearray, stream_limit: int
+        ) -> None:
+            nonlocal output_limited
             async for chunk in stream:
-                parts.append(chunk)
+                remaining = min(
+                    stream_limit - len(output),
+                    self.maximum_output_bytes - len(stdout) - len(stderr),
+                )
+                output.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    output_limited = True
+                    tasks.cancel_scope.cancel()
+                    return
 
         try:
             try:
                 with anyio.fail_after(timeout_seconds):
                     async with anyio.create_task_group() as tasks:
                         assert process.stdout is not None and process.stderr is not None
-                        tasks.start_soon(drain, process.stdout, stdout_parts)
-                        tasks.start_soon(drain, process.stderr, stderr_parts)
+                        tasks.start_soon(drain, process.stdout, stdout, self.maximum_stdout_bytes)
+                        tasks.start_soon(drain, process.stderr, stderr, self.maximum_stderr_bytes)
                         await process.wait()
             except TimeoutError:
                 timed_out = True
         finally:
             with anyio.fail_after(10, shield=True):
-                if process.returncode is None:
-                    process.kill()
-                await process.aclose()
+                await terminate_guarded_process(process, guarded=bool(pass_fds))
         return (
-            None if timed_out else process.returncode,
-            b"".join(stdout_parts),
-            b"".join(stderr_parts),
+            None if timed_out or output_limited else process.returncode,
+            bytes(stdout),
+            bytes(stderr),
             timed_out,
+            output_limited,
         )
 
     async def run(
@@ -165,10 +198,10 @@ class ClaudeCli:
         failure_kind: str | None = None
         tool_calls: tuple[str, ...] = ()
         try:
-            exit_code, stdout, stderr, timed_out = await self._capture(
+            exit_code, stdout, stderr, timed_out, output_limited = await self._capture(
                 argv, directory, timeout_seconds
             )
-            if timed_out:
+            if timed_out or output_limited:
                 try:
                     partial_output, tool_calls, version = _parse_stream_events(
                         stdout, allow_trailing_partial=True
@@ -177,7 +210,7 @@ class ClaudeCli:
                         output_metadata = _output_metadata(partial_output)
                 except (UnicodeDecodeError, ValueError):
                     tool_calls = ()
-                failure_kind = "claude_timeout"
+                failure_kind = "claude_output_limit" if output_limited else "claude_timeout"
             else:
                 try:
                     version = _parse_stream_version(stdout)

@@ -9,7 +9,6 @@ from time import perf_counter_ns
 from typing import Protocol
 from urllib.parse import urlencode
 
-import anyio
 import httpcore
 import httpx
 
@@ -18,6 +17,7 @@ from carl.core.http import FormField, RequestPlan, header_values, redirect_targe
 from carl.core.models import Header, JsonValue
 from carl.core.routing import LocalSocks5Endpoint
 from carl.io.cleanup import shielded_cleanup
+from carl.io.resource_permits import resource_operation, run_cpu
 
 
 async def close_httpx_client(
@@ -213,6 +213,7 @@ class _HttpxAcquirer:
             }
             raise
 
+    @resource_operation("http")
     async def _acquire(
         self,
         plan: RequestPlan,
@@ -405,11 +406,10 @@ class _HttpxAcquirer:
                 )
                 metadata["redirect_target"] = target
                 try:
-                    decoded_body = await anyio.to_thread.run_sync(
+                    decoded_body = await run_cpu(
                         decode_content,
                         bytes(body),
                         content_encodings,
-                        abandon_on_cancel=True,
                     )
                 except ContentDecodingError as error:
                     metadata["body"] = {

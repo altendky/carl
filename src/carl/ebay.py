@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from random import uniform
 from time import perf_counter_ns
@@ -44,6 +45,7 @@ from carl.io.network_activity import (
 )
 from carl.io.paths import CarlDirectories
 from carl.io.provenance import collect_code_provenance_async, process_invocation
+from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 
 COLLECT_EBAY_SEARCH = ComponentId(("carl", "ebay", "collect", "search_page"))
@@ -695,7 +697,8 @@ async def extract_ebay_search_acquisition(
     )
     try:
         headers = terminal_response.get("headers")
-        decoded = decoded_stored_body(
+        decoded = await run_cpu(
+            decoded_stored_body,
             stored_body,
             body_metadata.get("representation"),
             stored_content_encodings(headers),
@@ -712,15 +715,18 @@ async def extract_ebay_search_acquisition(
         status_code = terminal_response.get("status_code")
         if not isinstance(status_code, int) or isinstance(status_code, bool):
             raise ValueError("eBay acquisition terminal response has no HTTP status")
-        extraction = extract_ebay_search(
-            html,
-            status_code=status_code,
-            listing_state=request.listing_state,
-            redirect_target=(
-                terminal_response["redirect_target"]
-                if isinstance(terminal_response.get("redirect_target"), str)
-                else None
-            ),
+        extraction = await run_cpu(
+            partial(
+                extract_ebay_search,
+                html,
+                status_code=status_code,
+                listing_state=request.listing_state,
+                redirect_target=(
+                    terminal_response["redirect_target"]
+                    if isinstance(terminal_response.get("redirect_target"), str)
+                    else None
+                ),
+            )
         )
     except Exception as error:
         await database.fail_operation(

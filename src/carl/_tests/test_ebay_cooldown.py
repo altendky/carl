@@ -104,7 +104,9 @@ async def _fail(
         settings=WorkerSettings(
             worker_count=1,
             lease_duration_ns=60_000_000_000,
-            renewal_interval_ns=1_000_000_000,
+            # This helper deliberately freezes its policy clock. It exercises
+            # retry eligibility, not heartbeat renewal against advancing time.
+            renewal_interval_ns=30_000_000_000,
             idle_poll_interval_ns=1,
         ),
         services=WorkerRuntimeServices(

@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 
-import anyio
-
 from carl.core.acquisition_identity import acquisition_resource_identity
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.content_encoding import decoded_stored_body
@@ -59,6 +57,7 @@ from carl.io.httpx import (
     RouteConfigurationFailure,
 )
 from carl.io.network_activity import NetworkActivityScheduler
+from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 from carl.io.worker import TypedWorkHandler, WorkHandler, WorkHandlerRegistry
 
@@ -379,7 +378,7 @@ async def _extract_outcome(
         effective_url = acquisition.get("effective_url")
         if not isinstance(effective_url, str):
             raise ValueError("Acquisition has no effective URL")
-        decoded_listing = await anyio.to_thread.run_sync(
+        decoded_listing = await run_cpu(
             _decode_and_extract,
             stored_body,
             body_metadata.get("representation"),
@@ -387,7 +386,6 @@ async def _extract_outcome(
             requested_listing_id,
             payload.acquisition_record_identifier,
             effective_url,
-            abandon_on_cancel=True,
         )
     except ValueError as error:
         return _extraction_failure_outcome(
@@ -524,7 +522,7 @@ async def _usable_retained_item_acquisition(
         if not isinstance(body_identifier, str):
             return False
         metadata, content = await database.get_artifact(body_identifier)
-        decoded = await anyio.to_thread.run_sync(
+        decoded = await run_cpu(
             _decode_and_extract,
             content,
             metadata.get("representation"),
@@ -532,7 +530,6 @@ async def _usable_retained_item_acquisition(
             listing_identifier,
             acquisition_identifier,
             effective_url,
-            abandon_on_cancel=True,
         )
     except (KeyError, ValueError):
         return False

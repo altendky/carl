@@ -1,6 +1,7 @@
 """Application orchestration around Carl's pure core and I/O adapters."""
 
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from time import perf_counter_ns
 from uuid import uuid4
@@ -12,6 +13,7 @@ from carl.core.models import BytesDraft, Header, JsonValue, NamedOutput, RecordD
 from carl.facebook_workers import ACQUIRE_HTTP, EXTRACT_FACEBOOK, build_component_registry
 from carl.io.httpx import AcquisitionFailure, DirectHttpxAcquirer, HttpAcquirer
 from carl.io.provenance import collect_code_provenance_async, process_invocation
+from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 
 
@@ -162,8 +164,11 @@ async def extract_acquisition(
         ),
     )
     try:
-        decoded = decoded_stored_body(
-            stored_body, body_metadata.get("representation"), stored_content_encodings(headers)
+        decoded = await run_cpu(
+            decoded_stored_body,
+            stored_body,
+            body_metadata.get("representation"),
+            stored_content_encodings(headers),
         )
         charset, charset_source = stored_response_charset(headers)
         try:
@@ -177,18 +182,24 @@ async def extract_acquisition(
         requested_listing_id = acquisition.get("requested_listing_id")
         if not isinstance(requested_listing_id, str):
             raise ValueError("Acquisition has no requested listing identifier")
-        extraction = extract_listing(
-            html,
-            listing_id=requested_listing_id,
-            acquisition_record_id=acquisition_record_id,
+        extraction = await run_cpu(
+            partial(
+                extract_listing,
+                html,
+                listing_id=requested_listing_id,
+                acquisition_record_id=acquisition_record_id,
+            )
         )
         effective_url = acquisition.get("effective_url")
         if not isinstance(effective_url, str):
             raise ValueError("Acquisition has no effective URL")
-        classification = classify_item_response(
-            html,
-            requested_listing_id=requested_listing_id,
-            effective_url=effective_url,
+        classification = await run_cpu(
+            partial(
+                classify_item_response,
+                html,
+                requested_listing_id=requested_listing_id,
+                effective_url=effective_url,
+            )
         )
     except Exception as error:
         await database.fail_operation(

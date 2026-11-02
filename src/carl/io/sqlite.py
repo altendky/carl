@@ -104,6 +104,7 @@ from carl.core.models import (
     StorageBackend,
     StorageSchemaIdentity,
 )
+from carl.core.resources import ResourceLease, ResourceRequest
 from carl.core.review import (
     AnalysisDescriptor,
     CandidateSource,
@@ -182,9 +183,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=13,
+    version=14,
 )
 
+_V13_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 13})
+_V13_SCHEMA_DEFINITION_SHA256 = "eae632323c7be6189ce3116ed09e9be6c679861cb64262ab481247e4e4a0c6bb"
 _V12_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 12})
 _V12_SCHEMA_DEFINITION_SHA256 = "93b88a76a1bbc95d29c0cc72876560e5354da0d44250a483f9f5afe177ad2241"
 _V11_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 11})
@@ -211,6 +214,39 @@ _V1_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 1})
 _V1_SCHEMA_DEFINITION_SHA256 = "b3fa83413034992e01f84abf8ffe4993864cfad23b4792442b38b60a47b8dca6"
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS resource_budgets (
+    scope TEXT NOT NULL CHECK (length(scope) > 0),
+    name TEXT NOT NULL CHECK (length(name) > 0),
+    capacity INTEGER NOT NULL CHECK (capacity > 0),
+    PRIMARY KEY (scope, name)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS resource_permits (
+    token TEXT PRIMARY KEY CHECK (length(token) > 0),
+    scope TEXT NOT NULL CHECK (length(scope) > 0),
+    owner TEXT NOT NULL CHECK (length(owner) > 0),
+    state TEXT NOT NULL CHECK (state IN ('held', 'released', 'reclaimed')),
+    acquired_at_utc_ns INTEGER NOT NULL CHECK (acquired_at_utc_ns >= 0),
+    expires_at_utc_ns INTEGER NOT NULL CHECK (expires_at_utc_ns > acquired_at_utc_ns),
+    UNIQUE (token, scope)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS resource_permits_occupied
+ON resource_permits(scope, state, expires_at_utc_ns, token);
+
+CREATE TABLE IF NOT EXISTS resource_allocations (
+    permit_token TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    name TEXT NOT NULL,
+    units INTEGER NOT NULL CHECK (units > 0),
+    PRIMARY KEY (permit_token, name),
+    FOREIGN KEY (permit_token, scope) REFERENCES resource_permits(token, scope),
+    FOREIGN KEY (scope, name) REFERENCES resource_budgets(scope, name)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS resource_allocations_budget
+ON resource_allocations(scope, name, permit_token, units);
+
 CREATE TABLE IF NOT EXISTS network_connectivity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
@@ -851,6 +887,229 @@ class Database:
         async with self._connections.writer():
             yield
 
+    @staticmethod
+    async def _resource_lease_from_row(
+        connection: AsyncConnection, row: Sequence[apsw.SQLiteValue]
+    ) -> ResourceLease:
+        cursor = await connection.execute(
+            "SELECT name, units FROM resource_allocations WHERE permit_token = ? ORDER BY name",
+            (_text(row[0]),),
+        )
+        return ResourceLease(
+            token=_text(row[0]),
+            scope=_text(row[1]),
+            owner=_text(row[2]),
+            acquired_at_utc_ns=_integer(row[3]),
+            expires_at_utc_ns=_integer(row[4]),
+            allocations=tuple(
+                ResourceRequest(name=_text(allocation[0]), units=_integer(allocation[1]))
+                for allocation in await cursor.fetchall()
+            ),
+        )
+
+    @staticmethod
+    async def _configure_resource_budgets(
+        connection: AsyncConnection, scope: str, capacities: dict[str, int]
+    ) -> None:
+        cursor = await connection.execute(
+            "SELECT name, capacity FROM resource_budgets WHERE scope = ?", (scope,)
+        )
+        registered = {_text(row[0]): _integer(row[1]) for row in await cursor.fetchall()}
+        changed = any(
+            name in registered and registered[name] != capacity
+            for name, capacity in capacities.items()
+        )
+        if changed:
+            cursor = await connection.execute(
+                "SELECT 1 FROM resource_permits WHERE scope = ? AND state = 'held' LIMIT 1",
+                (scope,),
+            )
+            if await cursor.fetchone() is not None:
+                raise ValueError("Resource capacities cannot change while permits occupy the scope")
+        await connection.executemany(
+            """
+            INSERT INTO resource_budgets(scope, name, capacity) VALUES (?, ?, ?)
+            ON CONFLICT(scope, name) DO UPDATE SET capacity = excluded.capacity
+            WHERE resource_budgets.capacity != excluded.capacity
+            """,
+            [(scope, name, capacity) for name, capacity in sorted(capacities.items())],
+        )
+
+    async def try_acquire_resource_permit(
+        self,
+        *,
+        scope: str,
+        token: str,
+        owner: str,
+        requests: Sequence[ResourceRequest],
+        capacities: dict[str, int],
+        now_utc_ns: int,
+        lease_duration_ns: int,
+    ) -> ResourceLease | None:
+        """Reserve every requested budget atomically, or reserve none.
+
+        Capacity is coordinated only inside this database and the supplied scope.
+        Expired held permits remain occupied until guarded reclamation proves that
+        their execution owner can no longer consume the resource.
+        """
+
+        if lease_duration_ns <= 0:
+            raise ValueError("Resource lease duration must be positive")
+        lease = ResourceLease(
+            scope=scope,
+            token=token,
+            owner=owner,
+            allocations=tuple(sorted(requests, key=lambda request: request.name)),
+            acquired_at_utc_ns=now_utc_ns,
+            expires_at_utc_ns=now_utc_ns + lease_duration_ns,
+        )
+        for name, capacity in capacities.items():
+            ResourceRequest(name=name, units=capacity)
+        for request in lease.allocations:
+            if request.name not in capacities:
+                raise ValueError(f"No capacity configured for resource {request.name!r}")
+            if request.units > capacities[request.name]:
+                raise ValueError(f"Requested units exceed resource {request.name!r} capacity")
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                "SELECT 1 FROM resource_permits WHERE token = ?", (token,)
+            )
+            if await cursor.fetchone() is not None:
+                raise ValueError("Resource permit tokens may never be reused")
+            await self._configure_resource_budgets(connection, scope, capacities)
+            for request in lease.allocations:
+                cursor = await connection.execute(
+                    """
+                    SELECT COALESCE(SUM(allocation.units), 0)
+                    FROM resource_permits AS permit INDEXED BY resource_permits_occupied
+                    JOIN resource_allocations AS allocation
+                      ON allocation.permit_token = permit.token
+                    WHERE permit.scope = ? AND permit.state = 'held' AND allocation.name = ?
+                    """,
+                    (scope, request.name),
+                )
+                row = await cursor.fetchone()
+                assert row is not None
+                if _integer(row[0]) + request.units > capacities[request.name]:
+                    return None
+            await connection.execute(
+                """
+                INSERT INTO resource_permits(
+                    token, scope, owner, state, acquired_at_utc_ns, expires_at_utc_ns
+                ) VALUES (?, ?, ?, 'held', ?, ?)
+                """,
+                (token, scope, owner, now_utc_ns, lease.expires_at_utc_ns),
+            )
+            await connection.executemany(
+                "INSERT INTO resource_allocations(permit_token, scope, name, units) VALUES (?, ?, ?, ?)",
+                [(token, scope, request.name, request.units) for request in lease.allocations],
+            )
+        return lease
+
+    async def renew_resource_permit(
+        self,
+        *,
+        token: str,
+        owner: str,
+        now_utc_ns: int,
+        lease_duration_ns: int,
+    ) -> ResourceLease | None:
+        """Renew a current owner; expiry never grants a stale owner a new lease."""
+
+        if now_utc_ns < 0 or lease_duration_ns <= 0:
+            raise ValueError("Resource renewal timestamps are invalid")
+        async with self._connections.writer() as connection:
+            await connection.execute(
+                """
+                UPDATE resource_permits
+                SET expires_at_utc_ns = MAX(expires_at_utc_ns, ?)
+                WHERE token = ? AND owner = ? AND state = 'held' AND expires_at_utc_ns > ?
+                """,
+                (now_utc_ns + lease_duration_ns, token, owner, now_utc_ns),
+            )
+            if await connection.changes() != 1:
+                return None
+            cursor = await connection.execute(
+                """
+                SELECT token, scope, owner, acquired_at_utc_ns, expires_at_utc_ns
+                FROM resource_permits WHERE token = ?
+                """,
+                (token,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            return await self._resource_lease_from_row(connection, row)
+
+    async def validate_resource_permit(self, *, token: str, owner: str, now_utc_ns: int) -> bool:
+        """Check ownership, joining a caller's writer transaction for publication fencing."""
+
+        if now_utc_ns < 0:
+            raise ValueError("Resource validation time must be nonnegative")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT 1 FROM resource_permits
+                WHERE token = ? AND owner = ? AND state = 'held' AND expires_at_utc_ns > ?
+                """,
+                (token, owner, now_utc_ns),
+            )
+            return await cursor.fetchone() is not None
+
+    async def release_resource_permit(self, *, token: str, owner: str) -> bool:
+        """Release only this owner, including cleanup after its lease expired."""
+
+        async with self._connections.writer() as connection:
+            await connection.execute(
+                "UPDATE resource_permits SET state = 'released' WHERE token = ? AND owner = ? AND state = 'held'",
+                (token, owner),
+            )
+            return await connection.changes() == 1
+
+    async def expired_resource_permits(
+        self, *, scope: str, now_utc_ns: int
+    ) -> tuple[ResourceLease, ...]:
+        """List occupied expired permits for independent execution-owner guard checks."""
+
+        if now_utc_ns < 0:
+            raise ValueError("Resource expiry time must be nonnegative")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT token, scope, owner, acquired_at_utc_ns, expires_at_utc_ns
+                FROM resource_permits
+                WHERE scope = ? AND state = 'held' AND expires_at_utc_ns <= ?
+                ORDER BY expires_at_utc_ns, token
+                """,
+                (scope, now_utc_ns),
+            )
+            return tuple(
+                [
+                    await self._resource_lease_from_row(connection, row)
+                    for row in await cursor.fetchall()
+                ]
+            )
+
+    async def reclaim_expired_resource_permit(
+        self, *, token: str, owner: str, now_utc_ns: int
+    ) -> bool:
+        """Reclaim after the caller acquires and holds the owner's OS execution guard.
+
+        A timestamp or a guessed dead PID is insufficient. The manager must keep
+        the guard until this transaction commits; expiry is rechecked here.
+        """
+
+        if now_utc_ns < 0:
+            raise ValueError("Resource reclamation time must be nonnegative")
+        async with self._connections.writer() as connection:
+            await connection.execute(
+                """
+                UPDATE resource_permits SET state = 'reclaimed'
+                WHERE token = ? AND owner = ? AND state = 'held' AND expires_at_utc_ns <= ?
+                """,
+                (token, owner, now_utc_ns),
+            )
+            return await connection.changes() == 1
+
     @classmethod
     @asynccontextmanager
     async def managed(
@@ -860,6 +1119,7 @@ class Database:
         initialize: bool = False,
         reader_count: int = 4,
         prepare_schema: bool = True,
+        resource_capacities: dict[str, int] | None = None,
     ) -> AsyncGenerator[Database]:
         """Open the database, normally migrating and validating before yielding it.
 
@@ -889,7 +1149,10 @@ class Database:
                     await database.initialize()
                 else:
                     await database.validate_schema()
-            yield database
+            from carl.io.resource_permits import resource_manager_context
+
+            async with resource_manager_context(database, capacities=resource_capacities):
+                yield database
 
     @staticmethod
     def _expected_metadata() -> dict[str, str]:
@@ -980,6 +1243,14 @@ class Database:
         }
 
     @staticmethod
+    def _v13_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V13_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "13",
+            "schema_definition_sha256": _V13_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v7_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V7_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -1032,6 +1303,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v13_metadata())
                 and not await cls._metadata_matches(connection, cls._v12_metadata())
                 and not await cls._metadata_matches(connection, cls._v11_metadata())
                 and not await cls._metadata_matches(connection, cls._v10_metadata())
@@ -1447,6 +1719,12 @@ class Database:
                     )
             if await self._metadata_matches(connection, self._v12_metadata()):
                 await self._migrate_work_cancellation(connection)
+                for key, value in self._v13_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v13_metadata()):
+                await connection.execute(_SCHEMA)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
