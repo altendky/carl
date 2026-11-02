@@ -797,16 +797,33 @@ async def test_workspace_analysis_preview_resolves_claimed_batch(
         workspace_work = await application.get_workspace_work_status("workspace")
         timed_out_wait = await application.wait_for_workspace_work("workspace", timeout_seconds=0)
 
+        progress_status_reads = 0
+
         async def queued_status(
-            _application: ReviewApplication, record_identifier: str
+            _application: ReviewApplication,
+            record_identifier: str,
+            *,
+            maximum_active_work: int,
+            maximum_failed_work: int,
         ) -> WorkspaceWorkStatus:
+            nonlocal progress_status_reads
+            progress_status_reads += 1
             assert record_identifier == "workspace"
+            assert maximum_active_work == maximum_failed_work == 20
             return workspace_work
 
-        # Test progress delivery and timeout, not whether SQLite finishes within 10 ms.
+        wait_clock = 0.0
+
+        async def advance_wait_clock(seconds: float) -> None:
+            nonlocal wait_clock
+            wait_clock += seconds
+
+        # Isolate progress delivery from database latency and wall-clock scheduling.
         # The real queued status and zero-timeout read are verified above.
         with monkeypatch.context() as wait_patch:
-            wait_patch.setattr(ReviewApplication, "get_workspace_work_status", queued_status)
+            wait_patch.setattr(ReviewApplication, "_workspace_work_status", queued_status)
+            wait_patch.setattr("carl.review.anyio.current_time", lambda: wait_clock)
+            wait_patch.setattr("carl.review.anyio.sleep", advance_wait_clock)
             progress_wait = await application.wait_for_workspace_work(
                 "workspace",
                 timeout_seconds=0.01,
@@ -845,6 +862,8 @@ async def test_workspace_analysis_preview_resolves_claimed_batch(
     assert timed_out_wait.timed_out
     assert timed_out_wait.status.queued_count == 1
     assert progress_wait.timed_out
+    assert progress_status_reads > 0
+    assert progress_wait.waited_seconds == pytest.approx(0.01)
     assert wait_progress and wait_progress[0][:2] == (1, 0)
     assert not idle_wait.timed_out
     assert idle_wait.status.idle
