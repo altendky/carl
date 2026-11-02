@@ -222,6 +222,10 @@ async def test_facebook_cards_have_same_track_scoped_read_path(tmp_path: Path) -
                         {
                             "request": _search_run_value("Nagler")["request"],
                             "traversal": {"maximum_pages": 1},
+                            "traversal_strategy": {
+                                "kind": "overlapping_price_partitions",
+                                "width": "600",
+                            },
                         }
                     )
                 ),

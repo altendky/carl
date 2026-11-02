@@ -51,6 +51,7 @@ def _facebook_search(maximum: str = "3000") -> CreateSearchRequest:
             {
                 "request": _search_run_value("foosball")["request"],
                 "traversal": {"maximum_pages": 10},
+                "traversal_strategy": {"kind": "overlapping_price_partitions", "width": "3000"},
             }
         )
     )
@@ -189,6 +190,7 @@ async def test_group_v1_refresh_inherits_explicit_neutral_route_but_not_legacy_p
                 {
                     "request": original.request.model_dump(mode="json"),
                     "traversal": original.traversal.model_dump(mode="json"),
+                    "traversal_strategy": original.traversal_strategy.model_dump(mode="json"),
                     "proton_route": "carl",
                 }
             )
@@ -217,6 +219,9 @@ async def test_group_v1_refresh_inherits_explicit_neutral_route_but_not_legacy_p
                                 "search": {
                                     "request": original.request.model_dump(mode="json"),
                                     "traversal": original.traversal.model_dump(mode="json"),
+                                    "traversal_strategy": original.traversal_strategy.model_dump(
+                                        mode="json"
+                                    ),
                                     "proton_route": "carl",
                                 },
                             },

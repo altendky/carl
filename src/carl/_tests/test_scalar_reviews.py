@@ -47,7 +47,11 @@ async def _search(
 ) -> str:
     run = _search_run_value(name)
     search = CreateSearchRequest.model_validate(
-        {"request": run["request"], "traversal": {"maximum_pages": 1}}
+        {
+            "request": run["request"],
+            "traversal": {"maximum_pages": 1},
+            "traversal_strategy": {"kind": "overlapping_price_partitions", "width": "600"},
+        }
     )
     group = await app.create_marketplace_search(
         CreateMarketplaceSearchRequest(targets=(FacebookSearchTargetSpecification(search=search),))

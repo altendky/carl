@@ -56,6 +56,7 @@ def _payload() -> CollectSearchPayload:
             price=SearchPriceRange(currency="USD", maximum=Decimal("600")),
         ),
         traversal=SearchTraversalPolicy(maximum_pages=3),
+        traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(width=Decimal("600")),
         routing=("bright_data", "account", "residential"),
     )
 
@@ -86,7 +87,12 @@ def test_search_request_round_trips_as_typed_json() -> None:
             "maximum_consecutive_pages_without_new_listings": None,
             "requested_page_size": None,
         },
-        "traversal_strategy": {"kind": "cursor"},
+        "traversal_strategy": {
+            "kind": "overlapping_price_partitions",
+            "width": "600",
+            "overlap": "0",
+            "order": "balanced",
+        },
         "routing": ["bright_data", "account", "residential"],
         "retry_attempt_offset": 0,
     }

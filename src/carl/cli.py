@@ -49,7 +49,6 @@ from carl.core.facebook_images import (
     plan_image_followups,
 )
 from carl.core.facebook_search import (
-    CursorSearchTraversalStrategy,
     OverlappingPricePartitionSearchTraversalStrategy,
     SearchPricePartitionOrder,
     SearchTraversalPolicy,
@@ -2156,6 +2155,11 @@ def search(
     async def perform() -> dict[str, JsonValue]:
         if maximum_results is None and maximum_pages is None:
             raise ValueError("Specify --maximum-results, --maximum-pages, or both")
+        if price_partition_width is None or maximum_price is None:
+            raise ValueError(
+                "Facebook searches require --price-partition-width and --maximum-price; "
+                "cursor pagination is disabled"
+            )
         if not network_route or network_route != network_route.strip():
             raise ValueError("The network route identifier must be nonempty and trimmed")
         price = (
@@ -2167,18 +2171,11 @@ def search(
                 maximum=maximum_price,
             )
         )
-        if price_partition_width is None:
-            if price_partition_overlap is not None:
-                raise ValueError("--price-partition-overlap requires --price-partition-width")
-            traversal_strategy = CursorSearchTraversalStrategy()
-        else:
-            traversal_strategy = OverlappingPricePartitionSearchTraversalStrategy(
-                width=price_partition_width,
-                overlap=(
-                    Decimal(0) if price_partition_overlap is None else price_partition_overlap
-                ),
-                order=price_partition_order,
-            )
+        traversal_strategy = OverlappingPricePartitionSearchTraversalStrategy(
+            width=price_partition_width,
+            overlap=(Decimal(0) if price_partition_overlap is None else price_partition_overlap),
+            order=price_partition_order,
+        )
         request = CreateSearchRequest(
             request=FacebookSearchRequest(
                 query=query,

@@ -16,6 +16,7 @@ from carl.core.facebook_search import (
     OverlappingPricePartitionSearchTraversalStrategy,
     PricePartitionSearchTraversalState,
     SearchPricePartition,
+    SearchStoppingReason,
     SearchTraversalAction,
     SearchTraversalState,
     account_search_elapsed_interval,
@@ -53,6 +54,10 @@ from carl.core.facebook_search_session import (
     SearchSessionMaterialEvidence,
     SearchSessionMaterialIssue,
     extract_search_session_material,
+)
+from carl.core.facebook_search_support import (
+    UnsupportedFacebookSearchMode,
+    require_supported_facebook_search_acquisition,
 )
 from carl.core.facebook_work import (
     RETRYABLE_SEARCH_SESSION_FAILURE_CODES,
@@ -175,7 +180,6 @@ async def _resume_partition_occurrences(
         outputs=outputs,
         checkpoint_result={
             "state": "collecting",
-            "search_run_identifier": checkpoint.traversal_state.search_run_identifier,
             "pages_persisted": checkpoint.traversal_state.partitions_processed,
             "traversal_state": checkpoint.traversal_state.model_dump(mode="json"),
             "partition_retry_checkpoint": checkpoint.model_dump(mode="json"),
@@ -233,7 +237,6 @@ def search_session_failure_work(
     *,
     error: FacebookSearchSessionFailure,
     context: AttemptContext,
-    search_run_identifier: str,
     routing: tuple[str, ...],
     policy_attempt: int | None = None,
 ) -> RetryWork | TerminalFailureWork:
@@ -249,7 +252,6 @@ def search_session_failure_work(
     }
     result: dict[str, JsonValue] = {
         "state": "transport_failed",
-        "search_run_identifier": search_run_identifier,
         "attempt": context.attempt,
         "network_path": list(routing),
     }
@@ -273,7 +275,6 @@ def search_acquisition_failure_work(
     *,
     error: AcquisitionFailure,
     context: AttemptContext,
-    search_run_identifier: str,
     policy_attempt: int | None = None,
 ) -> RetryWork | TerminalFailureWork:
     """Classify a failed search request while retaining its transport evidence."""
@@ -285,7 +286,6 @@ def search_acquisition_failure_work(
     }
     result: dict[str, JsonValue] = {
         "state": "acquisition_failed",
-        "search_run_identifier": search_run_identifier,
         "attempt": context.attempt,
         "acquisition": error.result,
     }
@@ -579,7 +579,6 @@ async def _checkpoint_session_bootstrap(
         outputs=outputs,
         checkpoint_result={
             "state": "collecting",
-            "search_run_identifier": search_run_identifier,
             "session_bootstrap_persisted": True,
             "pages_persisted": (
                 0
@@ -896,7 +895,6 @@ async def _checkpoint_page(
         outputs=outputs,
         checkpoint_result={
             "state": "collecting",
-            "search_run_identifier": search_run_identifier,
             "pages_persisted": page_ordinal,
             "traversal_state": (
                 None if traversal_state is None else traversal_state.model_dump(mode="json")
@@ -920,6 +918,15 @@ def build_search_handler(
     price_partition_planner_component: Component,
 ) -> Callable[[CollectSearchPayload, AttemptContext], Awaitable[WorkOutcome]]:
     async def collect(payload: CollectSearchPayload, context: AttemptContext) -> WorkOutcome:
+        try:
+            require_supported_facebook_search_acquisition(
+                payload.request, payload.traversal_strategy
+            )
+        except UnsupportedFacebookSearchMode as error:
+            return TerminalFailureWork(
+                error={"kind": "unsupported_facebook_search_mode", "message": str(error)},
+                result={"state": "unsupported"},
+            )
         policy_attempt = context.retry_attempt(payload.retry_attempt_offset)
         if policy_attempt < 1:
             raise ValueError("Search retry attempt offset is inconsistent with durable work")
@@ -1044,9 +1051,11 @@ def build_search_handler(
         )
         applied_configuration: AppliedSearchConfiguration | None = None
         completed_session_observation: dict[str, JsonValue] | None = None
+        pagination_failure: dict[str, JsonValue] | None = None
+        pagination_failure_result: dict[str, JsonValue] = {}
         elapsed_accounted_at = dependencies.monotonic_ns()
+        session = None
         try:
-            session = None
             async with AsyncExitStack() as session_stack:
                 setup_activity = network_activity_definition(
                     identifier=dependencies.new_identifier(),
@@ -1137,7 +1146,6 @@ def build_search_handler(
                         },
                         result={
                             "state": "failed",
-                            "search_run_identifier": search_run_identifier,
                             "response_classification": (
                                 session_bootstrap_classification.model_dump(mode="json")
                             ),
@@ -1148,7 +1156,6 @@ def build_search_handler(
                         error={"kind": "search_session_material_extraction_failure"},
                         result={
                             "state": "failed",
-                            "search_run_identifier": search_run_identifier,
                             "session_material_issues": [
                                 issue.model_dump(mode="json")
                                 for issue in material_extraction.issues
@@ -1249,7 +1256,6 @@ def build_search_handler(
                         },
                         result={
                             "state": "failed",
-                            "search_run_identifier": search_run_identifier,
                             "response_classification": response_classification.model_dump(
                                 mode="json"
                             ),
@@ -1454,7 +1460,6 @@ def build_search_handler(
                                 },
                                 result={
                                     "state": "failed",
-                                    "search_run_identifier": search_run_identifier,
                                     "page_ordinal": page_ordinal,
                                     "price_partition": current_price_partition.model_dump(
                                         mode="json"
@@ -1608,24 +1613,32 @@ def build_search_handler(
                                 traversal_state=cursor_traversal_state,
                                 requested_search=current_search_request,
                             )
-                            return TerminalFailureWork(
-                                error={
-                                    "kind": (
-                                        "search_pagination_rate_limited"
-                                        if rate_limited
-                                        else "search_pagination_extraction_failure"
-                                    )
-                                },
-                                result={
-                                    "state": "rate_limited" if rate_limited else "failed",
-                                    "search_run_identifier": search_run_identifier,
-                                    "page_ordinal": page_ordinal,
-                                    "protocol_issues": [
-                                        issue.model_dump(mode="json")
-                                        for issue in page_extraction.issues
-                                    ],
-                                },
+                            pagination_failure_result = {
+                                "page_ordinal": page_ordinal,
+                                "protocol_issues": [
+                                    issue.model_dump(mode="json")
+                                    for issue in page_extraction.issues
+                                ],
+                            }
+                            if not rate_limited:
+                                return TerminalFailureWork(
+                                    error={"kind": "search_pagination_extraction_failure"},
+                                    result={"state": "failed", **pagination_failure_result},
+                                )
+                            cursor_traversal_state = cursor_traversal_state.model_copy(
+                                update={"stopping_reason": SearchStoppingReason.RATE_LIMITED}
                             )
+                            pagination_failure = {
+                                "kind": "search_pagination_rate_limited",
+                                "attempt": policy_attempt,
+                                "maximum_attempts": SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS,
+                                "facebook_search_cooldown": {
+                                    "network_path": list(payload.routing),
+                                    "until_utc_ns": dependencies.utc_now_ns()
+                                    + facebook_challenge_retry_delay_ns(policy_attempt),
+                                },
+                            }
+                            break
                         page_completed_at = dependencies.monotonic_ns()
                         decision = advance_search_traversal(
                             state=cursor_traversal_state,
@@ -1694,7 +1707,6 @@ def build_search_handler(
             outcome = search_acquisition_failure_work(
                 error=error,
                 context=context,
-                search_run_identifier=search_run_identifier,
                 policy_attempt=transport_attempt,
             )
             if isinstance(outcome, RetryWork) and retry_checkpoint is not None:
@@ -1706,7 +1718,11 @@ def build_search_handler(
                         }
                     }
                 )
-            return outcome
+            if pagination_failure is None:
+                return outcome
+            pagination_failure["session_cleanup_failure"] = (
+                outcome.reason if isinstance(outcome, RetryWork) else outcome.error
+            )
         except FacebookSearchSessionFailure as error:
             transport_attempt = max(
                 1,
@@ -1730,7 +1746,6 @@ def build_search_handler(
             outcome = search_session_failure_work(
                 error=error,
                 context=context,
-                search_run_identifier=search_run_identifier,
                 routing=payload.routing,
                 policy_attempt=transport_attempt,
             )
@@ -1743,7 +1758,11 @@ def build_search_handler(
                         }
                     }
                 )
-            return outcome
+            if pagination_failure is None:
+                return outcome
+            pagination_failure["session_cleanup_failure"] = (
+                outcome.reason if isinstance(outcome, RetryWork) else outcome.error
+            )
         except ValueError as error:
             return TerminalFailureWork(
                 error={
@@ -1752,15 +1771,16 @@ def build_search_handler(
                 },
                 result={
                     "state": "failed",
-                    "search_run_identifier": search_run_identifier,
                 },
             )
 
         session_record_identifier = dependencies.new_identifier()
         run_record_identifier = dependencies.new_identifier()
         if completed_session_observation is None:
-            raise AssertionError("Completed search has no network session observation")
-        return CompletedWork(
+            if pagination_failure is None or session is None:
+                raise AssertionError("Completed search has no network session observation")
+            completed_session_observation = session.completed_observation()
+        completed = CompletedWork(
             records=(
                 RecordDraft(
                     identifier=session_record_identifier,
@@ -1822,7 +1842,8 @@ def build_search_handler(
                 ),
             ),
             result={
-                "state": "complete",
+                "state": "complete" if pagination_failure is None else "partial",
+                **pagination_failure_result,
                 "search_run_identifier": search_run_identifier,
                 "search_run_record_identifier": run_record_identifier,
                 "pages_processed": (
@@ -1845,6 +1866,22 @@ def build_search_handler(
                     else []
                 ),
             },
+        )
+        if pagination_failure is None:
+            return completed
+        if policy_attempt < SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS:
+            return RetryWork(
+                records=completed.records,
+                outputs=completed.outputs,
+                result=completed.result,
+                delay_ns=facebook_challenge_retry_delay_ns(policy_attempt),
+                reason={**pagination_failure, "decision": "retry"},
+            )
+        return TerminalFailureWork(
+            records=completed.records,
+            outputs=completed.outputs,
+            result=completed.result,
+            error={**pagination_failure, "decision": "retry_exhausted"},
         )
 
     return collect

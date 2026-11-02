@@ -74,6 +74,7 @@ from carl.facebook_refresh_workers import (
 )
 from carl.facebook_search_workers import FacebookSearchWorkerDependencies
 from carl.facebook_workers import FacebookWorkerDependencies, build_facebook_worker_registry
+from carl.io.facebook_search import FacebookSearchSessionFactory
 from carl.io.httpx import ClientHttpxAcquirer, DirectHttpxAcquirer
 from carl.io.network_activity import NetworkActivityScheduler
 from carl.io.sqlite import Database
@@ -219,7 +220,7 @@ class _PartitionSessionFactory:
 
 @final
 class _Harness:
-    def __init__(self, path: Path, factory: _PartitionSessionFactory):
+    def __init__(self, path: Path, factory: FacebookSearchSessionFactory):
         self.path = path
         self.factory = factory
         self.clock = _Clock()
@@ -238,7 +239,12 @@ class _Harness:
         )
 
     async def create(
-        self, database: Database, *, query: str = "telescope", partitioned: bool = True
+        self,
+        database: Database,
+        *,
+        query: str = "telescope",
+        partitioned: bool = True,
+        maximum_price: Decimal = Decimal("250"),
     ) -> tuple[str, str]:
         search = await self.app(database).create_marketplace_search(
             CreateMarketplaceSearchRequest(
@@ -249,7 +255,7 @@ class _Harness:
                                 query=query,
                                 location=SearchFacebookLocation(identifier="456"),
                                 radius=SearchRadius(value=60, unit=SearchDistanceUnit.MILES),
-                                price=SearchPriceRange(currency="USD", maximum=Decimal("250")),
+                                price=SearchPriceRange(currency="USD", maximum=maximum_price),
                             ),
                             traversal=SearchTraversalPolicy(maximum_pages=10),
                             traversal_strategy=(
@@ -474,15 +480,14 @@ async def test_interrupted_guest_login_resumes_same_partition_with_fresh_session
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("partitioned", (True, False))
 async def test_first_route_login_wall_retries_with_fresh_session_after_restart(
-    tmp_path: Path, partitioned: bool
+    tmp_path: Path,
 ) -> None:
     factory = _PartitionSessionFactory(challenges=0, login_walls_by_partition={"0": 1})
     harness = _Harness(tmp_path / "carl.sqlite3", factory)
     factory.clock = harness.clock
     async with Database.managed(harness.path, initialize=True) as database:
-        _, work_identifier = await harness.create(database, partitioned=partitioned)
+        _, work_identifier = await harness.create(database)
         outcome = await harness.run(database, work_identifier)
         assert isinstance(outcome, RetryWork)
         reason = cast(dict[str, JsonValue], outcome.reason)
@@ -504,7 +509,8 @@ async def test_first_route_login_wall_retries_with_fresh_session_after_restart(
         "0",
         "bootstrap",
         "0",
-        *(["90", "180"] if partitioned else []),
+        "90",
+        "180",
     ]
 
 
@@ -565,9 +571,9 @@ async def test_route_login_wall_pauses_next_sibling_search_across_restart(tmp_pa
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(("challenges", "login_walls"), ((2, 3), (0, 5)))
-@pytest.mark.parametrize(("partitioned", "minimum"), ((True, "0"), (True, "90"), (False, "0")))
+@pytest.mark.parametrize("minimum", ("0", "90"))
 async def test_guest_login_and_challenge_share_one_bounded_partition_budget(
-    tmp_path: Path, challenges: int, login_walls: int, partitioned: bool, minimum: str
+    tmp_path: Path, challenges: int, login_walls: int, minimum: str
 ) -> None:
     factory = _PartitionSessionFactory(
         challenges=challenges,
@@ -576,7 +582,7 @@ async def test_guest_login_and_challenge_share_one_bounded_partition_budget(
     )
     harness = _Harness(tmp_path / "carl.sqlite3", factory)
     async with Database.managed(harness.path, initialize=True) as database:
-        _, work_identifier = await harness.create(database, partitioned=partitioned)
+        _, work_identifier = await harness.create(database)
         for attempt in range(1, 6):
             outcome = await harness.run(database, work_identifier)
             if attempt < 5:

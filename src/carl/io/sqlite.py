@@ -688,6 +688,65 @@ ON records(json_extract(value_json, '$.search_run_record_identifier'), object_id
 _SCHEMA_DEFINITION_SHA256 = hashlib.sha256(_SCHEMA.encode()).hexdigest()
 
 
+def _partial_facebook_search_publication(
+    operation: str,
+    *,
+    run_identifier: str | None = None,
+    internal_identifier: str | None = None,
+) -> str:
+    """SQL for an ended attempt that explicitly published a usable partial run.
+
+    Arguments are internal SQL expressions, never caller-provided values. Failed
+    acquisition checkpoints alone do not make their search evidence eligible.
+    """
+
+    run_match = "" if run_identifier is None else f"AND partial_run.id = {run_identifier}"
+    internal_match = (
+        ""
+        if internal_identifier is None
+        else f"AND json_extract(partial_record.value_json, '$.search_run_identifier') = {internal_identifier}"
+    )
+    return f"""(
+        {operation}.state = 'failed'
+        AND json_extract({operation}.result_json, '$.state') = 'partial'
+        AND json_extract({operation}.result_json, '$.stopping_reason') = 'rate_limited'
+        AND EXISTS (
+            SELECT 1 FROM objects AS partial_run
+            JOIN records AS partial_record ON partial_record.object_id = partial_run.id
+            WHERE partial_run.id = json_extract(
+                {operation}.result_json, '$.search_run_record_identifier'
+            )
+              AND partial_run.created_by_operation_id = {operation}.id
+              AND partial_run.kind_parts_json = '["carl","facebook","search_run"]'
+              AND json_extract(partial_record.value_json, '$.traversal.stopping_reason') = 'rate_limited'
+              {run_match}
+              {internal_match}
+        )
+    )"""
+
+
+def _facebook_search_publication_event(
+    operation: str,
+    event: str,
+    *,
+    run_identifier: str | None = None,
+    internal_identifier: str | None = None,
+) -> str:
+    """SQL preserving successful reads and admitting fenced partial publications."""
+
+    partial = _partial_facebook_search_publication(
+        operation, run_identifier=run_identifier, internal_identifier=internal_identifier
+    )
+    return f"""(
+        ({operation}.state = 'completed' AND {event}.event_kind = 'completed')
+        OR (
+            {partial}
+            AND {event}.event_kind IN ('released', 'terminal_failure')
+            AND json_extract({event}.data_json, '$.operation_identifier') = {operation}.id
+        )
+    )"""
+
+
 def _json(value: JsonValue) -> str:
     return encode_json(value)
 
@@ -6528,7 +6587,7 @@ class Database:
         after_object_rowid: int = 0,
         limit: int = 100,
     ) -> tuple[dict[str, JsonValue], ...]:
-        """Read incremental cards belonging to exact work attempts or completed runs."""
+        """Read incremental cards belonging to exact work attempts or published runs."""
 
         if (
             len(search_work_identifiers) > 100
@@ -6545,7 +6604,7 @@ class Database:
             return ()
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 WITH requested_work AS MATERIALIZED (
                     SELECT DISTINCT value AS identifier FROM json_each(?)
                 ), requested_runs AS MATERIALIZED (
@@ -6560,7 +6619,15 @@ class Database:
                     JOIN objects AS run ON run.id = requested.identifier
                     JOIN records AS record ON record.object_id = run.id
                     JOIN operations AS operation ON operation.id = run.created_by_operation_id
-                    WHERE operation.state = 'completed'
+                    WHERE (operation.state = 'completed' OR (
+                        {_partial_facebook_search_publication("operation", run_identifier="run.id")}
+                        AND EXISTS (
+                            SELECT 1 FROM work_operations AS owner
+                            JOIN work_events AS event ON event.work_item_id = owner.work_item_id
+                            WHERE owner.operation_id = operation.id
+                              AND {_facebook_search_publication_event("operation", "event", run_identifier="run.id")}
+                        )
+                    ))
                       AND run.kind_parts_json IN (
                           '["carl","facebook","search_run"]',
                           '["carl","ebay","search_run"]'
@@ -6696,7 +6763,7 @@ class Database:
         as_of_completion_sequence: int,
         maximum_object_rowid: int | None = None,
     ) -> tuple[tuple[str, JsonValue], ...]:
-        """Read completed cards for exact source runs, without other-source scans."""
+        """Read published cards for exact source runs, without other-source scans."""
         if marketplace not in ("facebook", "ebay"):
             raise ValueError("Search occurrence marketplace is invalid")
         if len(run_identifiers) > 100 or any(not identifier for identifier in run_identifiers):
@@ -6736,6 +6803,18 @@ class Database:
             if marketplace == "facebook"
             else ""
         )
+        publication_event = (
+            _facebook_search_publication_event(
+                "operation", "event", internal_identifier="requested.value"
+            )
+            if marketplace == "facebook"
+            else "event.event_kind = 'completed'"
+        )
+        partial_publication = (
+            _partial_facebook_search_publication("operation", internal_identifier="requested.value")
+            if marketplace == "facebook"
+            else "0"
+        )
         async with self._connections.reader() as connection:
             if maximum_object_rowid is None:
                 cursor = await connection.execute("SELECT COALESCE(MAX(rowid), 0) FROM objects")
@@ -6754,13 +6833,21 @@ class Database:
                   ON operation.id = object.created_by_operation_id
                 WHERE object.kind_parts_json = ?
                   AND object.rowid <= ?
-                  AND operation.state = 'completed'
+                  AND (operation.state = 'completed' OR (
+                    {partial_publication}
+                    AND EXISTS (
+                        SELECT 1 FROM work_operations AS work
+                        JOIN work_events AS event ON event.work_item_id = work.work_item_id
+                        WHERE work.operation_id = operation.id
+                          AND {publication_event}
+                    )
+                  ))
                   {partial_predicate}
                   AND COALESCE((SELECT MAX(event.sequence)
                     FROM work_operations AS work
                     JOIN work_events AS event ON event.work_item_id = work.work_item_id
                     WHERE work.operation_id = object.created_by_operation_id
-                      AND event.event_kind = 'completed'
+                      AND {publication_event}
                       AND json_extract(event.data_json, '$.operation_identifier') =
                           object.created_by_operation_id), 0) <= ?
                 ORDER BY object.rowid, object.id
@@ -8167,11 +8254,31 @@ class Database:
         return tuple((_text(row[0]), _analysis_descriptor(row[1:])) for row in rows)
 
     async def current_completion_boundary(self) -> int:
-        """Return the latest durable successful-work publication sequence."""
+        """Return the latest durable successful or saved partial publication sequence."""
 
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                "SELECT coalesce(max(sequence), 0) FROM work_events WHERE event_kind = 'completed'"
+                f"""
+                WITH latest_completed AS MATERIALIZED (
+                    SELECT COALESCE(MAX(sequence), 0) AS sequence
+                    FROM work_events WHERE event_kind = 'completed'
+                )
+                SELECT MAX(sequence) FROM (
+                    SELECT sequence FROM latest_completed
+                    UNION ALL
+                    SELECT COALESCE(MAX(event.sequence), 0)
+                    FROM latest_completed AS latest
+                    CROSS JOIN work_events AS event ON event.sequence > latest.sequence
+                    JOIN work_operations AS owner
+                      ON owner.operation_id = json_extract(event.data_json, '$.operation_identifier')
+                     AND owner.work_item_id = event.work_item_id
+                    JOIN work_items AS work ON work.id = owner.work_item_id
+                    JOIN operations AS operation ON operation.id = owner.operation_id
+                    WHERE work.kind_parts_json = '["carl","facebook","work","collect_search"]'
+                      AND operation.state = 'failed'
+                      AND {_facebook_search_publication_event("operation", "event")}
+                )
+                """
             )
             row = await cursor.fetchone()
         if row is None:
@@ -8274,13 +8381,13 @@ class Database:
         *,
         as_of_completion_sequence: int,
     ) -> SearchRunCandidate:
-        """Read one exact completed search run and its explicit refresh parent."""
+        """Read one exact published search run and its explicit refresh parent."""
 
         if as_of_completion_sequence < 0:
             raise ValueError("Completion boundary must not be negative")
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 SELECT search_run.id,
                        json_extract(record.value_json, '$.search_run_identifier'),
                        completed.sequence,
@@ -8306,12 +8413,11 @@ class Database:
                 JOIN records AS record ON record.object_id = search_run.id
                 JOIN operations AS operation
                   ON operation.id = search_run.created_by_operation_id
-                 AND operation.state = 'completed'
                 JOIN work_operations AS search_work
                   ON search_work.operation_id = search_run.created_by_operation_id
                 JOIN work_events AS completed
                   ON completed.work_item_id = search_work.work_item_id
-                 AND completed.event_kind = 'completed'
+                 AND {_facebook_search_publication_event("operation", "completed", run_identifier="search_run.id")}
                  AND completed.sequence <= ?
                 WHERE search_run.id = ?
                   AND search_run.kind_parts_json = ?
@@ -8379,7 +8485,7 @@ class Database:
         ]
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 WITH requested_runs AS MATERIALIZED (
                     SELECT CAST(key AS INTEGER) AS run_depth,
                            json_extract(value, '$.record_identifier') AS record_identifier,
@@ -8396,12 +8502,11 @@ class Database:
                     JOIN records AS run_record ON run_record.object_id = run.id
                     JOIN operations AS operation
                       ON operation.id = run.created_by_operation_id
-                     AND operation.state = 'completed'
                     JOIN work_operations AS run_work
                       ON run_work.operation_id = run.created_by_operation_id
                     JOIN work_events AS completed
                       ON completed.work_item_id = run_work.work_item_id
-                     AND completed.event_kind = 'completed'
+                     AND {_facebook_search_publication_event("operation", "completed", run_identifier="run.id")}
                      AND completed.sequence <= ?
                     WHERE run.kind_parts_json = ?
                       AND json_extract(
@@ -8518,7 +8623,7 @@ class Database:
         ]
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 WITH requested_runs AS MATERIALIZED (
                     SELECT CAST(key AS INTEGER) AS run_depth,
                            json_extract(value, '$.record_identifier') AS record_identifier,
@@ -8538,12 +8643,11 @@ class Database:
                     JOIN records AS run_record ON run_record.object_id = run.id
                     JOIN operations AS operation
                       ON operation.id = run.created_by_operation_id
-                     AND operation.state = 'completed'
                     JOIN work_operations AS run_work
                       ON run_work.operation_id = run.created_by_operation_id
                     JOIN work_events AS completed
                       ON completed.work_item_id = run_work.work_item_id
-                     AND completed.event_kind = 'completed'
+                     AND {_facebook_search_publication_event("operation", "completed", run_identifier="run.id")}
                      AND completed.sequence <= ?
                     WHERE run.kind_parts_json = ?
                       AND json_extract(
@@ -8791,7 +8895,7 @@ class Database:
             raise ValueError("Projection search-card bounds are invalid")
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 WITH requested(listing_identifier) AS MATERIALIZED (
                     SELECT value FROM json_each(?)
                 ),
@@ -8850,14 +8954,13 @@ class Database:
                     CROSS JOIN operations AS operation
                         INDEXED BY sqlite_autoindex_operations_1
                       ON operation.id = occurrence_object.created_by_operation_id
-                     AND operation.state = 'completed'
                     CROSS JOIN work_operations AS search_work
                         INDEXED BY sqlite_autoindex_work_operations_1
                       ON search_work.operation_id = occurrence_object.created_by_operation_id
                     CROSS JOIN work_events AS completed
                         INDEXED BY work_events_work_item
                       ON completed.work_item_id = search_work.work_item_id
-                     AND completed.event_kind = 'completed'
+                     AND {_facebook_search_publication_event("operation", "completed", internal_identifier="json_extract(matching.value_json, '$.search_run_identifier')")}
                      AND completed.sequence <= ?
                 )
                 SELECT listing_identifier, object_id, acquisition_record_identifier,
@@ -8908,7 +9011,7 @@ class Database:
         *,
         as_of_completion_sequence: int,
     ) -> tuple[StatusObservationCandidate, ...]:
-        """Return the newest completed search-card status evidence per listing."""
+        """Return the newest published search-card status evidence per listing."""
 
         if not listing_identifiers:
             return ()
@@ -8920,7 +9023,7 @@ class Database:
             raise ValueError("Completion boundary must not be negative")
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 WITH requested(listing_identifier) AS MATERIALIZED (
                     SELECT value FROM json_each(?)
                 ),
@@ -8984,20 +9087,21 @@ class Database:
                     CROSS JOIN operations AS operation
                         INDEXED BY sqlite_autoindex_operations_1
                       ON operation.id = occurrence_object.created_by_operation_id
-                     AND operation.state = 'completed'
                     CROSS JOIN work_operations AS search_work
                         INDEXED BY sqlite_autoindex_work_operations_1
                       ON search_work.operation_id = occurrence_object.created_by_operation_id
                     CROSS JOIN work_events AS completed
                         INDEXED BY work_events_work_item
                       ON completed.work_item_id = search_work.work_item_id
-                     AND completed.event_kind = 'completed'
+                     AND {_facebook_search_publication_event("operation", "completed", internal_identifier="json_extract(matching.value_json, '$.search_run_identifier')")}
                      AND completed.sequence <= ?
                     CROSS JOIN objects AS search_run
                         INDEXED BY objects_operation_kind
                       ON search_run.created_by_operation_id =
                          occurrence_object.created_by_operation_id
                      AND search_run.kind_parts_json = ?
+                     AND (operation.state = 'completed' OR search_run.id =
+                         json_extract(operation.result_json, '$.search_run_record_identifier'))
                 )
                 SELECT listing_identifier, object_id, search_run_record_identifier,
                        internal_run_identifier, acquisition_record_identifier,
@@ -9191,13 +9295,13 @@ class Database:
     async def facebook_search_run_records(
         self, *, query: str | None = None, limit: int = 50
     ) -> tuple[FacebookSearchRunRecord, ...]:
-        """Return recent completed search-run records for refresh selection."""
+        """Return recent published search-run records for refresh selection."""
 
         if limit < 1:
             raise ValueError("Search-run limit must be positive")
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 SELECT search_run.id, completed.sequence,
                        producing_operation.started_at_utc,
                        producing_operation.ended_at_utc,
@@ -9215,7 +9319,7 @@ class Database:
                   ON work_operation.operation_id = search_run.created_by_operation_id
                 JOIN work_events AS completed
                   ON completed.work_item_id = work_operation.work_item_id
-                 AND completed.event_kind = 'completed'
+                 AND {_facebook_search_publication_event("producing_operation", "completed", run_identifier="search_run.id")}
                 LEFT JOIN work_events AS enqueued
                   ON enqueued.work_item_id = work_operation.work_item_id
                  AND enqueued.event_kind = 'enqueued'

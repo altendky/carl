@@ -4,6 +4,7 @@
 # pyright: reportPrivateUsage=false
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from carl._tests.test_review_workspace import _provenance, _search_run_value
 from carl._tests.test_work import _capabilities, _definition
 from carl.core.components import Component, ComponentId
 from carl.core.facebook_refresh import REFRESH_SEARCH_WORK_KIND
+from carl.core.facebook_search import OverlappingPricePartitionSearchTraversalStrategy
 from carl.core.models import CodeProvenance, NamedOutput, RecordDraft
 from carl.core.review_workspace import CreateReviewWorkspaceRequest, RequestWorkspaceRefreshRequest
 from carl.core.work import WorkCapability, WorkRequester, WorkState
@@ -62,7 +64,12 @@ async def test_workspace_mcp_cancels_78_pending_without_workers_and_fresh_refres
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         application = ReviewApplication(database, tmp_path, code_provenance=provenance)
         workspace_id = await _workspace(application)
-        request = RequestWorkspaceRefreshRequest(workspace_record_identifier=workspace_id)
+        request = RequestWorkspaceRefreshRequest(
+            workspace_record_identifier=workspace_id,
+            traversal_strategy=OverlappingPricePartitionSearchTraversalStrategy(
+                width=Decimal("600")
+            ),
+        )
         refresh = await application.request_workspace_refresh(request)
         root_ids = [refresh.work_identifier, *(f"root-{i}" for i in range(15))]
         expected_ids = [*root_ids, *(f"child-{i}" for i in range(62))]

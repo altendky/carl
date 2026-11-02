@@ -27,14 +27,16 @@ them; typed guide schemas and a general SQL query interface are not currently im
 
 Read response size and continuation metadata before treating any result as complete. Prefer a tool's
 native pagination and follow returned `next_cursor` or `next_offset` values; inspect `has_more` in
-the page or `carl/response` result metadata. An oversized result can instead
+the page or `carl/response` result metadata. Image-only results, including `get_listing_image`,
+remain native image blocks with exact saved bytes even above the text-response budget; do not
+reassemble them as JSON fragments. An oversized text or structured result can instead
 return `kind="carl_tool_response_page"`: the original tool has already run. Check
 `original_is_error` and `critical_metadata`, then call `get_tool_response_page` with each returned
 `next_cursor`. Read each full page, including `json_fragment`, from `structuredContent`.
 Structured response data is entirely there; the text is only a short notice. Concatenate
 `json_fragment` strings in `offset` order and parse the compact
 JSON. `payload_format=structured_json` contains the original structured payload; `mcp_result_json`
-preserves the original MCP result for genuine text/image/mixed output. `total_json_bytes` and `sha256`
+preserves the original MCP result for genuine text/mixed output. `total_json_bytes` and `sha256`
 describe that single representation, rather than duplicated text and structured JSON.
 Offsets count Unicode characters. After retaining all fragments and reconstructing the complete
 result, acknowledge the final page with
@@ -64,7 +66,7 @@ track spec; `image_network_path` selects Facebook gallery transport. Use these n
 not historical `proton_route` options. An explicit Proton path means real Proton.
 Inspect network activity and acquisition provenance for the actual provider.
 Item pages and eBay search keep their separate mobile/residential route unless explicitly changed.
-There is no automatic fallback. Datacenter Facebook bootstrap and pagination share one client and
+There is no automatic fallback. Datacenter Facebook bootstrap and price buckets share one client and
 cookie jar; use a static datacenter port to keep the exit stable across the search.
 
 When diagnosing server behavior, call `get_server_info` first and report its instance ID, start time,
@@ -225,6 +227,13 @@ workspace-native analysis preview and request tools.
 For a new search, call `create_search` with a `targets` array. Each target has a `marketplace`
 discriminator and a `search` object: Facebook uses its complete search intent and bounded traversal
 policy; eBay uses `query`, `stack_identifier`, and `maximum_pages` (default five, maximum twenty).
+Facebook acquisition requires explicit `traversal_strategy.kind="overlapping_price_partitions"`,
+bucket `width`, and `request.price.maximum`. Cursor pagination is disabled, including one-page
+cursor requests. The cursor model is retained only for reading history. Revise existing cursor
+tracks to price buckets before requesting another refresh or retry; a direct historical-run
+refresh may supply an explicit bucket strategy override. Queued legacy cursor acquisitions fail
+without opening a session or retrying. Retained downstream work can finish from an already
+completed search. Bucket saturation still means incomplete coverage.
 The returned search group contains each target's executions and work IDs. Poll those IDs with
 `get_work_status`, then page through `list_search_results` using the group's record ID and returned
 cursors. Results deduplicate within each marketplace and retain all source occurrences at a fixed
@@ -317,7 +326,8 @@ including older checkpoints recovered from operation history, without rerunning 
 completed/terminal child jobs. It rejects unsafe recovery and does not automatically retry programming
 errors. A reused item page retains its age; reuse does not establish that the remote page is unchanged.
 For Facebook, omit `traversal` and `traversal_strategy` to reuse
-the retained settings. To change bounds, provide a complete traversal object. To use price buckets,
+retained price-bucket settings. A retained cursor strategy must be replaced before acquisition.
+To change bounds, provide a complete traversal object. For price buckets,
 provide an `overlapping_price_partitions` strategy with decimal `width`, `overlap`, and either
 `balanced` or `ascending` order. Carl searches through the effective configured search route, reuses the latest semantically usable
 retained item page for each exact baseline or newly returned listing ID, and spends Decodo only on

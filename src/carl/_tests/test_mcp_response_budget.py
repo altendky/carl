@@ -83,20 +83,27 @@ def test_huge_unicode_and_nested_strings_reassemble_exactly(value: JsonValue) ->
     assert hashlib.sha256(rebuilt.encode()).hexdigest() == page.sha256
 
 
-def test_binary_image_content_is_budgeted_and_recoverable() -> None:
+def test_binary_image_content_stays_renderable_without_response_pages() -> None:
     store = ToolResponseStore()
-    original = CallToolResult(
-        content=[ImageContent(type="image", data="A" * 100_000, mime_type="image/png")]
+    image = ImageContent(
+        type="image",
+        data="A" * 100_000,
+        mime_type="image/png",
+        _meta={"carl/artifactIdentifier": "image-artifact", "carl/sha256": "a" * 64},
     )
+    original = CallToolResult(content=[image], _meta={"custom": "preserved"})
     result = store.bound("get_image", original)
     assert isinstance(result, CallToolResult)
-    page = _page(result)
-    chunks = [page.json_fragment]
-    while page.next_cursor:
-        page = _stored_page(store, page.next_cursor)
-        assert response_bytes(page_result(page)) <= store.target_bytes
-        chunks.append(page.json_fragment)
-    assert json.loads("".join(chunks))["content"][0]["data"] == "A" * 100_000
+    assert result.content == [image]
+    assert result.structured_content is None
+    assert tool_response_page(result) is None
+    assert response_bytes(result) > store.hard_bytes
+    assert result.meta == {
+        "custom": "preserved",
+        "carl/response": {"response_bytes": response_bytes(result), "has_more": False},
+    }
+    assert store.retained_bytes == 0
+    assert store.pending_cursors == ()
 
 
 def test_pages_transmit_one_compact_payload_with_bounded_manifest_overhead() -> None:

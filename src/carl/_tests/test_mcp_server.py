@@ -631,10 +631,11 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 62
+            assert capability_versions[("carl", "mcp", "instructions")] == 64
+            assert capability_versions[("carl", "facebook", "price_partition_search_only")] == 1
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 47
-            assert capability_versions[("carl", "mcp", "response_pages")] == 3
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 48
+            assert capability_versions[("carl", "mcp", "response_pages")] == 4
             assert capability_versions[("carl", "marketplace", "search_pipeline")] == 1
             assert capability_versions[("carl", "review", "workspace_work")] == 4
             assert capability_versions[("carl", "review", "composed_projection")] == 9

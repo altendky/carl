@@ -74,6 +74,11 @@ images, or analysis. Work progresses per listing: one listing can become ready f
 another is still collecting images. Fixed-selection analysis can also operate on retained workspace
 evidence after previewing the selection.
 
+Facebook acquisition requires explicit price buckets (`overlapping_price_partitions`), a bucket
+width, and a maximum price. Cursor pagination is disabled. Historical cursor searches remain
+readable, but their tracks must be revised to price buckets before another refresh or retry.
+Each bucket collects its first page; saturated buckets indicate incomplete coverage.
+
 Overlapping requests can share acquisition work, and follow-ups reuse usable retained item pages
 and validated matching images. This is evidence reuse, not remote unchanged-page detection. An
 ordinary search refresh may reuse item details without checking whether the remote item page changed;

@@ -1,4 +1,4 @@
-"""Bound MCP tool responses after SDK conversion without discarding mutation results.
+"""Bound text/structured MCP responses while preserving native image results.
 
 Cache limits are admission thresholds, not hard memory bounds. An in-flight
 result can exceed them, because it is already materialized and must remain
@@ -24,6 +24,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import (
     SERVER_INFO_META_KEY,
     CallToolResult,
+    ImageContent,
     Implementation,
     InputRequiredResult,
     TextContent,
@@ -290,6 +291,15 @@ class ToolResponseStore:
             )
         )
         normal = _annotated(result, has_more=has_more)
+        # Image-only results must remain native image blocks for clients to
+        # display the exact retained artifact; base64 is not paged as JSON text.
+        if (
+            isinstance(result, CallToolResult)
+            and result.structured_content is None
+            and result.content
+            and all(isinstance(content, ImageContent) for content in result.content)
+        ):
+            return normal
         if response_bytes(normal) <= self.target_bytes:
             return normal
         text, payload_format = canonical_payload(original)
