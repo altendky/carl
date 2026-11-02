@@ -217,6 +217,18 @@ class ManagedBrightDataSession:
         )
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire_mode(plan, new_identifier, capture=False)
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire_mode(plan, new_identifier, capture=True)
+
+    async def _acquire_mode(
+        self,
+        plan: RequestPlan,
+        new_identifier: IdentifierFactory,
+        *,
+        capture: bool,
+    ) -> Acquisition:
         if plan.routing != self.settings.route.network_path:
             raise RouteConfigurationFailure("request_route_does_not_match_bright_data_route")
         async with self._lock:
@@ -240,7 +252,11 @@ class ManagedBrightDataSession:
                 protected_response_headers=_PROTECTED_RESPONSE_HEADERS,
             )
             try:
-                acquisition = await acquirer.acquire(plan, new_identifier)
+                acquisition = (
+                    await acquirer.capture(plan, new_identifier)
+                    if capture
+                    else await acquirer.acquire(plan, new_identifier)
+                )
             except AcquisitionFailure as error:
                 self.failed = True
                 self.requests_completed += 1
@@ -343,6 +359,18 @@ class ManagedBrightDataHttpAcquirer:
         self.credential_source = credential_source
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire_mode(plan, new_identifier, capture=False)
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire_mode(plan, new_identifier, capture=True)
+
+    async def _acquire_mode(
+        self,
+        plan: RequestPlan,
+        new_identifier: IdentifierFactory,
+        *,
+        capture: bool,
+    ) -> Acquisition:
         acquisition: Acquisition | None = None
         failure: AcquisitionFailure | None = None
         session: ManagedBrightDataSession | None = None
@@ -353,7 +381,11 @@ class ManagedBrightDataHttpAcquirer:
         ) as opened_session:
             session = opened_session
             try:
-                acquisition = await opened_session.acquire(plan, new_identifier)
+                acquisition = (
+                    await opened_session.capture(plan, new_identifier)
+                    if capture
+                    else await opened_session.acquire(plan, new_identifier)
+                )
             except AcquisitionFailure as error:
                 failure = error
         if session is None:

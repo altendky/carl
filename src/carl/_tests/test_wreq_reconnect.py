@@ -248,6 +248,39 @@ async def test_completed_403_is_returned_without_reconnect() -> None:
 
 
 @pytest.mark.anyio
+async def test_capture_reconnect_keeps_prefix_in_the_aggregate_body_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("carl.io.wreq.MAX_ACQUISITION_BODY_BYTES", 7)
+    events: list[str] = []
+    first = _CookieClient(
+        [
+            _response(
+                url=_HOME, status=302, headers=((b"location", _SEARCH.encode()),), chunks=(b"1234",)
+            ),
+            _broken_pipe(),
+        ],
+        jar=wreq.Jar(),
+        events=events,
+        label="first",
+    )
+    replacement = _CookieClient(
+        [_response(url=_SEARCH, chunks=(b"5678",))],
+        jar=wreq.Jar(),
+        events=events,
+        label="second",
+    )
+    async with _acquirer(_ReplacingFactory([first, replacement], events)).session() as session:
+        with pytest.raises(AcquisitionFailure) as raised:
+            await session.capture(_plan(_HOME), lambda: "prefix-body")
+    assert raised.value.result["stopping_condition"] == "body_size_limit"
+    assert [body.content for body in raised.value.bodies] == [b"1234"]
+    assert raised.value.result["hops"][-1]["response"]["body"]["limit_scope"] == "acquisition"
+    assert raised.value.result["connection_recovery"]["attempted"] is True
+    assert events == ["open:1", "close:first", "open:2", "close:second"]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("maximum_redirects", (1, 2))
 async def test_resume_redirect_target_preserves_prefix_once_and_remaining_budget(
     maximum_redirects: int,

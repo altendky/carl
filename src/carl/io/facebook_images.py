@@ -15,7 +15,12 @@ from carl.io.decodo import (
     DecodoSessionManager,
     ManagedDecodoSession,
 )
-from carl.io.httpx import AcquisitionFailure, ClientHttpxAcquirer, HttpAcquirer, close_httpx_client
+from carl.io.httpx import (
+    AcquisitionFailure,
+    ClientHttpxAcquirer,
+    HttpCaptureAcquirer,
+    close_httpx_client,
+)
 from carl.io.proton import (
     ManagedProtonTransportFailure,
     ProtonSession,
@@ -27,7 +32,7 @@ from carl.io.proton import (
 @dataclass(slots=True)
 class FacebookImageHttpSession:
     identifier: str
-    acquirer: HttpAcquirer
+    acquirer: HttpCaptureAcquirer
     provider_session: ProtonSession | ManagedDecodoSession
 
     def active_observation(self) -> dict[str, JsonValue]:

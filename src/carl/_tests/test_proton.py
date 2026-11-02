@@ -463,6 +463,10 @@ class _FakeSocksAcquirer:
         del plan, new_identifier
         return Acquisition(record={"hops": []}, bodies=())
 
+    async def capture(self, plan: RequestPlan, new_identifier: object) -> Acquisition:
+        del plan, new_identifier
+        return Acquisition(record={"hops": [], "captured": True}, bodies=())
+
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("ending", ("usage", "runtime"))
@@ -617,9 +621,11 @@ async def test_facebook_proton_client_close_failure_preserves_primary_error(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("capture", (False, True))
 async def test_managed_proton_acquirer_closes_route_and_has_no_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capture: bool,
 ) -> None:
     settings = _settings(tmp_path)
     monkeypatch.setattr("carl.io.proton.LocalSocks5HttpxAcquirer", _FakeSocksAcquirer)
@@ -628,14 +634,15 @@ async def test_managed_proton_acquirer_closes_route_and_has_no_fallback(
         settings=settings,
     )
 
-    acquisition = await acquirer.acquire(
+    acquisition = await (acquirer.capture if capture else acquirer.acquire)(
         RequestPlan(url="https://example.com/", routing=settings.route.network_path),
         lambda: "identifier",
     )
     assert acquisition.record["routing"]["observed"]["shutdown_state"] == "terminated"
+    assert acquisition.record.get("captured") is (True if capture else None)
 
     with pytest.raises(RouteConfigurationFailure):
-        await acquirer.acquire(
+        await (acquirer.capture if capture else acquirer.acquire)(
             RequestPlan(url="https://example.com/", routing=("direct",)),
             lambda: "identifier",
         )
@@ -648,7 +655,7 @@ async def test_managed_proton_acquirer_closes_route_and_has_no_fallback(
         settings=settings,
     )
     with pytest.raises(AcquisitionFailure) as raised:
-        await failing.acquire(
+        await (failing.capture if capture else failing.acquire)(
             RequestPlan(url="https://example.com/", routing=settings.route.network_path),
             lambda: "identifier",
         )

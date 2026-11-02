@@ -1,11 +1,19 @@
 """Durable stage descriptions separate logical attempts from execution leases."""
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from carl.core.json import decode_json, encode_json
-from carl.core.models import JsonStringEnumeration, JsonValue, NamedInput, StrictModel
+from carl.core.models import (
+    ArtifactDraft,
+    JsonStringEnumeration,
+    JsonValue,
+    NamedInput,
+    NamedOutput,
+    RecordDraft,
+    StrictModel,
+)
 from carl.core.resources import ResourceLease, ResourceRequest
 from carl.core.work import (
     NetworkActivityAdmission,
@@ -13,6 +21,7 @@ from carl.core.work import (
     WorkDefinition,
     WorkLease,
 )
+from carl.core.worker import AttemptContext, CompletedWork, RetryWork, TerminalFailureWork
 
 
 class StageState(JsonStringEnumeration):
@@ -124,9 +133,26 @@ class StageClaimResult(StrictModel):
 class WaitWork(StrictModel):
     """A continuation within an attempt, never an acquisition retry."""
 
+    kind: Literal["wait"] = "wait"
+    inputs: tuple[NamedInput, ...] = ()
+    records: tuple[RecordDraft, ...] = ()
+    artifacts: tuple[ArtifactDraft, ...] = ()
+    outputs: tuple[NamedOutput, ...] = ()
     continuation: StageDefinition
     wait_kind: StageWaitKind
     result: JsonValue
+
+
+type StageOutcome = Annotated[
+    WaitWork | CompletedWork | RetryWork | TerminalFailureWork,
+    Field(discriminator="kind"),
+]
+
+
+class StageAttemptContext(AttemptContext):
+    stage_identifier: str = Field(min_length=1)
+    execution: int = Field(ge=1)
+    network_admission: NetworkActivityAdmission | None = None
 
 
 def stage_network_activity(

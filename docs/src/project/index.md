@@ -476,11 +476,40 @@ replacement execution, and publication plus stage completion share one
 transaction. Unadmitted polls discard their unused guard files; admitted token
 guards remain stable.
 
-These interfaces are an opt-in foundation. Stateless stage conversion,
-bounded resident sessions, and production dispatcher cutover are tracked
-separately; the existing foreground runtime remains the default until those
-adapters are ready. This foundation alone does not remove waits from legacy
-handlers.
+The stateless adapter registry now supplies Facebook/eBay gallery collection,
+eBay descriptions, and offline item/image extraction stages. Collection first
+checks reusable evidence under CPU admission, captures HTTP with a separate
+permit, and commits a bounded response checkpoint before waiting for CPU
+validation/publication. Provider sessions close before that wait. Checkpoints
+store exact transport-exposed bodies in private, atomic content-addressed files
+under `responses/sha256`; SQLite retains metadata and identifiers. Restore
+validates metadata and aggregate bounds before reading and verifies bytes
+without following symlinks. Successful checkpoints survive restart and image
+validation failures without another acquisition. Storage failure before a
+checkpoint commits terminates the acquisition rather than automatically
+repeating a completed request.
+
+Logical acquisition identity remains reserved through a stage wait even though
+execution and HTTP permits are released. Another consumer of the same resource
+waits for publication and then reuses validated evidence. CPU stages retain
+existing image/result identities and producer schemas. A completed HTTP body
+also survives provider teardown failure; a signed image URL expiring after
+capture does not invalidate those retained bytes.
+
+HTTP adapters expose additive `capture`/`capture_form` methods for these stages.
+HTTPX capture retains encoded message content, while Wreq retains its native
+decoded representation. Legacy `acquire` still returns decoded content, but
+releases each HTTP hop before requesting CPU admission. It decodes a redirect
+body before following the next hop, preserving malformed-body stopping rules.
+HTTPX received and retained body aggregates are each limited to 100 MB across
+an acquisition; Wreq's transport-exposed decoded bodies share the same aggregate
+cap, including reconnect prefixes. Request-plan
+serialization and stored request identities stay compatible. Complete bodies
+received before response-close failure remain available as raw evidence.
+
+These adapters are opt-in. Bounded resident sessions and production dispatcher
+cutover are tracked separately; the existing foreground runtime remains the
+default until those adapters are ready. The adapter registry starts no workers.
 
 SQLite is the durable source of pending work. A claim uses a short transaction
 to assign a lease token, worker identity, and expiration time. Processing occurs

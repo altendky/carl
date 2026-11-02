@@ -1,4 +1,5 @@
 import base64
+import gzip
 import ipaddress
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ from typing import cast
 import httpx
 import pytest
 
+from carl.core.http import RequestPlan
 from carl.core.models import (
     ConfigurationDocumentIdentity,
     ConfigurationSchemaIdentity,
@@ -19,7 +21,9 @@ from carl.core.routing import (
     MullvadRouteIdentity,
     WireproxyIdentity,
 )
+from carl.io.httpx import DirectHttpxAcquirer
 from carl.io.mullvad import (
+    ManagedMullvadHttpAcquirer,
     ManagedMullvadTransportFailure,
     MullvadWireproxyManager,
     MullvadWireproxySettings,
@@ -158,3 +162,27 @@ async def test_manager_uses_generic_process_lifecycle(
     async with manager.open(settings) as session:
         assert session.active_observation()["configuration"]["document_sha256"] == "c" * 64
     assert session.completed_observation().shutdown_state == "terminated"
+
+    compressed = gzip.compress(b"captured image")
+
+    def acquirer_factory(**_kwargs: object) -> DirectHttpxAcquirer:
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield compressed
+
+        return DirectHttpxAcquirer(
+            httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    200, headers={"Content-Encoding": "gzip"}, stream=Stream()
+                )
+            )
+        )
+
+    monkeypatch.setattr("carl.io.mullvad.LocalSocks5HttpxAcquirer", acquirer_factory)
+    acquired = await ManagedMullvadHttpAcquirer(manager=manager, settings=settings).capture(
+        RequestPlan(url="https://offline.test/", routing=settings.route.network_path),
+        lambda: "captured-body",
+    )
+    assert acquired.bodies[0].content == compressed
+    assert acquired.bodies[0].representation["content_decoded"] is False
+    assert acquired.record["routing"]["observed"]["shutdown_state"] == "terminated"

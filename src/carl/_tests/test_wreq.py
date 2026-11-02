@@ -229,6 +229,46 @@ def _decodo_settings() -> DecodoProxySettings:
     )
 
 
+@pytest.mark.anyio
+async def test_capture_keeps_native_decoded_representation() -> None:
+    response = _response(chunks=(b"native decoded",))
+    acquired = await _acquirer(_Factory([response])).capture(
+        RequestPlan(url=response.url, routing=("proton", "personal", "carl")),
+        lambda: "body",
+    )
+    assert acquired.bodies[0].content == b"native decoded"
+    assert acquired.bodies[0].representation["content_decoded"] is True
+    assert acquired.bodies[0].representation["kind"] == "content_decoded_http_body"
+    assert acquired.bodies[0].representation["received_content_bytes"]["state"] == "unavailable"
+    assert response.closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("capture", (False, True))
+async def test_redirect_bodies_share_one_aggregate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    capture: bool,
+) -> None:
+    monkeypatch.setattr("carl.io.wreq.MAX_ACQUISITION_BODY_BYTES", 7)
+    first = _response(
+        url="https://www.ebay.com/first",
+        status=302,
+        headers=((b"location", b"/last"),),
+        chunks=(b"1234",),
+    )
+    last = _response(url="https://www.ebay.com/last", chunks=(b"5678",))
+    acquirer = _acquirer(_Factory([first, last]))
+    with pytest.raises(AcquisitionFailure) as raised:
+        await (acquirer.capture if capture else acquirer.acquire)(
+            RequestPlan(url=first.url, routing=("proton", "personal", "carl")),
+            lambda: "body",
+        )
+    assert raised.value.result["stopping_condition"] == "body_size_limit"
+    assert [body.content for body in raised.value.bodies] == [b"1234"]
+    assert raised.value.result["hops"][-1]["response"]["body"]["limit_scope"] == "acquisition"
+    assert first.closed and last.closed
+
+
 def test_real_wreq_accepts_list_header_order_without_network() -> None:
     headers = wreq.HeaderMap()
     headers.append("Referer", "https://example.invalid/")
@@ -831,7 +871,8 @@ class _ProtonSettings:
 
 
 @pytest.mark.anyio
-async def test_managed_proton_wreq_acquirer_records_released_route() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_managed_proton_wreq_acquirer_records_released_route(capture: bool) -> None:
     settings = cast(ProtonWireproxySettings, cast(object, _ProtonSettings()))
     factory = _Factory([_response(url="https://www.ebay.com/")])
     manager = _Manager()
@@ -841,7 +882,7 @@ async def test_managed_proton_wreq_acquirer_records_released_route() -> None:
         client_factory=cast(WreqClientFactory, cast(object, factory)),
     )
 
-    acquisition = await acquirer.acquire(
+    acquisition = await (acquirer.capture if capture else acquirer.acquire)(
         RequestPlan(url="https://www.ebay.com/", routing=settings.route.network_path),
         lambda: "body",
     )
@@ -853,14 +894,15 @@ async def test_managed_proton_wreq_acquirer_records_released_route() -> None:
     }
 
     with pytest.raises(RouteConfigurationFailure):
-        _ = await acquirer.acquire(
+        _ = await (acquirer.capture if capture else acquirer.acquire)(
             RequestPlan(url="https://www.ebay.com/", routing=("direct",)),
             lambda: "unused",
         )
 
 
 @pytest.mark.anyio
-async def test_managed_decodo_wreq_acquirer_uses_safe_sticky_proxy_session() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_managed_decodo_wreq_acquirer_uses_safe_sticky_proxy_session(capture: bool) -> None:
     factory = _Factory([_response()])
     identifiers = iter(("session-record", "body"))
     acquirer = ManagedDecodoWreqAcquirer(
@@ -872,7 +914,7 @@ async def test_managed_decodo_wreq_acquirer_uses_safe_sticky_proxy_session() -> 
         provider_session_factory=lambda: "ProviderSession",
     )
 
-    acquisition = await acquirer.acquire(
+    acquisition = await (acquirer.capture if capture else acquirer.acquire)(
         RequestPlan(
             url="https://www.ebay.com/sch/i.html?_nkw=oscilloscope",
             routing=("decodo", "personal", "carl"),
@@ -901,7 +943,10 @@ async def test_managed_decodo_wreq_acquirer_uses_safe_sticky_proxy_session() -> 
 
 
 @pytest.mark.anyio
-async def test_managed_decodo_wreq_proxy_failure_is_attributed_without_diagnostic() -> None:
+@pytest.mark.parametrize("capture", (False, True))
+async def test_managed_decodo_wreq_proxy_failure_is_attributed_without_diagnostic(
+    capture: bool,
+) -> None:
     factory = _Factory([wreq.exceptions.ProxyConnectionError("secret proxy diagnostic")])
     identifiers = iter(("session-record", "unused"))
     acquirer = ManagedDecodoWreqAcquirer(
@@ -914,7 +959,7 @@ async def test_managed_decodo_wreq_proxy_failure_is_attributed_without_diagnosti
     )
 
     with pytest.raises(AcquisitionFailure) as raised:
-        _ = await acquirer.acquire(
+        _ = await (acquirer.capture if capture else acquirer.acquire)(
             RequestPlan(
                 url="https://www.ebay.com/",
                 routing=("decodo", "personal", "carl"),

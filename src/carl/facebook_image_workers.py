@@ -36,6 +36,7 @@ from carl.core.worker import (
     WorkOutcome,
 )
 from carl.io.httpx import (
+    Acquisition,
     AcquisitionFailure,
     HttpAcquirer,
     IdentifierFactory,
@@ -380,11 +381,35 @@ def _saved_image_result(
     )
 
 
-async def _collect(
+def image_expired_outcome(
+    payload: CollectImagePayload, dependencies: ImageWorkerDependencies
+) -> TerminalFailureWork | None:
+    checked_at = dependencies.utc_now_ns()
+    expiry = facebook_image_url_expiry_utc_ns(payload.reference.original_url)
+    if expiry is None or expiry > checked_at:
+        return None
+    return TerminalFailureWork(
+        inputs=(
+            NamedInput(
+                name=("gallery_image_reference",),
+                object_identifier=payload.reference_record_identifier,
+            ),
+        ),
+        error={"kind": "expired_url", "failure_kind": "expired_url"},
+        result={
+            "state": "gallery_stale",
+            "gallery_stale_reason": "expired_url",
+            "expired_at_utc_ns": expiry,
+            "checked_at_utc_ns": checked_at,
+        },
+    )
+
+
+async def prepare_image_collection(
     payload: CollectImagePayload,
     context: AttemptContext,
     dependencies: ImageWorkerDependencies,
-) -> WorkOutcome:
+) -> WorkOutcome | None:
     saved = await validate_saved_image_results(
         dependencies.database,
         await dependencies.database.saved_facebook_image_candidates_for_references(
@@ -450,30 +475,17 @@ async def _collect(
             },
         )
 
-    def expired_outcome() -> TerminalFailureWork | None:
-        checked_at = dependencies.utc_now_ns()
-        expiry = facebook_image_url_expiry_utc_ns(payload.reference.original_url)
-        if expiry is None or expiry > checked_at:
-            return None
-        return TerminalFailureWork(
-            inputs=(
-                NamedInput(
-                    name=("gallery_image_reference",),
-                    object_identifier=payload.reference_record_identifier,
-                ),
-            ),
-            error={"kind": "expired_url", "failure_kind": "expired_url"},
-            result={
-                "state": "gallery_stale",
-                "gallery_stale_reason": "expired_url",
-                "expired_at_utc_ns": expiry,
-                "checked_at_utc_ns": checked_at,
-            },
-        )
+    return image_expired_outcome(payload, dependencies)
 
-    expired = expired_outcome()
-    if expired is not None:
-        return expired
+
+async def _collect(
+    payload: CollectImagePayload,
+    context: AttemptContext,
+    dependencies: ImageWorkerDependencies,
+) -> WorkOutcome:
+    prepared = await prepare_image_collection(payload, context, dependencies)
+    if prepared is not None:
+        return prepared
     try:
         if dependencies.network_activity_scheduler is None:
             acquisition = await dependencies.acquirer.acquire(
@@ -491,19 +503,29 @@ async def _collect(
                 url=payload.request_plan.url,
             )
             async with dependencies.network_activity_scheduler.admit(activity) as permit:
-                expired = expired_outcome()
+                expired = image_expired_outcome(payload, dependencies)
                 if expired is not None:
                     return expired
                 permit.mark_dispatched()
                 acquisition = await dependencies.acquirer.acquire(
                     payload.request_plan, dependencies.new_identifier
                 )
-    except RouteConfigurationFailure as error:
+    except (RouteConfigurationFailure, TimeoutError, AcquisitionFailure) as error:
+        return image_acquisition_failure_work(error, context)
+
+    return await complete_image_collection(payload, context, dependencies, acquisition)
+
+
+def image_acquisition_failure_work(
+    error: RouteConfigurationFailure | TimeoutError | AcquisitionFailure,
+    context: AttemptContext,
+) -> WorkOutcome:
+    if isinstance(error, RouteConfigurationFailure):
         return TerminalFailureWork(
             error={"kind": "route_configuration_failure", "code": error.code},
             result={"state": "route_configuration_failed"},
         )
-    except TimeoutError as error:
+    if isinstance(error, TimeoutError):
         result = {
             "state": "acquisition_failed",
             "acquisition": {
@@ -521,7 +543,7 @@ async def _collect(
             error={"kind": "image_acquisition_failure", "failure_kind": "transport_timeout"},
             result=result,
         )
-    except AcquisitionFailure as error:
+    if isinstance(error, AcquisitionFailure):
         result: dict[str, JsonValue] = {
             "state": "acquisition_failed",
             "acquisition": error.result,
@@ -544,6 +566,17 @@ async def _collect(
             },
             result=result,
         )
+
+    raise TypeError("Unsupported image acquisition failure")
+
+
+async def complete_image_collection(
+    payload: CollectImagePayload,
+    context: AttemptContext,
+    dependencies: ImageWorkerDependencies,
+    acquisition: Acquisition,
+) -> WorkOutcome:
+    """Validate and publish an already captured response without network access."""
 
     acquisition_identifier = dependencies.new_identifier()
     response = _terminal_response(acquisition.record)
@@ -733,7 +766,15 @@ async def _extract(
             reference, dict
         ):
             raise ValueError("Gallery reference record is invalid")
-        reference_model = GalleryImageReference.model_validate(reference)
+        reference_model = GalleryImageReference.model_validate_json(
+            encode_json(
+                {
+                    field: reference[field]
+                    for field in GalleryImageReference.model_fields
+                    if field in reference
+                }
+            )
+        )
         response = _terminal_response(acquisition)
         body = response.get("body")
         if not isinstance(body, dict) or body.get("state") != "available":

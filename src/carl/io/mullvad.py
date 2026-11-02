@@ -28,7 +28,6 @@ from carl.core.routing import (
 from carl.io.httpx import (
     Acquisition,
     AcquisitionFailure,
-    HttpAcquirer,
     IdentifierFactory,
     LocalSocks5HttpxAcquirer,
     RouteConfigurationFailure,
@@ -251,6 +250,18 @@ class ManagedMullvadHttpAcquirer:
         self.settings = settings
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire_mode(plan, new_identifier, capture=False)
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._acquire_mode(plan, new_identifier, capture=True)
+
+    async def _acquire_mode(
+        self,
+        plan: RequestPlan,
+        new_identifier: IdentifierFactory,
+        *,
+        capture: bool,
+    ) -> Acquisition:
         if plan.routing != self.settings.route.network_path:
             raise RouteConfigurationFailure("request_route_does_not_match_mullvad_route")
         acquisition: Acquisition | None = None
@@ -258,13 +269,17 @@ class ManagedMullvadHttpAcquirer:
         session: ManagedMullvadSession | None = None
         try:
             async with self.manager.open(self.settings) as session:
-                acquirer: HttpAcquirer = LocalSocks5HttpxAcquirer(
+                acquirer = LocalSocks5HttpxAcquirer(
                     endpoint=session.endpoint,
                     expected_routing=self.settings.route.network_path,
                     routing_observation=session.active_observation(),
                 )
                 try:
-                    acquisition = await acquirer.acquire(plan, new_identifier)
+                    acquisition = (
+                        await acquirer.capture(plan, new_identifier)
+                        if capture
+                        else await acquirer.acquire(plan, new_identifier)
+                    )
                 except AcquisitionFailure as error:
                     failure = error
         except RouteConfigurationFailure:

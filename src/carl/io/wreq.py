@@ -26,6 +26,7 @@ from carl.core.models import Header, JsonValue, StrictModel
 from carl.core.routing import LocalSocks5Endpoint
 from carl.io.cleanup import report_cleanup_failure
 from carl.io.httpx import (
+    MAX_ACQUISITION_BODY_BYTES,
     AcquiredBody,
     Acquisition,
     AcquisitionFailure,
@@ -610,11 +611,16 @@ def _sync_acquire(
     client_hints: _ClientHints | None = None,
     cookie_provider: wreq.Jar | None = None,
     visited_urls: frozenset[str] = frozenset(),
+    maximum_body_bytes: int | None = None,
 ) -> _SyncResult:
     client_hints = client_hints if client_hints is not None else _ClientHints()
     owns_client = client is None
     if client is None:
         client = client_factory(proxy=proxy_factory(), settings=settings, plan=plan)
+    maximum_body_bytes = (
+        MAX_ACQUISITION_BODY_BYTES if maximum_body_bytes is None else maximum_body_bytes
+    )
+    total_bytes = 0
     hops: list[_SyncHop] = []
     current_url = plan.url
     seen_urls = set(visited_urls)
@@ -664,7 +670,9 @@ def _sync_acquire(
                 with response.stream() as stream:
                     for chunk in stream:
                         if isinstance(chunk, (bytes, memoryview)):
-                            if len(body) + len(chunk) > plan.max_body_bytes:
+                            if len(body) + len(chunk) > min(
+                                plan.max_body_bytes, maximum_body_bytes - total_bytes
+                            ):
                                 metadata = _response_metadata(
                                     response,
                                     duration_ns=perf_counter_ns() - started,
@@ -674,6 +682,11 @@ def _sync_acquire(
                                     "state": "unavailable",
                                     "reason": "size_limit_exceeded",
                                     "measured_representation": "wreq_content_decoded",
+                                    **(
+                                        {"limit_scope": "acquisition"}
+                                        if maximum_body_bytes - total_bytes < plan.max_body_bytes
+                                        else {}
+                                    ),
                                 }
                                 hops.append(
                                     _SyncHop(
@@ -750,6 +763,7 @@ def _sync_acquire(
                 value.decode("latin-1")
                 for value in header_values(response_headers, b"content-encoding")
             )
+            total_bytes += len(body)
             hops.append(
                 _SyncHop(
                     request=_request_evidence(
@@ -1068,6 +1082,8 @@ class ProxyWreqAcquirer:
                 client_hints=self._client_hints,
                 cookie_provider=self._cookie_jar,
                 visited_urls=frozenset(cast(str, hop.request["url"]) for hop in prefix),
+                maximum_body_bytes=MAX_ACQUISITION_BODY_BYTES
+                - sum(len(hop.content) for hop in prefix if hop.content is not None),
             )
         except _SyncAcquisitionFailure as final:
             raise _SyncAcquisitionFailure(
@@ -1093,6 +1109,10 @@ class ProxyWreqAcquirer:
             stopping_condition=resumed.stopping_condition,
             connection_recovery=_ConnectionRecovery(True, True, "broken_pipe", first),
         )
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        """Capture transport-exposed bytes; wreq content-decodes them natively."""
+        return await self.acquire(plan, new_identifier)
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         async with self._lock:
@@ -1212,3 +1232,6 @@ class LocalSocks5WreqAcquirer:
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
         return await self.acquirer.acquire(plan, new_identifier)
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self.acquirer.capture(plan, new_identifier)

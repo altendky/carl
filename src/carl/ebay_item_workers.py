@@ -880,11 +880,11 @@ def _image_record(
     return record
 
 
-async def _collect_image(
+async def prepare_image_collection(
     payload: CollectEbayImagePayload,
     context: AttemptContext,
     dependencies: EbayItemWorkerDependencies,
-) -> WorkOutcome:
+) -> WorkOutcome | None:
     inputs = (
         NamedInput(
             name=("gallery_reference",), object_identifier=payload.reference_record_identifier
@@ -952,6 +952,25 @@ async def _collect_image(
                         "reused": True,
                     },
                 )
+        return None
+    except (KeyError, ValueError, OSError) as error:
+        return _failure(error, context, inputs=inputs, image=True)
+
+
+async def _collect_image(
+    payload: CollectEbayImagePayload,
+    context: AttemptContext,
+    dependencies: EbayItemWorkerDependencies,
+) -> WorkOutcome:
+    prepared = await prepare_image_collection(payload, context, dependencies)
+    if prepared is not None:
+        return prepared
+    inputs = (
+        NamedInput(
+            name=("gallery_reference",), object_identifier=payload.reference_record_identifier
+        ),
+    )
+    try:
         image_network_path = IMAGE_NETWORK_PATH
         if dependencies.image_acquirer is None:
             loaded = load_configuration(dependencies.directories.configuration_file)
@@ -985,6 +1004,22 @@ async def _collect_image(
         TimeoutError,
     ) as error:
         return _failure(error, context, inputs=inputs, image=True)
+    return await complete_image_collection(payload, context, dependencies, acquisition)
+
+
+async def complete_image_collection(
+    payload: CollectEbayImagePayload,
+    context: AttemptContext,
+    dependencies: EbayItemWorkerDependencies,
+    acquisition: Acquisition,
+) -> WorkOutcome:
+    """Validate and publish a retained image response without acquiring it again."""
+
+    inputs = (
+        NamedInput(
+            name=("gallery_reference",), object_identifier=payload.reference_record_identifier
+        ),
+    )
     acquisition_identifier = dependencies.new_identifier()
     result_identifier = dependencies.new_identifier()
     identity = {
@@ -1116,11 +1151,11 @@ async def _collect_image(
     )
 
 
-async def _collect_description(
+async def prepare_description_collection(
     payload: CollectEbayDescriptionPayload,
     context: AttemptContext,
     dependencies: EbayItemWorkerDependencies,
-) -> WorkOutcome:
+) -> WorkOutcome | None:
     inputs = (
         NamedInput(name=("observation",), object_identifier=payload.observation_record_identifier),
     )
@@ -1229,6 +1264,23 @@ async def _collect_description(
                     "reused": True,
                 },
             )
+        return None
+    except (KeyError, ValueError) as error:
+        return _failure(error, context, inputs=inputs)
+
+
+async def _collect_description(
+    payload: CollectEbayDescriptionPayload,
+    context: AttemptContext,
+    dependencies: EbayItemWorkerDependencies,
+) -> WorkOutcome:
+    prepared = await prepare_description_collection(payload, context, dependencies)
+    if prepared is not None:
+        return prepared
+    inputs = (
+        NamedInput(name=("observation",), object_identifier=payload.observation_record_identifier),
+    )
+    try:
         acquirer, network_path = _item_acquirer(payload.request, dependencies)
         activity = network_activity_definition(
             identifier=dependencies.new_identifier(),
@@ -1257,6 +1309,20 @@ async def _collect_description(
         AcquisitionFailure,
     ) as error:
         return _failure(error, context, inputs=inputs)
+    return await complete_description_collection(payload, context, dependencies, acquisition)
+
+
+async def complete_description_collection(
+    payload: CollectEbayDescriptionPayload,
+    context: AttemptContext,
+    dependencies: EbayItemWorkerDependencies,
+    acquisition: Acquisition,
+) -> WorkOutcome:
+    """Extract and publish an already captured description response."""
+
+    inputs = (
+        NamedInput(name=("observation",), object_identifier=payload.observation_record_identifier),
+    )
     acquisition_identifier = dependencies.new_identifier()
     artifacts = _body_artifacts(acquisition)
     text: str | None = None

@@ -1,12 +1,13 @@
 """Bounded HTTP acquisition using HTTPX raw response streams."""
 
 import sys
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from time import perf_counter_ns
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from urllib.parse import urlencode
 
 import httpcore
@@ -18,6 +19,8 @@ from carl.core.models import Header, JsonValue
 from carl.core.routing import LocalSocks5Endpoint
 from carl.io.cleanup import shielded_cleanup
 from carl.io.resource_permits import resource_operation, run_cpu
+
+MAX_ACQUISITION_BODY_BYTES = 100_000_000
 
 
 async def close_httpx_client(
@@ -52,6 +55,22 @@ class Acquisition:
     bodies: tuple[AcquiredBody, ...]
 
 
+class _CompletionTrackingStream(httpx.AsyncByteStream):
+    """Distinguish EOF-close errors from failures before all bytes arrived."""
+
+    def __init__(self, stream: httpx.AsyncByteStream):
+        self.stream = stream
+        self.complete = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self.stream:
+            yield chunk
+        self.complete = True
+
+    async def aclose(self) -> None:
+        await self.stream.aclose()
+
+
 class IdentifierFactory(Protocol):
     def __call__(self) -> str: ...
 
@@ -64,6 +83,26 @@ class HttpAcquirer(Protocol):
 
 class HttpFormAcquirer(HttpAcquirer, Protocol):
     async def acquire_form(
+        self,
+        plan: RequestPlan,
+        fields: tuple[FormField, ...],
+        new_identifier: IdentifierFactory,
+    ) -> Acquisition: ...
+
+
+@runtime_checkable
+class HttpCaptureAcquirer(HttpAcquirer, Protocol):
+    """Capture transport-exposed bodies with their actual decoding representation."""
+
+    async def capture(
+        self, plan: RequestPlan, new_identifier: IdentifierFactory
+    ) -> Acquisition: ...
+
+
+class HttpFormCaptureAcquirer(HttpCaptureAcquirer, HttpFormAcquirer, Protocol):
+    """Capture form responses while preserving the same protected request evidence."""
+
+    async def capture_form(
         self,
         plan: RequestPlan,
         fields: tuple[FormField, ...],
@@ -88,6 +127,69 @@ class RouteConfigurationFailure(Exception):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+def completed_capture_after_close_failure(
+    error: AcquisitionFailure,
+    *,
+    plan: RequestPlan,
+) -> Acquisition | None:
+    """Recover a complete stage capture without changing legacy failure contracts."""
+
+    if error.result.get("stopping_condition") != "transport_failure":
+        return None
+    phase = error.result.get("failure_phase")
+    if not isinstance(phase, str) or phase not in {
+        "response_close",
+        "client_close",
+        "session_close",
+    }:
+        return None
+    hops = error.result.get("hops")
+    if not isinstance(hops, list) or not hops or not isinstance(hops[-1], dict):
+        return None
+    response = hops[-1].get("response")
+    if not isinstance(response, dict):
+        return None
+    metadata = response.get("body")
+    if not isinstance(metadata, dict) or metadata.get("state") != "available":
+        return None
+    retained = next(
+        (body for body in error.bodies if body.identifier == metadata.get("artifact_id")), None
+    )
+    if (
+        retained is None
+        or type(metadata.get("bytes")) is not int
+        or metadata["bytes"] != len(retained.content)
+    ):
+        return None
+    status = response.get("status_code")
+    if type(status) is not int or (plan.follow_redirects and 300 <= status < 400):
+        return None
+    url = response.get("url")
+    if not isinstance(url, str):
+        request = hops[-1].get("request")
+        url = request.get("url") if isinstance(request, dict) else None
+    if not isinstance(url, str):
+        return None
+    record = dict(error.result)
+    cleanup: dict[str, JsonValue] = {"type": type(error).__name__, "failure_phase": phase}
+    exception_type = record.pop("exception_type", None)
+    if isinstance(exception_type, str):
+        cleanup["exception_type"] = exception_type[:256]
+    record.pop("failure_phase", None)
+    record.update(
+        {
+            "effective_url": url,
+            "redirect_count": len(hops) - 1,
+            "collection_completeness": "complete",
+            "session_cleanup_failure": cleanup,
+            "stopping_condition": "redirect_following_disabled"
+            if 300 <= status < 400
+            else "terminal_response",
+        }
+    )
+    return Acquisition(record=record, bodies=error.bodies)
 
 
 def _headers(raw: list[tuple[bytes, bytes]]) -> tuple[Header, ...]:
@@ -183,16 +285,10 @@ class _HttpxAcquirer:
             await close_httpx_client(client, primary_error=sys.exception())
 
     async def acquire(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
-        if self.expected_routing is not None and plan.routing != self.expected_routing:
-            raise RouteConfigurationFailure("request_route_does_not_match_acquirer")
-        try:
-            return await self._acquire(plan, new_identifier, form_fields=())
-        except AcquisitionFailure as error:
-            error.result["routing"] = {
-                "configured": list(plan.routing),
-                "observed": self.routing_observation,
-            }
-            raise
+        return await self._execute(plan, new_identifier, form_fields=(), decode=True)
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        return await self._execute(plan, new_identifier, form_fields=(), decode=False)
 
     async def acquire_form(
         self,
@@ -202,10 +298,30 @@ class _HttpxAcquirer:
     ) -> Acquisition:
         if plan.method != "POST":
             raise ValueError("Form acquisition requires POST")
+        return await self._execute(plan, new_identifier, form_fields=fields, decode=True)
+
+    async def capture_form(
+        self,
+        plan: RequestPlan,
+        fields: tuple[FormField, ...],
+        new_identifier: IdentifierFactory,
+    ) -> Acquisition:
+        if plan.method != "POST":
+            raise ValueError("Form acquisition requires POST")
+        return await self._execute(plan, new_identifier, form_fields=fields, decode=False)
+
+    async def _execute(
+        self,
+        plan: RequestPlan,
+        new_identifier: IdentifierFactory,
+        *,
+        form_fields: tuple[FormField, ...],
+        decode: bool,
+    ) -> Acquisition:
         if self.expected_routing is not None and plan.routing != self.expected_routing:
             raise RouteConfigurationFailure("request_route_does_not_match_acquirer")
         try:
-            return await self._acquire(plan, new_identifier, form_fields=fields)
+            return await self._acquire(plan, new_identifier, form_fields=form_fields, decode=decode)
         except AcquisitionFailure as error:
             error.result["routing"] = {
                 "configured": list(plan.routing),
@@ -214,12 +330,208 @@ class _HttpxAcquirer:
             raise
 
     @resource_operation("http")
+    async def _capture_hop(
+        self,
+        client: httpx.AsyncClient,
+        request: httpx.Request,
+        *,
+        plan: RequestPlan,
+        request_body_evidence: dict[str, JsonValue] | None,
+        hops: list[dict[str, JsonValue]],
+        bodies: list[AcquiredBody],
+        maximum_bytes: int,
+        new_identifier: IdentifierFactory,
+    ) -> tuple[httpx.Response, bytes, int, str]:
+        actual_headers = _headers(request.headers.raw)
+        started_at_utc = datetime.now(UTC).isoformat()
+        started = perf_counter_ns()
+        incomplete_response: dict[str, JsonValue] | None = None
+        response: httpx.Response | None = None
+        stream: _CompletionTrackingStream | None = None
+        body = bytearray()
+
+        def close_failure(error: Exception) -> AcquisitionFailure:
+            if response is not None and stream is not None and stream.complete:
+                headers = _headers(response.headers.raw)
+                encodings = [
+                    value.decode("latin-1") for value in header_values(headers, b"content-encoding")
+                ]
+                identifier = new_identifier()
+                metadata = _response_metadata(
+                    response,
+                    perf_counter_ns() - started,
+                    protected_headers=self.protected_response_headers,
+                )
+                metadata["body"] = {
+                    "state": "available",
+                    "artifact_id": identifier,
+                    "bytes": len(body),
+                    "received_content_bytes": len(body),
+                }
+                bodies.append(
+                    AcquiredBody(
+                        identifier=identifier,
+                        media_type=_content_type(headers),
+                        representation={
+                            "kind": "http_message_content",
+                            "http_hop_index": len(hops),
+                            "transfer_framing_removed": True,
+                            "content_decoded": False,
+                            "exact_wire_bytes": False,
+                            "content_encoding_headers": encodings,
+                            "storage_compression": {"kind": "none"},
+                        },
+                        content=bytes(body),
+                    )
+                )
+                hops.append(
+                    {
+                        "request": {
+                            "method": plan.method,
+                            "url": str(request.url),
+                            "headers": _header_evidence(
+                                actual_headers, self.protected_request_headers
+                            ),
+                            "started_at_utc": started_at_utc,
+                            "ended_at_utc": datetime.now(UTC).isoformat(),
+                            "body": request_body_evidence,
+                        },
+                        "response": metadata,
+                    }
+                )
+            return AcquisitionFailure(
+                "HTTP transport failed while closing a response",
+                result={
+                    "hops": hops,
+                    "stopping_condition": "transport_failure",
+                    "exception_type": type(error).__name__,
+                    "failure_phase": "response_close",
+                    "failed_request": {"method": plan.method, "url": str(request.url)},
+                },
+                bodies=tuple(bodies),
+            )
+
+        try:
+            response = await client.send(request, stream=True, follow_redirects=False)
+            if not isinstance(response.stream, httpx.AsyncByteStream):
+                raise RuntimeError("HTTPX returned a synchronous response stream")
+            stream = _CompletionTrackingStream(response.stream)
+            response.stream = stream
+            incomplete_response = _response_metadata(
+                response,
+                0,
+                protected_headers=self.protected_response_headers,
+            )
+            async for chunk in response.aiter_raw():
+                if len(body) + len(chunk) > maximum_bytes:
+                    metadata = _response_metadata(
+                        response,
+                        perf_counter_ns() - started,
+                        protected_headers=self.protected_response_headers,
+                    )
+                    metadata["body"] = {
+                        "state": "unavailable",
+                        "reason": "size_limit_exceeded",
+                        **(
+                            {"limit_scope": "acquisition"}
+                            if maximum_bytes < plan.max_body_bytes
+                            else {}
+                        ),
+                    }
+                    hops.append(
+                        {
+                            "request": {
+                                "method": plan.method,
+                                "url": str(request.url),
+                                "headers": _header_evidence(
+                                    actual_headers, self.protected_request_headers
+                                ),
+                                "started_at_utc": started_at_utc,
+                                "ended_at_utc": datetime.now(UTC).isoformat(),
+                                "body": request_body_evidence,
+                            },
+                            "response": metadata,
+                        }
+                    )
+                    raise AcquisitionFailure(
+                        "Response body exceeded configured limit",
+                        result={
+                            "hops": hops,
+                            "stopping_condition": "body_size_limit",
+                        },
+                        bodies=tuple(bodies),
+                    )
+                body.extend(chunk)
+        except AcquisitionFailure:
+            raise
+        except (
+            httpx.HTTPError,
+            httpcore.NetworkError,
+            httpcore.ProtocolError,
+            httpcore.ProxyError,
+            httpcore.TimeoutException,
+        ) as error:
+            if stream is not None and stream.complete:
+                raise close_failure(error) from error
+            if incomplete_response is not None:
+                incomplete_response["duration_ns"] = perf_counter_ns() - started
+                incomplete_response["body"] = {
+                    "state": "unavailable",
+                    "reason": "incomplete_transfer",
+                }
+                hops.append(
+                    {
+                        "request": {
+                            "method": plan.method,
+                            "url": str(request.url),
+                            "headers": _header_evidence(
+                                actual_headers, self.protected_request_headers
+                            ),
+                            "started_at_utc": started_at_utc,
+                            "ended_at_utc": datetime.now(UTC).isoformat(),
+                            "body": request_body_evidence,
+                        },
+                        "response": incomplete_response,
+                    }
+                )
+            raise AcquisitionFailure(
+                "HTTP transport failed before a complete body was received",
+                result={
+                    "hops": hops,
+                    "stopping_condition": "transport_failure",
+                    "exception_type": type(error).__name__,
+                    "failed_request": {
+                        "method": plan.method,
+                        "url": str(request.url),
+                    },
+                },
+                bodies=tuple(bodies),
+            ) from error
+        except Exception as error:
+            if stream is not None and stream.complete:
+                raise close_failure(error) from error
+            raise
+        finally:
+            if response is not None:
+                try:
+                    async with shielded_cleanup(
+                        "http_response_close", primary_error=sys.exception()
+                    ):
+                        await response.aclose()
+                except Exception as error:
+                    raise close_failure(error) from error
+
+        if response is None:
+            raise AssertionError("HTTPX returned no response")
+        return response, bytes(body), perf_counter_ns() - started, started_at_utc
+
     async def _acquire(
         self,
         plan: RequestPlan,
         new_identifier: IdentifierFactory,
         *,
         form_fields: tuple[FormField, ...],
+        decode: bool,
     ) -> Acquisition:
         timeout = httpx.Timeout(
             connect=plan.timeout.connect_seconds,
@@ -247,6 +559,8 @@ class _HttpxAcquirer:
             }
         hops: list[dict[str, JsonValue]] = []
         bodies: list[AcquiredBody] = []
+        total_bytes = 0
+        total_received_bytes = 0
         seen_urls: set[str] = set()
         current_url = plan.url
 
@@ -266,121 +580,22 @@ class _HttpxAcquirer:
                     content=request_content,
                     timeout=timeout,
                 )
+                response, body, duration_ns, started_at_utc = await self._capture_hop(
+                    client,
+                    request,
+                    plan=plan,
+                    request_body_evidence=request_body_evidence,
+                    hops=hops,
+                    bodies=bodies,
+                    maximum_bytes=min(
+                        plan.max_body_bytes,
+                        MAX_ACQUISITION_BODY_BYTES - total_received_bytes,
+                        MAX_ACQUISITION_BODY_BYTES - total_bytes,
+                    ),
+                    new_identifier=new_identifier,
+                )
+                total_received_bytes += len(body)
                 actual_headers = _headers(request.headers.raw)
-                started_at_utc = datetime.now(UTC).isoformat()
-                started = perf_counter_ns()
-                incomplete_response: dict[str, JsonValue] | None = None
-                response: httpx.Response | None = None
-                try:
-                    response = await client.send(request, stream=True, follow_redirects=False)
-                    incomplete_response = _response_metadata(
-                        response,
-                        0,
-                        protected_headers=self.protected_response_headers,
-                    )
-                    body = bytearray()
-                    async for chunk in response.aiter_raw():
-                        if len(body) + len(chunk) > plan.max_body_bytes:
-                            metadata = _response_metadata(
-                                response,
-                                perf_counter_ns() - started,
-                                protected_headers=self.protected_response_headers,
-                            )
-                            metadata["body"] = {
-                                "state": "unavailable",
-                                "reason": "size_limit_exceeded",
-                            }
-                            hops.append(
-                                {
-                                    "request": {
-                                        "method": plan.method,
-                                        "url": str(request.url),
-                                        "headers": _header_evidence(
-                                            actual_headers, self.protected_request_headers
-                                        ),
-                                        "started_at_utc": started_at_utc,
-                                        "ended_at_utc": datetime.now(UTC).isoformat(),
-                                        "body": request_body_evidence,
-                                    },
-                                    "response": metadata,
-                                }
-                            )
-                            raise AcquisitionFailure(
-                                "Response body exceeded configured limit",
-                                result={
-                                    "hops": hops,
-                                    "stopping_condition": "body_size_limit",
-                                },
-                                bodies=tuple(bodies),
-                            )
-                        body.extend(chunk)
-                except AcquisitionFailure:
-                    raise
-                except (
-                    httpx.HTTPError,
-                    httpcore.NetworkError,
-                    httpcore.ProtocolError,
-                    httpcore.ProxyError,
-                    httpcore.TimeoutException,
-                ) as error:
-                    if incomplete_response is not None:
-                        incomplete_response["duration_ns"] = perf_counter_ns() - started
-                        incomplete_response["body"] = {
-                            "state": "unavailable",
-                            "reason": "incomplete_transfer",
-                        }
-                        hops.append(
-                            {
-                                "request": {
-                                    "method": plan.method,
-                                    "url": str(request.url),
-                                    "headers": _header_evidence(
-                                        actual_headers, self.protected_request_headers
-                                    ),
-                                    "started_at_utc": started_at_utc,
-                                    "ended_at_utc": datetime.now(UTC).isoformat(),
-                                    "body": request_body_evidence,
-                                },
-                                "response": incomplete_response,
-                            }
-                        )
-                    raise AcquisitionFailure(
-                        "HTTP transport failed before a complete body was received",
-                        result={
-                            "hops": hops,
-                            "stopping_condition": "transport_failure",
-                            "exception_type": type(error).__name__,
-                            "failed_request": {
-                                "method": plan.method,
-                                "url": str(request.url),
-                            },
-                        },
-                        bodies=tuple(bodies),
-                    ) from error
-                finally:
-                    if response is not None:
-                        try:
-                            async with shielded_cleanup(
-                                "http_response_close", primary_error=sys.exception()
-                            ):
-                                await response.aclose()
-                        except Exception as error:
-                            raise AcquisitionFailure(
-                                "HTTP transport failed while closing a response",
-                                result={
-                                    "hops": hops,
-                                    "stopping_condition": "transport_failure",
-                                    "exception_type": type(error).__name__,
-                                    "failure_phase": "response_close",
-                                    "failed_request": {
-                                        "method": plan.method,
-                                        "url": str(request.url),
-                                    },
-                                },
-                                bodies=tuple(bodies),
-                            ) from error
-
-                duration_ns = perf_counter_ns() - started
                 if response is None:
                     raise AssertionError("HTTPX returned no response")
                 response_headers = _headers(response.headers.raw)
@@ -406,10 +621,17 @@ class _HttpxAcquirer:
                 )
                 metadata["redirect_target"] = target
                 try:
-                    decoded_body = await run_cpu(
-                        decode_content,
-                        bytes(body),
-                        content_encodings,
+                    decoded_body = (
+                        await run_cpu(
+                            partial(
+                                decode_content,
+                                body,
+                                content_encodings,
+                                maximum_bytes=MAX_ACQUISITION_BODY_BYTES - total_bytes,
+                            )
+                        )
+                        if decode
+                        else body
                     )
                 except ContentDecodingError as error:
                     metadata["body"] = {
@@ -442,6 +664,7 @@ class _HttpxAcquirer:
                         },
                         bodies=tuple(bodies),
                     ) from error
+                total_bytes += len(decoded_body)
                 body_identifier = new_identifier()
                 metadata["body"] = {
                     "state": "available",
@@ -470,10 +693,12 @@ class _HttpxAcquirer:
                         identifier=body_identifier,
                         media_type=_content_type(response_headers),
                         representation={
-                            "kind": "content_decoded_http_body",
+                            "kind": "content_decoded_http_body"
+                            if decode
+                            else "http_message_content",
                             "http_hop_index": hop_index,
                             "transfer_framing_removed": True,
-                            "content_decoded": True,
+                            "content_decoded": decode,
                             "exact_wire_bytes": False,
                             "content_encoding_headers": content_encoding_headers,
                             "storage_compression": {"kind": "none"},
@@ -569,3 +794,11 @@ class RoutedHttpAcquirer:
         if acquirer is None:
             raise RouteConfigurationFailure("unconfigured_network_route")
         return await acquirer.acquire(plan, new_identifier)
+
+    async def capture(self, plan: RequestPlan, new_identifier: IdentifierFactory) -> Acquisition:
+        acquirer = self.routes.get(plan.routing)
+        if acquirer is None:
+            raise RouteConfigurationFailure("unconfigured_network_route")
+        if not isinstance(acquirer, HttpCaptureAcquirer):
+            raise RouteConfigurationFailure("network_route_does_not_support_capture")
+        return await acquirer.capture(plan, new_identifier)
