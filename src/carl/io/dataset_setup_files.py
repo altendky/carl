@@ -75,8 +75,10 @@ def _nonfinite(_value: str) -> NoReturn:
     raise DatasetSetupFileError
 
 
-def _identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+def _identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    # Publication exposes a complete hardlink before removing its temporary
+    # name. That legitimate link-count change updates ctime during other reads.
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
 def _read(bucket: int, reference: DatasetSetupReference, maximum_bytes: int) -> JsonValue:
@@ -98,6 +100,7 @@ def _read(bucket: int, reference: DatasetSetupReference, maximum_bytes: int) -> 
             if not chunk:
                 break
             content.extend(chunk)
+        _private(descriptor)
         if (
             len(content) != reference.bytes
             or hashlib.sha256(content).hexdigest() != reference.sha256

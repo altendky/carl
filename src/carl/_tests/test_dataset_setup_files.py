@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -69,6 +70,62 @@ def test_concurrent_same_content_publish_validates_one_immutable_file(tmp_path: 
     assert len(set(ref.model_dump_json() for ref in references)) == 1
     assert read_setup_value(tmp_path, references[0]) == value
     assert len(tuple((tmp_path / "setup-values").iterdir())) == 1
+
+
+def test_reader_accepts_publisher_removing_temporary_hardlink_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = {"sources": ["dataset"], "cursor": 2}
+    content = files.encode_json(value).encode()
+    reference = DatasetSetupReference(
+        sha256=hashlib.sha256(content).hexdigest(), bytes=len(content)
+    )
+    path = tmp_path / reference.locator
+    published, reading, unlinked = threading.Event(), threading.Event(), threading.Event()
+    metadata: list[os.stat_result] = []
+    original_unlink, original_read = files.os.unlink, files.os.read
+
+    def unlink(
+        name: str | bytes | os.PathLike[str] | os.PathLike[bytes], *, dir_fd: int | None = None
+    ) -> None:
+        if isinstance(name, str) and name.startswith(".setup-"):
+            metadata.append(path.stat())
+            published.set()
+            assert reading.wait(5), "Reader did not enter the published CAS file"
+            original_unlink(name, dir_fd=dir_fd)
+            metadata.append(path.stat())
+            unlinked.set()
+        else:
+            original_unlink(name, dir_fd=dir_fd)
+
+    def read(descriptor: int, size: int) -> bytes:
+        data = original_read(descriptor, size)
+        if data:
+            reading.set()
+            assert unlinked.wait(5), "Publisher did not remove its temporary link"
+        return data
+
+    monkeypatch.setattr(files.os, "unlink", unlink)
+    monkeypatch.setattr(files.os, "read", read)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(write_setup_value, tmp_path, value)
+        try:
+            assert published.wait(5), "Publisher did not make its complete file visible"
+            restored = read_setup_value(tmp_path, reference)
+        finally:
+            # A reader failure must not leave the publisher's test thread waiting.
+            reading.set()
+            unlinked.set()
+        assert future.result(timeout=5) == reference
+    assert restored == value
+    before, after = metadata
+    assert before.st_nlink == 2 and after.st_nlink == 1
+    assert (before.st_ino, before.st_size, before.st_mtime_ns) == (
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    assert read_setup_value(tmp_path, reference) == value
 
 
 @pytest.mark.parametrize("phase", ("", "../outside", "a/b", "x" * 101, "has space"))
@@ -207,6 +264,29 @@ def test_file_mutation_during_read_fails_identity_check(
         content = original(descriptor, size)
         if content:
             path.write_text(json.dumps({"x": 22}))
+        return content
+
+    monkeypatch.setattr(files.os, "read", read)
+    with pytest.raises(DatasetSetupFileError):
+        _ = read_setup_value(tmp_path, reference)
+
+
+@pytest.mark.parametrize("mutation", ("mtime", "permissions"))
+def test_unchanged_bytes_do_not_bypass_metadata_checks_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    reference = write_setup_value(tmp_path, {"x": 1})
+    path = tmp_path / reference.locator
+    original = files.os.read
+    before = path.stat()
+
+    def read(descriptor: int, size: int) -> bytes:
+        content = original(descriptor, size)
+        if content:
+            if mutation == "mtime":
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+            else:
+                path.chmod(0o644)
         return content
 
     monkeypatch.setattr(files.os, "read", read)
