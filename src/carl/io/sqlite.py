@@ -171,6 +171,19 @@ from carl.core.work import (
     WorkRequester,
     WorkState,
 )
+from carl.core.work_dispatch import (
+    DispatchCandidate,
+    DispatchCursor,
+    DispatchPage,
+    ExpiredLegacyWorkCandidate,
+    ExpiredLegacyWorkPage,
+    ExpiredStageCandidate,
+    ExpiredStagePage,
+    ExpiryCursor,
+    InitialStageRegistration,
+    WorkDispatchSnapshot,
+    WorkSnapshotStale,
+)
 from carl.core.worker import FollowOnWork
 from carl.io.db import DEFAULT_BUSY_TIMEOUT_MS, DatabaseConnections
 from carl.route_cutover import rebuild_work_definition
@@ -200,9 +213,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=17,
+    version=18,
 )
 
+_V17_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 17})
+_V17_SCHEMA_DEFINITION_SHA256 = "237aa1054113cb8c61eb1f2d079e741eca10cbb794fac1caa2e74ca312427acf"
 _V16_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 16})
 _V16_SCHEMA_DEFINITION_SHA256 = "9ca33db9613edfd7156e57cf9ef73c68b41f730101ccfcd65448adad93f3e9b6"
 _V15_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 15})
@@ -594,6 +609,12 @@ CREATE TABLE IF NOT EXISTS work_items (
 
 CREATE INDEX IF NOT EXISTS work_items_claim
 ON work_items(state, eligible_at_utc_ns, priority DESC, created_at_utc_ns);
+
+CREATE INDEX IF NOT EXISTS work_items_dispatch
+ON work_items(state, priority DESC, eligible_at_utc_ns, created_at_utc_ns, id);
+
+CREATE INDEX IF NOT EXISTS work_items_expired
+ON work_items(state, lease_expires_at_utc_ns, id);
 
 CREATE UNIQUE INDEX IF NOT EXISTS work_items_active_deduplication
 ON work_items(kind_parts_json, deduplication_identity_json)
@@ -1088,13 +1109,54 @@ class Database:
         created_at_utc_ns: int,
         *,
         continuation: bool = False,
+        expected_snapshot: WorkDispatchSnapshot | None = None,
     ) -> None:
         serialized = definition.model_dump_json()
+        current: WorkDispatchSnapshot | None = None
+        if expected_snapshot is not None:
+            if continuation:
+                raise ValueError("Initial registration snapshots cannot fence continuations")
+            try:
+                current = await self._work_dispatch_snapshot(
+                    connection, definition.work_item_identifier
+                )
+            except KeyError:
+                raise WorkSnapshotStale from None
+            exact_existing = (
+                current.active_stage_identifier == definition.identifier
+                and current.active_operation_identifier == definition.operation_identifier
+                and current.active_stage_state == "pending"
+                and current.active_attempt_state in ("pending", "active")
+            )
+            if (
+                definition.work_item_identifier != expected_snapshot.definition.identifier
+                or (
+                    current.state is not WorkState.PENDING
+                    and not (current.state is WorkState.LEASED and exact_existing)
+                )
+                or current.state is not expected_snapshot.state
+                or current.fingerprint != expected_snapshot.fingerprint
+                or current.definition != expected_snapshot.definition
+                or current.attempt != expected_snapshot.attempt
+                or current.active_operation_identifier
+                != expected_snapshot.active_operation_identifier
+                or current.active_stage_identifier != expected_snapshot.active_stage_identifier
+                or current.active_stage_state != expected_snapshot.active_stage_state
+                or current.active_attempt_state != expected_snapshot.active_attempt_state
+                or (current.active_stage_identifier is not None and not exact_existing)
+                or (
+                    current.active_operation_identifier is not None
+                    and current.active_stage_identifier != definition.identifier
+                )
+            ):
+                raise WorkSnapshotStale(current.active_stage_identifier)
         cursor = await connection.execute(
             "SELECT definition_json FROM work_stages WHERE id = ?", (definition.identifier,)
         )
         existing = await cursor.fetchone()
         if existing is not None:
+            if current is not None and current.active_stage_identifier != definition.identifier:
+                raise WorkSnapshotStale(current.active_stage_identifier)
             if existing[0] != serialized:
                 raise ValueError("A stage identifier cannot be reused for another definition")
             return
@@ -1182,13 +1244,413 @@ class Database:
             {"definition": definition.model_dump(mode="json")},
         )
 
-    async def register_stage(self, definition: StageDefinition, *, created_at_utc_ns: int) -> None:
+    async def register_stage(
+        self,
+        definition: StageDefinition,
+        *,
+        created_at_utc_ns: int,
+        expected_snapshot: WorkDispatchSnapshot | None = None,
+    ) -> None:
         """Opt work into staged routing without claiming it or creating an operation."""
 
         if created_at_utc_ns < 0:
             raise ValueError("Stage registration time must be nonnegative")
         async with self._connections.writer() as connection:
-            await self._register_stage(connection, definition, created_at_utc_ns)
+            await self._register_stage(
+                connection, definition, created_at_utc_ns, expected_snapshot=expected_snapshot
+            )
+
+    async def try_register_initial_stage(
+        self,
+        definition: StageDefinition,
+        *,
+        expected_snapshot: WorkDispatchSnapshot,
+        created_at_utc_ns: int,
+    ) -> InitialStageRegistration:
+        """Decline optimistically, but never swallow an enclosing writer's rollback."""
+        # Resident admission may already have inserted permits in an outer writer.
+        # Such a caller must receive the exception and unwind that transaction.
+        nested = self._connections._current_writer_task_identifier == anyio.get_current_task().id  # pyright: ignore[reportPrivateUsage]
+        try:
+            await self.register_stage(
+                definition, created_at_utc_ns=created_at_utc_ns, expected_snapshot=expected_snapshot
+            )
+        except WorkSnapshotStale as error:
+            if nested:
+                raise
+            return InitialStageRegistration(
+                status="existing" if error.existing_stage_identifier is not None else "stale",
+                stage_identifier=error.existing_stage_identifier,
+            )
+        return InitialStageRegistration(
+            status="existing"
+            if expected_snapshot.active_stage_identifier == definition.identifier
+            else "registered",
+            stage_identifier=definition.identifier,
+        )
+
+    @staticmethod
+    def _dispatch_limit(limit: int, now_utc_ns: int) -> None:
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 256
+            or type(now_utc_ns) is not int
+            or now_utc_ns < 0
+        ):
+            raise ValueError(
+                "Dispatch queries require a page limit within 1..256 and a nonnegative time"
+            )
+
+    async def dispatch_candidates(
+        self,
+        *,
+        supported_capabilities: Sequence[WorkCapability],
+        now_utc_ns: int,
+        limit: int,
+        after: DispatchCursor | None = None,
+        eligible_identifiers: Sequence[str] | None = None,
+    ) -> DispatchPage:
+        """Read bounded metadata only; admission remains authoritative and separate."""
+        self._dispatch_limit(limit, now_utc_ns)
+        if not 1 <= len(supported_capabilities) <= 256:
+            raise ValueError("Dispatch requires 1..256 supported capabilities")
+        predicate = " OR ".join(
+            "(w.kind_parts_json=? AND w.payload_schema_version=?)" for _ in supported_capabilities
+        )
+        bindings: list[apsw.SQLiteValue] = [now_utc_ns, now_utc_ns]
+        for capability in supported_capabilities:
+            bindings.extend((_json(list(capability.kind)), capability.payload_schema_version))
+        scope = ""
+        if eligible_identifiers is not None:
+            scope = "AND w.id IN (SELECT value FROM json_each(?))"
+            bindings.append(_json(list(eligible_identifiers)))
+        frontier = ""
+        if after is not None:
+            frontier = "AND (w.priority<? OR (w.priority=? AND (w.eligible_at_utc_ns,w.created_at_utc_ns,w.id)>(?,?,?)))"
+            bindings.extend(
+                (
+                    after.priority,
+                    after.priority,
+                    after.eligible_at_utc_ns,
+                    after.created_at_utc_ns,
+                    after.work_item_identifier,
+                )
+            )
+        bindings.append(limit + 1)
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                f"""
+                SELECT w.id,w.kind_parts_json,w.payload_schema_version,w.state,w.attempt,
+                       w.priority,w.eligible_at_utc_ns,w.created_at_utc_ns,
+                       s.id,s.operation_id,json_extract(s.definition_json,'$.kind'),
+                       json_extract(s.definition_json,'$.schema_version'),
+                       json_extract(s.definition_json,'$.resident_session_identifier')
+                FROM work_items AS w
+                LEFT JOIN stage_attempts AS a ON a.work_item_id=w.id AND a.state IN ('pending','active')
+                LEFT JOIN work_stages AS s ON s.work_item_id=w.id AND s.state IN ('pending','running')
+                WHERE w.state IN ('pending','leased') AND w.eligible_at_utc_ns<=?
+                  AND (s.id IS NULL OR s.eligible_at_utc_ns<=?)
+                  AND ((w.state='pending' AND a.operation_id IS NULL AND s.id IS NULL)
+                       OR (s.state='pending' AND s.operation_id=a.operation_id))
+                  AND ({predicate}) {scope} {frontier}
+                ORDER BY w.priority DESC,w.eligible_at_utc_ns,w.created_at_utc_ns,w.id LIMIT ?
+            """,
+                bindings,
+            )
+            rows = await cursor.fetchall()
+        items = tuple(
+            DispatchCandidate(
+                work_item_identifier=_text(row[0]),
+                capability=WorkCapability(
+                    kind=tuple(cast(list[str], decode_json(_text(row[1])))),
+                    payload_schema_version=_integer(row[2]),
+                ),
+                state=WorkState(_text(row[3])),
+                attempt=_integer(row[4]),
+                priority=_integer(row[5]),
+                eligible_at_utc_ns=_integer(row[6]),
+                created_at_utc_ns=_integer(row[7]),
+                stage_identifier=None if row[8] is None else _text(row[8]),
+                operation_identifier=None if row[9] is None else _text(row[9]),
+                stage_kind=None
+                if row[10] is None
+                else tuple(cast(list[str], decode_json(_text(row[10])))),
+                stage_schema_version=None if row[11] is None else _integer(row[11]),
+                resident_session_identifier=None if row[12] is None else _text(row[12]),
+            )
+            for row in rows[:limit]
+        )
+        more = len(rows) > limit
+        return DispatchPage(
+            items=items, has_more=more, next_cursor=items[-1].cursor if more else None
+        )
+
+    async def _work_dispatch_snapshot(
+        self, connection: AsyncConnection, identifier: str
+    ) -> WorkDispatchSnapshot:
+        cursor = await connection.execute(
+            """
+            SELECT kind_parts_json,payload_schema_version,payload_json,deduplication_identity_json,
+                   priority,eligible_at_utc_ns,state,attempt,lease_token,lease_owner,lease_expires_at_utc_ns,created_at_utc_ns
+            FROM work_items WHERE id=?
+        """,
+            (identifier,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise KeyError(identifier)
+        cursor = await connection.execute(
+            "SELECT scope_kind,scope_identity_json FROM work_scopes WHERE work_item_id=? ORDER BY scope_kind,scope_identity_json",
+            (identifier,),
+        )
+        scopes = await cursor.fetchall()
+        cursor = await connection.execute(
+            """
+            SELECT a.operation_id,a.state,s.id,s.state,s.definition_json,s.execution,s.token,s.lease_expires_at_utc_ns
+            FROM stage_attempts AS a LEFT JOIN work_stages AS s
+              ON s.work_item_id=a.work_item_id AND s.operation_id=a.operation_id AND s.state IN ('pending','running')
+            WHERE a.work_item_id=? AND a.state IN ('pending','active')
+        """,
+            (identifier,),
+        )
+        active = await cursor.fetchone()
+        fingerprint = hashlib.sha256(
+            encode_json(
+                {
+                    "identifier": identifier,
+                    "work": list(row),
+                    "scopes": [list(scope) for scope in scopes],
+                    "active": None if active is None else list(active),
+                }
+            ).encode()
+        ).hexdigest()
+        return WorkDispatchSnapshot(
+            definition=WorkDefinition(
+                identifier=identifier,
+                kind=tuple(cast(list[str], decode_json(_text(row[0])))),
+                payload_schema_version=_integer(row[1]),
+                payload=decode_json(_text(row[2])),
+                deduplication_identity=tuple(cast(list[str], decode_json(_text(row[3])))),
+                priority=_integer(row[4]),
+                not_before_utc_ns=_integer(row[5]),
+                scopes=tuple(
+                    SchedulingScope(
+                        kind=SchedulingScopeKind(_text(scope[0])),
+                        identity=tuple(cast(list[str], decode_json(_text(scope[1])))),
+                    )
+                    for scope in scopes
+                ),
+            ),
+            state=WorkState(_text(row[6])),
+            attempt=_integer(row[7]),
+            fingerprint=fingerprint,
+            active_operation_identifier=None if active is None else _text(active[0]),
+            active_attempt_state=None if active is None else _text(active[1]),
+            active_stage_identifier=None
+            if active is None or active[2] is None
+            else _text(active[2]),
+            active_stage_state=None if active is None or active[3] is None else _text(active[3]),
+        )
+
+    async def work_dispatch_snapshot(self, work_identifier: str) -> WorkDispatchSnapshot:
+        """Explicit selected point read, including active stage identity, in one snapshot."""
+        async with self._connections.reader() as connection:
+            return await self._work_dispatch_snapshot(connection, work_identifier)
+
+    async def expired_stage_candidates(
+        self,
+        *,
+        coordination_scope: str,
+        now_utc_ns: int,
+        limit: int,
+        after: ExpiryCursor | None = None,
+    ) -> ExpiredStagePage:
+        self._dispatch_limit(limit, now_utc_ns)
+        if not coordination_scope or coordination_scope != coordination_scope.strip():
+            raise ValueError("Stage recovery requires a coordination scope")
+        frontier = "" if after is None else "AND (lease_expires_at_utc_ns,id)>(?,?)"
+        bindings: list[apsw.SQLiteValue] = [coordination_scope, now_utc_ns]
+        if after is not None:
+            bindings.extend((after.expires_at_utc_ns, after.identifier))
+        bindings.append(limit + 1)
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                f"""
+                SELECT id,token,worker_identifier,coordination_scope,execution,lease_expires_at_utc_ns
+                FROM work_stages WHERE state='running' AND coordination_scope=? AND lease_expires_at_utc_ns<=?
+                {frontier} ORDER BY lease_expires_at_utc_ns,id LIMIT ?
+            """,
+                bindings,
+            )
+            rows = await cursor.fetchall()
+        items = tuple(
+            ExpiredStageCandidate(
+                stage_identifier=_text(row[0]),
+                token=_text(row[1]),
+                worker_identifier=_text(row[2]),
+                coordination_scope=_text(row[3]),
+                execution=_integer(row[4]),
+                expires_at_utc_ns=_integer(row[5]),
+            )
+            for row in rows[:limit]
+        )
+        more = len(rows) > limit
+        return ExpiredStagePage(
+            items=items, has_more=more, next_cursor=items[-1].cursor if more else None
+        )
+
+    async def stage_execution_lease(
+        self,
+        stage_identifier: str,
+        *,
+        expected_token: str,
+        expected_execution: int,
+        coordination_scope: str | None = None,
+    ) -> StageLease | None:
+        """Point-load the matching lease only after the caller owns its physical guard."""
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT lease_json FROM work_stages WHERE id=? AND state='running' AND token=? AND execution=?
+                  AND (? IS NULL OR coordination_scope=?)
+            """,
+                (
+                    stage_identifier,
+                    expected_token,
+                    expected_execution,
+                    coordination_scope,
+                    coordination_scope,
+                ),
+            )
+            row = await cursor.fetchone()
+        return None if row is None else StageLease.model_validate_json(_text(row[0]))
+
+    async def expired_legacy_work_candidates(
+        self,
+        *,
+        now_utc_ns: int,
+        limit: int,
+        after: ExpiryCursor | None = None,
+        eligible_identifiers: Sequence[str] | None = None,
+    ) -> ExpiredLegacyWorkPage:
+        self._dispatch_limit(limit, now_utc_ns)
+        frontier = "" if after is None else "AND (w.lease_expires_at_utc_ns,w.id)>(?,?)"
+        bindings: list[apsw.SQLiteValue] = [now_utc_ns]
+        if after is not None:
+            bindings.extend((after.expires_at_utc_ns, after.identifier))
+        scope = ""
+        if eligible_identifiers is not None:
+            scope = "AND w.id IN (SELECT value FROM json_each(?))"
+            bindings.append(_json(list(eligible_identifiers)))
+        bindings.append(limit + 1)
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                f"""
+                SELECT w.id,w.state,w.attempt,w.lease_token,w.lease_owner,w.lease_expires_at_utc_ns,
+                       (SELECT operation_id FROM work_operations WHERE work_item_id=w.id AND attempt=w.attempt AND lease_token=w.lease_token AND worker_identifier=w.lease_owner)
+                FROM work_items AS w WHERE w.state IN ('leased','cancelling') AND w.lease_expires_at_utc_ns<=?
+                  AND NOT EXISTS (SELECT 1 FROM stage_attempts WHERE work_item_id=w.id AND state IN ('pending','active'))
+                  AND NOT EXISTS (SELECT 1 FROM work_stages WHERE work_item_id=w.id AND state IN ('pending','running'))
+                {frontier} {scope} ORDER BY w.lease_expires_at_utc_ns,w.id LIMIT ?
+            """,
+                bindings,
+            )
+            rows = await cursor.fetchall()
+        items = tuple(
+            ExpiredLegacyWorkCandidate(
+                work_item_identifier=_text(row[0]),
+                state=WorkState(_text(row[1])),
+                attempt=_integer(row[2]),
+                lease_token=_text(row[3]),
+                worker_identifier=_text(row[4]),
+                lease_expires_at_utc_ns=_integer(row[5]),
+                operation_identifier=None if row[6] is None else _text(row[6]),
+            )
+            for row in rows[:limit]
+        )
+        more = len(rows) > limit
+        return ExpiredLegacyWorkPage(
+            items=items, has_more=more, next_cursor=items[-1].cursor if more else None
+        )
+
+    async def recover_expired_legacy_work(
+        self,
+        expected: ExpiredLegacyWorkCandidate,
+        *,
+        now_utc_ns: int,
+        event_identifier: str | None = None,
+    ) -> bool:
+        if type(now_utc_ns) is not int or now_utc_ns < 0:
+            raise ValueError("Legacy recovery requires a nonnegative time")
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT state,attempt,lease_token,lease_owner,lease_expires_at_utc_ns FROM work_items
+                WHERE id=? AND NOT EXISTS(SELECT 1 FROM stage_attempts WHERE work_item_id=work_items.id AND state IN ('pending','active'))
+                  AND NOT EXISTS(SELECT 1 FROM work_stages WHERE work_item_id=work_items.id AND state IN ('pending','running'))
+            """,
+                (expected.work_item_identifier,),
+            )
+            row = await cursor.fetchone()
+            if (
+                row is None
+                or tuple(row)
+                != (
+                    expected.state.value,
+                    expected.attempt,
+                    expected.lease_token,
+                    expected.worker_identifier,
+                    expected.lease_expires_at_utc_ns,
+                )
+                or expected.state not in (WorkState.LEASED, WorkState.CANCELLING)
+                or expected.lease_expires_at_utc_ns > now_utc_ns
+            ):
+                return False
+            cursor = await connection.execute(
+                "SELECT operation_id FROM work_operations WHERE work_item_id=? AND attempt=? AND lease_token=? AND worker_identifier=?",
+                (
+                    expected.work_item_identifier,
+                    expected.attempt,
+                    expected.lease_token,
+                    expected.worker_identifier,
+                ),
+            )
+            operation = await cursor.fetchone()
+            if expected.state is WorkState.CANCELLING:
+                return await self.finalize_cancelled_work(
+                    work_item_identifier=expected.work_item_identifier,
+                    lease_token=expected.lease_token,
+                    worker_identifier=expected.worker_identifier,
+                    operation_id=None if operation is None else _text(operation[0]),
+                    utc_now_ns=lambda: now_utc_ns,
+                    event_identifier=event_identifier or str(uuid4()),
+                    ended_at_utc=_utc_text_from_ns(now_utc_ns),
+                    duration_ns=0,
+                )
+            recovered = await self._recover_expired_work_attempt(
+                connection,
+                work_item_identifier=expected.work_item_identifier,
+                attempt=expected.attempt,
+                recovered_at_utc_ns=now_utc_ns,
+            )
+            await connection.execute(
+                "UPDATE work_items SET state='pending',lease_token=NULL,lease_owner=NULL,lease_expires_at_utc_ns=NULL WHERE id=?",
+                (expected.work_item_identifier,),
+            )
+            await self._append_work_event(
+                connection,
+                event_identifier=event_identifier or str(uuid4()),
+                work_item_identifier=expected.work_item_identifier,
+                event_kind=WorkEventKind.LEASE_EXPIRED,
+                recorded_at_utc_ns=now_utc_ns,
+                data={
+                    "expired_token": expected.lease_token,
+                    "expired_owner": expected.worker_identifier,
+                    "expired_at_utc_ns": expected.lease_expires_at_utc_ns,
+                    "recovered_operation_identifiers": list(recovered),
+                },
+            )
+            return True
 
     async def stage(self, identifier: str) -> StageDefinition:
         async with self._connections.reader() as connection:
@@ -3086,6 +3548,14 @@ class Database:
         }
 
     @staticmethod
+    def _v17_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V17_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": str(_V17_DATABASE_SCHEMA.version),
+            "schema_definition_sha256": _V17_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v2_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V2_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -3250,6 +3720,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v17_metadata())
                 and not await cls._metadata_matches(connection, cls._v16_metadata())
                 and not await cls._metadata_matches(connection, cls._v15_metadata())
                 and not await cls._metadata_matches(connection, cls._v14_metadata())
@@ -3700,6 +4171,12 @@ class Database:
                     "INSERT INTO resident_request_charges SELECT * FROM resident_request_charges_v16"
                 )
                 await connection.execute("DROP TABLE resident_request_charges_v16")
+                for key, value in self._expected_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v17_metadata()):
+                await connection.execute(_SCHEMA)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
@@ -6654,6 +7131,15 @@ class Database:
                 )
                 if definition is None:
                     continue
+                staged_cursor = await connection.execute(
+                    "SELECT 1 FROM stage_attempts WHERE work_item_id=? AND state IN ('pending','active') "
+                    "UNION ALL SELECT 1 FROM work_stages WHERE work_item_id=? AND state IN ('pending','running') LIMIT 1",
+                    (_text(row[0]), _text(row[0])),
+                )
+                if await staged_cursor.fetchone() is not None:
+                    raise ValueError(
+                        f"Route cutover requires staged work {_text(row[0])} to finish or cancel"
+                    )
                 if _text(row[4]) == "leased" and _integer(row[5]) > at_utc_ns:
                     raise ValueError(
                         f"Route cutover requires work {_text(row[0])} to release its lease"

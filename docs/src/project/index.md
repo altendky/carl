@@ -478,6 +478,16 @@ replacement execution, and publication plus stage completion share one
 transaction. Unadmitted polls discard their unused guard files; admitted token
 guards remain stable.
 
+Dispatcher discovery has bounded keyset pages of work and stage metadata, ordered by
+priority, eligibility, creation time and identifier. Scans exclude retained payloads, results,
+errors and full leases; a selected work snapshot fences initial registration against cancellation,
+definition changes and competing registrars. Completed stage history permits a fresh retry attempt.
+Explicit legacy recovery excludes pending or active staged work. Stage recovery processes at most
+32 candidates per call, retaining a fixed pass time and advancing past busy guards across calls.
+Full lease reads occur only after the matching physical guard is acquired. Storage schema 18 adds
+dispatch/recovery indices without rewriting evidence or ownership. These APIs prepare the shared
+runtime cutover; they do not switch the legacy worker pool to stage dispatch.
+
 The stateless adapter registry now supplies Facebook detail and Facebook/eBay
 gallery collection, eBay descriptions, and offline item/image extraction stages.
 Collection first
