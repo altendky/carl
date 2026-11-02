@@ -446,6 +446,42 @@ validation, and bounded analysis stdout/stderr (8 MiB/1 MiB, 8 MiB combined).
 Hitting an analysis output bound terminates and reaps the child and records
 `claude_output_limit`. These bounds do not constitute a whole-process RSS cap.
 
+The stage foundation separates a logical work attempt and its operation from
+individual execution leases. A versioned stage records resource requirements,
+eligibility, settled-work dependencies, immutable checkpoint inputs, and an
+optional resident-session identity. Continuation payloads are limited to 64 KiB;
+response bytes and secrets belong in their existing evidence/session owners.
+Stage registration does not consume an attempt. Nonblocking admission reserves
+resources, applicable HTTP admission, work ownership, and the stage execution
+in one transaction or rolls all of them back. Time, dependency, outage, and
+capacity waits leave durable pending stages without execution leases.
+
+Suspension publishes checkpoint evidence within the same logical operation.
+Resuming rotates execution/publication tokens while preserving the work
+attempt and acquisition retry budget. Actual `RetryWork` remains a new logical
+attempt. Work explicitly registered with stages stays routed to stages across
+such retries, so legacy workers cannot seize a waiting continuation. Network
+activities have execution-specific identities and stable holdoff decisions;
+repeated admission polls neither consume rate starts nor postpone eligibility.
+Dependencies may settle successfully, fail, or be cancelled; the resumed
+handler inspects their outcomes.
+
+`StageManager` obtains a local execution guard before admission, renews all
+stage/work/resource/network ownership together, and adopts reserved resource
+units in common adapters. Local child operations share a reservation's unit
+limits. Finalization stops new borrowers and drains actual CPU/HTTP/analysis
+operations before releasing capacity. Expired stages recover only after their
+exact host/database guard can be held. Stale tokens cannot publish through a
+replacement execution, and publication plus stage completion share one
+transaction. Unadmitted polls discard their unused guard files; admitted token
+guards remain stable.
+
+These interfaces are an opt-in foundation. Stateless stage conversion,
+bounded resident sessions, and production dispatcher cutover are tracked
+separately; the existing foreground runtime remains the default until those
+adapters are ready. This foundation alone does not remove waits from legacy
+handlers.
+
 SQLite is the durable source of pending work. A claim uses a short transaction
 to assign a lease token, worker identity, and expiration time. Processing occurs
 outside the transaction. Completion uses the lease token as a fencing value so

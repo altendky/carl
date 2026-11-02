@@ -131,6 +131,14 @@ from carl.core.review_workspace import (
     ReviewWorksetConflict,
 )
 from carl.core.search_scope import search_scope_sha256
+from carl.core.stages import (
+    StageClaimResult,
+    StageDefinition,
+    StageLease,
+    StageWaitKind,
+    WaitWork,
+    stage_network_activity,
+)
 from carl.core.work import (
     CONSTRAINT_ADAPTER,
     ClaimResult,
@@ -183,9 +191,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=14,
+    version=15,
 )
 
+_V14_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 14})
+_V14_SCHEMA_DEFINITION_SHA256 = "3897ad46eeef3ab426ab20b9964dd4604f69b31335aefcdf76a3becf04c52079"
 _V13_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 13})
 _V13_SCHEMA_DEFINITION_SHA256 = "eae632323c7be6189ce3116ed09e9be6c679861cb64262ab481247e4e4a0c6bb"
 _V12_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 12})
@@ -214,6 +224,95 @@ _V1_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 1})
 _V1_SCHEMA_DEFINITION_SHA256 = "b3fa83413034992e01f84abf8ffe4993864cfad23b4792442b38b60a47b8dca6"
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS stage_attempts (
+    operation_id TEXT PRIMARY KEY,
+    work_item_id TEXT NOT NULL,
+    attempt INTEGER CHECK (attempt IS NULL OR attempt >= 1),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'completed', 'cancelled')),
+    created_at_utc_ns INTEGER NOT NULL CHECK (created_at_utc_ns >= 0),
+    UNIQUE (work_item_id, operation_id),
+    FOREIGN KEY (work_item_id) REFERENCES work_items(id)
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS stage_attempts_active_work
+ON stage_attempts(work_item_id) WHERE state IN ('pending', 'active');
+
+CREATE INDEX IF NOT EXISTS stage_attempts_work ON stage_attempts(work_item_id);
+
+CREATE TABLE IF NOT EXISTS work_stages (
+    id TEXT PRIMARY KEY,
+    work_item_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    definition_json TEXT NOT NULL CHECK (json_valid(definition_json)),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'completed', 'cancelled')),
+    execution INTEGER NOT NULL DEFAULT 0 CHECK (execution >= 0),
+    eligible_at_utc_ns INTEGER NOT NULL CHECK (eligible_at_utc_ns >= 0),
+    wait_kind TEXT,
+    created_at_utc_ns INTEGER NOT NULL CHECK (created_at_utc_ns >= 0),
+    token TEXT,
+    worker_identifier TEXT,
+    coordination_scope TEXT,
+    lease_expires_at_utc_ns INTEGER,
+    lease_json TEXT CHECK (lease_json IS NULL OR json_valid(lease_json)),
+    FOREIGN KEY (work_item_id, operation_id)
+        REFERENCES stage_attempts(work_item_id, operation_id),
+    CHECK (
+        (state = 'running' AND token IS NOT NULL AND worker_identifier IS NOT NULL
+         AND coordination_scope IS NOT NULL AND lease_expires_at_utc_ns IS NOT NULL
+         AND lease_json IS NOT NULL)
+        OR
+        (state != 'running' AND token IS NULL AND worker_identifier IS NULL
+         AND coordination_scope IS NULL AND lease_expires_at_utc_ns IS NULL
+         AND lease_json IS NULL)
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS work_stages_active_work
+ON work_stages(work_item_id) WHERE state IN ('pending', 'running');
+
+CREATE INDEX IF NOT EXISTS work_stages_ready
+ON work_stages(state, eligible_at_utc_ns, created_at_utc_ns, id);
+
+CREATE INDEX IF NOT EXISTS work_stages_expired
+ON work_stages(coordination_scope, state, lease_expires_at_utc_ns, id);
+
+CREATE TABLE IF NOT EXISTS stage_execution_tokens (
+    token TEXT PRIMARY KEY CHECK (length(token) > 0),
+    stage_id TEXT NOT NULL,
+    execution INTEGER NOT NULL CHECK (execution >= 1),
+    UNIQUE (stage_id, execution),
+    FOREIGN KEY (stage_id) REFERENCES work_stages(id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS stage_dependencies (
+    stage_id TEXT NOT NULL,
+    dependency_work_id TEXT NOT NULL,
+    PRIMARY KEY (stage_id, dependency_work_id),
+    FOREIGN KEY (stage_id) REFERENCES work_stages(id),
+    FOREIGN KEY (dependency_work_id) REFERENCES work_items(id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS stage_inputs (
+    stage_id TEXT NOT NULL,
+    name_parts_json TEXT NOT NULL CHECK (json_valid(name_parts_json)),
+    object_id TEXT NOT NULL,
+    PRIMARY KEY (stage_id, name_parts_json, object_id),
+    FOREIGN KEY (stage_id) REFERENCES work_stages(id),
+    FOREIGN KEY (object_id) REFERENCES objects(id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS stage_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    stage_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL CHECK (length(event_kind) > 0),
+    recorded_at_utc_ns INTEGER NOT NULL CHECK (recorded_at_utc_ns >= 0),
+    data_json TEXT NOT NULL CHECK (json_valid(data_json)),
+    FOREIGN KEY (stage_id) REFERENCES work_stages(id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS stage_events_stage ON stage_events(stage_id, sequence);
+
 CREATE TABLE IF NOT EXISTS resource_budgets (
     scope TEXT NOT NULL CHECK (length(scope) > 0),
     name TEXT NOT NULL CHECK (length(name) > 0),
@@ -869,6 +968,12 @@ class LeaseLostError(RuntimeError):
     """A worker no longer owns an active lease for a work item."""
 
 
+class _StageAdmissionDeferred(Exception):
+    def __init__(self, result: StageClaimResult):
+        super().__init__("Stage admission is not currently available")
+        self.result = result
+
+
 class _SuccessfulItemPageAvailable(Exception):
     def __init__(self, result: SuccessfulItemPageResult):
         super().__init__(result.listing_id)
@@ -886,6 +991,1031 @@ class Database:
 
         async with self._connections.writer():
             yield
+
+    @staticmethod
+    async def _append_stage_event(
+        connection: AsyncConnection,
+        stage_identifier: str,
+        event_kind: str,
+        now_utc_ns: int,
+        data: JsonValue,
+    ) -> None:
+        await connection.execute(
+            "INSERT INTO stage_events(id, stage_id, event_kind, recorded_at_utc_ns, data_json) VALUES (?, ?, ?, ?, ?)",
+            (str(uuid4()), stage_identifier, event_kind, now_utc_ns, _json(data)),
+        )
+
+    async def _register_stage(
+        self,
+        connection: AsyncConnection,
+        definition: StageDefinition,
+        created_at_utc_ns: int,
+        *,
+        continuation: bool = False,
+    ) -> None:
+        serialized = definition.model_dump_json()
+        cursor = await connection.execute(
+            "SELECT definition_json FROM work_stages WHERE id = ?", (definition.identifier,)
+        )
+        existing = await cursor.fetchone()
+        if existing is not None:
+            if existing[0] != serialized:
+                raise ValueError("A stage identifier cannot be reused for another definition")
+            return
+        cursor = await connection.execute(
+            "SELECT state FROM work_items WHERE id = ?", (definition.work_item_identifier,)
+        )
+        work = await cursor.fetchone()
+        if work is None:
+            raise KeyError(definition.work_item_identifier)
+        if work[0] not in {"pending", "leased"}:
+            raise ValueError("Only pending or suspended work can receive a stage")
+        cursor = await connection.execute(
+            "SELECT work_item_id, state FROM stage_attempts WHERE operation_id = ?",
+            (definition.operation_identifier,),
+        )
+        attempt = await cursor.fetchone()
+        if attempt is None:
+            if continuation or work[0] != "pending":
+                raise ValueError("An initial stage requires pending logical work")
+            cursor = await connection.execute(
+                "SELECT 1 FROM stage_attempts WHERE work_item_id = ? AND state IN ('pending', 'active')",
+                (definition.work_item_identifier,),
+            )
+            if await cursor.fetchone() is not None:
+                raise ValueError("Logical work already has an active stage attempt")
+            cursor = await connection.execute(
+                "SELECT 1 FROM operations WHERE id = ?", (definition.operation_identifier,)
+            )
+            if await cursor.fetchone() is not None:
+                raise ValueError("A stage's candidate operation identifier is already in use")
+            await connection.execute(
+                "INSERT INTO stage_attempts VALUES (?, ?, NULL, 'pending', ?)",
+                (
+                    definition.operation_identifier,
+                    definition.work_item_identifier,
+                    created_at_utc_ns,
+                ),
+            )
+        elif (
+            attempt[0] != definition.work_item_identifier
+            or attempt[1] != "active"
+            or not continuation
+        ):
+            raise ValueError("A continuation must belong to the current logical stage attempt")
+        cursor = await connection.execute(
+            "SELECT 1 FROM work_stages WHERE work_item_id = ? AND state IN ('pending', 'running')",
+            (definition.work_item_identifier,),
+        )
+        if await cursor.fetchone() is not None:
+            raise ValueError("Logical work already has a pending or running stage")
+        await connection.execute(
+            """
+            INSERT INTO work_stages(
+                id, work_item_id, operation_id, definition_json, state,
+                eligible_at_utc_ns, created_at_utc_ns
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                definition.identifier,
+                definition.work_item_identifier,
+                definition.operation_identifier,
+                serialized,
+                definition.not_before_utc_ns,
+                created_at_utc_ns,
+            ),
+        )
+        if definition.dependency_work_identifiers:
+            await connection.executemany(
+                "INSERT INTO stage_dependencies VALUES (?, ?)",
+                [(definition.identifier, item) for item in definition.dependency_work_identifiers],
+            )
+        if definition.checkpoint_inputs:
+            await connection.executemany(
+                "INSERT INTO stage_inputs VALUES (?, ?, ?)",
+                [
+                    (definition.identifier, _json(list(item.name)), item.object_identifier)
+                    for item in definition.checkpoint_inputs
+                ],
+            )
+        await self._append_stage_event(
+            connection,
+            definition.identifier,
+            "registered",
+            created_at_utc_ns,
+            {"definition": definition.model_dump(mode="json")},
+        )
+
+    async def register_stage(self, definition: StageDefinition, *, created_at_utc_ns: int) -> None:
+        """Opt work into staged routing without claiming it or creating an operation."""
+
+        if created_at_utc_ns < 0:
+            raise ValueError("Stage registration time must be nonnegative")
+        async with self._connections.writer() as connection:
+            await self._register_stage(connection, definition, created_at_utc_ns)
+
+    async def stage(self, identifier: str) -> StageDefinition:
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT definition_json FROM work_stages WHERE id = ?", (identifier,)
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise KeyError(identifier)
+        return StageDefinition.model_validate_json(_text(row[0]))
+
+    async def _stage_wait(
+        self,
+        connection: AsyncConnection,
+        identifier: str,
+        result: StageClaimResult,
+        now_utc_ns: int,
+    ) -> StageClaimResult:
+        cursor = await connection.execute(
+            "SELECT state, wait_kind FROM work_stages WHERE id = ?", (identifier,)
+        )
+        row = await cursor.fetchone()
+        if row is not None and row[0] == "pending":
+            kind = None if result.wait_kind is None else result.wait_kind.value
+            await connection.execute(
+                "UPDATE work_stages SET wait_kind = ?, eligible_at_utc_ns = ? WHERE id = ?",
+                (kind, result.next_eligible_at_utc_ns or now_utc_ns, identifier),
+            )
+            if row[1] != kind:
+                await self._append_stage_event(
+                    connection,
+                    identifier,
+                    "waiting",
+                    now_utc_ns,
+                    {"wait_kind": kind, "next_eligible_at_utc_ns": result.next_eligible_at_utc_ns},
+                )
+        return result
+
+    async def _resume_stage_work(
+        self,
+        connection: AsyncConnection,
+        definition: StageDefinition,
+        *,
+        token: str,
+        worker_identifier: str,
+        now_utc_ns: int,
+        lease_duration_ns: int,
+        network_stage: bool,
+    ) -> WorkLease:
+        cursor = await connection.execute(
+            """
+            SELECT state, lease_expires_at_utc_ns, attempt, kind_parts_json,
+                   payload_schema_version, payload_json
+            FROM work_items WHERE id = ?
+            """,
+            (definition.work_item_identifier,),
+        )
+        work = await cursor.fetchone()
+        if work is None:
+            raise KeyError(definition.work_item_identifier)
+        if work[0] != "leased" or _integer(work[1]) > now_utc_ns:
+            raise _StageAdmissionDeferred(
+                StageClaimResult(
+                    lease=None,
+                    wait_kind=StageWaitKind.OWNERSHIP,
+                    next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
+                )
+            )
+        kind = tuple(str(part) for part in cast(list[JsonValue], decode_json(_text(work[3]))))
+        payload = decode_json(_text(work[5]))
+        if network_stage:
+            cooldown_until = 0
+            if kind == COLLECT_EBAY_SEARCH_WORK_KIND:
+                stack = _ebay_search_stack_identifier(payload)
+                cooldowns = await self._ebay_search_stack_cooldowns(connection, now_utc_ns)
+                cooldown_until = cooldowns.get(stack, 0) if stack is not None else 0
+            elif kind == COLLECT_SEARCH_WORK_KIND:
+                routing = payload.get("routing") if isinstance(payload, dict) else None
+                cooldowns = await self._facebook_search_route_cooldowns(connection, now_utc_ns)
+                cooldown_until = cooldowns.get(_json(routing), 0)
+            if cooldown_until > now_utc_ns:
+                raise _StageAdmissionDeferred(
+                    StageClaimResult(
+                        lease=None,
+                        wait_kind=StageWaitKind.TIME,
+                        next_eligible_at_utc_ns=cooldown_until,
+                    )
+                )
+        available, next_eligible, _ = await self._constraint_availability(
+            connection,
+            work_item_identifier=definition.work_item_identifier,
+            now_utc_ns=now_utc_ns,
+            check_rates=False,
+        )
+        if not available:
+            raise _StageAdmissionDeferred(
+                StageClaimResult(
+                    lease=None,
+                    wait_kind=StageWaitKind.OWNERSHIP,
+                    next_eligible_at_utc_ns=min(
+                        next_eligible or now_utc_ns + 100_000_000, now_utc_ns + 100_000_000
+                    ),
+                )
+            )
+        resource = acquisition_resource_identity(kind, payload)
+        if resource is not None:
+            cursor = await connection.execute(
+                "SELECT payload_json FROM work_items WHERE kind_parts_json = ? AND id != ? AND state IN ('leased','cancelling') AND lease_expires_at_utc_ns > ?",
+                (_text(work[3]), definition.work_item_identifier, now_utc_ns),
+            )
+            if any(
+                acquisition_resource_identity(kind, decode_json(_text(row[0]))) == resource
+                for row in await cursor.fetchall()
+            ):
+                raise _StageAdmissionDeferred(
+                    StageClaimResult(
+                        lease=None,
+                        wait_kind=StageWaitKind.OWNERSHIP,
+                        next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
+                    )
+                )
+        expires = now_utc_ns + lease_duration_ns
+        await connection.execute(
+            "UPDATE work_items SET lease_token = ?, lease_owner = ?, lease_expires_at_utc_ns = ? WHERE id = ?",
+            (token, worker_identifier, expires, definition.work_item_identifier),
+        )
+        await connection.execute(
+            """
+            UPDATE work_operations SET lease_token = ?, worker_identifier = ?
+            WHERE operation_id = ? AND work_item_id = ? AND attempt = ?
+              AND EXISTS (SELECT 1 FROM operations WHERE id = ? AND state = 'started')
+            """,
+            (
+                token,
+                worker_identifier,
+                definition.operation_identifier,
+                definition.work_item_identifier,
+                _integer(work[2]),
+                definition.operation_identifier,
+            ),
+        )
+        if await connection.changes() != 1:
+            raise LeaseLostError("The staged logical operation is no longer active")
+        return WorkLease(
+            work_item_identifier=definition.work_item_identifier,
+            token=token,
+            worker_identifier=worker_identifier,
+            attempt=_integer(work[2]),
+            expires_at_utc_ns=expires,
+            kind=kind,
+            payload_schema_version=_integer(work[4]),
+            payload=decode_json(_text(work[5])),
+        )
+
+    async def try_claim_stage(
+        self,
+        *,
+        stage_identifier: str,
+        token: str,
+        worker_identifier: str,
+        resource_scope: str,
+        capacities: dict[str, int],
+        lease_duration_ns: int,
+        now_utc_ns: int,
+        component: Component,
+        provenance: CodeProvenance,
+        invocation: dict[str, JsonValue],
+    ) -> StageClaimResult:
+        """Atomically reserve execution, work, resources and HTTP admission, or none."""
+
+        if now_utc_ns < 0 or lease_duration_ns <= 0:
+            raise ValueError("Stage claim timestamps are invalid")
+        if any(
+            not value or value != value.strip()
+            for value in (token, worker_identifier, resource_scope)
+        ):
+            raise ValueError("Stage execution identities must be nonempty and trimmed")
+        async with self._connections.writer() as connection:
+            cursor = await connection.execute(
+                "SELECT definition_json, state, execution, eligible_at_utc_ns, wait_kind, created_at_utc_ns FROM work_stages WHERE id = ?",
+                (stage_identifier,),
+            )
+            stage = await cursor.fetchone()
+            if stage is None:
+                raise KeyError(stage_identifier)
+            definition = StageDefinition.model_validate_json(_text(stage[0]))
+            if stage[1] != "pending":
+                return StageClaimResult(
+                    lease=None,
+                    wait_kind=StageWaitKind.OWNERSHIP,
+                    next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
+                )
+            cursor = await connection.execute(
+                "SELECT state, eligible_at_utc_ns, kind_parts_json, payload_schema_version FROM work_items WHERE id = ?",
+                (definition.work_item_identifier,),
+            )
+            work = await cursor.fetchone()
+            assert work is not None
+            if work[0] not in {"pending", "leased"}:
+                return StageClaimResult(lease=None, wait_kind=StageWaitKind.OWNERSHIP)
+            eligible = max(definition.not_before_utc_ns, _integer(work[1]))
+            if eligible > now_utc_ns:
+                return await self._stage_wait(
+                    connection,
+                    stage_identifier,
+                    StageClaimResult(
+                        lease=None, wait_kind=StageWaitKind.TIME, next_eligible_at_utc_ns=eligible
+                    ),
+                    now_utc_ns,
+                )
+            cursor = await connection.execute(
+                """
+                SELECT 1 FROM stage_dependencies AS dependency
+                JOIN work_items AS work ON work.id = dependency.dependency_work_id
+                WHERE dependency.stage_id = ?
+                  AND work.state NOT IN ('completed','terminal_failure','cancelled') LIMIT 1
+                """,
+                (stage_identifier,),
+            )
+            if await cursor.fetchone() is not None:
+                return await self._stage_wait(
+                    connection,
+                    stage_identifier,
+                    StageClaimResult(
+                        lease=None,
+                        wait_kind=StageWaitKind.DEPENDENCY,
+                        next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
+                    ),
+                    now_utc_ns,
+                )
+            network_stage = definition.network_activity is not None or any(
+                request.name == "http" for request in definition.resources
+            )
+            if network_stage:
+                cursor = await connection.execute(
+                    "SELECT paused, next_probe_utc_ns FROM network_connectivity WHERE singleton = 1"
+                )
+                connectivity = await cursor.fetchone()
+                if connectivity is not None and connectivity[0] == 1:
+                    return await self._stage_wait(
+                        connection,
+                        stage_identifier,
+                        StageClaimResult(
+                            lease=None,
+                            wait_kind=StageWaitKind.CONNECTIVITY,
+                            next_eligible_at_utc_ns=max(
+                                now_utc_ns + 100_000_000, _integer(connectivity[1])
+                            ),
+                        ),
+                        now_utc_ns,
+                    )
+            execution = _integer(stage[2]) + 1
+            try:
+                # Nested writer is a savepoint: unavailable HTTP/resource admission
+                # rolls back work attempts, operations and all reservations together.
+                async with self._connections.writer():
+                    cursor = await connection.execute(
+                        "SELECT 1 FROM stage_execution_tokens WHERE token = ? UNION ALL SELECT 1 FROM resource_permits WHERE token = ? LIMIT 1",
+                        (token, token),
+                    )
+                    if await cursor.fetchone() is not None:
+                        raise ValueError("Stage execution tokens may never be reused")
+                    resource_lease = None
+                    if definition.resources:
+                        resource_lease = await self.try_acquire_resource_permit(
+                            scope=resource_scope,
+                            token=token,
+                            owner=worker_identifier,
+                            requests=definition.resources,
+                            capacities=capacities,
+                            now_utc_ns=now_utc_ns,
+                            lease_duration_ns=lease_duration_ns,
+                        )
+                        if resource_lease is None:
+                            raise _StageAdmissionDeferred(
+                                StageClaimResult(
+                                    lease=None,
+                                    wait_kind=StageWaitKind.RESOURCE,
+                                    next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
+                                )
+                            )
+                    cursor = await connection.execute(
+                        "SELECT state FROM stage_attempts WHERE operation_id = ?",
+                        (definition.operation_identifier,),
+                    )
+                    attempt = await cursor.fetchone()
+                    assert attempt is not None
+                    if attempt[0] == "pending":
+                        claim = await self.claim_work(
+                            supported_capabilities=(
+                                WorkCapability(
+                                    kind=tuple(
+                                        str(part)
+                                        for part in cast(
+                                            list[JsonValue], decode_json(_text(work[2]))
+                                        )
+                                    ),
+                                    payload_schema_version=_integer(work[3]),
+                                ),
+                            ),
+                            worker_identifier=worker_identifier,
+                            lease_token=token,
+                            lease_duration_ns=lease_duration_ns,
+                            utc_now_ns=lambda: now_utc_ns,
+                            event_identifier=str(uuid4()),
+                            eligible_identifiers=(definition.work_item_identifier,),
+                            _include_staged=True,
+                            _stage_has_network=network_stage,
+                        )
+                        if claim.lease is None:
+                            raise _StageAdmissionDeferred(
+                                StageClaimResult(
+                                    lease=None,
+                                    wait_kind=StageWaitKind.OWNERSHIP,
+                                    next_eligible_at_utc_ns=claim.next_eligible_at_utc_ns
+                                    or now_utc_ns + 100_000_000,
+                                )
+                            )
+                        work_lease = claim.lease
+                        await self.begin_leased_operation(
+                            work_item_identifier=definition.work_item_identifier,
+                            lease_token=token,
+                            worker_identifier=worker_identifier,
+                            lease_duration_ns=lease_duration_ns,
+                            utc_now_ns=lambda: now_utc_ns,
+                            event_identifier=str(uuid4()),
+                            operation_id=definition.operation_identifier,
+                            component=component,
+                            provenance=provenance,
+                            invocation=invocation,
+                            configuration={"stage": definition.model_dump(mode="json")},
+                            started_at_utc=_utc_text_from_ns(now_utc_ns),
+                            inputs=tuple(
+                                (item.name, item.object_identifier)
+                                for item in definition.checkpoint_inputs
+                            ),
+                        )
+                        # begin_leased_operation may extend the initial work fence.
+                        cursor = await connection.execute(
+                            "SELECT lease_expires_at_utc_ns FROM work_items WHERE id = ?",
+                            (definition.work_item_identifier,),
+                        )
+                        expiry = await cursor.fetchone()
+                        assert expiry is not None
+                        work_lease = work_lease.model_copy(
+                            update={"expires_at_utc_ns": _integer(expiry[0])}
+                        )
+                        await connection.execute(
+                            "UPDATE stage_attempts SET state = 'active', attempt = ? WHERE operation_id = ?",
+                            (work_lease.attempt, definition.operation_identifier),
+                        )
+                    elif attempt[0] == "active":
+                        work_lease = await self._resume_stage_work(
+                            connection,
+                            definition,
+                            token=token,
+                            worker_identifier=worker_identifier,
+                            now_utc_ns=now_utc_ns,
+                            lease_duration_ns=lease_duration_ns,
+                            network_stage=network_stage,
+                        )
+                    else:
+                        raise LeaseLostError("The logical stage attempt has already finished")
+                    network_admission = None
+                    network = stage_network_activity(definition, execution)
+                    if network is not None:
+                        await self.create_network_activity(
+                            network,
+                            created_at_utc_ns=_integer(stage[5]),
+                            event_identifier=str(uuid4()),
+                            sample_uniform_holdoff_ns=lambda minimum, maximum: (
+                                minimum
+                                + int(
+                                    hashlib.sha256(
+                                        f"{stage_identifier}:{execution}:{minimum}:{maximum}".encode()
+                                    ).hexdigest(),
+                                    16,
+                                )
+                                % (maximum - minimum + 1)
+                            ),
+                        )
+                        admitted = await self.try_admit_network_activity(
+                            network_activity_identifier=network.identifier,
+                            admission_token=token,
+                            permit_duration_ns=lease_duration_ns,
+                            now_utc_ns=now_utc_ns,
+                            event_identifier=str(uuid4()),
+                        )
+                        if admitted.admission is None:
+                            raise _StageAdmissionDeferred(
+                                StageClaimResult(
+                                    lease=None,
+                                    wait_kind=StageWaitKind.TIME,
+                                    next_eligible_at_utc_ns=admitted.next_eligible_at_utc_ns
+                                    or now_utc_ns + 100_000_000,
+                                )
+                            )
+                        network_admission = admitted.admission
+                    lease = StageLease(
+                        definition=definition,
+                        coordination_scope=resource_scope,
+                        token=token,
+                        execution=execution,
+                        work_lease=work_lease,
+                        resource_lease=resource_lease,
+                        network_admission=network_admission,
+                    )
+                    await connection.execute(
+                        "INSERT INTO stage_execution_tokens VALUES (?, ?, ?)",
+                        (token, stage_identifier, execution),
+                    )
+                    expires = min(
+                        work_lease.expires_at_utc_ns,
+                        resource_lease.expires_at_utc_ns
+                        if resource_lease is not None
+                        else work_lease.expires_at_utc_ns,
+                        network_admission.permit_expires_at_utc_ns
+                        if network_admission is not None
+                        else work_lease.expires_at_utc_ns,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE work_stages SET state = 'running', execution = ?, token = ?,
+                            worker_identifier = ?, coordination_scope = ?,
+                            lease_expires_at_utc_ns = ?, lease_json = ?, wait_kind = NULL
+                        WHERE id = ? AND state = 'pending'
+                        """,
+                        (
+                            execution,
+                            token,
+                            worker_identifier,
+                            resource_scope,
+                            expires,
+                            lease.model_dump_json(),
+                            stage_identifier,
+                        ),
+                    )
+                    await self._append_stage_event(
+                        connection,
+                        stage_identifier,
+                        "claimed",
+                        now_utc_ns,
+                        {
+                            "lease": lease.model_dump(mode="json"),
+                            "component_parts": list(component.identifier.parts),
+                            "output_schema_version": component.output_schema_version,
+                            "code_provenance": provenance.model_dump(mode="json"),
+                            "invocation": invocation,
+                        },
+                    )
+                    return StageClaimResult(lease=lease)
+            except _StageAdmissionDeferred as deferred:
+                return await self._stage_wait(
+                    connection, stage_identifier, deferred.result, now_utc_ns
+                )
+
+    @staticmethod
+    async def _stage_execution_owned(connection: AsyncConnection, lease: StageLease) -> bool:
+        cursor = await connection.execute(
+            """
+            SELECT 1 FROM work_stages WHERE id = ? AND state = 'running'
+              AND token = ? AND execution = ? AND worker_identifier = ?
+              AND coordination_scope = ? AND definition_json = ?
+            """,
+            (
+                lease.definition.identifier,
+                lease.token,
+                lease.execution,
+                lease.work_lease.worker_identifier,
+                lease.coordination_scope,
+                lease.definition.model_dump_json(),
+            ),
+        )
+        return await cursor.fetchone() is not None
+
+    async def validate_stage(self, lease: StageLease, *, now_utc_ns: int) -> bool:
+        """Validate all publication fences, joining an existing writer transaction."""
+
+        if now_utc_ns < 0:
+            raise ValueError("Stage validation time must be nonnegative")
+        async with self._connections.reader() as connection:
+            if not await self._stage_execution_owned(connection, lease):
+                return False
+            cursor = await connection.execute(
+                "SELECT lease_expires_at_utc_ns FROM work_stages WHERE id = ?",
+                (lease.definition.identifier,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            if _integer(row[0]) <= now_utc_ns:
+                return False
+            try:
+                attempt, _ = await self._require_active_lease(
+                    connection,
+                    work_item_identifier=lease.definition.work_item_identifier,
+                    lease_token=lease.token,
+                    worker_identifier=lease.work_lease.worker_identifier,
+                    now_utc_ns=now_utc_ns,
+                )
+                if attempt != lease.work_lease.attempt:
+                    return False
+                await self._require_bound_operation(
+                    connection,
+                    operation_id=lease.definition.operation_identifier,
+                    work_item_identifier=lease.definition.work_item_identifier,
+                    attempt=attempt,
+                    lease_token=lease.token,
+                    worker_identifier=lease.work_lease.worker_identifier,
+                )
+            except (LeaseLostError, WorkCancellationRequestedError):
+                return False
+            cursor = await connection.execute(
+                "SELECT 1 FROM operations WHERE id = ? AND state = 'started'",
+                (lease.definition.operation_identifier,),
+            )
+            if await cursor.fetchone() is None:
+                return False
+            if lease.resource_lease is not None and not await self.validate_resource_permit(
+                token=lease.token, owner=lease.resource_lease.owner, now_utc_ns=now_utc_ns
+            ):
+                return False
+            if lease.network_admission is not None:
+                cursor = await connection.execute(
+                    """
+                    SELECT 1 FROM network_activities
+                    WHERE id = ? AND state = 'admitted' AND admission_token = ?
+                      AND permit_expires_at_utc_ns > ?
+                    """,
+                    (lease.network_admission.activity_identifier, lease.token, now_utc_ns),
+                )
+                if await cursor.fetchone() is None:
+                    return False
+            return True
+
+    async def renew_stage(
+        self, lease: StageLease, *, now_utc_ns: int, lease_duration_ns: int
+    ) -> StageLease | None:
+        """Renew execution, work, resource and network fences in one transaction."""
+
+        if now_utc_ns < 0 or lease_duration_ns <= 0:
+            raise ValueError("Stage renewal timestamps are invalid")
+        async with self._connections.writer() as connection:
+            if not await self.validate_stage(lease, now_utc_ns=now_utc_ns):
+                return None
+            cursor = await connection.execute(
+                "SELECT lease_json FROM work_stages WHERE id = ?", (lease.definition.identifier,)
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            current = StageLease.model_validate_json(_text(row[0]))
+            expires = max(current.work_lease.expires_at_utc_ns, now_utc_ns + lease_duration_ns)
+            resource = current.resource_lease
+            if resource is not None:
+                resource = await self.renew_resource_permit(
+                    token=lease.token,
+                    owner=resource.owner,
+                    now_utc_ns=now_utc_ns,
+                    lease_duration_ns=expires - now_utc_ns,
+                )
+                assert resource is not None
+            network = current.network_admission
+            if network is not None:
+                await connection.execute(
+                    "UPDATE network_activities SET permit_expires_at_utc_ns = ? WHERE id = ? AND admission_token = ? AND state = 'admitted'",
+                    (expires, network.activity_identifier, lease.token),
+                )
+                if await connection.changes() != 1:
+                    raise LeaseLostError("Network stage ownership changed during renewal")
+                network = network.model_copy(update={"permit_expires_at_utc_ns": expires})
+            await connection.execute(
+                "UPDATE work_items SET lease_expires_at_utc_ns = ? WHERE id = ? AND lease_token = ? AND lease_owner = ?",
+                (
+                    expires,
+                    lease.definition.work_item_identifier,
+                    lease.token,
+                    lease.work_lease.worker_identifier,
+                ),
+            )
+            renewed = current.model_copy(
+                update={
+                    "work_lease": current.work_lease.model_copy(
+                        update={"expires_at_utc_ns": expires}
+                    ),
+                    "resource_lease": resource,
+                    "network_admission": network,
+                }
+            )
+            await connection.execute(
+                "UPDATE work_stages SET lease_expires_at_utc_ns = ?, lease_json = ? WHERE id = ? AND token = ?",
+                (expires, renewed.model_dump_json(), lease.definition.identifier, lease.token),
+            )
+            await self._append_stage_event(
+                connection,
+                lease.definition.identifier,
+                "renewed",
+                now_utc_ns,
+                {"token": lease.token, "execution": lease.execution, "expires_at_utc_ns": expires},
+            )
+            return renewed
+
+    async def _finish_stage_network(
+        self,
+        connection: AsyncConnection,
+        lease: StageLease,
+        *,
+        now_utc_ns: int,
+        state: NetworkActivityState,
+        result: JsonValue,
+    ) -> None:
+        if lease.network_admission is None:
+            return
+        cursor = await connection.execute(
+            "SELECT state, admission_token FROM network_activities WHERE id = ?",
+            (lease.network_admission.activity_identifier,),
+        )
+        row = await cursor.fetchone()
+        if row is not None and row[0] == "admitted" and row[1] == lease.token:
+            await self.finish_network_activity(
+                network_activity_identifier=lease.network_admission.activity_identifier,
+                admission_token=lease.token,
+                state=state,
+                ended_at_utc_ns=now_utc_ns,
+                result=result,
+                event_identifier=str(uuid4()),
+            )
+
+    @staticmethod
+    async def _clear_stage_execution(
+        connection: AsyncConnection,
+        identifier: str,
+        *,
+        state: str,
+        eligible_at_utc_ns: int,
+        wait_kind: StageWaitKind | None = None,
+    ) -> None:
+        await connection.execute(
+            """
+            UPDATE work_stages SET state = ?, token = NULL, worker_identifier = NULL,
+                coordination_scope = NULL, lease_expires_at_utc_ns = NULL, lease_json = NULL,
+                eligible_at_utc_ns = ?, wait_kind = ? WHERE id = ?
+            """,
+            (state, eligible_at_utc_ns, None if wait_kind is None else wait_kind.value, identifier),
+        )
+
+    async def suspend_stage(
+        self,
+        lease: StageLease,
+        wait: WaitWork,
+        *,
+        now_utc_ns: int,
+        records: Sequence[RecordDraft] = (),
+        artifacts: Sequence[ArtifactDraft] = (),
+        outputs: Sequence[NamedOutput] = (),
+        inputs: Sequence[NamedInput] = (),
+    ) -> None:
+        """Publish a checkpoint and continuation without spending an acquisition attempt."""
+
+        continuation = wait.continuation
+        if (
+            continuation.work_item_identifier != lease.definition.work_item_identifier
+            or continuation.operation_identifier != lease.definition.operation_identifier
+        ):
+            raise ValueError("A continuation must retain its logical work and operation")
+        if (
+            continuation.identifier == lease.definition.identifier
+            and continuation != lease.definition
+        ):
+            raise ValueError("A changed continuation requires a fresh stage identifier")
+        async with self._connections.writer() as connection:
+            if not await self.validate_stage(lease, now_utc_ns=now_utc_ns):
+                raise LeaseLostError("The stage no longer owns its execution")
+            await self.publish_leased_operation_checkpoint(
+                work_item_identifier=lease.definition.work_item_identifier,
+                lease_token=lease.token,
+                worker_identifier=lease.work_lease.worker_identifier,
+                utc_now_ns=lambda: now_utc_ns,
+                operation_id=lease.definition.operation_identifier,
+                records=records,
+                artifacts=artifacts,
+                outputs=outputs,
+                inputs=inputs,
+                checkpoint_result=wait.result,
+            )
+            await self._finish_stage_network(
+                connection,
+                lease,
+                now_utc_ns=now_utc_ns,
+                state=NetworkActivityState.COMPLETED,
+                result={"kind": "stage_suspended"},
+            )
+            same_stage = continuation.identifier == lease.definition.identifier
+            await self._clear_stage_execution(
+                connection,
+                lease.definition.identifier,
+                state="pending" if same_stage else "completed",
+                eligible_at_utc_ns=max(now_utc_ns, continuation.not_before_utc_ns),
+                wait_kind=wait.wait_kind if same_stage else None,
+            )
+            await connection.execute(
+                "UPDATE work_items SET lease_expires_at_utc_ns = ? WHERE id = ? AND lease_token = ?",
+                (now_utc_ns, lease.definition.work_item_identifier, lease.token),
+            )
+            if not same_stage:
+                await self._register_stage(connection, continuation, now_utc_ns, continuation=True)
+                await connection.execute(
+                    "UPDATE work_stages SET wait_kind = ? WHERE id = ?",
+                    (wait.wait_kind.value, continuation.identifier),
+                )
+            await self._append_stage_event(
+                connection,
+                lease.definition.identifier,
+                "suspended",
+                now_utc_ns,
+                {
+                    "token": lease.token,
+                    "execution": lease.execution,
+                    "continuation": continuation.identifier,
+                    "wait_kind": wait.wait_kind.value,
+                },
+            )
+
+    async def complete_stage(self, lease: StageLease, *, now_utc_ns: int) -> None:
+        """Fence finalization before logical publication in the caller's same transaction."""
+
+        async with self._connections.writer() as connection:
+            if not await self.validate_stage(lease, now_utc_ns=now_utc_ns):
+                raise LeaseLostError("The stage no longer owns its execution")
+            await self._finish_stage_network(
+                connection,
+                lease,
+                now_utc_ns=now_utc_ns,
+                state=NetworkActivityState.COMPLETED,
+                result={"kind": "stage_completed"},
+            )
+            await self._clear_stage_execution(
+                connection,
+                lease.definition.identifier,
+                state="completed",
+                eligible_at_utc_ns=now_utc_ns,
+            )
+            await connection.execute(
+                "UPDATE stage_attempts SET state = 'completed' WHERE operation_id = ?",
+                (lease.definition.operation_identifier,),
+            )
+            await self._append_stage_event(
+                connection,
+                lease.definition.identifier,
+                "completed",
+                now_utc_ns,
+                {"token": lease.token, "execution": lease.execution},
+            )
+
+    async def release_stage_execution(
+        self, lease: StageLease, *, now_utc_ns: int, reason: JsonValue
+    ) -> bool:
+        """Reset a current executor after physical cleanup, including after expiry.
+
+        A stale finalizer never resets a replacement executor or masks its error.
+        """
+
+        if now_utc_ns < 0:
+            raise ValueError("Stage release time must be nonnegative")
+        async with self._connections.writer() as connection:
+            if not await self._stage_execution_owned(connection, lease):
+                return False
+            cursor = await connection.execute(
+                "SELECT state, lease_token, lease_owner FROM work_items WHERE id = ?",
+                (lease.definition.work_item_identifier,),
+            )
+            work = await cursor.fetchone()
+            if (
+                work is None
+                or work[1] != lease.token
+                or work[2] != lease.work_lease.worker_identifier
+            ):
+                return False
+            if work[0] == "cancelling":
+                await self.finalize_cancelled_work(
+                    work_item_identifier=lease.definition.work_item_identifier,
+                    lease_token=lease.token,
+                    worker_identifier=lease.work_lease.worker_identifier,
+                    operation_id=lease.definition.operation_identifier,
+                    utc_now_ns=lambda: now_utc_ns,
+                    event_identifier=str(uuid4()),
+                    ended_at_utc=_utc_text_from_ns(now_utc_ns),
+                    duration_ns=0,
+                )
+                await self._cancel_staged_work(
+                    connection, lease.definition.work_item_identifier, now_utc_ns
+                )
+                return True
+            if work[0] != "leased":
+                return False
+            await self._finish_stage_network(
+                connection,
+                lease,
+                now_utc_ns=now_utc_ns,
+                state=NetworkActivityState.FAILED,
+                result={"kind": "stage_released", "reason": reason},
+            )
+            await self._clear_stage_execution(
+                connection,
+                lease.definition.identifier,
+                state="pending",
+                eligible_at_utc_ns=now_utc_ns,
+                wait_kind=StageWaitKind.OWNERSHIP,
+            )
+            await connection.execute(
+                "UPDATE work_items SET lease_expires_at_utc_ns = ? WHERE id = ? AND lease_token = ?",
+                (now_utc_ns, lease.definition.work_item_identifier, lease.token),
+            )
+            await self._append_stage_event(
+                connection,
+                lease.definition.identifier,
+                "released",
+                now_utc_ns,
+                {"token": lease.token, "execution": lease.execution, "reason": reason},
+            )
+            return True
+
+    async def expired_stage_executions(
+        self, *, coordination_scope: str, now_utc_ns: int
+    ) -> tuple[StageLease, ...]:
+        """List expired executors only in the caller's local physical coordination scope."""
+
+        if not coordination_scope or now_utc_ns < 0:
+            raise ValueError("Expired stage lookup requires a scope and nonnegative time")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT lease_json FROM work_stages
+                WHERE state = 'running' AND coordination_scope = ? AND lease_expires_at_utc_ns <= ?
+                ORDER BY lease_expires_at_utc_ns, id
+                """,
+                (coordination_scope, now_utc_ns),
+            )
+            return tuple(
+                StageLease.model_validate_json(_text(row[0])) for row in await cursor.fetchall()
+            )
+
+    async def recover_stage_execution(self, lease: StageLease, *, now_utc_ns: int) -> bool:
+        """Recover after the caller holds the expired execution's OS guard through commit."""
+
+        if now_utc_ns < 0:
+            raise ValueError("Stage recovery time must be nonnegative")
+        async with self._connections.writer() as connection:
+            if not await self._stage_execution_owned(connection, lease):
+                return False
+            cursor = await connection.execute(
+                "SELECT lease_expires_at_utc_ns FROM work_stages WHERE id = ?",
+                (lease.definition.identifier,),
+            )
+            stage = await cursor.fetchone()
+            assert stage is not None
+            if _integer(stage[0]) > now_utc_ns:
+                return False
+            cursor = await connection.execute(
+                "SELECT lease_token, lease_owner FROM work_items WHERE id = ?",
+                (lease.definition.work_item_identifier,),
+            )
+            work = await cursor.fetchone()
+            if (
+                work is None
+                or work[0] != lease.token
+                or work[1] != lease.work_lease.worker_identifier
+            ):
+                return False
+            if lease.resource_lease is not None:
+                # The held guard proves physical execution ended, independently
+                # of timestamps or how the old process stopped renewing.
+                await self.release_resource_permit(
+                    token=lease.token, owner=lease.resource_lease.owner
+                )
+            released = await self.release_stage_execution(
+                lease, now_utc_ns=now_utc_ns, reason={"kind": "expired_executor_guard_recovered"}
+            )
+            if released:
+                await self._append_stage_event(
+                    connection,
+                    lease.definition.identifier,
+                    "recovered",
+                    now_utc_ns,
+                    {"token": lease.token, "execution": lease.execution},
+                )
+            return released
+
+    async def _cancel_staged_work(
+        self, connection: AsyncConnection, work_item_identifier: str, now_utc_ns: int
+    ) -> None:
+        cursor = await connection.execute(
+            "SELECT id FROM work_stages WHERE work_item_id = ? AND state IN ('pending','running')",
+            (work_item_identifier,),
+        )
+        for stage in await cursor.fetchall():
+            identifier = _text(stage[0])
+            await self._clear_stage_execution(
+                connection, identifier, state="cancelled", eligible_at_utc_ns=now_utc_ns
+            )
+            await self._append_stage_event(connection, identifier, "cancelled", now_utc_ns, {})
+        await connection.execute(
+            "UPDATE stage_attempts SET state = 'cancelled' WHERE work_item_id = ? AND state IN ('pending','active')",
+            (work_item_identifier,),
+        )
 
     @staticmethod
     async def _resource_lease_from_row(
@@ -1251,6 +2381,14 @@ class Database:
         }
 
     @staticmethod
+    def _v14_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V14_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "14",
+            "schema_definition_sha256": _V14_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v7_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V7_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -1303,6 +2441,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v14_metadata())
                 and not await cls._metadata_matches(connection, cls._v13_metadata())
                 and not await cls._metadata_matches(connection, cls._v12_metadata())
                 and not await cls._metadata_matches(connection, cls._v11_metadata())
@@ -1724,6 +2863,12 @@ class Database:
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
                     )
             if await self._metadata_matches(connection, self._v13_metadata()):
+                await connection.execute(_SCHEMA)
+                for key, value in self._v14_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v14_metadata()):
                 await connection.execute(_SCHEMA)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
@@ -3087,11 +4232,37 @@ class Database:
                 recorded_at_utc_ns=requested_at_utc_ns,
                 data=data,
             )
-            if state == "pending":
+            cursor = await connection.execute(
+                """
+                SELECT attempt.operation_id FROM stage_attempts AS attempt
+                WHERE attempt.work_item_id = ? AND attempt.state = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM work_stages AS stage
+                      WHERE stage.work_item_id = attempt.work_item_id AND stage.state = 'running'
+                  )
+                """,
+                (identifier,),
+            )
+            suspended_stage = await cursor.fetchone()
+            if state == "pending" or suspended_stage is not None:
                 await connection.execute(
-                    "UPDATE work_items SET state='cancelled',error_json=NULL WHERE id=?",
+                    "UPDATE work_items SET state='cancelled',error_json=NULL,lease_token=NULL,lease_owner=NULL,lease_expires_at_utc_ns=NULL WHERE id=?",
                     (identifier,),
                 )
+                if suspended_stage is not None:
+                    await connection.execute(
+                        """
+                        UPDATE operations SET state = 'completed', ended_at_utc = ?, duration_ns = 0,
+                            result_json = ?, error_json = NULL
+                        WHERE id = ? AND state = 'started'
+                        """,
+                        (
+                            _utc_text_from_ns(requested_at_utc_ns),
+                            _json({"state": "cancelled"}),
+                            suspended_stage[0],
+                        ),
+                    )
+                await self._cancel_staged_work(connection, identifier, requested_at_utc_ns)
                 await self._append_work_event(
                     connection,
                     event_identifier=str(uuid4()),
@@ -3279,6 +4450,7 @@ class Database:
                 "UPDATE work_items SET state='cancelled',lease_token=NULL,lease_owner=NULL,lease_expires_at_utc_ns=NULL WHERE id=?",
                 (work_item_identifier,),
             )
+            await self._cancel_staged_work(connection, work_item_identifier, now)
             cursor = await connection.execute(
                 "SELECT reason,caller FROM work_cancellation_requests WHERE work_item_id=?",
                 (work_item_identifier,),
@@ -3463,6 +4635,7 @@ class Database:
         *,
         work_item_identifier: str,
         now_utc_ns: int,
+        check_rates: bool = True,
     ) -> tuple[bool, int | None, tuple[Constraint, ...]]:
         constraints = await self._constraints_for_work(connection, work_item_identifier)
         next_eligible: int | None = None
@@ -3496,7 +4669,7 @@ class Database:
                         next_eligible = (
                             expiry if next_eligible is None else min(next_eligible, expiry)
                         )
-            elif isinstance(constraint, SlidingWindowRateConstraint):
+            elif check_rates and isinstance(constraint, SlidingWindowRateConstraint):
                 threshold = now_utc_ns - constraint.period_ns
                 cursor = await connection.execute(
                     """
@@ -3529,6 +4702,8 @@ class Database:
         utc_now_ns: Callable[[], int],
         event_identifier: str,
         eligible_identifiers: Sequence[str] | None = None,
+        _include_staged: bool = False,
+        _stage_has_network: bool | None = None,
     ) -> ClaimResult:
         """Claim one eligible item and reserve all applicable permits atomically."""
 
@@ -3547,13 +4722,24 @@ class Database:
         identifier_predicate = (
             "AND id IN (SELECT value FROM json_each(?))" if eligible_identifiers is not None else ""
         )
+        staged_predicate = (
+            ""
+            if _include_staged
+            else "AND NOT EXISTS (SELECT 1 FROM stage_attempts WHERE work_item_id = work_items.id)"
+        )
         identifier_bindings: tuple[apsw.SQLiteValue, ...] = (
             (_json(list(eligible_identifiers)),) if eligible_identifiers is not None else ()
         )
         async with self._connections.writer() as connection:
             now_utc_ns = utc_now_ns()
             expired = await connection.execute(
-                "SELECT id,lease_token,lease_owner FROM work_items WHERE state='cancelling' AND lease_expires_at_utc_ns<=?",
+                """
+                SELECT id,lease_token,lease_owner FROM work_items
+                WHERE state='cancelling' AND lease_expires_at_utc_ns<=?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM stage_attempts WHERE work_item_id = work_items.id
+                  )
+                """,
                 (now_utc_ns,),
             )
             for cancelled in await expired.fetchall():
@@ -3616,6 +4802,7 @@ class Database:
                       )
                       AND ({capability_predicate})
                       {identifier_predicate}
+                      {staged_predicate}
                 ),
                 representatives AS (
                     SELECT *, row_number() OVER (
@@ -3663,17 +4850,22 @@ class Database:
                 if (
                     connectivity is not None
                     and connectivity[0] == 1
+                    and _stage_has_network is not False
                     and network_work_kind(tuple(decode_json(_text(row[1]))))
                 ):
                     next_checks.append(max(now_utc_ns + 1_000_000_000, _integer(connectivity[1])))
                     continue
-                if _text(row[1]) == _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)):
+                if _stage_has_network is not False and _text(row[1]) == _json(
+                    list(COLLECT_EBAY_SEARCH_WORK_KIND)
+                ):
                     stack = _ebay_search_stack_identifier(decode_json(_text(row[3])))
                     cooldown_until = ebay_cooldowns.get(stack, 0) if stack is not None else 0
                     if cooldown_until > now_utc_ns:
                         next_checks.append(cooldown_until)
                         continue
-                if _text(row[1]) == _json(list(COLLECT_SEARCH_WORK_KIND)):
+                if _stage_has_network is not False and _text(row[1]) == _json(
+                    list(COLLECT_SEARCH_WORK_KIND)
+                ):
                     payload = decode_json(_text(row[3]))
                     routing = payload.get("routing") if isinstance(payload, dict) else None
                     cooldown_until = facebook_cooldowns.get(_json(routing), 0)
