@@ -21,6 +21,7 @@ from carl.core.work import (
     WorkDefinition,
     WorkLease,
 )
+from carl.core.work_progress import ProgressWait
 from carl.core.worker import AttemptContext, CompletedWork, RetryWork, TerminalFailureWork
 
 
@@ -148,6 +149,13 @@ class WaitWork(StrictModel):
     continuation: StageDefinition
     wait_kind: StageWaitKind
     result: JsonValue
+    progress_wait: ProgressWait | None = None
+
+    @model_validator(mode="after")
+    def validate_progress_wait(self) -> "WaitWork":
+        if self.progress_wait is not None and self.wait_kind is not StageWaitKind.DEPENDENCY:
+            raise ValueError("Progress watches require a dependency wait")
+        return self
 
 
 type StageOutcome = Annotated[

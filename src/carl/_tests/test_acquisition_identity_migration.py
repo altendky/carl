@@ -207,7 +207,7 @@ def _assert_migrated(path: Path, expected: dict[str, str | None]) -> None:
             dict(connection.execute("SELECT key,value FROM schema_metadata"))
             == Database._expected_metadata()
         )
-        assert sqlite.DATABASE_SCHEMA.version == 20
+        assert sqlite.DATABASE_SCHEMA.version == 21
         actual = dict(connection.execute(f"SELECT id,{_COLUMN} FROM work_items"))
         assert {identifier: actual[identifier] for identifier in expected} == expected
         assert expected["case-4-completed"] != expected["explicit-plan-default"]

@@ -21,6 +21,7 @@ from carl.core.stages import (
     WaitWork,
 )
 from carl.core.work import WorkDefinition
+from carl.core.work_progress import ProgressWait
 from carl.core.worker import RetryWork
 from carl.io.sqlite import Database
 from carl.io.stage_workers import StageHandlerRegistry, TypedStageHandler, WorkStageAdapter
@@ -29,6 +30,9 @@ from carl.io.worker import WorkHandlerRegistry
 COORDINATOR_SELECT_STAGE_KIND = ("carl", "coordinator", "select")
 COORDINATOR_CPU_STAGE_KIND = ("carl", "coordinator", "cpu")
 _CPU = (ResourceRequest(name="cpu"),)
+_LOCAL_REASONS = frozenset(
+    {"continue_refresh", "continue_listing_details", "analysis_batch_continuation"}
+)
 
 _CONTROL_REASONS: dict[tuple[str, ...], frozenset[str]] = {
     REFRESH_SEARCH_WORK_KIND: frozenset(
@@ -205,6 +209,7 @@ def build_coordinator_stage_registry(
                     wait_kind=StageWaitKind.RESOURCE,
                     result=progress["result"],
                 )
+        observed_through_revision = await database.work_progress_watermark()
         outcome = await handler.execute(work.payload, context)
         reason = outcome.reason if isinstance(outcome, RetryWork) else None
         reason_kind = reason.get("kind") if isinstance(reason, dict) else None
@@ -213,14 +218,29 @@ def build_coordinator_stage_registry(
             and isinstance(reason_kind, str)
             and reason_kind in _CONTROL_REASONS[work.kind]
         ):
+            progress_wait = None
+            if outcome.progress_watch is not None and not outcome.progress_watch.empty:
+                baseline = outcome.progress_observed_through_revision
+                progress_wait = ProgressWait(
+                    observed_through_revision=min(observed_through_revision, baseline)
+                    if baseline is not None
+                    else observed_through_revision,
+                    watch=outcome.progress_watch,
+                )
+            immediate = (
+                progress_wait is not None or reason_kind in _LOCAL_REASONS or outcome.delay_ns == 0
+            )
             return WaitWork(
                 continuation=continuation(
                     reference,
                     context,
                     cpu=False,
-                    not_before_utc_ns=utc_now_ns() + outcome.delay_ns,
+                    not_before_utc_ns=utc_now_ns() + (0 if immediate else outcome.delay_ns),
                 ),
-                wait_kind=StageWaitKind.TIME,
+                wait_kind=StageWaitKind.DEPENDENCY
+                if progress_wait is not None
+                else StageWaitKind.TIME,
+                progress_wait=progress_wait,
                 inputs=outcome.inputs,
                 records=outcome.records,
                 artifacts=outcome.artifacts,

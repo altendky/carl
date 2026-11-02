@@ -53,9 +53,20 @@ class StageExecution:
         """Publish an outcome through this execution's continuation or final fence."""
 
         if isinstance(outcome, StagePublication):
+            if isinstance(outcome.outcome, WaitWork):
+                # Persist large watch descriptors in bounded, fenced batches
+                # before the child-publication transaction. Suspension attaches
+                # them atomically and releases this execution for metadata-only
+                # construction of the normalized subscriptions.
+                await self.manager.database.prepare_stage_progress_wait(
+                    self.lease, outcome.outcome, now_utc_ns=self.manager.utc_now_ns()
+                )
             await self._publish_children(outcome)
             return
         if isinstance(outcome, WaitWork):
+            await self.manager.database.prepare_stage_progress_wait(
+                self.lease, outcome, now_utc_ns=self.manager.utc_now_ns()
+            )
             await self.suspend(
                 outcome,
                 records=outcome.records,

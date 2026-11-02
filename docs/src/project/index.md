@@ -748,6 +748,16 @@ a real acquisition retry starts a new attempt and retains the existing request
 budget and outage exemptions. Captured responses and model output are checkpointed
 before later CPU admission, so offline replay does not repeat a paid request.
 
+Refreshes, pipelines and analysis batches sleep on durable child-progress watches.
+The revision captured before each readiness check is compared when its wait is
+registered, so a publication racing that check cannot be missed. Checkpoints can
+wake a parent before the child completes. Shared children notify every consuming
+parent through bounded, coalesced delivery that survives restart; cancellation
+neutralizes obsolete waits. Sleeping parents leave runnable discovery, hold no
+execution resource and spend no acquisition retry budget. Local phase transitions and retained pipeline
+pages continue immediately, while provider retries keep their existing delays.
+Bounded metadata reconciliation repairs readiness without executing idle handlers.
+
 Default shared capacities per database and host coordination scope are 25 HTTP
 requests, 4 CPU units and 10 analysis processes. The dispatcher has 39 fixed
 execution runners plus 4 resource-free coordinator runners; an explicit foreground

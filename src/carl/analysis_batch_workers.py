@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from time import time_ns
 from typing import Protocol
 
+from carl.coordinator_progress import consumer_progress_watch
 from carl.core.analysis_batch import (
     LEGACY_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
     MULTI_SOURCE_REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
@@ -179,6 +180,12 @@ async def _request_missing_analyses(
         return RetryWork(
             inputs=inputs,
             delay_ns=_WAIT_DELAY_NS,
+            progress_watch=await consumer_progress_watch(
+                dependencies.database,
+                parent_work_identifier=context.work_item_identifier,
+                requester_kind=("carl", "facebook", "analysis_batch"),
+                work_identifiers=child_identifiers,
+            ),
             reason={"kind": "waiting_for_listing_analyses"},
             result=result,
         )

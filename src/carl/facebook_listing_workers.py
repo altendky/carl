@@ -8,6 +8,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import anyio
 
+from carl.coordinator_progress import consumer_progress_watch
 from carl.core.components import Component, ComponentId
 from carl.core.facebook_images import (
     CollectImagePayload,
@@ -33,6 +34,7 @@ from carl.core.http import RequestPlan
 from carl.core.json import encode_json
 from carl.core.models import Header, JsonValue, NamedInput, NamedOutput, RecordDraft
 from carl.core.work import WorkCapability, WorkDefinition, WorkRequester
+from carl.core.work_progress import WorkProgressWatch
 from carl.core.worker import (
     AttemptContext,
     CompletedWork,
@@ -206,7 +208,10 @@ async def _item_phase(
     }
     if _pending(work):
         return RetryWork(
-            delay_ns=_WAIT_NS, reason={"kind": "waiting_for_item_collection"}, result=result
+            delay_ns=_WAIT_NS,
+            progress_watch=WorkProgressWatch(work_identifiers=(children[0],)),
+            reason={"kind": "waiting_for_item_collection"},
+            result=result,
         )
     extraction = _mapping(work.get("result")).get("extraction_work_identifier")
     if work.get("state") != "completed" or not isinstance(extraction, str):
@@ -217,7 +222,10 @@ async def _item_phase(
     result.update(stage="extracting_items", item_extraction_work_identifier=extraction)
     if _pending(extracted):
         return RetryWork(
-            delay_ns=_WAIT_NS, reason={"kind": "waiting_for_item_extraction"}, result=result
+            delay_ns=_WAIT_NS,
+            progress_watch=WorkProgressWatch(work_identifiers=(extraction,)),
+            reason={"kind": "waiting_for_item_extraction"},
+            result=result,
         )
     observation = _mapping(extracted.get("result")).get("observation_record_identifier")
     if extracted.get("state") != "completed" or not isinstance(observation, str):
@@ -476,7 +484,17 @@ async def _image_phase(
         "reused_images": len(reuses),
     }
     if any(_pending(work) for work in works):
-        return RetryWork(delay_ns=_WAIT_NS, reason={"kind": "waiting_for_images"}, result=result)
+        return RetryWork(
+            delay_ns=_WAIT_NS,
+            progress_watch=await consumer_progress_watch(
+                database,
+                parent_work_identifier=context.work_item_identifier,
+                requester_kind=("carl", "facebook", "listing_details", "image_group"),
+                work_identifiers=children,
+            ),
+            reason={"kind": "waiting_for_images"},
+            result=result,
+        )
     extraction_ids = tuple(
         identifier
         for work in works
@@ -488,6 +506,7 @@ async def _image_phase(
     if any(_pending(work) for work in extracted):
         return RetryWork(
             delay_ns=_WAIT_NS,
+            progress_watch=WorkProgressWatch(work_identifiers=tuple(dict.fromkeys(extraction_ids))),
             reason={"kind": "waiting_for_image_extractions"},
             result={**result, "stage": "extracting_images"},
         )

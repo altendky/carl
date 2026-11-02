@@ -3,6 +3,8 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # Frozen historical DDL is checked byte-for-byte against its schema hash.
+        exclude: ^src/carl/_tests/data/schema_v20\.sql$
       - id: end-of-file-fixer
       - id: check-added-large-files
       - id: check-case-conflict

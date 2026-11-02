@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import anyio
 
+from carl.coordinator_progress import consumer_progress_watch
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.facebook_images import (
     CollectImagePayload,
@@ -60,6 +61,7 @@ from carl.core.models import (
 from carl.core.refresh_recovery import classify_refresh_completion, refresh_failure_summary
 from carl.core.search_scope import search_scope_changed
 from carl.core.work import WorkCapability, WorkRequester, WorkState
+from carl.core.work_progress import WorkProgressWatch
 from carl.core.worker import (
     AttemptContext,
     CompletedWork,
@@ -256,6 +258,7 @@ async def _search_phase(
                 ),
             ),
             delay_ns=_search_child_delay_ns(result, dependencies.utc_now_ns()),
+            progress_watch=WorkProgressWatch(work_identifiers=(search_work_identifier,)),
             reason={"kind": "waiting_for_search_collection"},
             result={
                 "stage": "collecting_search",
@@ -296,6 +299,7 @@ async def _search_phase(
                     ),
                 ),
                 delay_ns=_CHILD_WAIT_DELAY_NS,
+                progress_watch=WorkProgressWatch(work_identifiers=(search_work_identifier,)),
                 reason={"kind": "resumed_search_collection_after_transient_failure"},
                 result={
                     "stage": "collecting_search",
@@ -520,6 +524,12 @@ async def _item_phase(
     if _unfinished(collections):
         return RetryWork(
             delay_ns=_CHILD_WAIT_DELAY_NS,
+            progress_watch=await consumer_progress_watch(
+                database,
+                parent_work_identifier=context.work_item_identifier,
+                requester_kind=("carl", "facebook", "search_refresh", "item"),
+                work_identifiers=collection_identifiers,
+            ),
             reason={"kind": "waiting_for_item_collections"},
             result={
                 "stage": "collecting_items",
@@ -554,6 +564,9 @@ async def _item_phase(
     if _unfinished(extractions):
         return RetryWork(
             delay_ns=_CHILD_WAIT_DELAY_NS,
+            progress_watch=WorkProgressWatch(
+                work_identifiers=tuple(dict.fromkeys(extraction_identifiers))
+            ),
             reason={"kind": "waiting_for_item_extractions"},
             result={
                 "stage": "extracting_items",
@@ -820,6 +833,9 @@ async def _image_phase(
         if _unfinished(resumed_results):
             return RetryWork(
                 delay_ns=_CHILD_WAIT_DELAY_NS,
+                progress_watch=WorkProgressWatch(
+                    work_identifiers=tuple(dict.fromkeys(resumed_identifiers))
+                ),
                 reason={"kind": "waiting_for_resumed_image_extractions"},
                 result={
                     **checkpoint,
@@ -1001,6 +1017,9 @@ async def _image_phase(
         if _unfinished(resumed_results):
             return RetryWork(
                 delay_ns=_CHILD_WAIT_DELAY_NS,
+                progress_watch=WorkProgressWatch(
+                    work_identifiers=tuple(dict.fromkeys(resumed_identifiers))
+                ),
                 reason={"kind": "waiting_for_resumed_image_extractions"},
                 result={
                     **checkpoint,
@@ -1312,6 +1331,12 @@ async def _image_phase(
     if _unfinished(collections):
         return RetryWork(
             delay_ns=_CHILD_WAIT_DELAY_NS,
+            progress_watch=await consumer_progress_watch(
+                database,
+                parent_work_identifier=context.work_item_identifier,
+                requester_kind=("carl", "facebook", "search_refresh", "image"),
+                work_identifiers=collection_identifiers,
+            ),
             reason={"kind": "waiting_for_image_collections"},
             result={
                 **checkpoint,
@@ -1333,6 +1358,9 @@ async def _image_phase(
     if _unfinished(extraction_results):
         return RetryWork(
             delay_ns=_CHILD_WAIT_DELAY_NS,
+            progress_watch=WorkProgressWatch(
+                work_identifiers=tuple(dict.fromkeys(extraction_identifiers))
+            ),
             reason={"kind": "waiting_for_image_extractions"},
             result={
                 **checkpoint,

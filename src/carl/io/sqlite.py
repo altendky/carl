@@ -192,8 +192,10 @@ from carl.core.work_dispatch import (
     WorkDispatchSnapshot,
     WorkSnapshotStale,
 )
+from carl.core.work_progress import ProgressDrainResult, ProgressReconcilePage
 from carl.core.worker import FollowOnWork
 from carl.io import fair_scheduling as fair_sql
+from carl.io import work_progress as progress_sql
 from carl.io.db import DEFAULT_BUSY_TIMEOUT_MS, DatabaseConnections
 from carl.route_cutover import rebuild_work_definition
 
@@ -222,9 +224,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=20,
+    version=21,
 )
 
+_V20_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 20})
+_V20_SCHEMA_DEFINITION_SHA256 = "b4336f5f4093b362d02befe4ec345ceb34512091a1c04f4ee0904c22c6513059"
 _V19_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 19})
 _V19_SCHEMA_DEFINITION_SHA256 = "e4cba8442c0eb6405811b2e61bc9133f9c0f83593de86331b7c10167452d8845"
 _V18_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 18})
@@ -290,6 +294,7 @@ CREATE TABLE IF NOT EXISTS work_stages (
     execution INTEGER NOT NULL DEFAULT 0 CHECK (execution >= 0),
     eligible_at_utc_ns INTEGER NOT NULL CHECK (eligible_at_utc_ns >= 0),
     wait_kind TEXT,
+    progress_waiting INTEGER NOT NULL DEFAULT 0 CHECK(progress_waiting IN (0,1)),
     created_at_utc_ns INTEGER NOT NULL CHECK (created_at_utc_ns >= 0),
     token TEXT,
     worker_identifier TEXT,
@@ -925,6 +930,7 @@ CREATE INDEX IF NOT EXISTS records_marketplace_source_run
 ON records(json_extract(value_json, '$.search_run_record_identifier'), object_id);
 """
     + fair_sql.FAIR_SCHEMA
+    + progress_sql.PROGRESS_SCHEMA
 )
 
 _SCHEMA_DEFINITION_SHA256 = hashlib.sha256(_SCHEMA.encode()).hexdigest()
@@ -1113,6 +1119,275 @@ class Database:
 
         async with self._connections.writer():
             yield
+
+    async def work_progress_watermark(self) -> int:
+        async with self._connections.reader() as connection:
+            return await progress_sql.watermark(connection)
+
+    async def missing_consumer_edges(
+        self,
+        parent_work_identifier: str,
+        requester_kind: tuple[str, ...],
+        child_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(child_ids) > 1000 or any(not value for value in child_ids):
+            raise ValueError("Consumer edge lookup exceeds its bound")
+        async with self._connections.reader() as connection:
+            rows = await (
+                await connection.execute(
+                    """SELECT ids.value FROM json_each(?) ids
+                WHERE NOT EXISTS(SELECT 1 FROM work_consumer_edges e WHERE e.parent_work_id=? AND e.kind_json=? AND e.child_work_id=ids.value)
+                ORDER BY cast(ids.key AS INTEGER)""",
+                    (_json(list(child_ids)), parent_work_identifier, _json(list(requester_kind))),
+                )
+            ).fetchall()
+        return tuple(_text(row[0]) for row in rows)
+
+    async def prepare_stage_progress_wait(
+        self, lease: StageLease, wait: WaitWork, *, now_utc_ns: int
+    ) -> None:
+        progress = wait.progress_wait
+        if progress is None:
+            return
+        if (wait.continuation.work_item_identifier, wait.continuation.operation_identifier) != (
+            lease.definition.work_item_identifier,
+            lease.definition.operation_identifier,
+        ):
+            raise ValueError("A progress continuation must retain its work and operation")
+        nested = self._connections._current_writer_task_identifier == anyio.get_current_task().id  # pyright: ignore[reportPrivateUsage]
+        if (
+            nested
+            and len(progress.watch.work_identifiers) > 128
+            and "fingerprint" not in progress.__dict__
+        ):
+            raise ValueError("Large progress waits must be prepared before an outer writer")
+        digest = progress_sql.wait_digest(progress)
+        identifier = progress_sql.build_identifier(lease.token, wait.continuation.identifier)
+        if (
+            not nested or len(progress.watch.work_identifiers) <= 128
+        ) and lease.definition.work_item_identifier in progress.watch.work_identifiers:
+            raise ValueError("A stage cannot subscribe to its own checkpoint progress")
+        async with self._connections.writer() as connection:
+            if not await self.validate_stage(lease, now_utc_ns=now_utc_ns):
+                raise LeaseLostError("Progress source no longer owns its stage")
+            existing = await (
+                await connection.execute(
+                    "SELECT digest,state FROM progress_wait_builds WHERE id=?", (identifier,)
+                )
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != digest:
+                    raise ValueError("A prepared progress source cannot change its descriptor")
+                if existing[1] in ("prepared", "building", "armed", "inactive"):
+                    return
+            if nested and len(progress.watch.work_identifiers) > 128:
+                raise ValueError("Large progress waits require separately committed source chunks")
+            if progress.observed_through_revision > await progress_sql.watermark(connection):
+                raise ValueError("Progress baseline is ahead of committed progress")
+            groups = _json([list(kind) for kind in progress.watch.consumer_requester_kinds])
+            await connection.execute(
+                """INSERT OR IGNORE INTO progress_wait_builds(
+                id,work_id,operation_id,source_stage_id,source_token,continuation_id,baseline,digest,groups_json,state)
+                VALUES(?,?,?,?,?,?,?,?,?,'source')""",
+                (
+                    identifier,
+                    lease.definition.work_item_identifier,
+                    lease.definition.operation_identifier,
+                    lease.definition.identifier,
+                    lease.token,
+                    wait.continuation.identifier,
+                    progress.observed_through_revision,
+                    digest,
+                    groups,
+                ),
+            )
+            for kind in progress.watch.consumer_requester_kinds:
+                encoded = _json(list(kind))
+                if (
+                    not progress.watch.work_identifiers
+                    and await (
+                        await connection.execute(
+                            "SELECT 1 FROM work_consumer_edges WHERE parent_work_id=? AND kind_json=? LIMIT 1",
+                            (lease.definition.work_item_identifier, encoded),
+                        )
+                    ).fetchone()
+                    is None
+                ):
+                    raise ValueError(
+                        "A legacy consumer group needs explicit unresolved-source fallback"
+                    )
+                await connection.execute(
+                    "INSERT OR IGNORE INTO progress_wait_groups VALUES(?,?,?)",
+                    (identifier, lease.definition.work_item_identifier, encoded),
+                )
+        for ordinal, start in enumerate(range(0, len(progress.watch.work_identifiers), 128)):
+            chunk = progress.watch.work_identifiers[start : start + 128]
+            encoded = _json(list(chunk))
+            if len(encoded.encode()) > 1_048_576:
+                raise ValueError("A progress source chunk exceeds its 1 MiB metadata bound")
+            async with self._connections.writer() as connection:
+                if not await self.validate_stage(lease, now_utc_ns=now_utc_ns):
+                    raise LeaseLostError("Progress source ownership changed during preparation")
+                count = await (
+                    await connection.execute(
+                        "SELECT count(DISTINCT ids.value) FROM json_each(?) ids JOIN work_items w ON w.id=ids.value",
+                        (encoded,),
+                    )
+                ).fetchone()
+                assert count is not None
+                if _integer(count[0]) != len(set(chunk)):
+                    raise KeyError("A watched progress source does not exist")
+                old = await (
+                    await connection.execute(
+                        "SELECT identifiers_json FROM progress_wait_source_chunks WHERE build_id=? AND ordinal=?",
+                        (identifier, ordinal),
+                    )
+                ).fetchone()
+                if old is not None and old[0] != encoded:
+                    raise ValueError("Progress source chunks are immutable")
+                await connection.execute(
+                    "INSERT OR IGNORE INTO progress_wait_source_chunks VALUES(?,?,?)",
+                    (identifier, ordinal, encoded),
+                )
+        async with self._connections.writer() as connection:
+            if not await self.validate_stage(lease, now_utc_ns=now_utc_ns):
+                raise LeaseLostError("Progress source lost its final preparation fence")
+            await connection.execute(
+                "UPDATE progress_wait_builds SET state='prepared',chunk_count=? WHERE id=? AND state='source'",
+                ((len(progress.watch.work_identifiers) + 127) // 128, identifier),
+            )
+
+    async def _activate_progress_wait(
+        self, connection: AsyncConnection, lease: StageLease, wait: WaitWork, now: int
+    ) -> None:
+        if wait.progress_wait is None:
+            return
+        identifier = progress_sql.build_identifier(lease.token, wait.continuation.identifier)
+        row = await (
+            await connection.execute(
+                "SELECT digest,chunk_count FROM progress_wait_builds WHERE id=? AND source_token=? AND state='prepared'",
+                (identifier, lease.token),
+            )
+        ).fetchone()
+        if row is None or row[0] != progress_sql.wait_digest(wait.progress_wait):
+            raise ValueError("Progress registration requires its exact prepared descriptor")
+        await connection.execute(
+            "UPDATE progress_wait_builds SET stage_id=?,state='building',ticket=? WHERE id=?",
+            (wait.continuation.identifier, await progress_sql.ticket(connection), identifier),
+        )
+        await connection.execute(
+            "UPDATE work_stages SET progress_waiting=1 WHERE id=? AND state='pending'",
+            (wait.continuation.identifier,),
+        )
+        if _integer(row[1]) <= 1:
+            await progress_sql.build_batch(connection, identifier, 128, now)
+
+    async def drain_progress_notifications(
+        self,
+        *,
+        now_utc_ns: int,
+        source_limit: int = 8,
+        edge_limit: int = 64,
+        total_limit: int = 128,
+    ) -> ProgressDrainResult:
+        if (
+            now_utc_ns < 0
+            or not 1 <= source_limit <= 32
+            or not 1 <= edge_limit <= 128
+            or not 1 <= total_limit <= 1024
+        ):
+            raise ValueError("Progress drain bounds are invalid")
+        woke = 0
+        remaining = total_limit
+        async with self._connections.reader() as connection:
+            builders = await (
+                await connection.execute(
+                    "SELECT id FROM progress_wait_builds WHERE state='building' ORDER BY ticket,id LIMIT ?",
+                    (source_limit,),
+                )
+            ).fetchall()
+            sources = await (
+                await connection.execute(
+                    "SELECT child_work_id FROM progress_notifications ORDER BY ticket,child_work_id LIMIT ?",
+                    (source_limit,),
+                )
+            ).fetchall()
+        build_budget = max(1, total_limit // 2) if sources else total_limit
+        for row in builders:
+            if build_budget <= 0 or remaining <= 0:
+                break
+            async with self._connections.writer() as connection:
+                used, changed = await progress_sql.build_batch(
+                    connection, _text(row[0]), min(edge_limit, build_budget, remaining), now_utc_ns
+                )
+            woke += changed
+            build_budget -= max(1, used)
+            remaining -= max(1, used)
+        for row in sources:
+            if remaining <= 0:
+                break
+            async with self._connections.writer() as connection:
+                used, changed = await progress_sql.drain_source(
+                    connection, _text(row[0]), min(edge_limit, remaining), now_utc_ns
+                )
+            woke += changed
+            remaining -= max(1, used)
+        async with self._connections.reader() as connection:
+            pending = await (
+                await connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM progress_wait_builds WHERE state='building') OR EXISTS(SELECT 1 FROM progress_notifications)"
+                )
+            ).fetchone()
+        assert pending is not None
+        return ProgressDrainResult(more=bool(pending[0]), woke=woke)
+
+    async def reconcile_progress_waits(
+        self, *, after: str | None = None, limit: int = 32, now_utc_ns: int
+    ) -> ProgressReconcilePage:
+        if not 1 <= limit <= 128 or now_utc_ns < 0:
+            raise ValueError("Progress reconciliation bounds are invalid")
+        woke = 0
+        async with self._connections.writer() as connection:
+            rows = await (
+                await connection.execute(
+                    "SELECT id FROM work_stages INDEXED BY work_stages_progress_sleep WHERE state='pending' AND progress_waiting=1 AND id>? ORDER BY id LIMIT ?",
+                    (after or "", limit + 1),
+                )
+            ).fetchall()
+            for row in rows[:limit]:
+                build = await (
+                    await connection.execute(
+                        "SELECT id,reconcile_after FROM progress_wait_builds WHERE stage_id=? AND state='armed'",
+                        (row[0],),
+                    )
+                ).fetchone()
+                if build is None:
+                    continue
+                members = await (
+                    await connection.execute(
+                        "SELECT m.child_work_id,coalesce(p.revision,0) FROM progress_wait_members m LEFT JOIN work_progress_revisions p ON p.work_id=m.child_work_id WHERE m.build_id=? AND m.child_work_id>? ORDER BY m.child_work_id LIMIT 33",
+                        (build[0], build[1]),
+                    )
+                ).fetchall()
+                maximum = max((_integer(member[1]) for member in members[:32]), default=0)
+                await connection.execute(
+                    "UPDATE progress_wait_builds SET reconcile_after=? WHERE id=?",
+                    (members[31][0] if len(members) > 32 else "", build[0]),
+                )
+                groups = await (
+                    await connection.execute(
+                        "SELECT coalesce(max(p.revision),0) FROM progress_wait_groups g LEFT JOIN consumer_group_progress p ON p.parent_work_id=g.parent_work_id AND p.kind_json=g.kind_json WHERE g.build_id=?",
+                        (build[0],),
+                    )
+                ).fetchone()
+                assert groups is not None
+                woke += await progress_sql.observe(
+                    connection, _text(build[0]), max(maximum, _integer(groups[0])), now_utc_ns
+                )
+        more = len(rows) > limit
+        return ProgressReconcilePage(
+            next_cursor=_text(rows[limit - 1][0]) if more else None, more=more, woke=woke
+        )
 
     @staticmethod
     async def _append_stage_event(
@@ -1355,11 +1630,18 @@ class Database:
             bindings.extend((_json(list(capability.kind)), capability.payload_schema_version))
         scope = ""
         source = "work_items AS w"
+        order_columns = "w.priority DESC,w.eligible_at_utc_ns,w.created_at_utc_ns,w.id"
         if eligible_identifiers is not None:
             # Drive exact/scoped metadata reads from their IDs. An IN filter can
             # otherwise make SQLite walk a large sibling queue in dispatch order.
             source = "(SELECT DISTINCT value AS id FROM json_each(?)) AS selected CROSS JOIN work_items AS w ON w.id=selected.id"
             bindings.insert(0, _json(list(eligible_identifiers)))
+        else:
+            # The shared projection omits progress sleepers before a queue scan,
+            # while retaining the original work priority/eligibility ordering.
+            source = "fair_ready AS ready INDEXED BY fair_ready_dispatch CROSS JOIN work_items AS w ON w.id=ready.work_item_id"
+            scope = "AND ready.active=1"
+            order_columns = "ready.priority DESC,ready.work_eligible_at_utc_ns,ready.created_at_utc_ns,ready.work_item_id"
         frontier = ""
         if after is not None:
             frontier = "AND (w.priority<? OR (w.priority=? AND (w.eligible_at_utc_ns,w.created_at_utc_ns,w.id)>(?,?,?)))"
@@ -1386,11 +1668,11 @@ class Database:
                 LEFT JOIN stage_attempts AS a ON a.work_item_id=w.id AND a.state IN ('pending','active')
                 LEFT JOIN work_stages AS s ON s.work_item_id=w.id AND s.state IN ('pending','running')
                 WHERE w.state IN ('pending','leased') AND w.eligible_at_utc_ns<=?
-                  AND (s.id IS NULL OR s.eligible_at_utc_ns<=?)
+                  AND (s.id IS NULL OR (s.eligible_at_utc_ns<=? AND s.progress_waiting=0))
                   AND ((w.state='pending' AND a.operation_id IS NULL AND s.id IS NULL)
                        OR (s.state='pending' AND s.operation_id=a.operation_id))
                   AND ({predicate}) {scope} {frontier}
-                ORDER BY w.priority DESC,w.eligible_at_utc_ns,w.created_at_utc_ns,w.id LIMIT ?
+                ORDER BY {order_columns} LIMIT ?
             """,
                 bindings,
             )
@@ -2193,20 +2475,29 @@ class Database:
         bindings: list[apsw.SQLiteValue] = [now_utc_ns]
         if after is not None:
             bindings.extend((after.expires_at_utc_ns, after.identifier))
-        scope = ""
+        source = "fair_ready AS ready INDEXED BY fair_ready_legacy_expiry CROSS JOIN work_items AS w ON w.id=ready.work_item_id"
+        order_columns = "ready.legacy_lease_expires_at_utc_ns,ready.work_item_id"
+        if after is not None:
+            frontier = "AND (ready.legacy_lease_expires_at_utc_ns,ready.work_item_id)>(?,?)"
+        scope = "AND ready.legacy_lease_expires_at_utc_ns IS NOT NULL AND ready.legacy_lease_expires_at_utc_ns<=?"
+        bindings.append(now_utc_ns)
         if eligible_identifiers is not None:
-            scope = "AND w.id IN (SELECT value FROM json_each(?))"
-            bindings.append(_json(list(eligible_identifiers)))
+            source = "(SELECT DISTINCT value AS id FROM json_each(?)) AS selected CROSS JOIN work_items AS w ON w.id=selected.id"
+            scope = ""
+            order_columns = "w.lease_expires_at_utc_ns,w.id"
+            frontier = "" if after is None else "AND (w.lease_expires_at_utc_ns,w.id)>(?,?)"
+            bindings.pop()
+            bindings.insert(0, _json(list(eligible_identifiers)))
         bindings.append(limit + 1)
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
                 f"""
                 SELECT w.id,w.state,w.attempt,w.lease_token,w.lease_owner,w.lease_expires_at_utc_ns,
                        (SELECT operation_id FROM work_operations WHERE work_item_id=w.id AND attempt=w.attempt AND lease_token=w.lease_token AND worker_identifier=w.lease_owner)
-                FROM work_items AS w WHERE w.state IN ('leased','cancelling') AND w.lease_expires_at_utc_ns<=?
+                FROM {source} WHERE w.state IN ('leased','cancelling') AND w.lease_expires_at_utc_ns<=?
                   AND NOT EXISTS (SELECT 1 FROM stage_attempts WHERE work_item_id=w.id AND state IN ('pending','active'))
                   AND NOT EXISTS (SELECT 1 FROM work_stages WHERE work_item_id=w.id AND state IN ('pending','running'))
-                {frontier} {scope} ORDER BY w.lease_expires_at_utc_ns,w.id LIMIT ?
+                {frontier} {scope} ORDER BY {order_columns} LIMIT ?
             """,
                 bindings,
             )
@@ -2530,7 +2821,7 @@ class Database:
             raise ValueError("Stage execution identities must be nonempty and trimmed")
         async with self._connections.writer() as connection:
             cursor = await connection.execute(
-                "SELECT definition_json, state, execution, eligible_at_utc_ns, wait_kind, created_at_utc_ns FROM work_stages WHERE id = ?",
+                "SELECT definition_json, state, execution, eligible_at_utc_ns, wait_kind, created_at_utc_ns, progress_waiting FROM work_stages WHERE id = ?",
                 (stage_identifier,),
             )
             stage = await cursor.fetchone()
@@ -2543,6 +2834,8 @@ class Database:
                     wait_kind=StageWaitKind.OWNERSHIP,
                     next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
                 )
+            if stage[6] == 1:
+                return StageClaimResult(lease=None, wait_kind=StageWaitKind.DEPENDENCY)
             cursor = await connection.execute(
                 "SELECT state, eligible_at_utc_ns, kind_parts_json, payload_schema_version FROM work_items WHERE id = ?",
                 (definition.work_item_identifier,),
@@ -3112,6 +3405,7 @@ class Database:
     ) -> None:
         """Publish a checkpoint and continuation without spending an acquisition attempt."""
 
+        await self.prepare_stage_progress_wait(lease, wait, now_utc_ns=now_utc_ns)
         continuation = wait.continuation
         if (
             continuation.work_item_identifier != lease.definition.work_item_identifier
@@ -3163,6 +3457,7 @@ class Database:
                     "UPDATE work_stages SET wait_kind = ? WHERE id = ?",
                     (wait.wait_kind.value, continuation.identifier),
                 )
+            await self._activate_progress_wait(connection, lease, wait, now_utc_ns)
             await self._append_stage_event(
                 connection,
                 lease.definition.identifier,
@@ -4282,6 +4577,14 @@ class Database:
         }
 
     @staticmethod
+    def _v20_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V20_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "20",
+            "schema_definition_sha256": _V20_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v19_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V19_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -4470,6 +4773,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v20_metadata())
                 and not await cls._metadata_matches(connection, cls._v19_metadata())
                 and not await cls._metadata_matches(connection, cls._v18_metadata())
                 and not await cls._metadata_matches(connection, cls._v17_metadata())
@@ -4946,9 +5250,38 @@ class Database:
                     "INSERT OR IGNORE INTO fair_unowned SELECT id FROM work_items WHERE NOT EXISTS(SELECT 1 FROM work_scheduling WHERE work_item_id=work_items.id)"
                 )
                 await self._backfill_work_scheduling(connection)
-                for key, value in self._expected_metadata().items():
+                for key, value in self._v20_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value = ? WHERE key = ?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v20_metadata()):
+                triggers = await (
+                    await connection.execute(
+                        "SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'fair_refresh_*'"
+                    )
+                ).fetchall()
+                for trigger in triggers:
+                    name = _text(trigger[0]).replace('"', '""')
+                    await connection.execute(f'DROP TRIGGER "{name}"')
+                await self._apply_schema(connection)
+                after = 0
+                while True:
+                    requests = await (
+                        await connection.execute(
+                            "SELECT rowid,id,requested_at_utc_ns FROM work_requests WHERE rowid>? ORDER BY rowid LIMIT 128",
+                            (after,),
+                        )
+                    ).fetchall()
+                    if not requests:
+                        break
+                    for request in requests:
+                        await progress_sql.publish_consumer_edge(
+                            connection, _text(request[1]), _integer(request[2])
+                        )
+                    after = _integer(requests[-1][0])
+                for key, value in self._expected_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value=? WHERE key=?", (value, key)
                     )
             if not await self._metadata_matches(connection, self._expected_metadata()):
                 raise RuntimeError("Unsupported database schema metadata")
@@ -4957,6 +5290,33 @@ class Database:
     @staticmethod
     async def _apply_schema(connection: AsyncConnection) -> None:
         """Prepare older work tables before applying indexes from the current schema."""
+
+        legacy_projection_added = False
+        for table, column, definition in (
+            (
+                "work_stages",
+                "progress_waiting",
+                "INTEGER NOT NULL DEFAULT 0 CHECK(progress_waiting IN (0,1))",
+            ),
+            ("fair_workspace_service", "ready_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("fair_root_service", "ready_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("fair_ready", "work_eligible_at_utc_ns", "INTEGER NOT NULL DEFAULT 0"),
+            ("fair_ready", "legacy_lease_expires_at_utc_ns", "INTEGER"),
+        ):
+            existing = {
+                _text(row[1])
+                for row in await (
+                    await connection.execute(f"PRAGMA table_info({table})")
+                ).fetchall()
+            }
+            if existing and column not in existing:
+                await connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                if table == "fair_ready" and column == "work_eligible_at_utc_ns":
+                    await connection.execute(
+                        "UPDATE fair_ready SET work_eligible_at_utc_ns=coalesce((SELECT eligible_at_utc_ns FROM work_items WHERE id=fair_ready.work_item_id),0)"
+                    )
+                if column == "legacy_lease_expires_at_utc_ns":
+                    legacy_projection_added = True
 
         cursor = await connection.execute("PRAGMA table_info(work_items)")
         columns = {_text(row[1]) for row in await cursor.fetchall()}
@@ -4981,6 +5341,9 @@ class Database:
                 "ALTER TABLE work_requests ADD COLUMN parent_work_identifier TEXT REFERENCES work_items(id)"
             )
         await connection.execute(_SCHEMA)
+        await fair_sql.initialize_service_counts(connection)
+        if legacy_projection_added:
+            await fair_sql.initialize_legacy_lease_projection(connection)
 
     @staticmethod
     async def _migrate_acquisition_resource_identities(connection: AsyncConnection) -> None:
@@ -6313,6 +6676,8 @@ class Database:
             """,
             () if request_identifier is None else (request_identifier,),
         )
+        if request_identifier is not None:
+            await progress_sql.publish_consumer_edge(connection, request_identifier, time_ns())
 
     @staticmethod
     async def _work_descendants(
@@ -9336,6 +9701,14 @@ class Database:
                     for output in outputs
                 ),
             )
+        if records or artifacts or outputs:
+            owner = await (
+                await connection.execute(
+                    "SELECT work_item_id FROM work_operations WHERE operation_id=?", (operation_id,)
+                )
+            ).fetchone()
+            if owner is not None:
+                await progress_sql.mark(connection, _text(owner[0]))
 
     async def _complete_operation(
         self,
@@ -10306,9 +10679,11 @@ class Database:
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
                 """
-                SELECT work.id, work.state, work.payload_json, work.result_json, work.error_json
+                SELECT work.id, work.state, work.payload_json, work.result_json, work.error_json,
+                       coalesce(progress.revision,0)
                 FROM json_each(?) AS requested
                 JOIN work_items AS work ON work.id = requested.value
+                LEFT JOIN work_progress_revisions AS progress ON progress.work_id=work.id
                 ORDER BY CAST(requested.key AS INTEGER)
                 """,
                 (_json(list(identifiers)),),
@@ -10323,6 +10698,7 @@ class Database:
                 "payload": decode_json(_text(row[2])),
                 "result": None if row[3] is None else decode_json(_text(row[3])),
                 "error": None if row[4] is None else decode_json(_text(row[4])),
+                "progress_revision": _integer(row[5]),
             }
             for row in rows
         )
