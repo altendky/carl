@@ -48,6 +48,7 @@ from carl.io.dataset_setup_files import (
 )
 from carl.io.dataset_workflow_owner import (
     DatasetWorkflowOwner,
+    DatasetWorkflowService,
     get_dataset_workflow_service,
 )
 from carl.io.geonames import GeonamesFailure
@@ -292,15 +293,24 @@ async def submit_dataset_setup_stage(
     component: Component,
     provenance: CodeProvenance,
     invocation: dict[str, JsonValue],
+    *,
+    service: DatasetWorkflowService | None = None,
 ) -> bool:
+    if service is not None and (
+        service.manager.database is not manager.database
+        or service.manager.resources is not manager.resources
+        or service.directories != engine.directories
+    ):
+        raise ValueError("Dataset setup service must share its database, resources and directories")
     state = await _state_for_stage(manager.database, engine, stage)
-    service = get_dataset_workflow_service(
-        manager,
-        engine.directories,
-        lambda owner: build_dataset_setup_owned_registry(manager.database, engine, owner),
-        provenance,
-        invocation,
-    )
+    if service is None:
+        service = get_dataset_workflow_service(
+            manager,
+            engine.directories,
+            lambda owner: build_dataset_setup_owned_registry(manager.database, engine, owner),
+            provenance,
+            invocation,
+        )
     return await service.submit(
         stage, component=component, definition=state.definition, resume=True
     )

@@ -21,6 +21,7 @@ from carl.core.facebook_work import CollectItemPayload, collect_item_work
 from carl.core.http import RequestPlan
 from carl.core.item_analysis import (
     ANALYSIS_RECIPE_VERSION,
+    ANALYZE_ITEM_WORK_KIND,
     IDENTIFICATION_PROMPT,
     TELESCOPE_PRODUCT_GUIDE,
     AnalysisImageSelection,
@@ -913,7 +914,7 @@ def test_cli_plans_evidence_and_skips_completed(
 ) -> None:
     path = tmp_path / "carl.sqlite3"
     binary = tmp_path / "fake-claude"
-    _fake_claude(binary)
+    _fake_claude(binary, expect_hard_link=True)
     html = (
         HTML.replace("A telescope", "Celestron telescope")
         .replace("https://example.invalid/one.jpg", "https://example.fbcdn.net/one.jpg")
@@ -1079,6 +1080,13 @@ def test_cli_plans_evidence_and_skips_completed(
     assert first["resumed"] == 0
     guide_identifier = first["product_guide_record_identifier"]
     assert isinstance(guide_identifier, str)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM work_stages AS stage JOIN work_items AS work "
+            "ON work.id=stage.work_item_id WHERE stage.state='completed' "
+            "AND work.kind_parts_json=?",
+            (json.dumps(list(ANALYZE_ITEM_WORK_KIND), separators=(",", ":")),),
+        ).fetchone() == (3,)
 
     async def verify_evidence_graph() -> None:
         async with Database.managed(path) as database:

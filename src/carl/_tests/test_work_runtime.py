@@ -247,8 +247,8 @@ async def test_runtime_joins_workers_and_watchers_before_closing_shared_transpor
                 assert "transport_closed" not in lifecycle
                 lifecycle.append("watcher_closed")
 
-    async def worker_pool(**kwargs: Any) -> None:
-        del kwargs
+    async def worker_pool(self: Any) -> None:
+        del self
         assert "transport_opened" in lifecycle
         manager.watcher_task_group.start_soon(watcher)
         worker_started.set()
@@ -264,7 +264,7 @@ async def test_runtime_joins_workers_and_watchers_before_closing_shared_transpor
         del args
 
     monkeypatch.setattr(work_runtime, "SharedProtonWireproxyManager", lambda: manager)
-    monkeypatch.setattr(work_runtime, "run_worker_pool", worker_pool)
+    monkeypatch.setattr(work_runtime.StageDispatcher, "run", worker_pool)
     monkeypatch.setattr(work_runtime, "prepare_worker_constraints", prepare_constraints)
 
     with anyio.fail_after(2):

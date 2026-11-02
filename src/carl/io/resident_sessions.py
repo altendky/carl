@@ -20,6 +20,7 @@ from carl.core.components import Component
 from carl.core.models import CodeProvenance, JsonValue
 from carl.core.residents import ResidentDefinition, ResidentLease, ResidentState
 from carl.core.stages import StageDefinition, WaitWork
+from carl.core.work_dispatch import WorkDispatchSnapshot, WorkSnapshotStale
 from carl.core.worker import TerminalFailureWork
 from carl.io.resource_permits import ResourceLeaseLost
 from carl.io.stage_publication import StagePublication
@@ -35,6 +36,10 @@ class ResidentValue(Protocol):
 
 class ResidentStateLimitExceeded(ValueError):
     """The completed phase must be retained before this session is disposed."""
+
+
+class _ResidentUnavailable(Exception):
+    """Abort speculative admission when a pending stage cannot change owners."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +90,11 @@ class ResidentSessionPool:
     @property
     def active_count(self) -> int:
         return len(self._actors) + len(self._quarantined)
+
+    def owns(self, identifier: str) -> bool:
+        """Report local ownership, including actors awaiting physical cleanup proof."""
+
+        return identifier in self._actors or identifier in self._quarantined
 
     async def wait_idle(self) -> None:
         """Wait for currently admitted actors; queued database work has no task."""
@@ -190,7 +200,13 @@ class ResidentSessionPool:
             if actor is not None and actor.execution is execution:
                 actor.execution = None
 
-    async def submit(self, stage: StageDefinition, *, component: Component) -> bool:
+    async def submit(
+        self,
+        stage: StageDefinition,
+        *,
+        component: Component,
+        expected_snapshot: WorkDispatchSnapshot | None = None,
+    ) -> bool:
         """Try admission before allocating a task; the caller retains blocked work."""
 
         if self._tasks is None or self._closing:
@@ -205,49 +221,65 @@ class ResidentSessionPool:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with anyio.CancelScope(shield=True):
-                async with self.manager.database.transaction():
-                    lease = await self.manager.database.try_acquire_resident_session(
-                        ResidentDefinition(
-                            identifier=identifier,
-                            work_item_identifier=stage.work_item_identifier,
-                            operation_identifier=stage.operation_identifier,
-                            state_bytes=self.state_bytes,
-                        ),
-                        token=token,
-                        owner=resources.owner,
-                        scope=resources.scope,
-                        capacities=resources.capacities,
-                        now_utc_ns=self.manager.utc_now_ns(),
-                        lease_duration_ns=self.manager.lease_duration_ns,
-                    )
-                    if lease is None:
-                        return False
-                    try:
-                        existing = await self.manager.database.stage(stage.identifier)
-                    except KeyError:
-                        stage = stage.model_copy(update={"resident_session_identifier": identifier})
-                        await self.manager.database.register_stage(
-                            stage, created_at_utc_ns=self.manager.utc_now_ns()
+                try:
+                    async with self.manager.database.transaction():
+                        lease = await self.manager.database.try_acquire_resident_session(
+                            ResidentDefinition(
+                                identifier=identifier,
+                                work_item_identifier=stage.work_item_identifier,
+                                operation_identifier=stage.operation_identifier,
+                                state_bytes=self.state_bytes,
+                            ),
+                            token=token,
+                            owner=resources.owner,
+                            scope=resources.scope,
+                            capacities=resources.capacities,
+                            now_utc_ns=self.manager.utc_now_ns(),
+                            lease_duration_ns=self.manager.lease_duration_ns,
                         )
-                    else:
-                        previous = existing.resident_session_identifier
-                        if (
-                            previous is None
-                            or not await self.manager.database.rebind_resident_stage(
+                        if lease is None:
+                            return False
+                        try:
+                            existing = await self.manager.database.stage(stage.identifier)
+                        except KeyError:
+                            stage = stage.model_copy(
+                                update={"resident_session_identifier": identifier}
+                            )
+                            await self.manager.database.register_stage(
+                                stage,
+                                created_at_utc_ns=self.manager.utc_now_ns(),
+                                expected_snapshot=expected_snapshot,
+                            )
+                        else:
+                            if expected_snapshot is not None:
+                                await self.manager.database.register_stage(
+                                    existing,
+                                    created_at_utc_ns=self.manager.utc_now_ns(),
+                                    expected_snapshot=expected_snapshot,
+                                )
+                            previous = existing.resident_session_identifier
+                            if previous is None:
+                                raise ResourceLeaseLost(
+                                    "Pending stage cannot transfer resident ownership"
+                                )
+                            if not await self.manager.database.rebind_resident_stage(
                                 stage.identifier,
                                 previous,
                                 lease,
                                 now_utc_ns=self.manager.utc_now_ns(),
-                            )
-                        ):
-                            raise ResourceLeaseLost(
-                                "Pending stage cannot transfer resident ownership"
-                            )
-                        stage = await self.manager.database.stage(stage.identifier)
+                            ):
+                                raise _ResidentUnavailable
+                            stage = await self.manager.database.stage(stage.identifier)
+                except (WorkSnapshotStale, _ResidentUnavailable):
+                    # Decline only after the enclosing transaction has rolled
+                    # back its resident reservation and resource allocations.
+                    return False
                 ledger_committed = True
                 actor = _Actor(lease, descriptor, stage, component)
                 self._actors[identifier] = actor
-                self._tasks.start_soon(self._run, actor)
+                # Preserve this pool's task ownership while using the manager's
+                # context-clearing wrapper for independent physical actors.
+                _ = self._tasks.start_soon(resources._run_background, self._run, (actor,))  # pyright: ignore[reportPrivateUsage]
                 committed = True
                 return True
         finally:

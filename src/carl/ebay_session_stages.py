@@ -1079,7 +1079,7 @@ def build_ebay_session_stage_registry(deps: EbaySessionStageDependencies) -> Sta
             operation_identifier=operation,
             kind=_PREPARE,
             resources=(ResourceRequest(name="cpu"),),
-        )
+        ).model_copy(update={"resident_session_identifier": work.identifier})
 
     item_component = build_ebay_item_worker_registry(_item_dependencies(deps)).handlers[0].component
     return StageHandlerRegistry(

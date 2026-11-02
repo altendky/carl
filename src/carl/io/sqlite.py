@@ -1354,7 +1354,8 @@ class Database:
                        w.priority,w.eligible_at_utc_ns,w.created_at_utc_ns,
                        s.id,s.operation_id,json_extract(s.definition_json,'$.kind'),
                        json_extract(s.definition_json,'$.schema_version'),
-                       json_extract(s.definition_json,'$.resident_session_identifier')
+                       json_extract(s.definition_json,'$.resident_session_identifier'),
+                       json_extract(s.definition_json,'$.resources')
                 FROM work_items AS w
                 LEFT JOIN stage_attempts AS a ON a.work_item_id=w.id AND a.state IN ('pending','active')
                 LEFT JOIN work_stages AS s ON s.work_item_id=w.id AND s.state IN ('pending','running')
@@ -1387,6 +1388,12 @@ class Database:
                 else tuple(cast(list[str], decode_json(_text(row[10])))),
                 stage_schema_version=None if row[11] is None else _integer(row[11]),
                 resident_session_identifier=None if row[12] is None else _text(row[12]),
+                stage_resources=()
+                if row[13] is None
+                else tuple(
+                    ResourceRequest.model_validate_json(encode_json(value))
+                    for value in decode_json(_text(row[13]))
+                ),
             )
             for row in rows[:limit]
         )
@@ -3301,6 +3308,21 @@ class Database:
                 for allocation in await cursor.fetchall()
             ),
         )
+
+    async def resource_occupancy(self, scope: str) -> dict[str, int]:
+        """Advisory occupied units; only atomic admission may grant execution.
+
+        Expired held permits remain occupied until physical guard recovery proves
+        their executor stopped. This snapshot can delay dispatch, never grant it.
+        """
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """SELECT a.name,SUM(a.units) FROM resource_allocations AS a
+                JOIN resource_permits AS p ON p.token=a.permit_token AND p.scope=a.scope
+                WHERE p.scope=? AND p.state='held' GROUP BY a.name""",
+                (scope,),
+            )
+            return {_text(row[0]): _integer(row[1]) for row in await cursor.fetchall()}
 
     @staticmethod
     async def _configure_resource_budgets(
