@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from carl.core.components import Component, ComponentId
 from carl.core.models import NamedInput, NamedOutput, RecordDraft
+from carl.core.travel import TravelEstimate
 from carl.core.travel_refresh import (
     REFRESH_LISTING_ROUTE_WORK_KIND,
     TRAVEL_ESTIMATE_RECORD_KIND,
@@ -39,7 +40,15 @@ async def _refresh(
     )
     if len(estimates) != 1:
         raise ValueError("Route refresh service returned a mismatched estimate count")
-    estimate = estimates[0]
+    return travel_refresh_outcome(payload, estimates[0], dependencies)
+
+
+def travel_refresh_outcome(
+    payload: TravelRefreshPayload,
+    estimate: TravelEstimate,
+    dependencies: TravelWorkerDependencies,
+) -> WorkOutcome:
+    """Publish the existing route schema independently from physical query execution."""
     if estimate.unavailable_reason == "origin_changed":
         return TerminalFailureWork(
             error={"kind": "origin_changed"},

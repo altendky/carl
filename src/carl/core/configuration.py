@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
-from pydantic import BeforeValidator, Field, field_validator, model_validator
+from pydantic import BeforeValidator, Field, ValidationInfo, field_validator, model_validator
 
 from carl.core.models import ConfigurationSchemaIdentity, JsonValue, StrictModel
 from carl.core.routing import (
@@ -372,8 +372,8 @@ class OsrmConfiguration(StrictModel):
 
     @field_validator("dataset_path", mode="before")
     @classmethod
-    def parse_path(cls, value: object) -> object:
-        return Path(value) if isinstance(value, str) else value
+    def parse_path(cls, value: object, info: ValidationInfo) -> object:
+        return Path(value) if info.mode == "python" and isinstance(value, str) else value
 
     @field_validator("dataset_path")
     @classmethod
@@ -389,8 +389,8 @@ class GeonamesConfiguration(StrictModel):
 
     @field_validator("database_path", mode="before")
     @classmethod
-    def parse_path(cls, value: object) -> object:
-        return Path(value) if isinstance(value, str) else value
+    def parse_path(cls, value: object, info: ValidationInfo) -> object:
+        return Path(value) if info.mode == "python" and isinstance(value, str) else value
 
     @field_validator("database_path")
     @classmethod

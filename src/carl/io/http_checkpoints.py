@@ -7,6 +7,7 @@ import stat
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -114,7 +115,9 @@ def _read_body(bucket: int, name: str, *, digest: str, size: int, retain: bool) 
         os.close(descriptor)
 
 
-def _publish_body(root: Path, body: AcquiredBody) -> ExternalFileDraft:
+def _publish_body(
+    root: Path, body: AcquiredBody, *, kind: tuple[str, ...] = BODY_KIND
+) -> ExternalFileDraft:
     digest = hashlib.sha256(body.content).hexdigest()
     size = len(body.content)
     name = f"{digest}.body"
@@ -158,7 +161,7 @@ def _publish_body(root: Path, body: AcquiredBody) -> ExternalFileDraft:
                 os.fsync(bucket)
         return ExternalFileDraft(
             identifier=body.identifier,
-            kind=BODY_KIND,
+            kind=kind,
             media_type=body.media_type,
             representation=decode_json(encode_json(body.representation)),
             sha256=digest,
@@ -171,6 +174,32 @@ def _publish_body(root: Path, body: AcquiredBody) -> ExternalFileDraft:
 
 def _publish_bodies(root: Path, bodies: tuple[AcquiredBody, ...]) -> tuple[ExternalFileDraft, ...]:
     return tuple(_publish_body(root, body) for body in bodies)
+
+
+async def publish_checkpoint_artifact(
+    content: bytes,
+    *,
+    data_directory: Path,
+    identifier: str,
+    kind: tuple[str, ...],
+    media_type: str,
+    representation: dict[str, JsonValue],
+    maximum_bytes: int,
+) -> ExternalFileDraft:
+    """Reuse private atomic checkpoint storage for a separately typed bounded artifact."""
+    if not 0 < maximum_bytes <= MAX_CHECKPOINT_BODY_BYTES or len(content) > maximum_bytes:
+        raise ValueError("Checkpoint artifact exceeds its byte bound")
+    artifact = await anyio.to_thread.run_sync(
+        partial(
+            _publish_body,
+            data_directory.resolve(),
+            AcquiredBody(identifier, media_type, representation, content),
+            kind=kind,
+        ),
+        abandon_on_cancel=False,
+    )
+    await anyio.lowlevel.checkpoint()
+    return artifact
 
 
 def _validate_body_bounds(sizes: Sequence[int]) -> None:
