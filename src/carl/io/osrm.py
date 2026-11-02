@@ -5,31 +5,23 @@ import math
 import os
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 import anyio
-import anyio.to_process
 
+from carl.core.native_routing import NativeRoutingDataset
 from carl.core.travel import TravelCoordinate
+from carl.io.native_routing_pool import (
+    NativeRoutingBorrowExpired,
+    close_unmanaged_native_routing,
+    ephemeral_native_query,
+    native_routing_pool,
+)
+from carl.io.resource_permits import current_resource_manager, run_cpu
 
 _BATCH_SIZE = 64
 _QUERY_TIMEOUT_SECONDS = 60
-type _SettingsIdentity = tuple[str, str, float, bool]
-type _Coordinate = tuple[float, float]
-
-
-@dataclass(frozen=True)
-class _WorkerSettings:
-    dataset_path: Path
-    dataset_identifier: str
-    maximum_snap_distance_meters: float
-    use_mmap: bool
-
-
-_native_router: "OsrmRouter | None" = None
-_native_identity: _SettingsIdentity | None = None
 
 
 @contextmanager
@@ -49,23 +41,6 @@ def _quiet_native_output() -> Iterator[None]:
         finally:
             os.dup2(stdout, 1)
             os.dup2(stderr, 2)
-
-
-def _native_table(
-    settings: _SettingsIdentity, origin: _Coordinate, destinations: tuple[_Coordinate, ...]
-) -> tuple[tuple[float, float] | str, ...]:
-    """Picklable subprocess entry point; retain only one mapped dataset per child."""
-    global _native_router, _native_identity
-    with _quiet_native_output():
-        if _native_router is None or _native_identity != settings:
-            _native_router = OsrmRouter(
-                _WorkerSettings(Path(settings[0]), settings[1], settings[2], settings[3])
-            )
-            _native_identity = settings
-        return _native_router._table(
-            TravelCoordinate(latitude=origin[0], longitude=origin[1]),
-            tuple(TravelCoordinate(latitude=lat, longitude=lon) for lat, lon in destinations),
-        )
 
 
 class OsrmSettings(Protocol):
@@ -101,12 +76,11 @@ def _array(value: Any, size: int) -> list[Any]:
 
 
 class OsrmRouter:
-    """Keep a warm engine in an AnyIO subprocess, isolated from the main GIL.
+    """Use an owned native engine whose warm residency is separate from CPU work.
 
-    OSRM 26.10 native bindings retain the GIL during construction and queries.
-    Threads would therefore stall the main event loop despite the offload. AnyIO
-    owns the process pool, cleans it up on shutdown, and kills a busy child when
-    its caller is cancelled. Injected test engines use threads instead.
+    Managed runtimes share a bounded pool across router instances. Outside a
+    managed database, each call uses a serial ephemeral supervised process.
+    Injected test bindings run in non-abandoning CPU-admitted threads.
 
     Dataset files must be immutable while mapped. Publish a rebuilt dataset under
     a new prefix and identifier, then reload configuration. The identifier also
@@ -123,7 +97,6 @@ class OsrmRouter:
         self.bindings_loader = bindings_loader
         self._native_process = bindings_loader is _bindings
         self._lock = anyio.Lock()
-        self._limiter = anyio.CapacityLimiter(1)
         self._engine: Any = None
         self._module: Any = None
         self._engine_identity: tuple[Path, str, bool] | None = None
@@ -233,29 +206,54 @@ class OsrmRouter:
         results: list[tuple[float, float] | str] = []
         async with self._lock:
             for start in range(0, len(destinations), _BATCH_SIZE):
-                batch = destinations[start : start + _BATCH_SIZE]
+                batch = tuple(destinations[start : start + _BATCH_SIZE])
                 if self._native_process:
                     configuration = self.configuration
+                    dataset = NativeRoutingDataset(
+                        dataset_path=configuration.dataset_path,
+                        dataset_identifier=configuration.dataset_identifier,
+                        use_mmap=configuration.use_mmap,
+                    )
                     try:
                         with anyio.fail_after(_QUERY_TIMEOUT_SECONDS):
-                            estimates = await anyio.to_process.run_sync(
-                                _native_table,
-                                (
-                                    str(configuration.dataset_path),
-                                    configuration.dataset_identifier,
-                                    configuration.maximum_snap_distance_meters,
-                                    configuration.use_mmap,
-                                ),
-                                (origin.latitude, origin.longitude),
-                                tuple((item.latitude, item.longitude) for item in batch),
-                                cancellable=True,
-                                limiter=self._limiter,
-                            )
+                            manager = current_resource_manager()
+                            if manager is None:
+                                estimates = await ephemeral_native_query(
+                                    dataset,
+                                    origin,
+                                    batch,
+                                    maximum_snap_distance_meters=configuration.maximum_snap_distance_meters,
+                                    timeout_seconds=_QUERY_TIMEOUT_SECONDS,
+                                )
+                            else:
+                                while True:
+                                    try:
+                                        async with native_routing_pool(manager).borrow(
+                                            dataset
+                                        ) as borrow:
+                                            estimates = await borrow.query(
+                                                origin,
+                                                batch,
+                                                maximum_snap_distance_meters=configuration.maximum_snap_distance_meters,
+                                                timeout_seconds=_QUERY_TIMEOUT_SECONDS,
+                                            )
+                                        break
+                                    except NativeRoutingBorrowExpired:
+                                        # The CPU decorator has unwound before another residency wait.
+                                        continue
                     except TimeoutError:
                         estimates = ("osrm_timeout",) * len(batch)
-                    except (anyio.BrokenWorkerProcess, OSError, RuntimeError):
+                    except (OSError, RuntimeError):
                         estimates = ("osrm_unavailable",) * len(batch)
                 else:
-                    estimates = await anyio.to_thread.run_sync(self._table, origin, batch)
+                    estimates = await run_cpu(self._table, origin, batch)
                 results.extend(estimates)
         return tuple(results)
+
+    async def aclose(self) -> None:
+        """Managed engines belong to the root pool; standalone calls close eagerly."""
+        async with self._lock:
+            if current_resource_manager() is None:
+                await close_unmanaged_native_routing()
+            self._engine = self._module = None
+            self._engine_identity = None

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import anyio
-import anyio.to_process
 import pytest
 
 from carl.core.travel import TravelCoordinate
@@ -125,11 +124,24 @@ async def test_local_tables_are_warm_bounded_mapped_and_offloaded(tmp_path: Path
 async def test_stalled_native_query_is_bounded_and_explicit_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def stalled(*args: Any, **kwargs: Any) -> Any:
-        await anyio.sleep_forever()
+    class Stalled:
+        closed = False
+
+        async def query(self, origin: Any, destinations: Any, **kwargs: Any) -> Any:
+            with anyio.fail_after(kwargs["timeout_seconds"]):
+                await anyio.sleep_forever()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+    async def start(**kwargs: Any) -> Any:
+        return Stalled()
 
     monkeypatch.setattr("carl.io.osrm._QUERY_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr("anyio.to_process.run_sync", stalled)
+    monkeypatch.setattr("carl.io.native_routing_pool.NativeRoutingProcess.start", start)
     router = OsrmRouter(Settings(tmp_path / "roads.osrm"))
     assert await router.estimates(ORIGIN, [DESTINATION]) == ("osrm_timeout",)
 
@@ -247,44 +259,54 @@ async def test_native_process_uses_bounded_cancellable_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[dict[str, Any]] = []
+    owners: list[Any] = []
 
-    async def process(function: Any, *args: Any, **kwargs: Any) -> Any:
-        calls.append({"arguments": args, **kwargs})
-        return ((1.0, 2.0),) * len(args[2])
+    class Process:
+        closed = False
 
-    monkeypatch.setattr(anyio.to_process, "run_sync", process)
+        async def query(self, origin: Any, destinations: Any, **kwargs: Any) -> Any:
+            calls.append({"origin": origin, "destinations": destinations, **kwargs})
+            assert os.fstat(kwargs["cpu_guard_fd"]).st_uid == os.getuid()
+            return ((1.0, 2.0),) * len(destinations)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+    async def start(**kwargs: Any) -> Any:
+        assert kwargs["dataset"].dataset_identifier == "fixture-v1"
+        assert os.fstat(kwargs["resident_guard_fd"]).st_uid == os.getuid()
+        owner = Process()
+        owners.append(owner)
+        return owner
+
+    monkeypatch.setattr("carl.io.native_routing_pool.NativeRoutingProcess.start", start)
     router = OsrmRouter(Settings(tmp_path / "roads.osrm"))
     assert await router.estimates(ORIGIN, [DESTINATION] * 65) == ((1.0, 2.0),) * 65
-    assert len(calls) == 2
-    assert calls[0]["cancellable"] is True
-    assert calls[0]["limiter"].total_tokens == 1
-    assert calls[0]["limiter"] is calls[1]["limiter"]
-    assert calls[0]["arguments"][0] == (
-        str(tmp_path / "roads.osrm"),
-        "fixture-v1",
-        5000,
-        True,
-    )
-    assert calls[0]["arguments"][1] == (10.0, 20.0)
+    assert len(calls) == 2 and [len(call["destinations"]) for call in calls] == [64, 1]
+    assert calls[0]["origin"] == ORIGIN
+    assert calls[0]["maximum_snap_distance_meters"] == 5000
+    assert calls[0]["timeout_seconds"] == 60
+    assert all(owner.closed for owner in owners)
 
 
 @pytest.mark.anyio
 async def test_native_process_failure_is_sanitized_and_cancellation_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def broken(*args: Any, **kwargs: Any) -> Any:
-        raise anyio.BrokenWorkerProcess("sensitive details")
+    async def broken(**kwargs: Any) -> Any:
+        raise OSError("sensitive details")
 
-    monkeypatch.setattr(anyio.to_process, "run_sync", broken)
+    monkeypatch.setattr("carl.io.native_routing_pool.NativeRoutingProcess.start", broken)
     router = OsrmRouter(Settings(tmp_path / "roads.osrm"))
     assert await router.estimates(ORIGIN, [DESTINATION]) == ("osrm_unavailable",)
 
-    # Trio's Cancelled constructor is intentionally private; request cancellation
-    # through its public scope rather than manufacturing the exception.
-    async def wait(*args: Any, **kwargs: Any) -> Any:
+    async def wait(**kwargs: Any) -> Any:
         await anyio.sleep_forever()
 
-    monkeypatch.setattr(anyio.to_process, "run_sync", wait)
+    monkeypatch.setattr("carl.io.native_routing_pool.NativeRoutingProcess.start", wait)
     with anyio.move_on_after(0.01) as scope:
         _ = await router.estimates(ORIGIN, [DESTINATION])
         pytest.fail("Cancellation was swallowed")
