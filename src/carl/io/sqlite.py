@@ -8193,6 +8193,8 @@ class Database:
                 (recent_since_utc_ns,),
             )
             network_path_rows = await network_path_cursor.fetchall()
+            # Start with current activity; scope-first traversal rereads the
+            # entire network-path history even when the live list is empty.
             active_network_cursor = await connection.execute(
                 """
                 SELECT substr(activity.id,1,161), activity.kind_parts_json,
@@ -8201,8 +8203,8 @@ class Database:
                        activity.attempt, activity.created_at_utc_ns,
                        activity.eligible_at_utc_ns, activity.admitted_at_utc_ns,
                        activity.permit_expires_at_utc_ns
-                FROM network_activities AS activity
-                JOIN network_activity_scopes AS scope
+                FROM network_activities AS activity INDEXED BY network_activities_state
+                CROSS JOIN network_activity_scopes AS scope
                   ON scope.network_activity_id = activity.id
                  AND scope.scope_kind = 'network_path'
                 WHERE activity.state IN ('pending', 'admitted')
