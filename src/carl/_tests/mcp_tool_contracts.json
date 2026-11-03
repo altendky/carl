@@ -8921,7 +8921,7 @@
   },
   {
     "name": "get_activity_snapshot",
-    "description": "Discover active work, recent outcomes, and network activity in one bounded snapshot.",
+    "description": "Inspect logical work, host-scoped resource reservations, sampled blockers, and network activity. Held units remain occupied during cleanup; blocker observations are not admission guarantees.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -8961,21 +8961,24 @@
                 "$ref": "#/$defs/WorkKindActivity"
               },
               "title": "Work Kinds",
-              "type": "array"
+              "type": "array",
+              "maxItems": 32
             },
             "active_work": {
               "items": {
-                "$ref": "#/$defs/WorkActivity"
+                "$ref": "#/$defs/BoundedWorkActivity"
               },
               "title": "Active Work",
-              "type": "array"
+              "type": "array",
+              "maxItems": 100
             },
             "recent_terminal_work": {
               "items": {
-                "$ref": "#/$defs/WorkActivity"
+                "$ref": "#/$defs/BoundedWorkActivity"
               },
               "title": "Recent Terminal Work",
-              "type": "array"
+              "type": "array",
+              "maxItems": 100
             },
             "network": {
               "$ref": "#/$defs/NetworkActivityCounts"
@@ -8985,14 +8988,16 @@
                 "$ref": "#/$defs/NetworkPathActivity"
               },
               "title": "Network Paths",
-              "type": "array"
+              "type": "array",
+              "maxItems": 16
             },
             "active_network": {
               "items": {
                 "$ref": "#/$defs/ActiveNetworkActivity"
               },
               "title": "Active Network",
-              "type": "array"
+              "type": "array",
+              "maxItems": 100
             },
             "database_processes": {
               "default": [],
@@ -9000,10 +9005,116 @@
                 "$ref": "#/$defs/DatabaseProcessActivity"
               },
               "title": "Database Processes",
-              "type": "array"
+              "type": "array",
+              "maxItems": 8
             },
             "connectivity": {
               "$ref": "#/$defs/NetworkConnectivityActivity"
+            },
+            "database_process_count": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Database Process Count"
+            },
+            "process_omitted_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Process Omitted Count",
+              "type": "integer"
+            },
+            "work_kind_groups_omitted": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Work Kind Groups Omitted"
+            },
+            "work_kind_groups_truncated": {
+              "default": false,
+              "title": "Work Kind Groups Truncated",
+              "type": "boolean"
+            },
+            "network_path_groups_omitted": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Network Path Groups Omitted"
+            },
+            "network_path_groups_truncated": {
+              "default": false,
+              "title": "Network Path Groups Truncated",
+              "type": "boolean"
+            },
+            "active_work_omitted": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Active Work Omitted"
+            },
+            "recent_terminal_work_omitted": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Recent Terminal Work Omitted"
+            },
+            "active_network_omitted": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Active Network Omitted"
+            },
+            "scheduler": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SchedulerActivity"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -9130,28 +9241,32 @@
           "properties": {
             "identifier": {
               "title": "Identifier",
-              "type": "string"
+              "type": "string",
+              "maxLength": 160
             },
             "kind": {
               "items": {
-                "type": "string"
+                "$ref": "#/$defs/ActivityLabelPart"
               },
               "title": "Kind",
-              "type": "array"
+              "type": "array",
+              "maxItems": 8
             },
             "path": {
               "items": {
-                "type": "string"
+                "$ref": "#/$defs/ActivityLabelPart"
               },
               "title": "Path",
-              "type": "array"
+              "type": "array",
+              "maxItems": 8
             },
             "state": {
               "$ref": "#/$defs/NetworkActivityState"
             },
             "session_identifier": {
               "title": "Session Identifier",
-              "type": "string"
+              "type": "string",
+              "maxLength": 160
             },
             "ordinal": {
               "title": "Ordinal",
@@ -9190,6 +9305,16 @@
                 }
               ],
               "title": "Permit Expires At Utc Ns"
+            },
+            "identity_truncated": {
+              "default": false,
+              "title": "Identity Truncated",
+              "type": "boolean"
+            },
+            "labels_truncated": {
+              "default": false,
+              "title": "Labels Truncated",
+              "type": "boolean"
             }
           },
           "required": [
@@ -9217,12 +9342,14 @@
             },
             "command": {
               "title": "Command",
-              "type": "string"
+              "type": "string",
+              "maxLength": 96
             },
             "working_directory": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "type": "string",
+                  "maxLength": 160
                 },
                 {
                   "type": "null"
@@ -9232,10 +9359,11 @@
             },
             "database_files": {
               "items": {
-                "type": "string"
+                "$ref": "#/$defs/DatabaseFileKind"
               },
               "title": "Database Files",
-              "type": "array"
+              "type": "array",
+              "maxItems": 3
             },
             "current_process": {
               "title": "Current Process",
@@ -9244,7 +9372,8 @@
             "source_tree_sha256": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "type": "string",
+                  "maxLength": 64
                 },
                 {
                   "type": "null"
@@ -9399,10 +9528,11 @@
           "properties": {
             "path": {
               "items": {
-                "type": "string"
+                "$ref": "#/$defs/ActivityLabelPart"
               },
               "title": "Path",
-              "type": "array"
+              "type": "array",
+              "maxItems": 8
             },
             "pending": {
               "title": "Pending",
@@ -9443,6 +9573,11 @@
             "recent_cancelled": {
               "title": "Recent Cancelled",
               "type": "integer"
+            },
+            "labels_truncated": {
+              "default": false,
+              "title": "Labels Truncated",
+              "type": "boolean"
             }
           },
           "required": [
@@ -9461,128 +9596,16 @@
           "title": "NetworkPathActivity",
           "type": "object"
         },
-        "WorkActivity": {
-          "additionalProperties": false,
-          "properties": {
-            "identifier": {
-              "title": "Identifier",
-              "type": "string"
-            },
-            "kind": {
-              "items": {
-                "type": "string"
-              },
-              "title": "Kind",
-              "type": "array"
-            },
-            "state": {
-              "$ref": "#/$defs/WorkState"
-            },
-            "attempt": {
-              "title": "Attempt",
-              "type": "integer"
-            },
-            "created_at_utc_ns": {
-              "title": "Created At Utc Ns",
-              "type": "integer"
-            },
-            "eligible_at_utc_ns": {
-              "title": "Eligible At Utc Ns",
-              "type": "integer"
-            },
-            "lease_expires_at_utc_ns": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Lease Expires At Utc Ns"
-            },
-            "worker_identifier": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Worker Identifier"
-            },
-            "subject": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Subject"
-            },
-            "stage": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Stage"
-            },
-            "error_kind": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Error Kind"
-            },
-            "terminal_at_utc_ns": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Terminal At Utc Ns"
-            }
-          },
-          "required": [
-            "identifier",
-            "kind",
-            "state",
-            "attempt",
-            "created_at_utc_ns",
-            "eligible_at_utc_ns",
-            "lease_expires_at_utc_ns",
-            "worker_identifier",
-            "subject",
-            "stage",
-            "error_kind"
-          ],
-          "title": "WorkActivity",
-          "type": "object"
-        },
         "WorkKindActivity": {
           "additionalProperties": false,
           "properties": {
             "kind": {
               "items": {
-                "type": "string"
+                "$ref": "#/$defs/ActivityLabelPart"
               },
               "title": "Kind",
-              "type": "array"
+              "type": "array",
+              "maxItems": 8
             },
             "pending": {
               "title": "Pending",
@@ -9622,6 +9645,11 @@
               "default": 0,
               "title": "Recent Cancelled",
               "type": "integer"
+            },
+            "labels_truncated": {
+              "default": false,
+              "title": "Labels Truncated",
+              "type": "boolean"
             }
           },
           "required": [
@@ -9648,7 +9676,1061 @@
           "title": "WorkState",
           "type": "string"
         },
-        "CarlResponsePage_JsonValue": {}
+        "CarlResponsePage_JsonValue": {},
+        "ActivityLabelPart": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "BoundedWorkActivity": {
+          "additionalProperties": false,
+          "description": "Activity-monitor labels without changing explicit workspace progress.",
+          "properties": {
+            "identifier": {
+              "maxLength": 160,
+              "title": "Identifier",
+              "type": "string"
+            },
+            "kind": {
+              "items": {
+                "$ref": "#/$defs/ActivityLabelPart"
+              },
+              "maxItems": 8,
+              "title": "Kind",
+              "type": "array"
+            },
+            "state": {
+              "$ref": "#/$defs/WorkState"
+            },
+            "attempt": {
+              "title": "Attempt",
+              "type": "integer"
+            },
+            "created_at_utc_ns": {
+              "title": "Created At Utc Ns",
+              "type": "integer"
+            },
+            "eligible_at_utc_ns": {
+              "title": "Eligible At Utc Ns",
+              "type": "integer"
+            },
+            "lease_expires_at_utc_ns": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Lease Expires At Utc Ns"
+            },
+            "worker_identifier": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Worker Identifier"
+            },
+            "subject": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Subject"
+            },
+            "stage": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Stage"
+            },
+            "error_kind": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Error Kind"
+            },
+            "terminal_at_utc_ns": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Terminal At Utc Ns"
+            },
+            "identity_truncated": {
+              "default": false,
+              "title": "Identity Truncated",
+              "type": "boolean"
+            },
+            "labels_truncated": {
+              "default": false,
+              "title": "Labels Truncated",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "identifier",
+            "kind",
+            "state",
+            "attempt",
+            "created_at_utc_ns",
+            "eligible_at_utc_ns",
+            "lease_expires_at_utc_ns",
+            "worker_identifier",
+            "subject",
+            "stage",
+            "error_kind"
+          ],
+          "title": "BoundedWorkActivity",
+          "type": "object"
+        },
+        "DatabaseFileKind": {
+          "enum": [
+            "database",
+            "wal",
+            "shared_memory"
+          ],
+          "type": "string"
+        },
+        "SchedulerActivity": {
+          "additionalProperties": false,
+          "properties": {
+            "captured_at_utc_ns": {
+              "minimum": 0,
+              "title": "Captured At Utc Ns",
+              "type": "integer"
+            },
+            "coordination_boundary": {
+              "const": "database_and_host",
+              "default": "database_and_host",
+              "title": "Coordination Boundary",
+              "type": "string"
+            },
+            "scope_handle": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Scope Handle",
+              "type": "string"
+            },
+            "scope_configured": {
+              "title": "Scope Configured",
+              "type": "boolean"
+            },
+            "pending_scope": {
+              "const": "database",
+              "default": "database",
+              "title": "Pending Scope",
+              "type": "string"
+            },
+            "work_counts_scope": {
+              "const": "database",
+              "default": "database",
+              "title": "Work Counts Scope",
+              "type": "string"
+            },
+            "stage_counts_scope": {
+              "const": "database",
+              "default": "database",
+              "title": "Stage Counts Scope",
+              "type": "string"
+            },
+            "resources": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerResourceActivity"
+              },
+              "maxItems": 8,
+              "title": "Resources",
+              "type": "array"
+            },
+            "work_counts": {
+              "$ref": "#/$defs/SchedulerWorkCounts"
+            },
+            "stage_counts": {
+              "$ref": "#/$defs/SchedulerStageCounts"
+            },
+            "wait_groups": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerWaitGroup"
+              },
+              "maxItems": 8,
+              "title": "Wait Groups",
+              "type": "array"
+            },
+            "samples": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerWorkStatus"
+              },
+              "maxItems": 8,
+              "title": "Samples",
+              "type": "array"
+            },
+            "timings": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerTimingSummary"
+              },
+              "maxItems": 8,
+              "title": "Timings",
+              "type": "array"
+            },
+            "failures": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerFailureGroup"
+              },
+              "maxItems": 8,
+              "title": "Failures",
+              "type": "array"
+            },
+            "throughput": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SchedulerThroughput"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "coverage": {
+              "$ref": "#/$defs/SchedulerCoverage"
+            },
+            "omitted_resource_names": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Omitted Resource Names",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "captured_at_utc_ns",
+            "scope_handle",
+            "scope_configured",
+            "coverage"
+          ],
+          "title": "SchedulerActivity",
+          "type": "object"
+        },
+        "SchedulerBlocker": {
+          "enum": [
+            "dependency",
+            "building_dependencies",
+            "resource",
+            "execution_runner",
+            "metadata_runner",
+            "time",
+            "connectivity",
+            "resident_ownership",
+            "fairness",
+            "logical_policy",
+            "running",
+            "none_of_checked_conditions",
+            "terminal",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "SchedulerCoverage": {
+          "additionalProperties": false,
+          "properties": {
+            "method": {
+              "enum": [
+                "current_metadata",
+                "observed_transitions",
+                "recent_sample",
+                "unavailable"
+              ],
+              "title": "Method",
+              "type": "string"
+            },
+            "examined_rows": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Examined Rows",
+              "type": "integer"
+            },
+            "row_limit": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Row Limit",
+              "type": "integer"
+            },
+            "truncated": {
+              "default": false,
+              "title": "Truncated",
+              "type": "boolean"
+            },
+            "instrumented_since_utc_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Instrumented Since Utc Ns"
+            },
+            "censored_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Censored Count",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "title": "SchedulerCoverage",
+          "type": "object"
+        },
+        "SchedulerFailureGroup": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "enum": [
+                "connectivity",
+                "throttled",
+                "provider_challenge",
+                "capacity",
+                "cancelled",
+                "invalid_output",
+                "other"
+              ],
+              "title": "Reason",
+              "type": "string"
+            },
+            "count": {
+              "minimum": 0,
+              "title": "Count",
+              "type": "integer"
+            },
+            "cooldown_remaining_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cooldown Remaining Ns"
+            }
+          },
+          "required": [
+            "reason",
+            "count"
+          ],
+          "title": "SchedulerFailureGroup",
+          "type": "object"
+        },
+        "SchedulerMetric": {
+          "enum": [
+            "queue_delay",
+            "observed_resource_wait",
+            "phase_runtime",
+            "physical_hold"
+          ],
+          "type": "string"
+        },
+        "SchedulerResourceActivity": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/SchedulerResourceName"
+            },
+            "capacity": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Capacity"
+            },
+            "held_units": {
+              "minimum": 0,
+              "title": "Held Units",
+              "type": "integer"
+            },
+            "expired_held_units": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Expired Held Units",
+              "type": "integer"
+            },
+            "oldest_held_age_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Oldest Held Age Ns"
+            },
+            "complete": {
+              "default": true,
+              "title": "Complete",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "held_units"
+          ],
+          "title": "SchedulerResourceActivity",
+          "type": "object"
+        },
+        "SchedulerResourceName": {
+          "enum": [
+            "http",
+            "cpu",
+            "analysis",
+            "routing_engines",
+            "resident_sessions",
+            "resident_state_bytes"
+          ],
+          "type": "string"
+        },
+        "SchedulerResourceRequirement": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/SchedulerResourceName"
+            },
+            "units": {
+              "minimum": 1,
+              "title": "Units",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "units"
+          ],
+          "title": "SchedulerResourceRequirement",
+          "type": "object"
+        },
+        "SchedulerStageCounts": {
+          "additionalProperties": false,
+          "properties": {
+            "pending": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Pending",
+              "type": "integer"
+            },
+            "running": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Running",
+              "type": "integer"
+            },
+            "completed": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Completed",
+              "type": "integer"
+            },
+            "cancelled": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelled",
+              "type": "integer"
+            },
+            "progress_waiting": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Progress Waiting",
+              "type": "integer"
+            },
+            "complete": {
+              "default": true,
+              "title": "Complete",
+              "type": "boolean"
+            }
+          },
+          "title": "SchedulerStageCounts",
+          "type": "object"
+        },
+        "SchedulerThroughput": {
+          "additionalProperties": false,
+          "properties": {
+            "logical_scope": {
+              "const": "database",
+              "default": "database",
+              "title": "Logical Scope",
+              "type": "string"
+            },
+            "execution_scope": {
+              "const": "selected_host",
+              "default": "selected_host",
+              "title": "Execution Scope",
+              "type": "string"
+            },
+            "window_start_utc_ns": {
+              "minimum": 0,
+              "title": "Window Start Utc Ns",
+              "type": "integer"
+            },
+            "window_end_utc_ns": {
+              "minimum": 0,
+              "title": "Window End Utc Ns",
+              "type": "integer"
+            },
+            "logical_completed": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Logical Completed",
+              "type": "integer"
+            },
+            "logical_failed": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Logical Failed",
+              "type": "integer"
+            },
+            "logical_cancelled": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Logical Cancelled",
+              "type": "integer"
+            },
+            "stage_completed": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Stage Completed",
+              "type": "integer"
+            },
+            "stage_failed": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Stage Failed",
+              "type": "integer"
+            },
+            "stage_cancelled": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Stage Cancelled",
+              "type": "integer"
+            },
+            "admissions": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Admissions",
+              "type": "integer"
+            },
+            "complete": {
+              "default": false,
+              "title": "Complete",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "window_start_utc_ns",
+            "window_end_utc_ns"
+          ],
+          "title": "SchedulerThroughput",
+          "type": "object"
+        },
+        "SchedulerTimingSummary": {
+          "additionalProperties": false,
+          "properties": {
+            "metric": {
+              "$ref": "#/$defs/SchedulerMetric"
+            },
+            "count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Count",
+              "type": "integer"
+            },
+            "total_ns": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Total Ns",
+              "type": "integer"
+            },
+            "maximum_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Maximum Ns"
+            },
+            "bucket_upper_bounds_ns": {
+              "default": [
+                1000000,
+                5000000,
+                10000000,
+                50000000,
+                100000000,
+                500000000,
+                1000000000,
+                5000000000,
+                10000000000,
+                30000000000,
+                60000000000,
+                300000000000,
+                1800000000000
+              ],
+              "items": {
+                "type": "integer"
+              },
+              "maxItems": 16,
+              "title": "Bucket Upper Bounds Ns",
+              "type": "array"
+            },
+            "histogram_counts": {
+              "default": [],
+              "items": {
+                "type": "integer"
+              },
+              "maxItems": 17,
+              "title": "Histogram Counts",
+              "type": "array"
+            },
+            "censored_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Censored Count",
+              "type": "integer"
+            },
+            "method": {
+              "default": "unavailable",
+              "enum": [
+                "monotonic",
+                "utc_estimate",
+                "observed_lower_bound",
+                "unavailable"
+              ],
+              "title": "Method",
+              "type": "string"
+            }
+          },
+          "required": [
+            "metric"
+          ],
+          "title": "SchedulerTimingSummary",
+          "type": "object"
+        },
+        "SchedulerWaitGroup": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/SchedulerBlocker"
+            },
+            "count": {
+              "minimum": 0,
+              "title": "Count",
+              "type": "integer"
+            },
+            "oldest_age_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Oldest Age Ns"
+            },
+            "sampled": {
+              "default": true,
+              "title": "Sampled",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "reason",
+            "count"
+          ],
+          "title": "SchedulerWaitGroup",
+          "type": "object"
+        },
+        "SchedulerWorkCounts": {
+          "additionalProperties": false,
+          "properties": {
+            "pending": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Pending",
+              "type": "integer"
+            },
+            "leased": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Leased",
+              "type": "integer"
+            },
+            "completed": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Completed",
+              "type": "integer"
+            },
+            "terminal_failure": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Terminal Failure",
+              "type": "integer"
+            },
+            "cancelling": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelling",
+              "type": "integer"
+            },
+            "cancelled": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Cancelled",
+              "type": "integer"
+            },
+            "complete": {
+              "default": true,
+              "title": "Complete",
+              "type": "boolean"
+            }
+          },
+          "title": "SchedulerWorkCounts",
+          "type": "object"
+        },
+        "SchedulerWorkStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "work_handle": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Work Handle",
+              "type": "string"
+            },
+            "work_identifier": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Work Identifier"
+            },
+            "stage_handle": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Stage Handle"
+            },
+            "stage_identifier": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Stage Identifier"
+            },
+            "logical_state": {
+              "$ref": "#/$defs/WorkState"
+            },
+            "stage_state": {
+              "enum": [
+                "unregistered",
+                "pending",
+                "running",
+                "completed",
+                "cancelled",
+                "none"
+              ],
+              "title": "Stage State",
+              "type": "string"
+            },
+            "phase_family": {
+              "default": "other",
+              "enum": [
+                "http",
+                "cpu",
+                "analysis",
+                "coordinator",
+                "resident",
+                "dataset",
+                "travel",
+                "other"
+              ],
+              "title": "Phase Family",
+              "type": "string"
+            },
+            "execution": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Execution",
+              "type": "integer"
+            },
+            "execution_started_at_utc_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Execution Started At Utc Ns"
+            },
+            "execution_age_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Execution Age Ns"
+            },
+            "execution_age_method": {
+              "default": "unavailable",
+              "enum": [
+                "utc_estimate",
+                "unavailable"
+              ],
+              "title": "Execution Age Method",
+              "type": "string"
+            },
+            "scope_handle": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Scope Handle"
+            },
+            "resources": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerResourceRequirement"
+              },
+              "maxItems": 8,
+              "title": "Resources",
+              "type": "array"
+            },
+            "progress_state": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "building",
+                    "armed"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Progress State"
+            },
+            "recorded_wait_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/StageWaitKind"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "recorded_observation_reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SchedulerBlocker"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "recorded_observation_at_utc_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Recorded Observation At Utc Ns"
+            },
+            "observed_blockers": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerBlocker"
+              },
+              "maxItems": 8,
+              "title": "Observed Blockers",
+              "type": "array"
+            },
+            "blocked_resources": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerResourceName"
+              },
+              "maxItems": 8,
+              "title": "Blocked Resources",
+              "type": "array"
+            },
+            "observed_at_utc_ns": {
+              "minimum": 0,
+              "title": "Observed At Utc Ns",
+              "type": "integer"
+            },
+            "phase_ready_age_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Phase Ready Age Ns"
+            },
+            "wait_age_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Wait Age Ns"
+            },
+            "wait_observation_source": {
+              "default": "unavailable",
+              "enum": [
+                "advisory",
+                "admission",
+                "transition",
+                "unavailable"
+              ],
+              "title": "Wait Observation Source",
+              "type": "string"
+            },
+            "checks_complete": {
+              "default": false,
+              "title": "Checks Complete",
+              "type": "boolean"
+            },
+            "identity_omitted": {
+              "default": false,
+              "title": "Identity Omitted",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "work_handle",
+            "logical_state",
+            "stage_state",
+            "observed_at_utc_ns"
+          ],
+          "title": "SchedulerWorkStatus",
+          "type": "object"
+        },
+        "StageWaitKind": {
+          "enum": [
+            "resource",
+            "time",
+            "dependency",
+            "connectivity",
+            "ownership"
+          ],
+          "title": "StageWaitKind",
+          "type": "string"
+        }
       }
     },
     "annotations": {
@@ -21399,7 +22481,7 @@
   },
   {
     "name": "get_work_status",
-    "description": "Get compact live progress; include details only for raw durable diagnostic fields.",
+    "description": "Get live progress and bounded scheduler observations; include details only for raw durable diagnostic fields. Logical cancellation does not imply physical resources have been released.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -21544,6 +22626,17 @@
               "anyOf": [
                 {
                   "$ref": "#/$defs/WorkCancellationSummary"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "scheduler": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SchedulerWorkStatus"
                 },
                 {
                   "type": "null"
@@ -22269,7 +23362,339 @@
           "title": "WorkStatusDetails",
           "type": "object"
         },
-        "CarlResponsePage_JsonValue": {}
+        "CarlResponsePage_JsonValue": {},
+        "SchedulerBlocker": {
+          "enum": [
+            "dependency",
+            "building_dependencies",
+            "resource",
+            "execution_runner",
+            "metadata_runner",
+            "time",
+            "connectivity",
+            "resident_ownership",
+            "fairness",
+            "logical_policy",
+            "running",
+            "none_of_checked_conditions",
+            "terminal",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "SchedulerResourceName": {
+          "enum": [
+            "http",
+            "cpu",
+            "analysis",
+            "routing_engines",
+            "resident_sessions",
+            "resident_state_bytes"
+          ],
+          "type": "string"
+        },
+        "SchedulerResourceRequirement": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/SchedulerResourceName"
+            },
+            "units": {
+              "minimum": 1,
+              "title": "Units",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "units"
+          ],
+          "title": "SchedulerResourceRequirement",
+          "type": "object"
+        },
+        "SchedulerWorkStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "work_handle": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Work Handle",
+              "type": "string"
+            },
+            "work_identifier": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Work Identifier"
+            },
+            "stage_handle": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Stage Handle"
+            },
+            "stage_identifier": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Stage Identifier"
+            },
+            "logical_state": {
+              "$ref": "#/$defs/WorkState"
+            },
+            "stage_state": {
+              "enum": [
+                "unregistered",
+                "pending",
+                "running",
+                "completed",
+                "cancelled",
+                "none"
+              ],
+              "title": "Stage State",
+              "type": "string"
+            },
+            "phase_family": {
+              "default": "other",
+              "enum": [
+                "http",
+                "cpu",
+                "analysis",
+                "coordinator",
+                "resident",
+                "dataset",
+                "travel",
+                "other"
+              ],
+              "title": "Phase Family",
+              "type": "string"
+            },
+            "execution": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Execution",
+              "type": "integer"
+            },
+            "execution_started_at_utc_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Execution Started At Utc Ns"
+            },
+            "execution_age_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Execution Age Ns"
+            },
+            "execution_age_method": {
+              "default": "unavailable",
+              "enum": [
+                "utc_estimate",
+                "unavailable"
+              ],
+              "title": "Execution Age Method",
+              "type": "string"
+            },
+            "scope_handle": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Scope Handle"
+            },
+            "resources": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerResourceRequirement"
+              },
+              "maxItems": 8,
+              "title": "Resources",
+              "type": "array"
+            },
+            "progress_state": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "building",
+                    "armed"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Progress State"
+            },
+            "recorded_wait_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/StageWaitKind"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "recorded_observation_reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SchedulerBlocker"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "recorded_observation_at_utc_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Recorded Observation At Utc Ns"
+            },
+            "observed_blockers": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerBlocker"
+              },
+              "maxItems": 8,
+              "title": "Observed Blockers",
+              "type": "array"
+            },
+            "blocked_resources": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/SchedulerResourceName"
+              },
+              "maxItems": 8,
+              "title": "Blocked Resources",
+              "type": "array"
+            },
+            "observed_at_utc_ns": {
+              "minimum": 0,
+              "title": "Observed At Utc Ns",
+              "type": "integer"
+            },
+            "phase_ready_age_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Phase Ready Age Ns"
+            },
+            "wait_age_ns": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Wait Age Ns"
+            },
+            "wait_observation_source": {
+              "default": "unavailable",
+              "enum": [
+                "advisory",
+                "admission",
+                "transition",
+                "unavailable"
+              ],
+              "title": "Wait Observation Source",
+              "type": "string"
+            },
+            "checks_complete": {
+              "default": false,
+              "title": "Checks Complete",
+              "type": "boolean"
+            },
+            "identity_omitted": {
+              "default": false,
+              "title": "Identity Omitted",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "work_handle",
+            "logical_state",
+            "stage_state",
+            "observed_at_utc_ns"
+          ],
+          "title": "SchedulerWorkStatus",
+          "type": "object"
+        },
+        "StageWaitKind": {
+          "enum": [
+            "resource",
+            "time",
+            "dependency",
+            "connectivity",
+            "ownership"
+          ],
+          "title": "StageWaitKind",
+          "type": "string"
+        }
       }
     },
     "annotations": {

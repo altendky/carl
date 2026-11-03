@@ -492,16 +492,21 @@ class ResourceManager:
                     os.close(cleanup_descriptor)
 
 
+def resource_coordination_scope() -> str:
+    """Resolve the current host scope without configuring any resource budgets."""
+    host = os.environ.get("CARL_RESOURCE_HOST", socket.gethostname())
+    if not host.strip():
+        raise ValueError("Resource host identity must be nonempty")
+    return f"host:{host}"
+
+
 @asynccontextmanager
 async def resource_manager_context(
     database: ResourceDatabase, *, capacities: Mapping[str, int] | None = None
 ) -> AsyncIterator[ResourceManager]:
     """Bind root worker/CLI/MCP operations to their database's local budgets."""
 
-    host = os.environ.get("CARL_RESOURCE_HOST", socket.gethostname())
-    if not host.strip():
-        raise ValueError("Resource host identity must be nonempty")
-    scope = f"host:{host}"
+    scope = resource_coordination_scope()
     scope_hash = hashlib.sha256(scope.encode()).hexdigest()[:24]
     database_path = database.path.resolve()
     manager = ResourceManager(

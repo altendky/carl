@@ -617,7 +617,7 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                 tuple(capability["identity"]): capability["version"]
                 for capability in server_info.structured_content["capabilities"]
             }
-            assert capability_versions[("carl", "activity", "snapshot")] == 3
+            assert capability_versions[("carl", "activity", "snapshot")] == 4
             assert capability_versions[("carl", "work", "connectivity_outage_pause")] == 1
             assert capability_versions[("carl", "marketplace", "item_failure_retry")] == 1
             assert capability_versions[("carl", "facebook", "image_failure_retry")] == 2
@@ -634,7 +634,7 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "mcp", "instructions")] == 65
             assert capability_versions[("carl", "facebook", "price_partition_search_only")] == 1
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 48
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 49
             assert capability_versions[("carl", "mcp", "response_pages")] == 4
             assert capability_versions[("carl", "marketplace", "search_pipeline")] == 1
             assert capability_versions[("carl", "review", "workspace_work")] == 4

@@ -818,12 +818,55 @@ retry after five seconds. Other resource lanes continue throughout.
 
 Service bounds describe admission turns, not wall-clock latency through long
 executions, provider policies or unconfirmed physical cleanup. Existing work-kind
-and network policy caps remain eligibility gates. Dependency wakeups are separate
-work; this runtime still uses bounded polling. Coordinator image-validation phases reserve CPU before reading saved
+and network policy caps remain eligibility gates. The dispatcher polls bounded
+notification and recovery metadata while idle coordinators sleep on progress
+watches. Coordinator image-validation phases reserve CPU before reading saved
 bytes. Analysis-batch and listing-pipeline turns conservatively reserve CPU because
 their guide lookup reads retained text. A large refresh/history can still make one
 CPU turn long or materialize large metadata sets; fixed dispatcher task counts do
 not imply a hard whole-process memory bound or bounded CPU-turn duration.
+
+Activity snapshots, targeted work status and the terminal monitor include bounded
+scheduler observations. Resource capacities come from the persisted ledger for
+the selected database and host scope. Held units include expired reservations
+whose physical cleanup is unconfirmed. An absent capacity is unknown, rather
+than zero. CPU units and resident-state bytes are reservations, rather than
+processor utilization or measured RSS. Logical work and retained-stage counts
+cover the database; execution and resource measurements identify their host scope.
+
+Each sampled operation separates its last recorded wait from currently checked
+blockers, such as dependency construction, a future deadline, capacity or resident
+ownership. These observations do not grant admission. Wait groups and ages are
+sampled and carry coverage; skipped or unavailable measurements remain unknown.
+Observed resource-wait episodes begin at the first recorded blockage. Queue delay,
+monotonic execution-phase runtime and estimated physical reservation lifetime
+measure different intervals. Cleanup can retain a reservation after publication.
+Fixed duration buckets and minute rollups have bounded retention, with censored
+measurements and shortened windows reported explicitly. Diagnostics omit request
+headers, lease tokens, raw errors and process arguments.
+
+Run synthetic offline workloads in a new private database with:
+
+```console
+uv run carl benchmark scheduler http-images --mode verify --items 8 --output report.json
+```
+
+The benchmark uses mocked HTTP transport, real bounded image decoding, and a
+supervised local analysis child. Connectivity probes are also simulated. Profiles
+cover HTTP/image saturation, CPU and analysis pressure, multiple request groups,
+idle dependencies, retained watch history, outages, cancellation and checkpoint
+restart. Verification uses controlled gates and reports invariants. Throughput
+mode uses real monotonic elapsed time; fixture preparation is reported separately.
+Reports include the source revision, seed, workload configuration, effective
+capacities, completion and cleanup counts, sampled resource peaks and measurement
+coverage. Synthetic delays and incomplete samples remain labelled.
+
+The existing defaults of HTTP 25, CPU 4, analysis 10, one routing engine, 32 resident
+sessions and 128 MiB of reserved resident state are provisional input limits.
+Compare real-clock runs with explicit capacity overrides and representative image
+sizes before choosing deployment values. Offline synthetic runs do not establish
+provider limits, model billing, whole-machine memory use or cross-database capacity.
+Capacity tuning remains explicit; the benchmark does not change production limits.
 
 SQLite is the durable source of pending work. A claim uses a short transaction
 to assign a lease token, worker identity, and expiration time. Processing occurs

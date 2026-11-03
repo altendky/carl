@@ -95,7 +95,8 @@ def test_database_process_activity_reports_current_and_peer_processes(tmp_path: 
     assert not processes[1].current_process
     assert processes[1].source_tree_sha256 is None
     assert processes[1].database_files == ("wal",)
-    assert processes[2].command.endswith(f"carl mcp --database {database}")
+    assert processes[2].command == "python (carl mcp)"
+    assert all(process.working_directory is None for process in processes)
     assert processes[2].database_files == ()
 
 

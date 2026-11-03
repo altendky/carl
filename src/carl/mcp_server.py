@@ -722,7 +722,7 @@ def tool_definitions(
         recent_window_minutes: Annotated[int, Field(ge=1, le=7 * 24 * 60)] = 60,
         maximum_rows: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> ActivitySnapshot:
-        """Discover active work, recent outcomes, and network activity in one bounded snapshot."""
+        """Inspect logical work, host-scoped resource reservations, sampled blockers, and network activity. Held units remain occupied during cleanup; blocker observations are not admission guarantees."""
 
         return await expected(
             lambda: application.get_activity_snapshot(recent_window_minutes, maximum_rows)
@@ -1278,7 +1278,7 @@ def tool_definitions(
         work_identifier: str,
         include_details: bool = False,
     ) -> WorkStatus:
-        """Get compact live progress; include details only for raw durable diagnostic fields."""
+        """Get live progress and bounded scheduler observations; include details only for raw durable diagnostic fields. Logical cancellation does not imply physical resources have been released."""
 
         return await expected(lambda: application.get_work_status(work_identifier, include_details))
 

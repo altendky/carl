@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.live import Live
 
 from carl.app import extract_acquisition
+from carl.benchmark_cli import benchmark_app
 from carl.core.activity import ActivitySnapshot
 from carl.core.components import Component, ComponentId
 from carl.core.composed_projection import (
@@ -115,7 +116,7 @@ from carl.io.image_migration import (
     externalize_saved_images,
 )
 from carl.io.paths import user_directories
-from carl.io.processes import database_process_activity
+from carl.io.processes import database_process_snapshot
 from carl.io.provenance import collect_code_provenance_async, process_invocation
 from carl.io.route_cutover import cutover_route_overrides as perform_route_cutover
 from carl.io.sqlite import Database
@@ -126,6 +127,7 @@ from carl.work_runtime import managed_worker_pool, work_forever
 
 app = App(name="carl", help="Preserve web evidence and derived information")
 app.command(travel_app)
+app.command(benchmark_app)
 _HEADER_PAIRS = TypeAdapter(list[tuple[str, str]], config=ConfigDict(strict=True))
 
 
@@ -444,8 +446,10 @@ def monitor(
 ) -> None:
     """Watch durable activity, optionally processing queued work in the same process."""
 
-    if refresh_interval_seconds <= 0 or recent_window_minutes <= 0 or maximum_rows < 1:
-        raise ValueError("Monitor intervals and row count must be positive")
+    if refresh_interval_seconds <= 0 or recent_window_minutes <= 0 or not 1 <= maximum_rows <= 100:
+        raise ValueError(
+            "Monitor intervals must be positive and row count must be between 1 and 100"
+        )
     recent_window_ns = int(recent_window_minutes * 60 * 1_000_000_000)
     console = Console()
 
@@ -456,11 +460,17 @@ def monitor(
             maximum_rows=maximum_rows,
         )
         processes = await anyio.to_thread.run_sync(
-            database_process_activity,
+            database_process_snapshot,
             evidence_database.path,
             abandon_on_cancel=True,
         )
-        return activity.model_copy(update={"database_processes": processes})
+        return activity.model_copy(
+            update={
+                "database_processes": processes.processes,
+                "database_process_count": processes.total_count,
+                "process_omitted_count": max(0, processes.total_count - len(processes.processes)),
+            }
+        )
 
     async def perform() -> None:
         async with Database.managed(database) as evidence_database:

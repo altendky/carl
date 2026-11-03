@@ -17,6 +17,7 @@ from carl.core.models import (
     StrictModel,
 )
 from carl.core.refresh_recovery import RefreshFailureSummary
+from carl.core.scheduler_activity import SchedulerWorkStatus
 from carl.core.work import WorkEventKind, WorkState
 from carl.core.work_cancellation import WorkCancellationSummary
 
@@ -649,6 +650,7 @@ class WorkStatus(StrictModel):
     analysis_batch_progress: AnalysisBatchProgress | None = None
     details: WorkStatusDetails | None = None
     cancellation: WorkCancellationSummary | None = None
+    scheduler: SchedulerWorkStatus | None = None
 
 
 class ServerCapability(StrictModel):

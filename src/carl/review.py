@@ -400,7 +400,7 @@ from carl.io.claude import ClaudeCli
 from carl.io.configuration import ConfigurationFailure, load_configuration
 from carl.io.image_failures import refresh_image_failure_reason_counts
 from carl.io.paths import user_directories
-from carl.io.processes import database_process_activity
+from carl.io.processes import database_process_snapshot
 from carl.io.provenance import (
     collect_code_provenance_async,
     process_invocation,
@@ -890,14 +890,14 @@ class ReviewApplication:
             source_tree_sha256=source_tree_sha256,
             capabilities=(
                 ServerCapability(identity=("carl", "mcp", "instructions"), version=65),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=48),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=49),
                 ServerCapability(
                     identity=("carl", "facebook", "price_partition_search_only"), version=1
                 ),
                 ServerCapability(identity=("carl", "review", "driving_estimates"), version=4),
                 ServerCapability(identity=("carl", "mcp", "response_pages"), version=4),
                 ServerCapability(identity=("carl", "marketplace", "search_pipeline"), version=1),
-                ServerCapability(identity=("carl", "activity", "snapshot"), version=3),
+                ServerCapability(identity=("carl", "activity", "snapshot"), version=4),
                 ServerCapability(identity=("carl", "facebook", "search_refresh"), version=3),
                 ServerCapability(identity=("carl", "marketplace", "create_search"), version=1),
                 ServerCapability(identity=("carl", "marketplace", "search_group"), version=2),
@@ -948,7 +948,7 @@ class ReviewApplication:
                 ServerCapability(identity=("carl", "review", "selection_snapshot"), version=2),
                 ServerCapability(identity=("carl", "review", "selection_analysis"), version=5),
                 ServerCapability(identity=("carl", "review", "workspace_work"), version=4),
-                ServerCapability(identity=("carl", "work", "runtime_status"), version=2),
+                ServerCapability(identity=("carl", "work", "runtime_status"), version=3),
             ),
         )
 
@@ -969,12 +969,18 @@ class ReviewApplication:
             maximum_rows=maximum_rows,
         )
         processes = await anyio.to_thread.run_sync(
-            database_process_activity,
+            database_process_snapshot,
             self.database.path,
             self.server_source_tree_sha256,
             abandon_on_cancel=True,
         )
-        return snapshot.model_copy(update={"database_processes": processes})
+        return snapshot.model_copy(
+            update={
+                "database_processes": processes.processes,
+                "database_process_count": processes.total_count,
+                "process_omitted_count": processes.total_count - len(processes.processes),
+            }
+        )
 
     async def list_candidates(self, request: ListCandidatesRequest) -> CandidatePage:
         return candidate_page(await self.database.facebook_review_candidate_sources(), request)
@@ -7762,7 +7768,10 @@ class ReviewApplication:
         work_identifier: str,
         include_details: bool = False,
     ) -> WorkStatus:
-        work = await self.database.work(work_identifier)
+        observed_at_utc_ns = self.utc_now_ns()
+        work, scheduler = await self.database.work_with_scheduler_status(
+            work_identifier, now_utc_ns=observed_at_utc_ns
+        )
         operations_value = work.get("operations")
         operations = operations_value if isinstance(operations_value, list) else []
         result = work.get("result")
@@ -7939,7 +7948,6 @@ class ReviewApplication:
                     for summary in recent_failures
                 ),
             )
-        observed_at_utc_ns = self.utc_now_ns()
         lease_expires_value = work.get("lease_expires_at_utc_ns")
         lease_expires_at_utc_ns = (
             lease_expires_value if isinstance(lease_expires_value, int) else None
@@ -8006,4 +8014,5 @@ class ReviewApplication:
                 if isinstance(work.get("cancellation"), dict)
                 else None
             ),
+            scheduler=scheduler,
         )
