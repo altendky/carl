@@ -7003,7 +7003,6 @@ class Database:
         cancelled: list[JsonValue] = []
         cancelling: list[JsonValue] = []
         terminal: list[JsonValue] = []
-        changed = False
         for identifier in identifiers:
             cursor = await connection.execute(
                 "SELECT state FROM work_items WHERE id=?", (identifier,)
@@ -7019,7 +7018,6 @@ class Database:
                 cancelling.append(identifier)
                 continue
             data: JsonValue = {"reason": reason, "caller": caller}
-            changed = True
             await connection.execute(
                 "INSERT INTO work_cancellation_requests VALUES (?, ?, ?, ?)",
                 (identifier, requested_at_utc_ns, reason, caller),
@@ -7078,8 +7076,6 @@ class Database:
                     (identifier,),
                 )
                 cancelling.append(identifier)
-        if changed:
-            await self._clear_cancelled_cooldowns(connection, requested_at_utc_ns)
         return {
             "cancelled_pending": len(cancelled),
             "cancelling_leased": len(cancelling),
@@ -7854,6 +7850,17 @@ class Database:
         if row is None:
             raise KeyError(work_item_identifier)
         return WorkState(_text(row[0]))
+
+    async def work_kind(self, work_item_identifier: str) -> tuple[str, ...]:
+        """Read only kind metadata when applying a retained outcome policy."""
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT kind_parts_json FROM work_items WHERE id = ?", (work_item_identifier,)
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise KeyError(work_item_identifier)
+        return tuple(cast(list[str], decode_json(_text(row[0]))))
 
     async def work_definition(self, work_item_identifier: str) -> WorkDefinition:
         """Point-load retained work without history; not_before is current eligibility."""
@@ -8947,64 +8954,14 @@ class Database:
     async def _facebook_search_route_cooldowns(
         self, connection: AsyncConnection, now_utc_ns: int
     ) -> dict[str, int]:
-        """Read fenced search-only cooldowns; cancelled sources contribute nothing.
-
-        Leave sibling deadlines untouched so removing one source cannot erase a
-        different backoff or an explicit not-before deadline. Drive the lookup
-        from indexed search work, never historical item/image work or events.
-        """
-        cursor = await connection.execute(
-            """
-            WITH cooldowns AS (
-                SELECT coalesce(
-                    json_extract(event.data_json,'$.reason.facebook_search_cooldown.network_path'),
-                    json_extract(event.data_json,'$.error.facebook_search_cooldown.network_path')
-                ) AS routing, coalesce(
-                    json_extract(event.data_json,'$.reason.facebook_search_cooldown.until_utc_ns'),
-                    json_extract(event.data_json,'$.error.facebook_search_cooldown.until_utc_ns')
-                ) AS until_ns
-                FROM work_items AS work INDEXED BY work_items_analysis_lookup
-                CROSS JOIN work_events AS event INDEXED BY work_events_work_item
-                  ON event.work_item_id=work.id
-                WHERE work.kind_parts_json=?
-                  AND work.state NOT IN ('cancelled','cancelling')
-                  AND event.event_kind IN ('released','terminal_failure')
-                  AND event.recorded_at_utc_ns>?
-            )
-            SELECT routing,max(until_ns) FROM cooldowns
-            WHERE json_valid(routing) AND json_type(routing)='array'
-              AND typeof(until_ns)='integer' AND until_ns>?
-            GROUP BY routing
-            """,
-            (
-                _json(list(COLLECT_SEARCH_WORK_KIND)),
-                max(0, now_utc_ns - 60 * 60_000_000_000),
-                now_utc_ns,
-            ),
-        )
-        return {_text(row[0]): _integer(row[1]) for row in await cursor.fetchall()}
+        """Historical Marketplace cooldown markers no longer gate acquisition."""
+        return {}
 
     async def _ebay_search_stack_cooldowns(
         self, connection: AsyncConnection, now_utc_ns: int
     ) -> dict[str, int]:
-        """Read cooldowns from fenced attempt events, including terminal attempts."""
-        cursor = await connection.execute(
-            """
-            WITH cooldowns AS (
-                SELECT COALESCE(json_extract(event.data_json,'$.reason.cooldown.stack_identifier'),
-                                json_extract(event.data_json,'$.error.cooldown.stack_identifier')) stack,
-                       COALESCE(json_extract(event.data_json,'$.reason.cooldown.until_utc_ns'),
-                                json_extract(event.data_json,'$.error.cooldown.until_utc_ns')) until_ns
-                FROM work_items AS work JOIN work_events AS event ON event.work_item_id=work.id
-                WHERE work.kind_parts_json=? AND event.event_kind IN ('released','terminal_failure')
-                  AND work.state NOT IN ('cancelled','cancelling')
-            ) SELECT stack,MAX(until_ns) FROM cooldowns
-              WHERE typeof(stack)='text' AND typeof(until_ns)='integer' AND until_ns>?
-              GROUP BY stack
-            """,
-            (_json(list(COLLECT_EBAY_SEARCH_WORK_KIND)), now_utc_ns),
-        )
-        return {_text(row[0]): _integer(row[1]) for row in await cursor.fetchall()}
+        """Retain the compatibility query without reapplying retired cooldowns."""
+        return {}
 
     async def _defer_ebay_search_siblings(
         self,
@@ -10357,9 +10314,6 @@ class Database:
                     "reason": reason,
                 },
             )
-            await self._defer_ebay_search_siblings(
-                connection, work_item_identifier, reason, now_utc_ns, event_identifier
-            )
 
     async def terminally_fail_leased_operation(
         self,
@@ -10440,9 +10394,6 @@ class Database:
                     "error": error,
                     "result": result,
                 },
-            )
-            await self._defer_ebay_search_siblings(
-                connection, work_item_identifier, error, now_utc_ns, event_identifier
             )
 
     async def fail_operation(

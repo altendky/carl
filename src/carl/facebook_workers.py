@@ -78,7 +78,6 @@ PLAN_FACEBOOK_OVERLAPPING_PRICE_PARTITIONS = ComponentId(
 )
 PLAN_FACEBOOK_ITEM_PAGE_FOLLOWUPS = ComponentId(("carl", "facebook", "plan", "item_page_followups"))
 MAX_ACQUISITION_ATTEMPTS = 3
-ACQUISITION_RETRY_DELAY_NS = 1_000_000_000
 
 
 def build_component_registry() -> Registry:
@@ -294,7 +293,7 @@ def item_acquisition_failure_outcome(
         return RetryWork(
             artifacts=artifacts,
             outputs=outputs,
-            delay_ns=ACQUISITION_RETRY_DELAY_NS,
+            delay_ns=0,
             reason={**failure, "decision": "retry"},
             result=result,
         )

@@ -23,7 +23,6 @@ from carl.core.ebay import (
     CollectEbaySearchPayload,
     EbaySearchRequest,
     ebay_search_url,
-    ebay_search_work_constraint,
 )
 from carl.core.http import RequestPlan
 from carl.core.json import decode_json
@@ -182,7 +181,7 @@ def _configure(
     ],
     ids=["residential", "mobile", "fixed-dc", "range-dc", "pool-dc", "one-port-dc", "one-range-dc"],
 )
-async def test_verified_independent_sessions_keep_retry_without_cooling_siblings(
+async def test_verified_session_scope_keeps_retry_metadata_without_cooling_siblings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
@@ -208,15 +207,13 @@ async def test_verified_independent_sessions_keep_retry_without_cooling_siblings
     )
     _configure(monkeypatch, sessions, route_settings=settings)
     path, now = tmp_path / "test.sqlite3", 1_000_000_000_000
-    deadline = now + 600_000_000_000
     async with Database.managed(path, initialize=True) as database:
-        await database.register_constraint(ebay_search_work_constraint(), registered_at_utc_ns=now)
         await _enqueue(database, "blocked", now)
         await _enqueue(database, "sibling", now)
         await _fail(database, tmp_path, "blocked", now, collector=collect_configured_ebay_search)
         work = await database.work("blocked")
         assert work["state"] == "pending"
-        assert work["eligible_at_utc_ns"] == deadline
+        assert work["eligible_at_utc_ns"] == now
         assert work["attempt"] == 1
         async with database._connections.reader() as connection:
             cursor = await connection.execute(
@@ -229,11 +226,12 @@ async def test_verified_independent_sessions_keep_retry_without_cooling_siblings
         assert isinstance(released, dict)
         reason = cast(dict[str, JsonValue], cast(dict[str, JsonValue], released)["reason"])
         assert reason["maximum_attempts"] == 5
-        assert ("cooldown" not in reason) == independent
+        assert "cooldown" not in reason
+        assert reason.get("retry_scope") == ("independent_session" if independent else None)
         await _enqueue(database, "future", now + 1)
         for identifier in ("sibling", "future"):
             eligible = (await database.work(identifier))["eligible_at_utc_ns"]
-            assert eligible <= now + 1 if independent else eligible == deadline
+            assert eligible <= now + 1
     assert sessions.sessions[0].closed
     async with Database.managed(path) as database:
         registry = build_ebay_worker_registry(
@@ -248,7 +246,7 @@ async def test_verified_independent_sessions_keep_retry_without_cooling_siblings
             event_identifier=str(uuid4()),
             eligible_identifiers=("blocked",),
         )
-        assert waiting.lease is None and waiting.next_eligible_at_utc_ns == deadline
+        assert waiting.lease is not None and waiting.lease.attempt == 2
         sibling = await database.claim_work(
             supported_capabilities=registry.capabilities,
             worker_identifier="test",
@@ -258,9 +256,7 @@ async def test_verified_independent_sessions_keep_retry_without_cooling_siblings
             event_identifier=str(uuid4()),
             eligible_identifiers=("sibling",),
         )
-        assert (sibling.lease is not None) == independent
-        if sibling.lease is None:
-            assert sibling.next_eligible_at_utc_ns == deadline
+        assert sibling.lease is not None and sibling.lease.attempt == 1
 
 
 @pytest.mark.anyio
@@ -371,7 +367,7 @@ async def test_bootstrap_and_search_timeout_use_worker_retry_policy_with_retaine
             ),
         )
         assert isinstance(outcome, RetryWork)
-        assert outcome.delay_ns == 600_000_000_000
+        assert outcome.delay_ns == 0
         assert isinstance(outcome.reason, dict)
         reason = cast(dict[str, JsonValue], outcome.reason)
         assert reason["maximum_attempts"] == 5
@@ -482,7 +478,7 @@ async def test_seventh_attempt_recovers_with_same_cookie_jar_and_page_two_retrie
     sessions = _CookieSessions(search_statuses=(*([403] * 6), 200, 429, 200))
     _configure(monkeypatch, sessions)
     sleep = AsyncMock()
-    monkeypatch.setattr("carl.ebay.anyio.sleep", sleep)
+    monkeypatch.setattr("anyio.sleep", sleep)
     async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
         result = await collect_configured_ebay_search(
             database,
@@ -532,7 +528,7 @@ async def test_seventh_attempt_recovers_with_same_cookie_jar_and_page_two_retrie
 
 
 @pytest.mark.anyio
-async def test_configured_holdoff_applies_to_homepage_retry_search_retry_and_pagination(
+async def test_retained_holdoff_does_not_delay_homepage_retry_search_retry_or_pagination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sessions = _CookieSessions(homepage_status=403, search_statuses=(403, 200, 200))
@@ -541,15 +537,8 @@ async def test_configured_holdoff_applies_to_homepage_retry_search_retry_and_pag
         sessions,
         EbaySearchConfiguration(minimum_holdoff_seconds=4.0, maximum_holdoff_seconds=8.0),
     )
-    sampled: list[tuple[float, float]] = []
-
-    def sample(minimum: float, maximum: float) -> float:
-        sampled.append((minimum, maximum))
-        return 5.5
-
     sleep = AsyncMock()
-    monkeypatch.setattr("carl.ebay.uniform", sample)
-    monkeypatch.setattr("carl.ebay.anyio.sleep", sleep)
+    monkeypatch.setattr("anyio.sleep", sleep)
     async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
         result = await collect_configured_ebay_search(
             database,
@@ -558,8 +547,7 @@ async def test_configured_holdoff_applies_to_homepage_retry_search_retry_and_pag
         )
         assert result["state"] == "completed"
     assert len(sessions.sessions[0].requests) == 5
-    assert sampled == [(4.0, 8.0)] * 4
-    assert [call.args for call in sleep.await_args_list] == [(5.5,)] * 4
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -607,7 +595,7 @@ async def test_page_two_timeout_after_403_retains_attempts_and_uses_worker_retry
             ),
         )
         assert isinstance(outcome, RetryWork)
-        assert outcome.delay_ns == 600_000_000_000
+        assert outcome.delay_ns == 0
         assert isinstance(outcome.reason, dict)
         reason = cast(dict[str, JsonValue], outcome.reason)
         assert reason["retry_scope"] == "independent_session"

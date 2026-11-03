@@ -467,7 +467,7 @@ def legacy_image_network_concurrency_constraint() -> ConcurrencyConstraint:
 
 
 def image_network_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...]:
-    """Current image pacing; stage resources admit physical HTTP capacity."""
+    """Return historical image-pacing definitions for audit and compatibility."""
 
     return (
         facebook_network_path_constraint(routing),

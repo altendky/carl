@@ -19,8 +19,6 @@ from carl.core.facebook_images import (
     CollectImagePayload,
     ExtractImagePayload,
     facebook_image_url_expiry_utc_ns,
-    image_network_constraints,
-    legacy_image_pacing_constraint_identifiers,
 )
 from carl.core.facebook_search_support import (
     UnsupportedFacebookSearchMode,
@@ -38,8 +36,6 @@ from carl.core.facebook_work import (
     CollectItemPayload,
     CollectSearchPayload,
     ExtractItemPayload,
-    facebook_network_policy_constraints,
-    legacy_facebook_network_constraint_identifiers,
 )
 from carl.core.work import WorkCapability
 from carl.core.worker import AttemptContext, TerminalFailureWork, WorkOutcome
@@ -202,13 +198,6 @@ def build_routed_facebook_worker_registry(
                 routing=routing,
                 utc_now_ns=time_ns,
             )
-            await database.supersede_constraints(
-                retired_identifiers=legacy_facebook_network_constraint_identifiers(payload.routing),
-                replacements=facebook_network_policy_constraints(payload.routing),
-                operation_identifier=context.operation_identifier,
-                at_utc_ns=time_ns(),
-                reason="Apply the current Marketplace page-request policy",
-            )
             session_factory: FacebookSearchSessionFactory
             retry_scope: Literal["stack", "independent_session"] = "stack"
             if routing[0] == "decodo":
@@ -311,15 +300,6 @@ def build_routed_facebook_worker_registry(
                 update={
                     "request_plan": payload.request_plan.model_copy(update={"routing": routing})
                 }
-            )
-            await database.supersede_constraints(
-                retired_identifiers=legacy_image_pacing_constraint_identifiers(
-                    payload.request_plan.routing
-                ),
-                replacements=image_network_constraints(payload.request_plan.routing),
-                operation_identifier=context.operation_identifier,
-                at_utc_ns=time_ns(),
-                reason="Apply current image request pacing to the effective route",
             )
             session_identifier = new_identifier()
             if routing[0] == "decodo":

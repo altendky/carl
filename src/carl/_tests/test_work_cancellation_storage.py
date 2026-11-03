@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from carl._tests.test_ebay_item_workers import _identifiers, _retain_records
-from carl._tests.test_worker import _definition, _requester
+from carl._tests.test_worker import _definition, _provenance, _requester
 from carl.core.models import RecordDraft
 from carl.core.work import (
     ClaimResult,
@@ -18,6 +18,7 @@ from carl.core.work import (
     WorkState,
 )
 from carl.io import sqlite as sqlite_io
+from carl.io.marketplace_timing_retirement import retire_marketplace_timing
 from carl.io.sqlite import Database
 
 
@@ -339,7 +340,9 @@ async def test_publishing_one_dependency_request_does_not_scan_unrelated_request
 
 
 @pytest.mark.anyio
-async def test_cancelled_search_cooldown_preserves_siblings_own_deadline(tmp_path: Path) -> None:
+async def test_retired_cancelled_search_cooldown_preserves_explicit_deadlines(
+    tmp_path: Path,
+) -> None:
     kind = ("carl", "ebay", "collect", "search")
     async with Database.managed(tmp_path / "db.sqlite3", initialize=True) as database:
         for identifier in ("source", "sibling"):
@@ -394,8 +397,16 @@ async def test_cancelled_search_cooldown_preserves_siblings_own_deadline(tmp_pat
         await database.enqueue_work(
             late, _requester("late"), event_identifier="enqueue-late", enqueued_at_utc_ns=3
         )
-        assert (await database.work("late"))["eligible_at_utc_ns"] == 100
+        assert (await database.work("late"))["eligible_at_utc_ns"] == 50
         await database.cancel_work("source", reason="stop", caller="test", requested_at_utc_ns=3)
+        assert (await database.work("sibling"))["eligible_at_utc_ns"] == 100
+        await retire_marketplace_timing(
+            database,
+            provenance=_provenance(),
+            invocation={},
+            new_identifier=_identifiers(),
+            now_utc_ns=3,
+        )
         assert (await database.work("sibling"))["eligible_at_utc_ns"] == 50
         assert (await database.work("late"))["eligible_at_utc_ns"] == 50
 

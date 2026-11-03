@@ -369,7 +369,7 @@ async def test_partition_challenge_resumes_after_restart_and_preserves_public_ca
         search_identifier, work_identifier = await harness.create(database)
         first = await harness.run(database, work_identifier)
         assert isinstance(first, RetryWork)
-        assert first.delay_ns == 10 * MINUTE_NS
+        assert first.delay_ns == 0
         work = await database.work(work_identifier)
         assert work["state"] == WorkState.PENDING
         result = cast(dict[str, JsonValue], work["result"])
@@ -424,7 +424,7 @@ async def test_partition_challenge_resumes_after_restart_and_preserves_public_ca
 
 
 @pytest.mark.anyio
-async def test_partition_challenge_exhausts_five_attempts_with_long_backoff(tmp_path: Path) -> None:
+async def test_partition_challenge_exhausts_five_attempts_without_backoff(tmp_path: Path) -> None:
     factory = _PartitionSessionFactory(challenges=5)
     harness = _Harness(tmp_path / "carl.sqlite3", factory)
     async with Database.managed(harness.path, initialize=True) as database:
@@ -436,7 +436,7 @@ async def test_partition_challenge_exhausts_five_attempts_with_long_backoff(tmp_
             assert work["attempt"] == attempt
             if attempt < 5:
                 assert isinstance(outcome, RetryWork)
-                assert outcome.delay_ns == (10, 20, 40, 60)[attempt - 1] * MINUTE_NS
+                assert outcome.delay_ns == 0
                 assert work["state"] == WorkState.PENDING
                 eligible = work["eligible_at_utc_ns"]
                 assert eligible == harness.clock.now + outcome.delay_ns
@@ -468,7 +468,7 @@ async def test_interrupted_guest_login_resumes_same_partition_with_fresh_session
         reason = cast(dict[str, JsonValue], first.reason)
         assert reason["response_kind"] == "login_page"
         assert reason["guest_access_interrupted"] is True
-        assert first.delay_ns == 10 * MINUTE_NS
+        assert first.delay_ns == 0
         assert cast(dict[str, JsonValue], first.result)["partition_retry_checkpoint"] is not None
         harness.clock.now += first.delay_ns
     async with Database.managed(harness.path) as database:
@@ -502,10 +502,11 @@ async def test_first_route_login_wall_retries_with_fresh_session_after_restart(
         assert reason["kind"] == "search_route_definition_response_failure"
         assert reason["response_kind"] == "login_page"
         assert reason["guest_access_interrupted"] is True
-        assert outcome.delay_ns == 10 * MINUTE_NS
+        assert outcome.delay_ns == 0
         parent = await harness.parent(database, work_identifier)
         assert isinstance(parent, RetryWork)
-        assert parent.delay_ns == outcome.delay_ns
+        assert parent.delay_ns == 5_000_000_000
+        assert parent.progress_watch is not None
         harness.clock.now += outcome.delay_ns
     async with Database.managed(harness.path) as database:
         outcome = await harness.run(database, work_identifier)
@@ -542,7 +543,9 @@ async def test_bootstrap_login_wall_without_established_guest_session_remains_te
 
 
 @pytest.mark.anyio
-async def test_route_login_wall_pauses_next_sibling_search_across_restart(tmp_path: Path) -> None:
+async def test_route_login_wall_does_not_pause_sibling_search_across_restart(
+    tmp_path: Path,
+) -> None:
     factory = _PartitionSessionFactory(challenges=0, login_walls_by_partition={"0": 1})
     harness = _Harness(tmp_path / "carl.sqlite3", factory)
     async with Database.managed(harness.path, initialize=True) as database:
@@ -550,30 +553,24 @@ async def test_route_login_wall_pauses_next_sibling_search_across_restart(tmp_pa
         _, sibling = await harness.create(database, query="sibling")
         outcome = await harness.run(database, source)
         assert isinstance(outcome, RetryWork)
-        eligible = harness.clock.now + outcome.delay_ns
+        assert outcome.delay_ns == 0
     async with Database.managed(harness.path) as database:
-        for now in (harness.clock.now, eligible - 1, eligible):
-            harness.clock.now = now
-            claim = await database.claim_work(
-                supported_capabilities=(
-                    WorkCapability(
-                        kind=COLLECT_SEARCH_WORK_KIND,
-                        payload_schema_version=COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
-                    ),
+        claim = await database.claim_work(
+            supported_capabilities=(
+                WorkCapability(
+                    kind=COLLECT_SEARCH_WORK_KIND,
+                    payload_schema_version=COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
                 ),
-                eligible_identifiers=(sibling,),
-                worker_identifier="sibling-worker",
-                lease_token=harness.new_identifier(),
-                lease_duration_ns=SETTINGS.lease_duration_ns,
-                utc_now_ns=harness.clock,
-                event_identifier=harness.new_identifier(),
-            )
-            if now < eligible:
-                assert claim.lease is None
-                assert claim.next_eligible_at_utc_ns == eligible
-            else:
-                assert claim.lease is not None
-                assert claim.lease.work_item_identifier == sibling
+            ),
+            eligible_identifiers=(sibling,),
+            worker_identifier="sibling-worker",
+            lease_token=harness.new_identifier(),
+            lease_duration_ns=SETTINGS.lease_duration_ns,
+            utc_now_ns=harness.clock,
+            event_identifier=harness.new_identifier(),
+        )
+        assert claim.lease is not None
+        assert claim.lease.work_item_identifier == sibling
     assert len(factory.sessions) == 1
 
 
@@ -595,7 +592,7 @@ async def test_guest_login_and_challenge_share_one_bounded_partition_budget(
             outcome = await harness.run(database, work_identifier)
             if attempt < 5:
                 assert isinstance(outcome, RetryWork)
-                assert outcome.delay_ns == (10, 20, 40, 60)[attempt - 1] * MINUTE_NS
+                assert outcome.delay_ns == 0
                 assert cast(dict[str, JsonValue], outcome.reason)["response_kind"] == (
                     "login_page" if attempt <= login_walls else "bot_challenge"
                 )
@@ -643,7 +640,9 @@ async def test_missing_partition_protocol_remains_terminal_without_retry(tmp_pat
 
 
 @pytest.mark.anyio
-async def test_refresh_parent_waits_until_challenged_search_is_eligible(tmp_path: Path) -> None:
+async def test_refresh_parent_watches_immediately_eligible_challenged_search(
+    tmp_path: Path,
+) -> None:
     harness = _Harness(tmp_path / "carl.sqlite3", _PartitionSessionFactory(challenges=1))
     async with Database.managed(harness.path, initialize=True) as database:
         _, work_identifier = await harness.create(database)
@@ -651,8 +650,9 @@ async def test_refresh_parent_waits_until_challenged_search_is_eligible(tmp_path
         assert isinstance(child_outcome, RetryWork)
         parent = await harness.parent(database, work_identifier)
         assert isinstance(parent, RetryWork)
-        assert parent.delay_ns == child_outcome.delay_ns
-        assert parent.delay_ns > 5_000_000_000
+        assert child_outcome.delay_ns == 0
+        assert parent.delay_ns == 5_000_000_000
+        assert parent.progress_watch is not None
         assert cast(dict[str, JsonValue], parent.result)["stage"] == "collecting_search"
 
 
@@ -667,7 +667,7 @@ async def test_initial_challenge_reopens_session_and_finishes_all_partitions(
         search_identifier, work_identifier = await harness.create(database)
         first = await harness.run(database, work_identifier)
         assert isinstance(first, RetryWork)
-        assert first.delay_ns == 10 * MINUTE_NS
+        assert first.delay_ns == 0
         work = await database.work(work_identifier)
         eligible = work["eligible_at_utc_ns"]
         assert isinstance(eligible, int)
@@ -703,10 +703,10 @@ async def test_successful_partition_resets_challenge_budget_for_next_partition(
     harness = _Harness(tmp_path / "carl.sqlite3", factory)
     async with Database.managed(harness.path, initialize=True) as database:
         search_identifier, work_identifier = await harness.create(database)
-    delays = tuple(minutes * MINUTE_NS for minutes in (10, 20, 40, 60, 10))
+    delays = (0,) * 5
     if transport_failures:
-        # Five physical challenge attempts leave the first transport retry at one second.
-        delays += (1_000_000_000,)
+        # Transport retries retain their separate budget after five challenges.
+        delays += (0,)
     for delay in delays:
         async with Database.managed(harness.path) as database:
             outcome = await harness.run(database, work_identifier)

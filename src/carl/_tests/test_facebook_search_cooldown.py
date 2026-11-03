@@ -1,10 +1,9 @@
-"""Search-only route cooldowns survive restart and disappear with cancelled sources."""
+"""Legacy route markers retain history without delaying other search requests."""
 
 # Reuse the offline provenance fixture; these tests perform no network requests.
 # pyright: reportPrivateUsage=false
 
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -154,7 +153,9 @@ async def _activity(
 
 
 @pytest.mark.anyio
-async def test_cooldown_gates_existing_and_future_searches_after_restart(tmp_path: Path) -> None:
+async def test_legacy_marker_does_not_gate_existing_or_future_searches_after_restart(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "carl.sqlite3"
     async with Database.managed(path, initialize=True) as database:
         await _enqueue(database, "existing")
@@ -164,20 +165,25 @@ async def test_cooldown_gates_existing_and_future_searches_after_restart(tmp_pat
         await _enqueue(database, "other", route=_OTHER_ROUTE)
         for identifier in ("existing", "future"):
             claim = await _claim(database, identifier)
-            assert claim.lease is None
-            assert claim.next_eligible_at_utc_ns == _NOW + 10 * _MINUTE
+            assert claim.lease is not None
+            assert claim.lease.attempt == 1
             assert (await database.work(identifier))["eligible_at_utc_ns"] == _NOW
         assert (await _claim(database, "other")).lease is not None
-        assert (await _claim(database, "existing", now=_NOW + 10 * _MINUTE)).lease is not None
+        # The helper deliberately supplied a generic explicit retry delay under
+        # an unrecognized reason. Ignoring its marker must not erase that delay.
+        source = await database.work("source")
+        assert source["eligible_at_utc_ns"] == _NOW + 10 * _MINUTE
+        assert source["attempt"] == 1 and len(source["operations"]) == 1
+        assert (await _claim(database, "source")).lease is None
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("kind", sorted(FACEBOOK_SEARCH_NETWORK_ACTIVITY_KINDS))
-async def test_active_search_admission_obeys_route_cooldown(
+async def test_active_search_admission_ignores_legacy_route_cooldown(
     tmp_path: Path, kind: tuple[str, ...]
 ) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
-        await _activity(database, "already-waiting", kind=kind)
+        _ = await _activity(database, "already-waiting", kind=kind)
         await _cooldown(database, "source")
         result = await database.try_admit_network_activity(
             network_activity_identifier="already-waiting",
@@ -186,14 +192,14 @@ async def test_active_search_admission_obeys_route_cooldown(
             now_utc_ns=_NOW,
             event_identifier=str(uuid4()),
         )
-        assert result.admission is None
-        assert result.next_eligible_at_utc_ns == _NOW + 10 * _MINUTE
+        assert result.admission is not None
+        assert result.admission.admitted_at_utc_ns == _NOW
         for identifier, unrelated_kind, route in (
             ("other", kind, _OTHER_ROUTE),
             ("image", ("carl", "facebook", "network_activity", "image"), _ROUTE),
             ("item", ("carl", "facebook", "network_activity", "item_page"), _ROUTE),
         ):
-            await _activity(database, identifier, kind=unrelated_kind, route=route)
+            _ = await _activity(database, identifier, kind=unrelated_kind, route=route)
             admitted = await database.try_admit_network_activity(
                 network_activity_identifier=identifier,
                 admission_token=identifier,
@@ -205,38 +211,33 @@ async def test_active_search_admission_obeys_route_cooldown(
 
 
 @pytest.mark.anyio
-async def test_cancelled_source_preserves_other_cooldowns_and_not_before(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_cancelled_sources_preserve_peer_ownership_history_and_explicit_not_before(
+    tmp_path: Path,
 ) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         await _cooldown(database, "first", minutes=10)
-        # Model an independently leased search that was already active before
-        # the first response installed its shared route cooldown.
-        original = database._facebook_search_route_cooldowns
-
-        async def no_cooldown(*args: Any, **kwargs: Any):
-            return {}
-
-        with monkeypatch.context() as patch:
-            patch.setattr(database, "_facebook_search_route_cooldowns", no_cooldown)
-            await _cooldown(database, "second", minutes=20)
-        assert database._facebook_search_route_cooldowns == original
+        await _cooldown(database, "second", minutes=20)
         await _enqueue(database, "future")
         await _enqueue(database, "explicit", not_before=_NOW + 30 * _MINUTE)
         _ = await database.cancel_work(
             "first", reason="stop", caller="test", requested_at_utc_ns=_NOW
         )
-        assert (await _claim(database, "future")).next_eligible_at_utc_ns == _NOW + 20 * _MINUTE
+        peer = await _claim(database, "future")
+        assert peer.lease is not None and peer.lease.attempt == 1
         _ = await database.cancel_work(
             "second", reason="stop", caller="test", requested_at_utc_ns=_NOW
         )
-        assert (await _claim(database, "future")).lease is not None
+        assert (await database.work("future"))["state"] == "leased"
+        for identifier in ("first", "second"):
+            source = await database.work(identifier)
+            assert source["state"] == "cancelled"
+            assert source["attempt"] == 1 and len(source["operations"]) == 1
         assert (await database.work("explicit"))["eligible_at_utc_ns"] == _NOW + 30 * _MINUTE
         assert (await _claim(database, "explicit")).lease is None
 
 
 @pytest.mark.anyio
-async def test_active_admission_notices_cancelled_source_within_one_second(
+async def test_active_admission_does_not_sleep_or_require_cancelling_the_marker_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
@@ -244,19 +245,17 @@ async def test_active_admission_notices_cancelled_source_within_one_second(
         definition = await _activity(database, "active")
 
         # The scheduler creates this activity itself; remove no durable rows.
-        async def already_created(*args: Any, **kwargs: Any) -> int:
+        async def already_created(*_args: object, **_kwargs: object) -> int:
             return _NOW
 
         monkeypatch.setattr(database, "create_network_activity", already_created)
         sleeps: list[float] = []
 
-        async def cancel_during_sleep(seconds: float) -> None:
+        async def unexpected_sleep(seconds: float) -> None:
             sleeps.append(seconds)
-            _ = await database.cancel_work(
-                "source", reason="stop", caller="test", requested_at_utc_ns=_NOW
-            )
+            raise AssertionError("A legacy route marker must not require a cooldown wait")
 
-        monkeypatch.setattr("carl.io.network_activity.anyio.sleep", cancel_during_sleep)
+        monkeypatch.setattr("carl.io.network_activity.anyio.sleep", unexpected_sleep)
         scheduler = NetworkActivityScheduler(
             database=database,
             new_identifier=lambda: str(uuid4()),
@@ -266,11 +265,14 @@ async def test_active_admission_notices_cancelled_source_within_one_second(
         )
         async with scheduler.admit(definition) as permit:
             permit.mark_dispatched()
-        assert sleeps == [1.0]
+        assert sleeps == []
+        assert (await database.work("source"))["state"] == "pending"
 
 
 @pytest.mark.anyio
-async def test_requested_alias_cannot_bypass_effective_route_cooldown(tmp_path: Path) -> None:
+async def test_requested_alias_keeps_effective_route_provenance_without_a_cooldown_gate(
+    tmp_path: Path,
+) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         await _cooldown(database, "source")
         requested_alias = ("proton", "personal", "old_alias")
@@ -299,7 +301,7 @@ async def test_requested_alias_cannot_bypass_effective_route_cooldown(tmp_path: 
             configuration={},
             started_at_utc="2026-10-17T00:00:00+00:00",
         )
-        await _activity(
+        _ = await _activity(
             database,
             "alias",
             route=_ROUTE,
@@ -313,5 +315,6 @@ async def test_requested_alias_cannot_bypass_effective_route_cooldown(tmp_path: 
             now_utc_ns=_NOW,
             event_identifier=str(uuid4()),
         )
-        assert result.admission is None
-        assert result.next_eligible_at_utc_ns == _NOW + 10 * _MINUTE
+        assert result.admission is not None
+        assert result.admission.admitted_at_utc_ns == _NOW
+        assert (await database.work("source"))["eligible_at_utc_ns"] == _NOW + 10 * _MINUTE

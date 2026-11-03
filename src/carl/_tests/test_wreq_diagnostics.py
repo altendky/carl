@@ -252,6 +252,6 @@ async def test_detailed_request_error_keeps_existing_worker_retry_budget(attempt
     assert reason["maximum_attempts"] == 3
     assert "cooldown" not in reason
     if isinstance(outcome, RetryWork):
-        assert outcome.delay_ns == 1_000_000_000
+        assert outcome.delay_ns == 0
     assert outcome.result["acquisition"] == failure.result
     assert all(secret not in json.dumps(outcome.result) for secret in _SECRETS)

@@ -267,16 +267,16 @@ def test_search_session_lock_contention_retries_then_exhausts() -> None:
 
     assert isinstance(retry, RetryWork)
     assert "search_run_identifier" not in retry.result
-    assert retry.delay_ns == 1_000_000_000
+    assert retry.delay_ns == 0
     assert isinstance(operator_retry, RetryWork)
-    assert operator_retry.delay_ns == 1_000_000_000
+    assert operator_retry.delay_ns == 0
     assert retry.reason["code"] == "wireproxy_device_identity_busy"
     assert retry.reason["diagnostic"] == {"lock": "device"}
     assert isinstance(exhausted, TerminalFailureWork)
     assert exhausted.error["decision"] == "retry_exhausted"
 
 
-def test_search_transport_failure_uses_exponential_backoff_and_larger_budget() -> None:
+def test_search_transport_failure_retries_immediately_with_the_same_larger_budget() -> None:
     error = AcquisitionFailure(
         "failed",
         result={
@@ -312,7 +312,7 @@ def test_search_transport_failure_uses_exponential_backoff_and_larger_budget() -
 
     assert isinstance(retry, RetryWork)
     assert "search_run_identifier" not in retry.result
-    assert retry.delay_ns == 8_000_000_000
+    assert retry.delay_ns == 0
     assert retry.reason["exception_type"] == "ConnectError"
     assert retry.result["acquisition"]["routing"]["observed"]["provider_session"] == {
         "endpoint": {"host": "127.0.0.1", "port": 52643},

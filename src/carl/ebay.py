@@ -6,12 +6,9 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from random import uniform
 from time import perf_counter_ns
 from typing import cast
 from uuid import uuid4
-
-import anyio
 
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.configuration import EbaySearchConfiguration
@@ -118,23 +115,6 @@ def _terminal_response(acquisition: dict[str, JsonValue]) -> dict[str, JsonValue
     return cast(dict[str, JsonValue], response)
 
 
-class _PacedSearchAcquirer:
-    def __init__(self, acquirer: HttpAcquirer, policy: EbaySearchConfiguration) -> None:
-        self.acquirer = acquirer
-        self.policy = policy
-        self.started = False
-
-    async def wait(self) -> None:
-        if self.started and self.policy.maximum_holdoff_seconds > 0:
-            await anyio.sleep(
-                uniform(self.policy.minimum_holdoff_seconds, self.policy.maximum_holdoff_seconds)
-            )
-
-    async def acquire(self, plan: RequestPlan, new_identifier: Callable[[], str]) -> Acquisition:
-        self.started = True
-        return await self.acquirer.acquire(plan, new_identifier)
-
-
 def _attempt_summary(value: dict[str, JsonValue], attempt: int) -> dict[str, JsonValue]:
     return {
         "attempt": attempt,
@@ -176,7 +156,6 @@ async def collect_configured_ebay_search(
     search_run_identifier = search_run_identifier or new_identifier()
     provenance = await collect_code_provenance_async(_repository_root())
     async with acquirer.session(new_identifier) as session:
-        paced = _PacedSearchAcquirer(session, policy)
         home_plan = ebay_homepage_plan(network_path=route.route.network_path)
         home_attempts: list[JsonValue] = []
         homepage: dict[str, JsonValue] | None = None
@@ -189,7 +168,7 @@ async def collect_configured_ebay_search(
                     page_number=None,
                     page_ordinal=None,
                     search_run_identifier=search_run_identifier,
-                    acquirer=paced,
+                    acquirer=session,
                     new_identifier=new_identifier,
                     provenance=provenance,
                     request_attempt=attempt,
@@ -217,7 +196,7 @@ async def collect_configured_ebay_search(
                 database,
                 request=request,
                 network_path=route.route.network_path,
-                acquirer=paced,
+                acquirer=session,
                 new_identifier=new_identifier,
                 search_run_identifier=search_run_identifier,
                 provenance=provenance,
@@ -249,8 +228,6 @@ async def collect_ebay_search(
     policy: EbaySearchConfiguration | None = None,
 ) -> dict[str, JsonValue]:
     policy = policy or EbaySearchConfiguration()
-    if not isinstance(acquirer, _PacedSearchAcquirer):
-        acquirer = _PacedSearchAcquirer(acquirer, policy)
     resolved_provenance = provenance or await collect_code_provenance_async(_repository_root())
     search_run_identifier = search_run_identifier or new_identifier()
     pages: list[dict[str, JsonValue]] = []
@@ -439,10 +416,6 @@ async def _collect_ebay_search_document(
     request_attempt: int = 1,
 ) -> dict[str, JsonValue]:
     homepage = page_number is None
-    if isinstance(acquirer, _PacedSearchAcquirer):
-        # Pacing precedes admission/dispatch so cancelled waits cannot look like
-        # requests that were sent to the site.
-        await acquirer.wait()
     purpose = "ebay_search_homepage" if homepage else "ebay_search_page"
     registry = build_ebay_component_registry()
     component = registry.require(COLLECT_EBAY_SEARCH_HOMEPAGE if homepage else COLLECT_EBAY_SEARCH)

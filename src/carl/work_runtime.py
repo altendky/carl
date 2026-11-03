@@ -19,10 +19,6 @@ from carl.analysis_batch_workers import (
 )
 from carl.coordinator_stages import build_coordinator_stage_registry
 from carl.core.components import Component, ComponentId
-from carl.core.facebook_work import (
-    facebook_network_path_constraint,
-    legacy_facebook_network_path_constraint_identifier,
-)
 from carl.core.legacy_capacity import (
     FACEBOOK_ROUTE_CAPACITY_FAMILIES,
     is_legacy_facebook_route_capacity_constraint,
@@ -65,6 +61,7 @@ from carl.io.claude import ClaudeCli
 from carl.io.connectivity import ConnectivityMonitor
 from carl.io.dataset_setup import DatasetSetupEngine
 from carl.io.dataset_workflow_owner import managed_dataset_workflow_service
+from carl.io.marketplace_timing_retirement import retire_marketplace_timing
 from carl.io.paths import CarlDirectories, user_directories
 from carl.io.proton import SharedProtonWireproxyManager
 from carl.io.provenance import collect_code_provenance_async, process_invocation
@@ -126,11 +123,6 @@ class RuntimeComposition:
 async def prepare_worker_constraints(database: Database, repository_root: Path) -> None:
     """Upgrade immutable limits before workers can claim previously queued work."""
 
-    request_budget_routes = await database.legacy_facebook_request_budget_routes()
-    constraints = tuple(facebook_network_path_constraint(route) for route in request_budget_routes)
-    retired_identifiers = tuple(
-        legacy_facebook_network_path_constraint_identifier(route) for route in request_budget_routes
-    )
     retired_definitions = static_capacity_constraints()
     operation_identifier = _identifier()
     started = perf_counter_ns()
@@ -147,23 +139,21 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
             provenance=provenance,
             invocation=process_invocation(),
             configuration={
-                "retired_identifiers": [list(identifier) for identifier in retired_identifiers],
                 "retired_definitions": [
                     constraint.model_dump(mode="json") for constraint in retired_definitions
                 ],
-                "constraints": [constraint.model_dump(mode="json") for constraint in constraints],
             },
             started_at_utc=datetime.now(UTC).isoformat(),
         )
         try:
             await database.supersede_constraints(
-                retired_identifiers=retired_identifiers,
-                replacements=constraints,
+                retired_identifiers=(),
+                replacements=(),
                 operation_identifier=operation_identifier,
                 at_utc_ns=time_ns(),
                 reason=(
                     "Retire built-in static capacity caps superseded by staged host resource "
-                    "budgets; retain HTTP request pacing"
+                    "budgets"
                 ),
                 retired_definitions=retired_definitions,
             )
@@ -187,6 +177,13 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
             raise
 
     await _retire_facebook_route_capacity(database, provenance)
+    await retire_marketplace_timing(
+        database,
+        provenance=provenance,
+        invocation=process_invocation(),
+        new_identifier=_identifier,
+        now_utc_ns=time_ns(),
+    )
 
 
 async def _retire_facebook_route_capacity(database: Database, provenance: CodeProvenance) -> None:

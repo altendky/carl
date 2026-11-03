@@ -234,7 +234,7 @@ Facebook search `network_path`, refresh `search_network_path`, and Facebook
 search and image collection default to `--network-provider decodo
 --network-route datacenter`. Explicit Proton paths use real Proton; there is
 no automatic provider fallback. Searches on either provider run within the
-shared resource capacities and request-rate limits. Requests within each
+shared resource capacities. Requests within each
 resident session remain sequential.
 
 For an installation with older explicit Proton-to-Decodo route overrides, stop MCP
@@ -263,7 +263,12 @@ CPU budget, so waiting for validation does not retain an HTTP slot. Worker start
 retires the exact built-in image, description, analysis and coordinator capacity
 constraints that these resource budgets replace, including persisted constraints
 from older releases. Their definitions and retirement provenance remain available
-for audit. Custom constraints, request-rate limits and holdoffs remain active.
+for audit. Explicit custom constraints remain active. Built-in marketplace
+request-rate limits, inter-request holdoffs and acquisition-failure cooldowns
+are retired as well; retries are immediately eligible within their existing
+attempt budgets. Legacy eBay holdoff settings remain readable but no longer
+delay requests. Analysis timeout backoffs, connectivity outage probes and
+hosted travel-provider timing remain separate policies.
 Unknown predecessor definitions also remain active when their complete shipped
 definition cannot be verified; an old identifier alone is insufficient to retire
 a constraint safely.
@@ -423,7 +428,7 @@ HTTP acquisitions, 4 CPU units, and 10 analysis
 processes. `CARL_RESOURCE_HTTP`, `CARL_RESOURCE_CPU`, and `CARL_RESOURCE_ANALYSIS`
 configure positive integer capacities; embedding callers can supply
 `resource_capacities` to `Database.managed`. These are local capacity settings,
-separate from remote rate/cooldown policies and logical work ownership. SQLite
+separate from explicit custom policy, hosted travel pacing and logical work ownership. SQLite
 writes remain short serialized transactions and consume no execution permit.
 Parsing and image validation each reserve one CPU unit; native build commands
 reserve their configured thread count.
@@ -477,8 +482,9 @@ Resuming rotates execution/publication tokens while preserving the work
 attempt and acquisition retry budget. Actual `RetryWork` remains a new logical
 attempt. Work explicitly registered with stages stays routed to stages across
 such retries, so legacy workers cannot seize a waiting continuation. Network
-activities have execution-specific identities and stable holdoff decisions;
-repeated admission polls neither consume rate starts nor postpone eligibility.
+activities have execution-specific identities. Generic/custom policies can retain
+stable holdoff decisions; repeated admission polls neither consume their rate
+starts nor postpone eligibility. Built-in marketplace pacing is retired.
 Dependencies may settle successfully, fail, or be cancelled; the resumed
 handler inspects their outcomes.
 
@@ -762,7 +768,8 @@ wake a parent before the child completes. Shared children notify every consuming
 parent through bounded, coalesced delivery that survives restart; cancellation
 neutralizes obsolete waits. Sleeping parents leave runnable discovery, hold no
 execution resource and spend no acquisition retry budget. Local phase transitions and retained pipeline
-pages continue immediately, while provider retries keep their existing delays.
+pages and bounded marketplace acquisition retries continue immediately. Analysis
+timeout backoffs, connectivity outage probes and hosted travel timing remain separate.
 Bounded metadata reconciliation repairs readiness without executing idle handlers.
 
 Default shared capacities per database and host coordination scope are 25 HTTP
@@ -788,8 +795,10 @@ Older executables can still apply their old direct route caps or register polici
 restart all workers on the new version to obtain the new behavior consistently.
 Resource capacities coordinate per database and host; the old route ceilings were
 database-wide, so they no longer impose a separate aggregate limit across hosts.
-Request-rate limits, holdoffs, provider cooldowns, paid-request retry budgets and
-acquisition sharing still apply.
+Marketplace paid-request retry budgets and acquisition sharing still apply.
+Recognized legacy request-rate limits, holdoffs and failure cooldowns are retired,
+including their pending policy deadlines. Explicit user schedules, custom
+constraints, hosted travel pacing and connectivity outage pauses remain in force.
 These resource capacities remain upper bounds rather than throughput promises;
 custom constraints or provider policy can defer a phase while resource slots are free.
 
@@ -1066,8 +1075,9 @@ link and defaults to at most five pages, with a hard request-model limit of
 twenty. Follow-up pages send the preceding search page's URL as `Referer`, without
 a deliberate inter-page delay, using the same sticky session and cookie-preserving client.
 A missing next link stops normally. Challenge, empty, and unrecognized
-pages are retained as the terminal page. Item-detail requests, retries, and
-route fallback remain out of scope.
+pages are retained as the terminal page. Same-session retries retain their
+configured count bounds. Item-detail requests and implicit route fallback remain
+outside this traversal.
 
 MCP agents use the single `create_search` tool with one or more discriminated
 targets. Each target names `marketplace = "ebay"` or `marketplace = "facebook"`
@@ -1111,9 +1121,13 @@ while reporting both occurrence and cross-page unique-listing counts. The
 extractor classifies usable results, legitimate empty results, eBay challenge
 pages, error pages, non-success HTTP responses, and unrecognized page structures.
 A challenge or error remains retained HTTP evidence but is not a successful
-empty search. Durable work retries these response failures at most three total
-attempts with exponential backoff, preserving each attempt's evidence, then
-reports terminal failure. Explicit empty results remain successful.
+empty search. Durable work preserves each attempt's evidence through its bounded
+response retries, then reports terminal failure when the budget is exhausted.
+Blocked responses and timeouts retain their existing five-attempt logical bound;
+ordinary response failures retain three. These acquisition retries are immediately
+eligible. Same-session search-page requests default to seven attempts and homepage
+bootstrap to two; already configured and recorded maxima remain unchanged.
+Explicit empty results remain successful.
 
 ## Network providers
 
@@ -1338,9 +1352,8 @@ and its ordered attempts provide the current retry grouping; Carl does not yet
 create a separate parent collection operation.
 
 The implemented item-page policy allows at most three total attempts for HTTP
-transport failures, including interrupted transfers. Each retry advances the
-work item's persisted eligibility time by one second, so restart does not erase
-the delay. Complete HTTP responses, including error status responses and
+transport failures, including interrupted transfers. Each retry is immediately
+eligible and retains its durable attempt count across restart. Complete HTTP responses, including error status responses and
 challenge pages, are acquisitions and are not retried automatically. Item-page
 extraction classifies full listings, login pages, challenges, generic errors,
 unavailable listings, malformed or incomplete responses, and valid Marketplace
@@ -1561,12 +1574,12 @@ request between checkpoints to keep cancellation and progress boundaries small. 
 `carl work` foreground process can keep a bounded worker pool alive, so closing an MCP client cannot
 stop queue processing. `carl monitor --work` runs that same bounded pool alongside the dashboard.
 MCP servers and `carl search` never start workers implicitly; stale or concurrent clients therefore
-cannot multiply worker pools. Search session and HTTP transport failures use bounded exponential
-backoff. A transport failure invalidates the runtime-scoped WireProxy entry, whose child is always
+cannot multiply worker pools. Search session and HTTP transport failures retry immediately
+within their existing count bounds. A transport failure invalidates the runtime-scoped WireProxy entry, whose child is always
 waited and reaped; the next attempt starts and health-probes a fresh child.
-For Facebook, verified independently selectable Decodo sessions retain only the failed job's
-backoff; they do not impose challenge cooldowns or transport deferrals on sibling searches.
-Fixed exits and unknown collectors keep shared route protection. The worker classifies the
+Neither shared routes nor independently selectable Decodo sessions add acquisition-failure
+cooldowns or transport deferrals to sibling searches. A genuinely failed connectivity probe
+still pauses network work until the shared probe is due. The worker classifies the
 resolved configuration before datacenter port selection removes the pool information and records
 the selected retry scope. Independent selection can repeat a port and is not proof of unique IPs.
 Refresh coordinators
@@ -1790,14 +1803,12 @@ coverage includes the full sequence, and the root plus first result page have
 been verified live through Proton Free 54.
 
 Each root, route-definition, and pagination request is a separately recorded
-network activity. The initial policy allowed 12 starts per minute and sampled a
-2–5 second holdoff for route-definition and pagination requests. The versioned
-replacement allows three starts per second and 180 per minute on both the
-network path and `www.facebook.com`, with a 0–100 ms follow-up holdoff. The
-root request has no initial holdoff. Old definitions, reservations, and
-admission events remain retained; policy retirement is linked to a code-
-provenance operation. These values are trial limits, not an inferred Facebook
-quota.
+network activity. Historical policies included 12 starts per minute with 2–5 second
+holdoffs, then three starts per second and 180 per minute with 0–100 ms follow-up
+holdoffs. Those built-in temporal policies are retired. Their definitions,
+reservations and admission events remain retained, with retirement linked to a
+code-provenance operation. Requests now use physical resource admission without
+an additional built-in rate or holdoff policy.
 GraphQL error code 1675004 is retained as a typed `graphql_rate_limited` issue
 and produces a `search_pagination_rate_limited` terminal outcome; Carl does not
 silently retry it.
@@ -1811,19 +1822,12 @@ Decodo (default) or Proton route. It retains the request, response status,
 headers, timing, routing, and transfer outcome for every attempt. Captured response
 bytes are checkpointed before CPU admission for decoding and image validation.
 
-The initial image policy allowed one active image activity, 12 starts per
-minute, and a persisted random 2–5 second holdoff. Its definitions and past
-admissions remain retained after supersession. Current Facebook image work and
-image network activity each have an upper bound of 25, while shared HTTP resource
-admission also caps active requests across Facebook, eBay and other stages at 25.
-The runtime owns shared provider transports through shutdown. Image activity caps
-starts at three per second and 180 per minute across CDN hosts, and records a
-0–100 ms random holdoff. The per-path
-limit is also 180 per minute and is shared with other traffic on that route. Earlier search
-and item-page limits were scoped to the whole route and inadvertently slowed
-CDN requests; they are retired. Marketplace pages now have a separate
-three-per-second, 180-per-minute `www.facebook.com` origin limit and a 0–100 ms
-holdoff for item pages and search follow-ups. The shared worker pool pulls image
+Historical image policies used separate concurrency, starts-per-second/minute
+and randomized holdoff constraints. Their definitions and past admissions remain
+retained, but the built-in image, origin and network-path timing constraints no
+longer limit new requests. Shared HTTP resource admission defaults to 25 active
+requests across Facebook, eBay and other stages per database and host scope.
+The runtime owns shared provider transports through shutdown. The shared worker pool pulls image
 work from the durable queue and reports progress every 100 completed jobs. The command
 defaults to at most 10 missing network requests per invocation. Previously
 validated images with the same Facebook photo ID are reusable when their
@@ -1834,7 +1838,7 @@ follow a redirect to a different origin.
 
 Managed Proton startup, shutdown, and lock-contention failures retain their
 failure code, diagnostic object, and exit status. Codes classified as transient
-release the durable work lease for a bounded backoff and retry up to three
+release the durable work lease and retry immediately up to three
 attempts; permanent configuration and route failures remain terminal. The CLI
 `retry-image-failures` command and MCP operation `retry_image_failures` requeue
 terminal image work related to an exact search-run record or refresh work item.
