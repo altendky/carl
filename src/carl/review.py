@@ -883,7 +883,7 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=65),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=66),
                 ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=49),
                 ServerCapability(
                     identity=("carl", "facebook", "price_partition_search_only"), version=1

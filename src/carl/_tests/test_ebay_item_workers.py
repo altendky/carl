@@ -822,7 +822,7 @@ async def test_explicit_proton_image_session_startup_retries_with_a_bounded_budg
         )
         if attempt < 3:
             assert isinstance(outcome, RetryWork)
-            assert outcome.delay_ns == 2 ** (attempt - 1) * 1_000_000_000
+            assert outcome.delay_ns == 0
             assert _mapping(outcome.reason)["code"] == "wireproxy_startup_timeout"
             assert _mapping(outcome.result)["state"] == "session_failed"
         else:

@@ -6,10 +6,7 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
-from random import uniform
 from time import time_ns
-
-from anyio import sleep as item_retry_sleep
 
 from carl.core.acquisition_identity import acquisition_resource_identity, ebay_image_identity
 from carl.core.components import Component, ComponentId
@@ -36,7 +33,6 @@ from carl.core.ebay_items import (
     extract_ebay_item,
     extract_ebay_item_work,
 )
-from carl.core.ebay_retry import ebay_response_retry_delay_ns
 from carl.core.facebook_images import verify_image
 from carl.core.http import stored_content_encodings, stored_header_values, stored_response_charset
 from carl.core.image_failures import image_acquisition_failure_kind
@@ -158,7 +154,7 @@ def _failure(
                 artifacts=artifacts,
                 outputs=outputs,
                 result=result,
-                delay_ns=2 ** (context.retry_attempt() - 1) * 1_000_000_000,
+                delay_ns=0,
                 reason={"kind": "ebay_transport_failure"},
             )
         return TerminalFailureWork(
@@ -194,7 +190,7 @@ def _failure(
     ):
         return RetryWork(
             inputs=inputs,
-            delay_ns=2 ** (context.retry_attempt() - 1) * 1_000_000_000,
+            delay_ns=0,
             reason={"kind": "ebay_image_session_failure", "code": error.code},
             result={"state": "session_failed", "code": error.code, "diagnostic": error.diagnostic},
         )
@@ -253,13 +249,6 @@ def _item_response(acquisition: Acquisition, request: EbayItemRequest) -> EbayIt
         )
     except ValueError:
         return None
-
-
-async def _item_holdoff(policy: EbayItemConfiguration) -> None:
-    if policy.maximum_holdoff_seconds:
-        await item_retry_sleep(
-            uniform(policy.minimum_holdoff_seconds, policy.maximum_holdoff_seconds)
-        )
 
 
 async def _acquisition_candidates(
@@ -462,9 +451,7 @@ async def _collect_item(
         session_identifier = dependencies.new_identifier()
         plan = ebay_item_plan(payload.request, network_path=network_path)
         async with _item_session(acquirer, dependencies.new_identifier) as session:
-            for local_attempt in range(policy.maximum_page_attempts - len(identifiers)):
-                if local_attempt:
-                    await _item_holdoff(policy)
+            for _ in range(policy.maximum_page_attempts - len(identifiers)):
                 activity = network_activity_definition(
                     identifier=dependencies.new_identifier(),
                     kind=("carl", "ebay", "network_activity", "item_page"),
@@ -602,7 +589,7 @@ def complete_item_collection(
         if retry:
             return RetryWork(
                 inputs=inputs,
-                delay_ns=ebay_response_retry_delay_ns(context.retry_attempt(), blocked=False),
+                delay_ns=0,
                 reason=reason,
                 result=result,
             )

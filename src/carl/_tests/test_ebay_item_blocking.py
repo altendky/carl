@@ -68,7 +68,7 @@ async def test_seven_item_attempts_share_session_and_checkpoint_each_response(
     async def unexpected_sleep(_seconds: float) -> None:
         pytest.fail("The default item policy must not sleep between blocked responses")
 
-    monkeypatch.setattr("carl.ebay_item_workers.item_retry_sleep", unexpected_sleep)
+    monkeypatch.setattr("anyio.sleep", unexpected_sleep)
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
 
         class CheckpointAcquirer(_Acquirer):

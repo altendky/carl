@@ -278,7 +278,7 @@ def facebook_item_network_activity(
 
 
 def facebook_search_network_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...]:
-    """Return the current request-pacing policy for one network path."""
+    """Return historical request-pacing definitions for audit and compatibility."""
 
     constraints: list[Constraint] = [
         *_facebook_remote_origin_network_constraints(),
@@ -311,7 +311,7 @@ def facebook_search_network_constraints(routing: tuple[str, ...]) -> tuple[Const
 
 
 def facebook_network_policy_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...]:
-    """Register one coherent page policy before either search or item traffic."""
+    """Return historical page policies; normal workers no longer install them."""
 
     by_identifier = {
         constraint.identifier: constraint

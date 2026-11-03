@@ -258,7 +258,7 @@ def image_session_failure_work(
     }
     if retryable and context.retry_attempt() < MAX_IMAGE_TRANSPORT_ATTEMPTS:
         return RetryWork(
-            delay_ns=min(30, 2 ** (context.retry_attempt() - 1)) * 1_000_000_000,
+            delay_ns=0,
             reason={**failure, "decision": "retry"},
             result=result,
         )
@@ -533,7 +533,7 @@ def image_acquisition_failure_work(
         }
         if context.retry_attempt() < MAX_IMAGE_TRANSPORT_ATTEMPTS:
             return RetryWork(
-                delay_ns=1_000_000_000,
+                delay_ns=0,
                 reason={"kind": "image_transport_failure", "failure_kind": "transport_timeout"},
                 result=result,
             )
@@ -552,7 +552,7 @@ def image_acquisition_failure_work(
             and context.retry_attempt() < MAX_IMAGE_TRANSPORT_ATTEMPTS
         ):
             return RetryWork(
-                delay_ns=1_000_000_000,
+                delay_ns=0,
                 reason={"kind": "image_transport_failure", "decision": "retry"},
                 result=result,
             )

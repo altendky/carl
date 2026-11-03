@@ -21,7 +21,6 @@ from carl.core.review import ListCandidatesRequest, candidate_page
 from carl.core.work import WorkRequester, WorkState
 from carl.core.worker import WorkerSettings
 from carl.facebook_workers import (
-    ACQUISITION_RETRY_DELAY_NS,
     COLLECT_FACEBOOK_ITEM,
     EXTRACT_FACEBOOK,
     MAX_ACQUISITION_ATTEMPTS,
@@ -463,7 +462,7 @@ async def test_incomplete_worker_acquisition_is_retryable_without_partial_body(
                 else WorkState.TERMINAL_FAILURE
             )
             assert await database.work_state("collect-work") is expected_state
-            now += ACQUISITION_RETRY_DELAY_NS
+            assert (await database.work("collect-work"))["eligible_at_utc_ns"] == now
 
     with closing(sqlite3.connect(path)) as connection:
         operations = connection.execute(

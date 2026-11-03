@@ -333,9 +333,7 @@ async def test_challenge_retry_resumes_completed_bucket_without_resetting_its_bu
 
 
 @pytest.mark.parametrize("independent", (False, True))
-async def test_transport_failure_defers_siblings_only_for_shared_route_scope(
-    tmp_path: Path, independent: bool
-) -> None:
+async def test_transport_failure_never_defers_siblings(tmp_path: Path, independent: bool) -> None:
     clock, sessions = _Clock(), _Sessions(transport_failures=1)
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
         pool = _pool(database, clock)
@@ -356,7 +354,7 @@ async def test_transport_failure_defers_siblings_only_for_shared_route_scope(
             == 1
         )
         after = (await database.work(sibling.work_item_identifier))["eligible_at_utc_ns"]
-        assert (after == before) if independent else (after > before)
+        assert after == before
         assert sessions.sessions[0].closed
 
 

@@ -631,7 +631,7 @@ async def test_partial_capture_retains_bodies_and_existing_transport_retry_budge
         manager = stage_manager(database)
         captured = await _to_cpu(manager, registry, initial, component)
         outcome = await _run(manager, registry, captured.continuation, component)
-        assert isinstance(outcome, RetryWork) and outcome.delay_ns == 1_000_000_000
+        assert isinstance(outcome, RetryWork) and outcome.delay_ns == 0
         assert outcome.reason == {"kind": "ebay_transport_failure"}
         assert captured.artifacts and len(capture.plans) == 1
         assert outcome.artifacts == ()

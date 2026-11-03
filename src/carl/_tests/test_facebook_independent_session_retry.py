@@ -72,8 +72,6 @@ async def test_independent_challenge_budget_does_not_cool_queued_or_active_peers
             assert (await database.work(queued))["eligible_at_utc_ns"] == queued_deadline
 
             # An already-running peer must not inherit the failed session's wait.
-            # Advance beyond the ordinary short request-rate window first.
-            harness.clock.now += 1_000_000_000
             activity = await _activity(
                 database, f"active-peer-{attempt}", kind=activity_kind, route=PROTON
             )
@@ -87,11 +85,11 @@ async def test_independent_challenge_budget_does_not_cool_queued_or_active_peers
             assert admission.admission is not None
             if attempt < 5:
                 assert isinstance(outcome, RetryWork)
-                assert outcome.delay_ns == (10, 20, 40, 60)[attempt - 1] * MINUTE_NS
+                assert outcome.delay_ns == 0
                 assert work["state"] == WorkState.PENDING
                 eligible = work["eligible_at_utc_ns"]
                 assert isinstance(eligible, int)
-                assert eligible == harness.clock.now - 1_000_000_000 + outcome.delay_ns
+                assert eligible == harness.clock.now
                 harness.clock.now = eligible
             else:
                 assert isinstance(outcome, TerminalFailureWork)
@@ -121,7 +119,7 @@ async def test_independent_challenge_budget_does_not_cool_queued_or_active_peers
 @pytest.mark.anyio
 @pytest.mark.parametrize("retry_scope", ("stack", "independent_session"))
 @pytest.mark.parametrize("failure_phase", ("request", "session_open", "session_close"))
-async def test_transport_backoff_only_defers_peers_for_shared_sessions(
+async def test_transport_retries_do_not_defer_peers_for_any_session_scope(
     tmp_path: Path, retry_scope: _RetryScope, failure_phase: str
 ) -> None:
     base_factory = _PartitionSessionFactory(
@@ -158,11 +156,8 @@ async def test_transport_backoff_only_defers_peers_for_shared_sessions(
         own = await database.work(source)
         assert own["state"] == WorkState.PENDING
         assert own["eligible_at_utc_ns"] == harness.clock.now + outcome.delay_ns
-        expected = (
-            original_deadline
-            if retry_scope == "independent_session"
-            else harness.clock.now + outcome.delay_ns
-        )
+        assert outcome.delay_ns == 0
+        expected = original_deadline
         assert (await database.work(sibling))["eligible_at_utc_ns"] == expected
     async with Database.managed(harness.path) as database:
         assert (await database.work(sibling))["eligible_at_utc_ns"] == expected

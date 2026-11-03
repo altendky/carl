@@ -27,8 +27,6 @@ from carl.core.facebook_listing import (
 from carl.core.facebook_work import (
     CollectItemPayload,
     collect_item_work,
-    facebook_network_policy_constraints,
-    legacy_facebook_network_constraint_identifiers,
 )
 from carl.core.http import RequestPlan
 from carl.core.json import encode_json
@@ -142,15 +140,6 @@ async def _item_phase(
                     "reused_item_page": True,
                 },
             )
-        await database.supersede_constraints(
-            retired_identifiers=legacy_facebook_network_constraint_identifiers(
-                payload.item_routing
-            ),
-            replacements=facebook_network_policy_constraints(payload.item_routing),
-            operation_identifier=context.operation_identifier,
-            at_utc_ns=dependencies.utc_now_ns(),
-            reason="Use existing bounded item-page collection policy",
-        )
         headers = await anyio.to_thread.run_sync(brave_navigation_headers, abandon_on_cancel=True)
         definition = collect_item_work(
             identifier=_identifier(context.work_item_identifier, "item"),

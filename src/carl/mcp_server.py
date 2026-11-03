@@ -295,12 +295,12 @@ the retained source-run provenance, deduplicates within each marketplace, and ke
 fixed completion boundary. Check get_search execution collection_succeeded, response_classification,
 and stopping_reason, and list_search_results execution_warnings before interpreting zero cards as an
 empty successful search. Execution warnings are live, not frozen by the cards' pagination cursor.
-eBay challenge, error-page, HTTP-error, and unrecognized responses retry at most three total attempts;
-retained failed runs are not successful empty results. Challenges and HTTP 403/429 impose a durable
-stack-wide cooldown: two minutes after the first failure, four after the second, eight after the
-terminal third attempt. Queued and newly enqueued searches on that stack wait without consuming
-attempts; cooldowns survive worker restarts and manual retries. Other response failures use short
-bounded backoff. The eBay search stack already uses the same configured Decodo/wreq transport as
+eBay retained failed runs are not successful empty results. Acquisition retries are immediately
+eligible within the existing request and logical-attempt budgets; challenges, HTTP 403/429, and
+timeouts do not pause sibling searches. Search pages default to seven same-session attempts and
+homepage bootstrap to two; recorded configured maxima remain authoritative. Exhausted blocked or
+timeout search attempts retain their five-attempt logical bound, while ordinary response failures
+retain their three-attempt bound. The eBay search stack uses the same configured Decodo/wreq transport as
 item pages; its identifier does not imply a direct connection. eBay targets accept maximum_pages, defaulting to five and capped at
 twenty. Each eBay search attempt owns one Decodo sticky session and cookie-preserving client across
 all its pages; independent attempts and retries start fresh sessions. Session expiry stops traversal
@@ -370,11 +370,13 @@ its coordinator waits for the item and bounded gallery work.
 For either source
 refresh, poll the returned coordinator until item, description, and image follow-ups settle. Refresh reuses the latest usable retained item page for each exact listing
 ID and spends Decodo only on listings without one.
-Transient search and image transport/session failures retry with exponential backoff; a failed
-shared Proton transport (when selected) is replaced before another attempt. Facebook search retries
-retain their own bounded backoff. Verified independent Decodo sessions do not impose route-wide
-challenge cooldowns or transport backoff on sibling searches; fixed exits and unknown collectors
-retain shared route protection. Retry reasons retain retry_scope. Independence is classified from
+Transient marketplace acquisition failures retry immediately within their unchanged attempt bounds;
+a failed shared Proton transport (when selected) is replaced before another attempt. Facebook
+challenge recovery retains its five-attempt budget and completed-partition checkpoints. Built-in
+request-rate pacing, configured inter-request holdoffs, and acquisition-failure cooldowns no longer delay either
+shared or independently selected sessions. A genuine connectivity outage still uses its coalesced
+probe pause, and model-analysis timeout backoffs remain separate. Retry reasons retain retry_scope.
+Independence is classified from
 resolved provider settings before port selection and does not guarantee distinct exit IPs.
 Decodo search bootstrap and price buckets share a cookie-preserving client; use a static datacenter
 port to preserve the exit.
@@ -478,14 +480,14 @@ search absence alone does not mark an older listing unavailable. Use get_workspa
 when the full composed fields and evidence for one exact listing are needed. Use
 set_workspace_search_track_enabled to remove a track from
 or restore it to the active union without deleting its retained history.
-Facebook search acquisition is limited to one active job per Proton route. Decodo Facebook
-searches run concurrently within worker-pool and request-rate limits. eBay retains its
-separate search scheduling policy. If an initial track search
+Facebook and eBay acquisition phases share the configured HTTP and CPU resource budgets, with
+bounded resident sessions for stateful requests. They have no additional built-in route-capacity or
+temporal pacing limit. Explicit user schedules and custom constraints remain in force. If an initial track search
 exhausts a transient transport or session failure, get_workspace_work_status reports it under
 failed_work and successful=false; call retry_workspace_search_track with that stable track ID to
-give the same track a fresh retry budget. Retried legacy tracks are upgraded with the current
-search-route scheduler scope. When Proton is selected, a transport failure invalidates its shared transport and
-backs off every queued search on that route before a replacement transport is used.
+give the same track a fresh retry budget. Retried legacy tracks retain their route provenance.
+When Proton is selected, a transport failure invalidates its shared transport before a replacement
+is used; it does not add a delay to every queued search on that route.
 Rename a workspace with rename_review_workspace. Archive or restore it with
 set_review_workspace_archived; ordinary list_review_workspaces calls hide archived workspaces, while
 include_archived=true reveals them and exact workspace operations remain available.

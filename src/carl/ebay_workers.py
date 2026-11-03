@@ -14,7 +14,7 @@ from carl.core.ebay import (
     LEGACY_COLLECT_EBAY_SEARCH_PAYLOAD_SCHEMA_VERSION,
     CollectEbaySearchPayload,
 )
-from carl.core.ebay_retry import EBAY_BLOCKED_MAXIMUM_ATTEMPTS, ebay_response_retry_delay_ns
+from carl.core.ebay_retry import EBAY_BLOCKED_MAXIMUM_ATTEMPTS
 from carl.core.ebay_search_support import (
     UnsupportedEbaySearchMode,
     require_supported_ebay_search_acquisition,
@@ -171,7 +171,6 @@ def search_acquisition_failure_work(
     )
     if error.result.get("stopping_condition") == "transport_failure" or timeout:
         maximum_attempts = EBAY_BLOCKED_MAXIMUM_ATTEMPTS if timeout else 3
-        delay_ns = ebay_response_retry_delay_ns(policy_attempt, blocked=timeout)
         reason: dict[str, JsonValue] = {
             "kind": "ebay_search_acquisition_failure",
             "attempt": context.attempt,
@@ -186,11 +185,12 @@ def search_acquisition_failure_work(
                     "failure_phase": error.result.get("failure_phase"),
                 }
             )
-            _set_retry_cooldown(reason, error.result, payload, delay_ns, dependencies)
+            if error.result.get("retry_scope") == "independent_session":
+                reason["retry_scope"] = "independent_session"
         if policy_attempt < maximum_attempts:
             return RetryWork(
                 inputs=homepage_inputs,
-                delay_ns=delay_ns,
+                delay_ns=0,
                 reason=reason,
                 result={"state": "retryable_failure", "acquisition": error.result},
             )
@@ -274,15 +274,12 @@ def search_result_work(
         )
         maximum_attempts = EBAY_BLOCKED_MAXIMUM_ATTEMPTS if blocked else 3
         reason["maximum_attempts"] = maximum_attempts
-        # Each collector invocation already opens a fresh provider session and
-        # cookie jar. Give blocked queries time to recover between those sessions.
-        delay_ns = ebay_response_retry_delay_ns(policy_attempt, blocked=blocked)
-        if blocked:
-            _set_retry_cooldown(reason, result, payload, delay_ns, dependencies)
+        if blocked and result.get("retry_scope") == "independent_session":
+            reason["retry_scope"] = "independent_session"
         if policy_attempt < maximum_attempts:
             return RetryWork(
                 inputs=tuple(inputs),
-                delay_ns=delay_ns,
+                delay_ns=0,
                 reason=reason,
                 result={**result, "state": "retryable_failure"},
             )
@@ -292,26 +289,6 @@ def search_result_work(
             result={**result, "state": "terminal_failure"},
         )
     return CompletedWork(inputs=tuple(inputs), result=result)
-
-
-def _set_retry_cooldown(
-    reason: dict[str, JsonValue],
-    result: dict[str, JsonValue],
-    payload: CollectEbaySearchPayload,
-    delay_ns: int,
-    dependencies: EbaySearchWorkerDependencies,
-) -> None:
-    # The configured collector verifies session isolation using its actual
-    # provider settings. Keep the failing query's bounded durable retry, but do
-    # not pause sibling queries that select independent Decodo sessions. Unknown
-    # collectors and fixed exits retain the existing conservative stack scope.
-    if result.get("retry_scope") == "independent_session":
-        reason["retry_scope"] = "independent_session"
-        return
-    reason["cooldown"] = {
-        "stack_identifier": payload.request.stack_identifier,
-        "until_utc_ns": dependencies.utc_now_ns() + delay_ns,
-    }
 
 
 def build_ebay_worker_registry(dependencies: EbaySearchWorkerDependencies) -> WorkHandlerRegistry:

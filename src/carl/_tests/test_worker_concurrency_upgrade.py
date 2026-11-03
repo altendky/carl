@@ -39,7 +39,9 @@ from carl.work_runtime import prepare_worker_constraints
 
 
 @pytest.mark.anyio
-async def test_upgrade_retires_route_budgets_even_without_queued_searches(tmp_path: Path) -> None:
+async def test_upgrade_retires_route_budgets_without_installing_replacements(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "carl.sqlite3"
     routes = (("decodo", "personal", "datacenter"), ("proton", "personal", "removed_alias"))
     old_constraints = tuple(
@@ -71,8 +73,7 @@ async def test_upgrade_retires_route_budgets_even_without_queued_searches(tmp_pa
                     "SELECT definition_json FROM scheduling_constraints WHERE identifier_parts_json=?",
                     (json.dumps(replacement.identifier, separators=(",", ":")),),
                 ).fetchone()
-                assert row is not None
-                assert json.loads(row[0]) == replacement.model_dump(mode="json")
+                assert row is None
 
 
 @pytest.mark.anyio

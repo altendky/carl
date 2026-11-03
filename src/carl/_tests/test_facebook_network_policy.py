@@ -133,7 +133,7 @@ async def test_page_policy_retires_route_and_origin_limits(tmp_path: Path) -> No
         }
         policy_records = connection.execute(
             "SELECT count(*) FROM objects WHERE kind_parts_json = ?",
-            (json.dumps(["carl", "facebook", "network_policy_activation"], separators=(",", ":")),),
+            (json.dumps(["carl", "marketplace", "timing_retirement"], separators=(",", ":")),),
         ).fetchone()
     assert retired == {constraint.identifier for constraint in old_constraints}
     assert policy_records == (1,)
@@ -141,7 +141,7 @@ async def test_page_policy_retires_route_and_origin_limits(tmp_path: Path) -> No
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("provider", ("decodo", "proton"))
-async def test_request_budget_counts_http_once_and_excludes_setup_and_other_sources(
+async def test_custom_request_budget_counts_http_once_and_excludes_other_activity(
     tmp_path: Path, provider: str
 ) -> None:
     routing = (provider, "personal", "test")

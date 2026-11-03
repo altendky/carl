@@ -13,16 +13,12 @@ from carl.core.facebook_images import (
     EXTRACT_IMAGE_WORK_KIND,
     CollectImagePayload,
     image_network_activity,
-    image_network_constraints,
-    legacy_image_pacing_constraint_identifiers,
 )
 from carl.core.facebook_work import (
     COLLECT_ITEM_WORK_KIND,
     EXTRACT_ITEM_WORK_KIND,
     CollectItemPayload,
     facebook_item_network_activity,
-    facebook_item_network_constraints,
-    legacy_facebook_network_constraint_identifiers,
 )
 from carl.core.json import encode_json
 from carl.core.models import JsonValue, NamedInput, NamedOutput, StrictModel
@@ -329,15 +325,6 @@ def build_facebook_stateless_stage_registry(
                         "request_plan": image.request_plan.model_copy(update={"routing": routing})
                     }
                 )
-            await dependencies.database.supersede_constraints(
-                retired_identifiers=legacy_image_pacing_constraint_identifiers(
-                    image.request_plan.routing
-                ),
-                replacements=image_network_constraints(image.request_plan.routing),
-                operation_identifier=context.operation_identifier,
-                at_utc_ns=image_dependencies.utc_now_ns(),
-                reason="Apply image request pacing before durable HTTP stage admission",
-            )
         except (ConfigurationFailure, RouteConfigurationFailure) as error:
             return TerminalFailureWork(
                 error={"kind": "route_configuration_failure", "code": error.code},
@@ -542,14 +529,6 @@ def build_facebook_stateless_stage_registry(
                         )
                     }
                 )
-            routing = item.request_plan.routing
-            await dependencies.database.supersede_constraints(
-                retired_identifiers=legacy_facebook_network_constraint_identifiers(routing),
-                replacements=facebook_item_network_constraints(routing),
-                operation_identifier=context.operation_identifier,
-                at_utc_ns=dependencies.utc_now_ns(),
-                reason="Apply detail request policy before durable HTTP admission",
-            )
         except (ConfigurationFailure, RouteConfigurationFailure) as error:
             return TerminalFailureWork(
                 error={

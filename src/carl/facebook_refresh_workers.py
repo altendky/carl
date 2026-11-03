@@ -21,9 +21,7 @@ from carl.core.facebook_images import (
     collect_image_work,
     facebook_image_url_expiry_utc_ns,
     gallery_references,
-    image_network_constraints,
     image_reuse_record,
-    legacy_image_pacing_constraint_identifiers,
     plan_image_followups,
 )
 from carl.core.facebook_refresh import (
@@ -43,8 +41,6 @@ from carl.core.facebook_work import (
     SuccessfulItemPageResult,
     collect_item_work,
     collect_search_work,
-    facebook_network_policy_constraints,
-    legacy_facebook_network_constraint_identifiers,
     plan_item_page_followups,
     retryable_search_failure,
 )
@@ -195,13 +191,8 @@ async def _activate_page_policy(
     routing: tuple[str, ...],
     operation_identifier: str,
 ) -> None:
-    await dependencies.database.supersede_constraints(
-        retired_identifiers=legacy_facebook_network_constraint_identifiers(routing),
-        replacements=facebook_network_policy_constraints(routing),
-        operation_identifier=operation_identifier,
-        at_utc_ns=dependencies.utc_now_ns(),
-        reason="Marketplace page request pace raised for a bounded trial",
-    )
+    """Compatibility hook; worker startup retires the old pacing definitions."""
+    return None
 
 
 async def _search_phase(
@@ -1221,13 +1212,6 @@ async def _image_phase(
                 ended_at_utc=_utc_text(dependencies.utc_now_ns()),
                 duration_ns=max(0, dependencies.monotonic_ns() - reuse_started_monotonic_ns),
             )
-    await database.supersede_constraints(
-        retired_identifiers=legacy_image_pacing_constraint_identifiers(payload.image_routing),
-        replacements=image_network_constraints(payload.image_routing),
-        operation_identifier=context.operation_identifier,
-        at_utc_ns=dependencies.utc_now_ns(),
-        reason="Apply current image request pacing to the selected route",
-    )
     collection_identifiers: list[str] = []
     for entries in selected:
         reference_identifier, reference = entries[0]

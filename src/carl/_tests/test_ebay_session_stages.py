@@ -108,6 +108,7 @@ async def _setup(
     attempts: int = 3,
     fetch: bool = False,
     home_attempts: int = 2,
+    retained_holdoff_seconds: float = 0.0,
 ) -> tuple[ResidentSessionPool, StageDefinition]:
     pool = ResidentSessionPool(
         stage_manager(database), StageHandlerRegistry((), ()), _provenance(), {}, poll_seconds=0.005
@@ -121,9 +122,16 @@ async def _setup(
             pool,
             session_factory=sessions,
             search_policy=EbaySearchConfiguration(
-                maximum_page_attempts=attempts, maximum_homepage_attempts=home_attempts
+                maximum_page_attempts=attempts,
+                maximum_homepage_attempts=home_attempts,
+                minimum_holdoff_seconds=retained_holdoff_seconds,
+                maximum_holdoff_seconds=retained_holdoff_seconds,
             ),
-            item_policy=EbayItemConfiguration(maximum_page_attempts=attempts),
+            item_policy=EbayItemConfiguration(
+                maximum_page_attempts=attempts,
+                minimum_holdoff_seconds=retained_holdoff_seconds,
+                maximum_holdoff_seconds=retained_holdoff_seconds,
+            ),
             fetch_pagination=fetch,
         )
     )
@@ -207,12 +215,16 @@ async def test_search_resident_keeps_session_and_private_fetch_token_across_phas
         )
 
 
-async def test_home_and_page_challenges_preserve_same_session_attempt_budgets(
+@pytest.mark.parametrize("retained_holdoff_seconds", (0.0, 60.0))
+async def test_home_and_page_challenges_preserve_budgets_without_retained_holds(
     tmp_path: Path,
+    retained_holdoff_seconds: float,
 ) -> None:
     sessions = _Sessions([(b"blocked", 403), (b"home", 200), (b"blocked", 403), (_html(), 200)])
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
-        pool, stage = await _setup(database, tmp_path, sessions)
+        pool, stage = await _setup(
+            database, tmp_path, sessions, retained_holdoff_seconds=retained_holdoff_seconds
+        )
         await _run(pool, stage)
         work = await database.work(stage.work_item_identifier)
         assert work["state"] == "completed" and work["attempt"] == 1
@@ -235,13 +247,22 @@ async def test_search_exhausted_local_budget_uses_outer_retry_without_reset(tmp_
 
 
 @pytest.mark.parametrize("blocked", (False, True))
-async def test_item_same_session_loop_and_followup(tmp_path: Path, blocked: bool) -> None:
+@pytest.mark.parametrize("retained_holdoff_seconds", (0.0, 60.0))
+async def test_item_same_session_loop_and_followup(
+    tmp_path: Path, blocked: bool, retained_holdoff_seconds: float
+) -> None:
     responses: list[tuple[bytes, int] | AcquisitionFailure] = [(_item_html(), 200)]
     if blocked:
         responses.insert(0, (b"<title>Pardon Our Interruption</title>", 403))
     sessions = _Sessions(responses)
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
-        pool, stage = await _setup(database, tmp_path, sessions, item=True)
+        pool, stage = await _setup(
+            database,
+            tmp_path,
+            sessions,
+            item=True,
+            retained_holdoff_seconds=retained_holdoff_seconds,
+        )
         await _run(pool, stage)
         work = await database.work(stage.work_item_identifier)
         assert work["state"] == "completed"

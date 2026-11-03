@@ -44,14 +44,11 @@ from carl.core.facebook_work import (
     COLLECT_SEARCH_WORK_KIND,
     LEGACY_COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
     PREVIOUS_COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
-    RETRYABLE_SEARCH_SESSION_FAILURE_CODES,
     SEARCH_ROUTE_DEFINITION_NETWORK_ACTIVITY_KIND,
     SEARCH_SESSION_BOOTSTRAP_NETWORK_ACTIVITY_KIND,
     CollectSearchPayload,
     SearchPriceRange,
-    facebook_network_policy_constraints,
     facebook_search_network_activity,
-    legacy_facebook_network_constraint_identifiers,
 )
 from carl.core.json import encode_json
 from carl.core.models import Header, JsonValue, NamedInput, NamedOutput, RecordDraft, StrictModel
@@ -71,7 +68,6 @@ from carl.facebook_search_workers import (
     _decode_acquisition,
     _partition_checkpoint,
     _response_failure_work,
-    _search_retry_delay_ns,
     build_resumed_partition_checkpoint,
     build_search_bootstrap_checkpoint,
     build_search_page_checkpoint,
@@ -393,30 +389,16 @@ async def _transport_failure(
         ),
     )
     if isinstance(error, AcquisitionFailure):
-        retryable = error.result.get("stopping_condition") == "transport_failure"
         outcome = search_acquisition_failure_work(
             error=error, context=context, policy_attempt=attempt, retry_scope=progress.retry_scope
         )
     else:
-        retryable = error.code in RETRYABLE_SEARCH_SESSION_FAILURE_CODES
         outcome = search_session_failure_work(
             error=error,
             context=context,
             routing=progress.search.routing,
             policy_attempt=attempt,
             retry_scope=progress.retry_scope,
-        )
-    if retryable and progress.retry_scope != "independent_session":
-        now = dependencies.utc_now_ns()
-        await dependencies.database.defer_pending_collect_search_work_for_route(
-            routing=progress.search.routing,
-            eligible_at_utc_ns=now + _search_retry_delay_ns(attempt),
-            recorded_at_utc_ns=now,
-            event_batch_identifier=dependencies.new_identifier(),
-            reason={
-                "kind": "shared_search_route_transport_backoff",
-                "triggering_work_identifier": context.work_item_identifier,
-            },
         )
     if isinstance(outcome, RetryWork) and progress.retry_checkpoint is not None:
         outcome = outcome.model_copy(
@@ -585,13 +567,6 @@ def build_facebook_session_stage_registry(
             > strategy.width + (strategy.width - strategy.overlap) * 9_999
         ):
             raise ValueError("Facebook search exceeds its partition bound")
-        await dependencies.database.supersede_constraints(
-            retired_identifiers=legacy_facebook_network_constraint_identifiers(search.routing),
-            replacements=facebook_network_policy_constraints(search.routing),
-            operation_identifier=context.operation_identifier,
-            at_utc_ns=dependencies.utc_now_ns(),
-            reason="Apply Marketplace policy to the resident search route",
-        )
         state = PricePartitionSearchTraversalState(
             search_run_identifier=dependencies.new_identifier(),
             attempt=context.attempt,

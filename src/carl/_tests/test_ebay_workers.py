@@ -180,9 +180,6 @@ async def test_worker_bounds_response_failure_retries(
 
     blocked = classification == "challenge"
     maximum_attempts = 5 if blocked else 3
-    delay_ns = (
-        min(3600, 600 * 2 ** (attempt - 1)) if blocked else 2 ** (attempt - 1)
-    ) * 1_000_000_000
     reason: dict[str, JsonValue] = {
         "kind": "ebay_search_response_failure",
         "response_classification": result["response_classification"],
@@ -192,14 +189,9 @@ async def test_worker_bounds_response_failure_retries(
         "retry_attempt_offset": 0,
         "maximum_attempts": maximum_attempts,
     }
-    if classification == "challenge":
-        reason["cooldown"] = {
-            "stack_identifier": "ebay_anonymous",
-            "until_utc_ns": now_utc_ns + delay_ns,
-        }
     if attempt < maximum_attempts:
         assert isinstance(outcome, RetryWork)
-        assert outcome.delay_ns == delay_ns
+        assert outcome.delay_ns == 0
         assert outcome.reason == reason
     else:
         assert isinstance(outcome, TerminalFailureWork)
@@ -218,7 +210,7 @@ async def test_worker_bounds_response_failure_retries(
 @pytest.mark.anyio
 @pytest.mark.parametrize("evidence", ["http_status_403", "http_status_429"])
 @pytest.mark.parametrize("policy_attempt", [1, 2, 3, 4, 5])
-async def test_blocked_search_response_emits_stack_cooldown_with_fresh_retry_budget(
+async def test_blocked_search_response_keeps_fresh_retry_budget_without_stack_cooldown(
     tmp_path: Path, evidence: str, policy_attempt: int
 ) -> None:
     now_utc_ns = 10_000_000_000_000
@@ -260,17 +252,13 @@ async def test_blocked_search_response_emits_stack_cooldown_with_fresh_retry_bud
     assert isinstance(outcome, RetryWork if policy_attempt < 5 else TerminalFailureWork)
     reason = outcome.reason if isinstance(outcome, RetryWork) else outcome.error
     assert isinstance(reason, dict)
-    delay_ns = min(3600, 600 * 2 ** (policy_attempt - 1)) * 1_000_000_000
-    assert reason["cooldown"] == {
-        "stack_identifier": "alternate",
-        "until_utc_ns": now_utc_ns + delay_ns,
-    }
+    assert "cooldown" not in reason
     assert reason["attempt"] == offset + policy_attempt
     assert reason["policy_attempt"] == policy_attempt
     assert reason["retry_attempt_offset"] == offset
     assert reason["maximum_attempts"] == 5
     if isinstance(outcome, RetryWork):
-        assert outcome.delay_ns == delay_ns
+        assert outcome.delay_ns == 0
     assert outcome.result == {
         **result,
         "state": "retryable_failure" if policy_attempt < 5 else "terminal_failure",
@@ -320,7 +308,7 @@ async def test_transport_acquisition_failure_has_bounded_fresh_retry_budget(
         "maximum_attempts": 3,
     }
     if isinstance(outcome, RetryWork):
-        assert outcome.delay_ns == 2 ** (policy_attempt - 1) * 1_000_000_000
+        assert outcome.delay_ns == 0
     assert outcome.result == {
         "state": "retryable_failure" if policy_attempt < 3 else "acquisition_failed",
         "acquisition": acquisition,
@@ -410,7 +398,7 @@ async def test_operator_retry_retains_attempt_counter_and_has_fresh_bounded_budg
         assert reason["retry_attempt_offset"] == offset
         assert reason["maximum_attempts"] == 3
         if isinstance(outcome, RetryWork):
-            assert outcome.delay_ns == 2 ** (policy_attempt - 1) * 1_000_000_000
+            assert outcome.delay_ns == 0
         assert outcome.result["listing_count"] == result["listing_count"]
 
 

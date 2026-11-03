@@ -7,7 +7,6 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from random import uniform
 from time import perf_counter_ns, time_ns
 from typing import Literal, Protocol, cast
 
@@ -282,7 +281,6 @@ def _next(
     checkpoint: HttpCheckpoint | None = None,
     records: tuple[RecordDraft, ...] = (),
     outputs: tuple[NamedOutput, ...] = (),
-    delay: bool = False,
     child_bodies: bool = False,
 ) -> WaitWork:
     progress = SessionProgress.model_validate_json(progress.model_dump_json())
@@ -312,16 +310,6 @@ def _next(
             ordinal=progress.page_attempt + 1 if progress.item else len(progress.pages) + 1,
             attempt=attempt,
         )
-    holdoff = progress.item_policy if progress.item else progress.search_policy
-    deadline = (
-        deps.utc_now_ns()
-        + int(
-            uniform(holdoff.minimum_holdoff_seconds, holdoff.maximum_holdoff_seconds)
-            * 1_000_000_000
-        )
-        if delay
-        else 0
-    )
     return WaitWork(
         continuation=StageDefinition(
             identifier=deps.new_identifier(),
@@ -333,7 +321,6 @@ def _next(
                 checkpoint_identifier=None if checkpoint is None else checkpoint.record_identifier,
             ).model_dump(mode="json"),
             resources=(ResourceRequest(name="http" if phase == _CAPTURE else "cpu"),),
-            not_before_utc_ns=deadline,
             resident_session_identifier=_resident(context),
             network_activity=activity,
             checkpoint_inputs=(NamedInput(name=("progress",), object_identifier=identifier),)
@@ -347,7 +334,7 @@ def _next(
                 )
             ),
         ),
-        wait_kind=StageWaitKind.TIME if deadline else StageWaitKind.RESOURCE,
+        wait_kind=StageWaitKind.RESOURCE,
         records=(
             *records,
             *(() if checkpoint is None else checkpoint.records),
@@ -882,7 +869,7 @@ def build_ebay_session_stage_registry(deps: EbaySessionStageDependencies) -> Sta
                     and extracted.classification == EbayItemResponseKind.CHALLENGE
                 )
                 if blocked and progress.page_attempt < progress.item_policy.maximum_page_attempts:
-                    return _next(deps, context, progress, _CAPTURE, delay=True)
+                    return _next(deps, context, progress, _CAPTURE)
                 outcome = complete_item_collection(
                     progress.item,
                     context,
@@ -928,13 +915,12 @@ def build_ebay_session_stage_registry(deps: EbaySessionStageDependencies) -> Sta
                     summary["http_status"] == 403
                     and progress.homepage_attempt < progress.search_policy.maximum_homepage_attempts
                 ):
-                    return _next(deps, context, progress, _CAPTURE, delay=True)
+                    return _next(deps, context, progress, _CAPTURE)
                 return _next(
                     deps,
                     context,
                     progress.model_copy(update={"phase": "page", "bootstrap": False}),
                     _CAPTURE,
-                    delay=True,
                 )
             response = _terminal_response(acquisition.record)
             body = response.get("body")
@@ -980,7 +966,6 @@ def build_ebay_session_stage_registry(deps: EbaySessionStageDependencies) -> Sta
                         context,
                         progress.model_copy(update={"page_attempts": attempts}),
                         _CAPTURE,
-                        delay=True,
                     ),
                     (child,),
                 )
@@ -1032,7 +1017,6 @@ def build_ebay_session_stage_registry(deps: EbaySessionStageDependencies) -> Sta
                             }
                         ),
                         _CAPTURE,
-                        delay=True,
                     ),
                     (child,),
                 )

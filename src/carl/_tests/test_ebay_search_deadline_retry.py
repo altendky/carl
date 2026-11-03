@@ -245,7 +245,7 @@ async def _execute(database: Database, root: Path, now: int, *, response: str) -
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("response", ["timeout", "finalization_timeout"])
-async def test_403_then_deadline_retries_durably_with_shared_cooldown(
+async def test_403_then_deadline_retries_durably_without_shared_cooldown(
     tmp_path: Path,
     response: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -256,7 +256,6 @@ async def test_403_then_deadline_retries_durably_with_shared_cooldown(
         await _enqueue(database, "search", now)
         await _enqueue(database, "sibling", now)
         await _execute(database, tmp_path, now, response="403")
-        now += 600_000_000_000
         assert (await database.work("search"))["eligible_at_utc_ns"] == now
     async with Database.managed(path) as database:
         await _execute(database, tmp_path, now, response=response)
@@ -303,9 +302,8 @@ async def test_403_then_deadline_retries_durably_with_shared_cooldown(
             EbayRefreshWorkerDependencies(database, lambda: str(uuid4()), utc_now_ns=lambda: now),
         )
         assert isinstance(parent, RetryWork)
-        assert parent.delay_ns == 1200_000_000_000
+        assert parent.progress_watch is not None
         assert parent.reason == {"kind": "waiting_for_search_collection"}
-        now += 1200_000_000_000
         assert work["eligible_at_utc_ns"] == now
         assert (await database.work("sibling"))["eligible_at_utc_ns"] == now
     async with Database.managed(path) as database:
@@ -321,13 +319,11 @@ async def test_deadline_exhaustion_and_operator_retry_get_fresh_budget(tmp_path:
     async with Database.managed(tmp_path / "test.sqlite3", initialize=True) as database:
         await _enqueue(database, "search", now)
         await _enqueue(database, "sibling", now)
-        for delay in (0, 600_000_000_000, 1200_000_000_000, 2400_000_000_000, 3600_000_000_000):
-            now += delay
+        for _ in range(5):
             await _execute(database, tmp_path, now, response="timeout")
         work = await database.work("search")
         assert work["state"] == "terminal_failure" and work["attempt"] == 5
         assert work["error"]["maximum_attempts"] == 5
-        now += 3600_000_000_000
         assert (await database.work("sibling"))["eligible_at_utc_ns"] == now
         await database.retry_terminal_ebay_search_work(
             work_item_identifier="search",
@@ -339,5 +335,5 @@ async def test_deadline_exhaustion_and_operator_retry_get_fresh_budget(tmp_path:
         await _execute(database, tmp_path, now, response="timeout")
         work = await database.work("search")
         assert work["state"] == "pending" and work["attempt"] == 6
-        assert work["eligible_at_utc_ns"] == now + 600_000_000_000
+        assert work["eligible_at_utc_ns"] == now
         assert work["payload"]["retry_attempt_offset"] == 5

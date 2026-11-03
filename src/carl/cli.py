@@ -19,7 +19,6 @@ from rich.live import Live
 from carl.app import extract_acquisition
 from carl.benchmark_cli import benchmark_app
 from carl.core.activity import ActivitySnapshot
-from carl.core.components import Component, ComponentId
 from carl.core.composed_projection import (
     AnalysisPresenceFilter,
     ComposedListingFilters,
@@ -39,9 +38,7 @@ from carl.core.facebook_images import (
     collect_image_work,
     extract_image_work,
     gallery_references,
-    image_network_constraints,
     image_reuse_record,
-    legacy_image_pacing_constraint_identifiers,
     plan_image_followups,
 )
 from carl.core.facebook_search import (
@@ -59,8 +56,6 @@ from carl.core.facebook_work import (
     SearchRadius,
     SearchRunListingCandidates,
     collect_item_work,
-    facebook_network_policy_constraints,
-    legacy_facebook_network_constraint_identifiers,
     plan_item_page_followups,
 )
 from carl.core.fair_scheduling import SchedulingContext, SchedulingServiceClass
@@ -123,7 +118,7 @@ from carl.io.sqlite import Database
 from carl.mcp_server import serve_stdio
 from carl.review import ReviewApplication
 from carl.travel_cli import travel_app
-from carl.work_runtime import managed_worker_pool, work_forever
+from carl.work_runtime import managed_worker_pool, prepare_worker_constraints, work_forever
 
 app = App(name="carl", help="Preserve web evidence and derived information")
 app.command(travel_app)
@@ -342,77 +337,8 @@ def _print_work_result(result: dict[str, JsonValue]) -> None:
 async def _activate_facebook_page_network_policy(
     evidence_database: Database, network_path: tuple[str, ...]
 ) -> None:
-    """Retain a versioned, provenance-linked page policy before network work."""
-
-    replacements = facebook_network_policy_constraints(network_path)
-    retired_identifiers = legacy_facebook_network_constraint_identifiers(network_path)
-    component = Component(
-        ComponentId(("carl", "facebook", "network_policy", "activate")),
-        1,
-        facebook_network_policy_constraints,
-    )
-    operation_identifier = _identifier()
-    policy_record_identifier = _identifier()
-    started_utc_ns = time_ns()
-    started_monotonic_ns = perf_counter_ns()
-    await evidence_database.begin_operation(
-        operation_id=operation_identifier,
-        component=component,
-        provenance=await collect_code_provenance_async(_repository_root()),
-        invocation=process_invocation(),
-        configuration={"network_path": list(network_path)},
-        started_at_utc=_utc_text(started_utc_ns),
-        inputs=(),
-    )
-    try:
-        with anyio.CancelScope(shield=True):
-            await evidence_database.supersede_constraints(
-                retired_identifiers=retired_identifiers,
-                replacements=replacements,
-                operation_identifier=operation_identifier,
-                at_utc_ns=time_ns(),
-                reason="Marketplace page request pace raised for a bounded trial",
-            )
-            await evidence_database.complete_operation(
-                operation_id=operation_identifier,
-                records=(
-                    RecordDraft(
-                        identifier=policy_record_identifier,
-                        kind=("carl", "facebook", "network_policy_activation"),
-                        schema_version=1,
-                        value={
-                            "network_path": list(network_path),
-                            "replacement_constraints": [
-                                constraint.model_dump(mode="json") for constraint in replacements
-                            ],
-                            "retired_constraint_identifiers": [
-                                list(identifier) for identifier in retired_identifiers
-                            ],
-                            "operation_identifier": operation_identifier,
-                        },
-                    ),
-                ),
-                artifacts=(),
-                outputs=(
-                    NamedOutput(
-                        name=("network_policy_activation",),
-                        object_identifier=policy_record_identifier,
-                    ),
-                ),
-                result={"state": "active", "network_path": list(network_path)},
-                ended_at_utc=_utc_text(time_ns()),
-                duration_ns=max(0, perf_counter_ns() - started_monotonic_ns),
-            )
-    except BaseException as error:
-        with anyio.CancelScope(shield=True):
-            await evidence_database.fail_operation(
-                operation_id=operation_identifier,
-                error={"kind": "network_policy_activation_failure", "type": type(error).__name__},
-                result={"state": "failed"},
-                ended_at_utc=_utc_text(time_ns()),
-                duration_ns=max(0, perf_counter_ns() - started_monotonic_ns),
-            )
-        raise
+    """Apply timing retirement before the compatibility CLI enqueues acquisition."""
+    await prepare_worker_constraints(evidence_database, _repository_root())
 
 
 @app.command
@@ -1388,13 +1314,6 @@ def collect_images(
                     "resumed_images_failed": resumed_failed,
                 }
 
-            await evidence_database.supersede_constraints(
-                retired_identifiers=legacy_image_pacing_constraint_identifiers(network_path),
-                replacements=image_network_constraints(network_path),
-                operation_identifier=operation_identifier,
-                at_utc_ns=time_ns(),
-                reason="Apply current image request pacing",
-            )
             collection_identifiers: list[str] = []
             for entries in selected:
                 reference_identifier, reference = entries[0]

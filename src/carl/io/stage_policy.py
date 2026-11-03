@@ -7,6 +7,7 @@ from uuid import uuid4
 import anyio
 
 from carl.core.connectivity import connectivity_failure, network_work_kind
+from carl.core.marketplace_timing import immediate_marketplace_retry
 from carl.core.models import RecordDraft, StrictModel
 from carl.core.stages import StageAttemptContext, StageDefinition, StageWaitKind, WaitWork
 from carl.core.work import WorkCancellationRequestedError
@@ -123,8 +124,11 @@ class StagePolicy:
                 result={"state": "waiting_for_connectivity", "failure": value["result"]},
             )
         if value["kind"] == "retry":
-            return RetryWork(
+            outcome = RetryWork(
                 delay_ns=value["delay_ns"], reason=value["reason"], result=value["result"]
+            )
+            return immediate_marketplace_retry(
+                await self.monitor.database.work_kind(context.work_item_identifier), outcome
             )
         return TerminalFailureWork(error=value["error"], result=value["result"])
 

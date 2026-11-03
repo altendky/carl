@@ -47,7 +47,6 @@ from carl.core.facebook_search_requests import (
 from carl.core.facebook_search_retry import (
     FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS,
     PartitionSearchRetryCheckpoint,
-    facebook_challenge_retry_delay_ns,
 )
 from carl.core.facebook_search_session import (
     SearchSessionMaterialEvidence,
@@ -93,8 +92,6 @@ from carl.io.network_activity import NetworkActivityScheduler, network_activity_
 from carl.io.resource_permits import run_cpu
 from carl.io.sqlite import Database
 
-SEARCH_RETRY_DELAY_NS = 1_000_000_000
-
 
 class SearchCheckpointDependencies(Protocol):
     @property
@@ -135,10 +132,6 @@ async def _publish_search_checkpoint(
         outputs=draft.outputs,
         checkpoint_result=draft.result,
     )
-
-
-def _search_retry_delay_ns(attempt: int) -> int:
-    return min(60, 2 ** (attempt - 1)) * SEARCH_RETRY_DELAY_NS
 
 
 def _partition_checkpoint(
@@ -282,14 +275,9 @@ def _response_failure_work(
         "guest_access_interrupted": interrupted_guest_access,
         "retry_scope": retry_scope,
     }
-    if retry_scope != "independent_session":
-        diagnostic["facebook_search_cooldown"] = {
-            "network_path": list(routing),
-            "until_utc_ns": now_utc_ns + facebook_challenge_retry_delay_ns(attempt),
-        }
     if attempt < FACEBOOK_CHALLENGE_MAXIMUM_ATTEMPTS:
         return RetryWork(
-            delay_ns=facebook_challenge_retry_delay_ns(attempt),
+            delay_ns=0,
             reason={**diagnostic, "decision": "retry"},
             result={**result, "state": "challenge_backoff"},
         )
@@ -324,7 +312,7 @@ def search_session_failure_work(
     effective_attempt = context.retry_attempt() if policy_attempt is None else policy_attempt
     if retryable and effective_attempt < SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS:
         return RetryWork(
-            delay_ns=_search_retry_delay_ns(effective_attempt),
+            delay_ns=0,
             reason={**failure, "decision": "retry"},
             result=result,
         )
@@ -366,7 +354,7 @@ def search_acquisition_failure_work(
     ):
         return RetryWork(
             artifacts=artifacts,
-            delay_ns=_search_retry_delay_ns(effective_attempt),
+            delay_ns=0,
             reason={**failure, "decision": "retry"},
             result=result,
         )
@@ -1774,11 +1762,6 @@ def build_search_handler(
                                 "kind": "search_pagination_rate_limited",
                                 "attempt": policy_attempt,
                                 "maximum_attempts": SEARCH_TRANSPORT_MAXIMUM_ATTEMPTS,
-                                "facebook_search_cooldown": {
-                                    "network_path": list(payload.routing),
-                                    "until_utc_ns": dependencies.utc_now_ns()
-                                    + facebook_challenge_retry_delay_ns(policy_attempt),
-                                },
                             }
                             break
                         page_completed_at = dependencies.monotonic_ns()
@@ -1832,23 +1815,6 @@ def build_search_handler(
                 policy_attempt
                 - (0 if retry_checkpoint is None else retry_checkpoint.challenge_retry_attempts),
             )
-            if (
-                error.result.get("stopping_condition") == "transport_failure"
-                and dependencies.retry_scope != "independent_session"
-            ):
-                delay_ns = _search_retry_delay_ns(transport_attempt)
-                now_utc_ns = dependencies.utc_now_ns()
-                await dependencies.database.defer_pending_collect_search_work_for_route(
-                    routing=payload.routing,
-                    eligible_at_utc_ns=now_utc_ns + delay_ns,
-                    recorded_at_utc_ns=now_utc_ns,
-                    event_batch_identifier=dependencies.new_identifier(),
-                    reason={
-                        "kind": "shared_search_route_transport_backoff",
-                        "triggering_work_identifier": context.work_item_identifier,
-                        "exception_type": error.result.get("exception_type"),
-                    },
-                )
             outcome = search_acquisition_failure_work(
                 error=error,
                 context=context,
@@ -1875,23 +1841,6 @@ def build_search_handler(
                 policy_attempt
                 - (0 if retry_checkpoint is None else retry_checkpoint.challenge_retry_attempts),
             )
-            if (
-                error.code in RETRYABLE_SEARCH_SESSION_FAILURE_CODES
-                and dependencies.retry_scope != "independent_session"
-            ):
-                delay_ns = _search_retry_delay_ns(transport_attempt)
-                now_utc_ns = dependencies.utc_now_ns()
-                await dependencies.database.defer_pending_collect_search_work_for_route(
-                    routing=payload.routing,
-                    eligible_at_utc_ns=now_utc_ns + delay_ns,
-                    recorded_at_utc_ns=now_utc_ns,
-                    event_batch_identifier=dependencies.new_identifier(),
-                    reason={
-                        "kind": "shared_search_route_session_backoff",
-                        "triggering_work_identifier": context.work_item_identifier,
-                        "code": error.code,
-                    },
-                )
             outcome = search_session_failure_work(
                 error=error,
                 context=context,
@@ -2024,7 +1973,7 @@ def build_search_handler(
                 records=completed.records,
                 outputs=completed.outputs,
                 result=completed.result,
-                delay_ns=facebook_challenge_retry_delay_ns(policy_attempt),
+                delay_ns=0,
                 reason={**pagination_failure, "decision": "retry"},
             )
         return TerminalFailureWork(
