@@ -436,25 +436,40 @@ def legacy_image_session_work_constraint_identifiers() -> tuple[tuple[str, ...],
     )
 
 
-def image_network_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...]:
-    return (
-        image_session_work_constraint(),
-        ConcurrencyConstraint(
-            identifier=(
-                "carl",
-                "facebook",
-                "image",
-                "network_activity_concurrency",
-                "all_cdns",
-                "v4",
-            ),
-            subject_kind=SchedulingSubjectKind.NETWORK_ACTIVITY,
-            scope=SchedulingScope(
-                kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND,
-                identity=IMAGE_NETWORK_ACTIVITY_KIND,
-            ),
-            maximum_active=IMAGE_MAXIMUM_ACTIVE,
+def legacy_image_pacing_constraint_identifiers(
+    routing: tuple[str, ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Supersede pacing without retiring customized historical capacity rules."""
+
+    capacity_families = {
+        ("carl", "facebook", "image", "work_concurrency"),
+        ("carl", "facebook", "image", "network_activity_concurrency"),
+    }
+    return tuple(
+        identifier
+        for identifier in legacy_image_network_constraint_identifiers(routing)
+        if identifier[:4] not in capacity_families
+    )
+
+
+def legacy_image_network_concurrency_constraint() -> ConcurrencyConstraint:
+    """Retain the shipped v4 image capacity definition for historical evidence."""
+
+    return ConcurrencyConstraint(
+        identifier=("carl", "facebook", "image", "network_activity_concurrency", "all_cdns", "v4"),
+        subject_kind=SchedulingSubjectKind.NETWORK_ACTIVITY,
+        scope=SchedulingScope(
+            kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND,
+            identity=IMAGE_NETWORK_ACTIVITY_KIND,
         ),
+        maximum_active=25,
+    )
+
+
+def image_network_constraints(routing: tuple[str, ...]) -> tuple[Constraint, ...]:
+    """Current image pacing; stage resources admit physical HTTP capacity."""
+
+    return (
         facebook_network_path_constraint(routing),
         SlidingWindowRateConstraint(
             identifier=("carl", "facebook", "image", "network_activity_rate", "all_cdns", "v2"),

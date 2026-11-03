@@ -23,7 +23,7 @@ from carl.core.facebook_images import (
     gallery_references,
     image_network_constraints,
     image_reuse_record,
-    legacy_image_network_constraint_identifiers,
+    legacy_image_pacing_constraint_identifiers,
     plan_image_followups,
 )
 from carl.core.facebook_refresh import (
@@ -1222,11 +1222,11 @@ async def _image_phase(
                 duration_ns=max(0, dependencies.monotonic_ns() - reuse_started_monotonic_ns),
             )
     await database.supersede_constraints(
-        retired_identifiers=legacy_image_network_constraint_identifiers(payload.image_routing),
+        retired_identifiers=legacy_image_pacing_constraint_identifiers(payload.image_routing),
         replacements=image_network_constraints(payload.image_routing),
         operation_identifier=context.operation_identifier,
         at_utc_ns=dependencies.utc_now_ns(),
-        reason="Share Proton transport across bounded concurrent image requests",
+        reason="Apply current image request pacing to the selected route",
     )
     collection_identifiers: list[str] = []
     for entries in selected:

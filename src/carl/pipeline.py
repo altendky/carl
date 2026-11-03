@@ -31,7 +31,6 @@ from carl.core.pipeline import (
     build_pipeline_component_registry,
     pipeline_collection_failed,
     pipeline_request_sha256,
-    pipeline_work_constraints,
     search_pipeline_work,
 )
 from carl.core.review_errors import ReviewInputError
@@ -220,10 +219,6 @@ async def request_search_pipeline(
             duration_ns=max(0, application.monotonic_ns() - started),
             result={"work_identifier": work_identifier, "state": "accepted"},
         )
-        for constraint in pipeline_work_constraints():
-            await database.register_constraint(
-                constraint, registered_at_utc_ns=application.utc_now_ns()
-            )
         enqueued = await database.enqueue_work(
             search_pipeline_work(identifier=work_identifier, payload=payload),
             WorkRequester(

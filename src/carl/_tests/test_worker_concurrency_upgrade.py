@@ -15,7 +15,7 @@ from carl.core.ebay_items import (
     COLLECT_EBAY_IMAGE_WORK_KIND,
     ebay_item_work_constraints,
 )
-from carl.core.facebook_images import image_network_constraints, image_session_work_constraint
+from carl.core.facebook_images import IMAGE_NETWORK_ACTIVITY_KIND, image_session_work_constraint
 from carl.core.facebook_work import (
     COLLECT_SEARCH_PAYLOAD_SCHEMA_VERSION,
     COLLECT_SEARCH_WORK_KIND,
@@ -26,7 +26,14 @@ from carl.core.facebook_work import (
     legacy_facebook_network_path_constraint_identifier,
 )
 from carl.core.marketplace_images import marketplace_image_network_constraint
-from carl.core.work import SchedulingScope, SchedulingScopeKind, WorkCapability, WorkRequester
+from carl.core.work import (
+    ConcurrencyConstraint,
+    SchedulingScope,
+    SchedulingScopeKind,
+    SchedulingSubjectKind,
+    WorkCapability,
+    WorkRequester,
+)
 from carl.io.sqlite import Database
 from carl.work_runtime import prepare_worker_constraints
 
@@ -78,18 +85,20 @@ async def test_upgrade_retires_old_caps_and_is_idempotent(tmp_path: Path) -> Non
                 "maximum_active": 10,
             }
         )
-        old_network = image_network_constraints(("proton", "personal", "carl"))[1].model_copy(
-            update={
-                "identifier": (
-                    "carl",
-                    "facebook",
-                    "image",
-                    "network_activity_concurrency",
-                    "all_cdns",
-                    "v3",
-                ),
-                "maximum_active": 10,
-            }
+        old_network = ConcurrencyConstraint(
+            identifier=(
+                "carl",
+                "facebook",
+                "image",
+                "network_activity_concurrency",
+                "all_cdns",
+                "v3",
+            ),
+            subject_kind=SchedulingSubjectKind.NETWORK_ACTIVITY,
+            scope=SchedulingScope(
+                kind=SchedulingScopeKind.NETWORK_ACTIVITY_KIND, identity=IMAGE_NETWORK_ACTIVITY_KIND
+            ),
+            maximum_active=10,
         )
         old_ebay = tuple(
             constraint.model_copy(
@@ -131,7 +140,7 @@ async def test_upgrade_retires_old_caps_and_is_idempotent(tmp_path: Path) -> Non
                 marketplace_image_network_constraint(),
                 *ebay_item_work_constraints(),
             ):
-                assert active[constraint.identifier] == constraint.model_dump(mode="json")
+                assert constraint.identifier not in active
             assert connection.execute(
                 "SELECT count(*) FROM scheduling_constraint_retirements"
             ).fetchone() == (4,)

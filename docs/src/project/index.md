@@ -255,14 +255,19 @@ observations record the port and whether a static peer was requested; they do
 not invent a mobile sticky-session lifetime. Import its separate password with
 `carl configure-decodo-credential datacenter` before using that route.
 
-Facebook and eBay image downloads share a database-enforced limit of 25
-simultaneous image requests, across network paths and worker processes. Each
-source's image work limit is also 25; these are not two additive pools of 25.
-eBay seller descriptions permit ten concurrent jobs. The worker pool remains
-30 per process, and the existing request-rate and holdoff limits are unchanged.
-Worker startup retires the older immutable image/description constraints and
-records the replacement policy with code provenance, including for work queued
-before the upgrade.
+Facebook and eBay image downloads, seller descriptions and other HTTP phases
+share the configured HTTP resource budget. Its default is 25 simultaneous
+requests per database and host coordination scope. CPU decoding uses the separate
+CPU budget, so waiting for validation does not retain an HTTP slot. Worker startup
+retires the exact built-in image, description, analysis and coordinator capacity
+constraints that these resource budgets replace, including persisted constraints
+from older releases. Their definitions and retirement provenance remain available
+for audit. Custom constraints, request-rate limits and holdoffs remain active.
+Unknown predecessor definitions also remain active when their complete shipped
+definition cannot be verified; an old identifier alone is insufficient to retire
+a constraint safely.
+The generic constraint API still permits explicit first-time registration;
+identifiers that have already been retired cannot be reactivated.
 
 Facebook's `overlapping_price_partitions` strategy requests the first result
 page of each price bucket without cursor pagination. Cursor pagination is
@@ -331,7 +336,8 @@ source provenance. Workspaces may mix Facebook/eBay tracks, reviews, claims, wor
 eBay review identities use `ebay:<item ID>` while legacy Facebook numeric IDs remain compatible.
 Refresh coordinators wait for item, description, and gallery work; search-only calls do not implicitly
 fetch every item. eBay AI inputs include exact saved description and gallery provenance and share
-the global analysis concurrency limit. SQLite v9 migrates existing numeric claim rows intact and adds
+the analysis resource budget with Facebook within each database-and-host scope.
+SQLite v9 migrates existing numeric claim rows intact and adds
 marketplace evidence indexes. Restart old MCP and worker processes together after upgrading.
 Offline fixtures cover these paths;
 the eBay item parser has not yet been validated against live provider responses.
@@ -765,9 +771,13 @@ worker count can reduce the execution runners. Zero-buffer handoffs and a bounde
 in-flight identifier set prevent queue length from creating tasks. Capacity snapshots
 only delay candidates; atomic admission and physical execution guards remain
 authoritative. Recovery runs even when the snapshots show every resource occupied.
-Existing durable work-kind, route, rate and sharing constraints still apply as
-additional admission policy. These capacities are upper bounds; a legacy whole-work
-cap can also defer an offline continuation of the same kind while peer work is live.
+The former built-in static work-kind and image-request caps no longer impose a
+second execution ceiling. Their exact shipped definitions are retired without
+removing customized constraints, even when a custom definition uses the same scope.
+Facebook requested/effective search-route admission, request-rate limits, holdoffs,
+provider cooldowns, paid-request retry budgets and acquisition sharing still apply.
+These resource capacities remain upper bounds rather than throughput promises;
+custom constraints or provider policy can defer a phase while resource slots are free.
 
 Stateful marketplace requests run in separate serial actors, bounded by 32 resident
 sessions and 128 MiB of reserved state, with at most 4 MiB per actor. They retain
