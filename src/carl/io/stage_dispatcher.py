@@ -24,6 +24,12 @@ from carl.io.stage_workers import StageHandlerRegistry
 from carl.io.stages import StageManager
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingAdmission:
+    requirements: tuple[ResourceRequest, ...]
+    reservations: tuple[ResourceRequest, ...]
+
+
 @dataclass
 class StageDispatcher:
     manager: StageManager
@@ -39,6 +45,7 @@ class StageDispatcher:
     page_size: int = 32
     poll_seconds: float = 0.25
     _queued: set[str] = field(default_factory=set, init=False)
+    _pending_admissions: dict[str, _PendingAdmission] = field(default_factory=dict, init=False)
     _after: FairDispatchCursor | None = field(default=None, init=False)
     _pass_time: int | None = field(default=None, init=False)
     _expired_after: ExpiryCursor | None = field(default=None, init=False)
@@ -188,6 +195,9 @@ class StageDispatcher:
                         provenance=self.provenance,
                         invocation=self.invocation,
                     ) as admission:
+                        # Atomic admission now owns the physical ledger, or has
+                        # declined. Its hint must not survive handler execution.
+                        self._pending_admissions.pop(candidate.work_item_identifier, None)
                         if admission.execution is not None:
                             await self.registry.execute(admission.execution)
                 except (WorkCancellationRequestedError, ResourceLeaseLost, LeaseLostError):
@@ -201,6 +211,7 @@ class StageDispatcher:
                     if unexpected is not None:
                         raise unexpected from error
                 finally:
+                    self._pending_admissions.pop(candidate.work_item_identifier, None)
                     self._queued.discard(candidate.work_item_identifier)
 
     async def run(self) -> None:
@@ -259,8 +270,23 @@ class StageDispatcher:
                         work_identifiers=offers,
                         now_utc_ns=self.manager.utc_now_ns(),
                     )
+                # Capture hints before the ledger read: a runner may commit and
+                # clear its hint while that read is in flight. Full reservations
+                # may count twice for one page, rather than disappear from both.
+                pending = tuple(self._pending_admissions.values())
                 occupied = await self.manager.database.resource_occupancy(
                     self.manager.resources.scope
+                )
+                for admission in pending:
+                    for request in admission.reservations:
+                        occupied[request.name] = occupied.get(request.name, 0) + request.units
+                weighted_probe_pending = any(
+                    not admission.reservations
+                    and any(
+                        request.name == "cpu" and request.units > 1
+                        for request in admission.requirements
+                    )
+                    for admission in pending
                 )
                 handed_off = False
                 observations: list[SchedulerWaitObservation] = []
@@ -286,22 +312,27 @@ class StageDispatcher:
                     weighted_cpu = any(
                         request.name == "cpu" and request.units > 1 for request in requirements
                     )
-                    if not weighted_cpu and any(
-                        occupied.get(request.name, 0) + request.units
-                        > capacities.get(request.name, 0)
+                    weighted_probe = weighted_cpu and any(
+                        request.name == "cpu"
+                        and occupied.get("cpu", 0) + request.units > capacities.get("cpu", 0)
                         for request in requirements
-                    ):
+                    )
+                    unavailable = tuple(
+                        request.name
+                        for request in requirements
+                        if (request.name != "cpu" or not weighted_cpu)
+                        and occupied.get(request.name, 0) + request.units
+                        > capacities.get(request.name, 0)
+                    )
+                    if weighted_probe and weighted_probe_pending:
+                        unavailable += ("cpu",)
+                    if unavailable:
                         if len(observations) < 32:
                             observations.append(
                                 self._wait_observation(
                                     candidate,
                                     "resource",
-                                    tuple(
-                                        request.name
-                                        for request in requirements
-                                        if occupied.get(request.name, 0) + request.units
-                                        > capacities.get(request.name, 0)
-                                    ),
+                                    unavailable,
                                 )
                             )
                         continue
@@ -321,6 +352,17 @@ class StageDispatcher:
                     self._queued.add(candidate.work_item_identifier)
                     try:
                         channel.send_nowait(candidate)
+                        # One nonfitting CPU probe can establish an aged drain,
+                        # but cannot reserve any budget while it awaits that
+                        # decision. It may race a later physical grant; atomic
+                        # admission remains authoritative for that bounded probe.
+                        reservations = () if weighted_probe else requirements
+                        self._pending_admissions[candidate.work_item_identifier] = (
+                            _PendingAdmission(requirements, reservations)
+                        )
+                        for request in reservations:
+                            occupied[request.name] = occupied.get(request.name, 0) + request.units
+                        weighted_probe_pending = weighted_probe_pending or weighted_probe
                         handed_off = True
                     except anyio.WouldBlock:
                         self._queued.remove(candidate.work_item_identifier)
