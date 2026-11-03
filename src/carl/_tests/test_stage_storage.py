@@ -614,7 +614,7 @@ async def test_legacy_cancel_expiry_sweep_cannot_bypass_staged_guard_recovery(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("marketplace", ("facebook", "ebay"))
-async def test_http_continuations_obey_marketplace_cooldowns_but_cpu_continuations_do_not(
+async def test_retained_marketplace_cooldowns_block_neither_http_nor_cpu_continuations(
     tmp_path: Path, marketplace: str
 ) -> None:
     kind = (
@@ -708,10 +708,10 @@ async def test_http_continuations_obey_marketplace_cooldowns_but_cpu_continuatio
             ended_at_utc="2027-01-15T08:00:00+00:00",
             duration_ns=1,
         )
-        blocked = await _claim(database, "next-http-work", token="http-resume", now=NOW + 3)
-        assert blocked.lease is None
-        assert blocked.wait_kind is StageWaitKind.TIME
-        assert blocked.next_eligible_at_utc_ns == until
+        online = await _claim(database, "next-http-work", token="http-resume", now=NOW + 3)
+        assert online.lease is not None
+        assert online.lease.work_lease.attempt == 1
+        assert online.next_eligible_at_utc_ns is None
         offline = await _claim(database, "next-cpu-work", token="cpu-resume", now=NOW + 3)
         assert offline.lease is not None
         assert offline.lease.work_lease.attempt == 1
