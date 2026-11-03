@@ -123,8 +123,8 @@ def _assert_current_schema(path: Path) -> None:
     with closing(sqlite3.connect(path)) as connection:
         actual = dict(connection.execute("SELECT key, value FROM schema_metadata"))
         assert actual == Database._expected_metadata()
-        assert sqlite.DATABASE_SCHEMA.version == 22
-        assert actual["schema_version"] == "22"
+        assert sqlite.DATABASE_SCHEMA.version == 23
+        assert actual["schema_version"] == Database._expected_metadata()["schema_version"]
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         for name, expected in _INDEX_COLUMNS.items():
             # Verify key order and descending priority, not just index names.

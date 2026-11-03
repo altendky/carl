@@ -1,9 +1,12 @@
 """Keep synthetic historical fixtures free of schema additions from v20."""
 
+# pyright: reportPrivateUsage=false
+
 import sqlite3
 
 from carl.io.fair_scheduling import FAIR_SCHEMA
 from carl.io.scheduler_activity import SCHEDULER_SCHEMA
+from carl.io.sqlite import _HISTORY_QUERY_INDEXES
 from carl.io.work_progress import PROGRESS_SCHEMA
 
 _REQUESTER_COLUMNS = (
@@ -14,7 +17,11 @@ _REQUESTER_COLUMNS = (
 
 def without_fair_schema(schema: str) -> str:
     """Strip appended fairness DDL before executing a historical schema slice."""
-    schema = schema.removesuffix(SCHEDULER_SCHEMA).removesuffix(PROGRESS_SCHEMA)
+    schema = (
+        schema.removesuffix(_HISTORY_QUERY_INDEXES)
+        .removesuffix(SCHEDULER_SCHEMA)
+        .removesuffix(PROGRESS_SCHEMA)
+    )
     if not schema.endswith(FAIR_SCHEMA):
         raise ValueError("Historical schema fixture must contain the current fairness suffix")
     schema = schema.removesuffix(FAIR_SCHEMA)
@@ -70,7 +77,12 @@ def remove_fair_schema(connection: sqlite3.Connection) -> None:
         "fair_initial_resources",
     ):
         connection.execute(f'DROP TABLE IF EXISTS "{name}"')
-    for name in ("work_stages_progress_ready", "work_stages_progress_sleep"):
+    for name in (
+        "work_stages_progress_ready",
+        "work_stages_progress_sleep",
+        "work_items_completed_acquisition",
+        "work_events_terminal_time",
+    ):
         connection.execute(f'DROP INDEX IF EXISTS "{name}"')
     stages = {row[1] for row in connection.execute("PRAGMA table_info(work_stages)")}
     if "progress_waiting" in stages:
