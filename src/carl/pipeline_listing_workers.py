@@ -21,6 +21,7 @@ from carl.core.pipeline import (
 from carl.core.review import RequestAnalysisRequest, RequestAnalysisResult
 from carl.core.review_errors import IncompleteGalleryError, ReviewInputError
 from carl.core.work import WorkCapability
+from carl.core.work_progress import WorkProgressWatch
 from carl.core.worker import (
     AttemptContext,
     CompletedWork,
@@ -84,13 +85,22 @@ def _pending(work: dict[str, JsonValue]) -> bool:
     return work.get("state") in {"pending", "leased"}
 
 
-def _retry(result: dict[str, JsonValue], stage: str, *, delay_ns: int | None = None) -> RetryWork:
+def _retry(
+    result: dict[str, JsonValue],
+    stage: str,
+    *,
+    delay_ns: int | None = None,
+    work_identifiers: tuple[str, ...] = (),
+) -> RetryWork:
     observation = result.get("observation_record_identifier")
     return RetryWork(
         inputs=(NamedInput(name=("listing_observation",), object_identifier=observation),)
         if isinstance(observation, str)
         else (),
         delay_ns=_WAIT_NS if delay_ns is None else delay_ns,
+        progress_watch=WorkProgressWatch(work_identifiers=tuple(dict.fromkeys(work_identifiers)))
+        if work_identifiers
+        else None,
         reason={"kind": "listing_pipeline_continuation", "stage": stage},
         result={**result, "stage": stage},
     )
@@ -215,8 +225,8 @@ async def _run_listing_pipeline(
                 item_completed=True,
                 image_work_identifiers=_strings(detail_result.get("image_work_identifiers")),
             )
-            return _retry(result, "collecting_evidence")
-        return _retry(result, "collecting_details")
+            return _retry(result, "collecting_evidence", work_identifiers=(details_identifier,))
+        return _retry(result, "collecting_details", work_identifiers=(details_identifier,))
     if detail_work.get("state") != "completed":
         return _failed(result, "listing_pipeline_detail_failed")
     extraction_identifier = detail_result.get("extraction_work_identifier")
@@ -224,7 +234,7 @@ async def _run_listing_pipeline(
         extracted = await database.work(extraction_identifier)
         result["item_extraction_work_identifier"] = extraction_identifier
         if _pending(extracted):
-            return _retry(result, "extracting_details")
+            return _retry(result, "extracting_details", work_identifiers=(extraction_identifier,))
         if extracted.get("state") != "completed":
             return _failed(result, "listing_pipeline_extraction_failed")
         detail_result = _mapping(extracted.get("result"))
@@ -269,7 +279,11 @@ async def _run_listing_pipeline(
         [("description", await database.work(identifier)) for identifier in descriptions]
     )
     if any(_pending(work) for _, work in children):
-        return _retry(result, "collecting_evidence")
+        return _retry(
+            result,
+            "collecting_evidence",
+            work_identifiers=tuple(images + descriptions),
+        )
     image_extractions: list[str] = []
     for category, work in children:
         extraction = _mapping(work.get("result")).get("extraction_work_identifier")
@@ -278,7 +292,7 @@ async def _run_listing_pipeline(
     extracted_images = [await database.work(identifier) for identifier in image_extractions]
     result["image_extraction_work_identifiers"] = image_extractions
     if any(_pending(work) for work in extracted_images):
-        return _retry(result, "extracting_images")
+        return _retry(result, "extracting_images", work_identifiers=tuple(image_extractions))
     failures = sum(work.get("state") != "completed" for _, work in children) + sum(
         work.get("state") != "completed" for work in extracted_images
     )
@@ -347,7 +361,7 @@ async def _run_listing_pipeline(
     result["analysis_work_identifier"] = analysis_identifier
     analysis = await database.work(analysis_identifier)
     if _pending(analysis):
-        return _retry(result, "analyzing")
+        return _retry(result, "analyzing", work_identifiers=(analysis_identifier,))
     if analysis.get("state") != "completed":
         return _failed(result, "listing_pipeline_analysis_failed")
     return CompletedWork(

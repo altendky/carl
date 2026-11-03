@@ -570,3 +570,17 @@ async def test_facebook_reports_pinned_item_before_its_gallery_is_complete(
         assert result["images_completed"] is False
         assert result["stage"] == "collecting_evidence"
         assert not application.analysis_requests
+        outcome = await _run_listing_pipeline(
+            payload,
+            AttemptContext(
+                work_item_identifier="listing",
+                lease_token="test",
+                worker_identifier="test",
+                operation_identifier="test",
+                attempt=1,
+            ),
+            PipelineListingWorkerDependencies(database, application),
+        )
+        assert isinstance(outcome, RetryWork)
+        assert outcome.progress_watch is not None
+        assert outcome.progress_watch.work_identifiers == (result["detail_work_identifier"],)

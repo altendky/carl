@@ -6,6 +6,7 @@ from time import time_ns
 from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
+from carl.coordinator_progress import consumer_progress_watch
 from carl.core.acquisition_identity import ebay_image_identity
 from carl.core.components import Component, ComponentId
 from carl.core.ebay import CollectEbaySearchPayload, collect_ebay_search_work
@@ -27,6 +28,7 @@ from carl.core.models import JsonValue, NamedInput, NamedOutput, RecordDraft
 from carl.core.refresh_recovery import classify_refresh_completion
 from carl.core.search_scope import search_scope_changed
 from carl.core.work import WorkCapability, WorkDefinition, WorkRequester, WorkState
+from carl.core.work_progress import WorkProgressWatch
 from carl.core.worker import (
     AttemptContext,
     CompletedWork,
@@ -218,6 +220,7 @@ async def _search_phase(
         return RetryWork(
             inputs=inputs,
             delay_ns=_pending_delay_ns((work,), dependencies.utc_now_ns()),
+            progress_watch=WorkProgressWatch(work_identifiers=(identifier,)),
             reason={"kind": "waiting_for_search_collection"},
             result=checkpoint,
         )
@@ -320,6 +323,12 @@ async def _item_phase(
     if _pending(works):
         return RetryWork(
             delay_ns=_pending_delay_ns(works, dependencies.utc_now_ns()),
+            progress_watch=await consumer_progress_watch(
+                database,
+                parent_work_identifier=context.work_item_identifier,
+                requester_kind=_ITEM_REQUESTER,
+                work_identifiers=children,
+            ),
             reason={"kind": "waiting_for_item_collections"},
             result=result,
         )
@@ -335,6 +344,7 @@ async def _item_phase(
     if _pending(extracted):
         return RetryWork(
             delay_ns=_pending_delay_ns(extracted, dependencies.utc_now_ns()),
+            progress_watch=WorkProgressWatch(work_identifiers=tuple(dict.fromkeys(extractions))),
             reason={"kind": "waiting_for_item_extractions"},
             result=result,
         )
@@ -365,6 +375,7 @@ async def _item_phase(
     if _pending(description_works):
         return RetryWork(
             delay_ns=_pending_delay_ns(description_works, dependencies.utc_now_ns()),
+            progress_watch=WorkProgressWatch(work_identifiers=tuple(dict.fromkeys(descriptions))),
             reason={"kind": "waiting_for_item_descriptions"},
             result=result,
         )
@@ -800,6 +811,14 @@ async def _image_phase(
     if _pending(works) or deferred_references:
         return RetryWork(
             delay_ns=_pending_delay_ns(works, dependencies.utc_now_ns()) if _pending(works) else 0,
+            progress_watch=await consumer_progress_watch(
+                database,
+                parent_work_identifier=context.work_item_identifier,
+                requester_kind=_IMAGE_REQUESTER,
+                work_identifiers=children,
+            )
+            if _pending(works)
+            else None,
             reason={"kind": "waiting_for_image_collections"},
             result=result,
         )

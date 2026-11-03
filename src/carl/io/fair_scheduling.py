@@ -56,7 +56,8 @@ def _refresh_sql(identifier: str) -> str:
     return f"""
     INSERT INTO fair_ready(work_item_id,root_request_identifier,workspace_key,service_class,
         lane,stage_id,kind_parts_json,payload_schema_version,priority,available_at_utc_ns,
-        ready_since_utc_ns,created_at_utc_ns,active)
+        ready_since_utc_ns,created_at_utc_ns,active,work_eligible_at_utc_ns,
+        legacy_lease_expires_at_utc_ns)
     SELECT w.id,coalesce(owner.root_request_identifier,'["legacy"]'),
         coalesce(owner.workspace_key,'["legacy"]'),
         coalesce(owner.service_class,'background'),{lane},s.id,w.kind_parts_json,
@@ -68,7 +69,10 @@ def _refresh_sql(identifier: str) -> str:
         CASE WHEN w.state IN ('pending','leased') AND
             ((w.state='pending' AND s.id IS NULL AND NOT EXISTS(
                 SELECT 1 FROM stage_attempts a WHERE a.work_item_id=w.id AND a.state IN ('pending','active')))
-             OR s.state='pending') THEN 1 ELSE 0 END
+             OR (s.state='pending' AND s.progress_waiting=0)) THEN 1 ELSE 0 END,w.eligible_at_utc_ns,
+        CASE WHEN w.state IN ('leased','cancelling') AND s.id IS NULL AND NOT EXISTS(
+            SELECT 1 FROM stage_attempts a WHERE a.work_item_id=w.id AND a.state IN ('pending','active'))
+            THEN w.lease_expires_at_utc_ns END
     FROM work_items w LEFT JOIN work_scheduling owner ON owner.work_item_id=w.id
     LEFT JOIN work_stages s ON s.work_item_id=w.id AND s.state IN ('pending','running')
     WHERE w.id={identifier}
@@ -78,6 +82,8 @@ def _refresh_sql(identifier: str) -> str:
         lane=excluded.lane,stage_id=excluded.stage_id,kind_parts_json=excluded.kind_parts_json,
         payload_schema_version=excluded.payload_schema_version,priority=excluded.priority,
         available_at_utc_ns=excluded.available_at_utc_ns,
+        work_eligible_at_utc_ns=excluded.work_eligible_at_utc_ns,
+        legacy_lease_expires_at_utc_ns=excluded.legacy_lease_expires_at_utc_ns,
         ready_since_utc_ns=CASE WHEN fair_ready.stage_id IS excluded.stage_id
             THEN fair_ready.ready_since_utc_ns ELSE excluded.ready_since_utc_ns END,
         active=excluded.active;
@@ -114,27 +120,37 @@ CREATE TABLE IF NOT EXISTS fair_lanes (
 CREATE TABLE IF NOT EXISTS fair_workspace_service (
     scope TEXT NOT NULL,lane TEXT NOT NULL,service_class TEXT NOT NULL,
     workspace_key TEXT NOT NULL,sequence INTEGER NOT NULL,
+    ready_count INTEGER NOT NULL DEFAULT 0 CHECK(ready_count>=0),
     PRIMARY KEY(scope,lane,service_class,workspace_key)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS fair_workspace_turn ON fair_workspace_service(scope,lane,service_class,sequence,workspace_key);
+CREATE INDEX IF NOT EXISTS fair_workspace_ready_turn ON fair_workspace_service(scope,lane,service_class,sequence,workspace_key) WHERE ready_count>0;
+CREATE INDEX IF NOT EXISTS fair_workspace_count_group ON fair_workspace_service(workspace_key,service_class,lane);
 CREATE TABLE IF NOT EXISTS fair_root_service (
     scope TEXT NOT NULL,lane TEXT NOT NULL,service_class TEXT NOT NULL,
     workspace_key TEXT NOT NULL,root_request_identifier TEXT NOT NULL,sequence INTEGER NOT NULL,
+    ready_count INTEGER NOT NULL DEFAULT 0 CHECK(ready_count>=0),
     PRIMARY KEY(scope,lane,root_request_identifier)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS fair_root_turn ON fair_root_service(scope,lane,service_class,workspace_key,sequence,root_request_identifier);
+CREATE INDEX IF NOT EXISTS fair_root_ready_turn ON fair_root_service(scope,lane,service_class,workspace_key,sequence,root_request_identifier) WHERE ready_count>0;
+CREATE INDEX IF NOT EXISTS fair_root_count_group ON fair_root_service(root_request_identifier,lane);
 CREATE TABLE IF NOT EXISTS fair_ready (
     work_item_id TEXT PRIMARY KEY REFERENCES work_items(id),root_request_identifier TEXT NOT NULL,
     workspace_key TEXT NOT NULL,service_class TEXT NOT NULL,lane TEXT NOT NULL,stage_id TEXT,
     kind_parts_json TEXT NOT NULL,payload_schema_version INTEGER NOT NULL,priority INTEGER NOT NULL,
     available_at_utc_ns INTEGER NOT NULL,ready_since_utc_ns INTEGER NOT NULL,
-    created_at_utc_ns INTEGER NOT NULL,active INTEGER NOT NULL
+    created_at_utc_ns INTEGER NOT NULL,active INTEGER NOT NULL,
+    work_eligible_at_utc_ns INTEGER NOT NULL DEFAULT 0,
+    legacy_lease_expires_at_utc_ns INTEGER
 ) STRICT;
 CREATE INDEX IF NOT EXISTS fair_ready_group ON fair_ready(root_request_identifier,lane,active,available_at_utc_ns,work_item_id);
 CREATE INDEX IF NOT EXISTS fair_ready_workspace ON fair_ready(workspace_key,service_class,lane,active,available_at_utc_ns,root_request_identifier,work_item_id);
 CREATE INDEX IF NOT EXISTS fair_ready_priority ON fair_ready(root_request_identifier,lane,active,priority DESC,available_at_utc_ns,created_at_utc_ns,work_item_id);
 CREATE INDEX IF NOT EXISTS fair_ready_age ON fair_ready(root_request_identifier,lane,active,ready_since_utc_ns,work_item_id);
 CREATE INDEX IF NOT EXISTS fair_ready_initial ON fair_ready(kind_parts_json,payload_schema_version,work_item_id) WHERE active=1 AND stage_id IS NULL;
+CREATE INDEX IF NOT EXISTS fair_ready_dispatch ON fair_ready(priority DESC,work_eligible_at_utc_ns,created_at_utc_ns,work_item_id) WHERE active=1;
+CREATE INDEX IF NOT EXISTS fair_ready_legacy_expiry ON fair_ready(legacy_lease_expires_at_utc_ns,work_item_id) WHERE legacy_lease_expires_at_utc_ns IS NOT NULL;
 CREATE TABLE IF NOT EXISTS fair_offers (
     scope TEXT NOT NULL,lane TEXT NOT NULL,work_item_id TEXT NOT NULL REFERENCES work_items(id),
     stage_id TEXT,signature TEXT NOT NULL,resources_json TEXT NOT NULL CHECK(json_valid(resources_json)),
@@ -158,12 +174,40 @@ INSERT OR IGNORE INTO fair_roots VALUES ('["legacy"]','["legacy"]','background',
 for _name, _table, _identity, _events in (
     ("work", "work_items", "NEW.id", ("INSERT", "UPDATE")),
     ("stage", "work_stages", "NEW.work_item_id", ("INSERT", "UPDATE")),
+    ("attempt", "stage_attempts", "NEW.work_item_id", ("INSERT", "UPDATE")),
     ("owner", "work_scheduling", "NEW.work_item_id", ("INSERT",)),
     ("resident", "resident_sessions", "NEW.work_item_id", ("INSERT", "UPDATE")),
 ):
     for _event in _events:
         _schema += f"CREATE TRIGGER IF NOT EXISTS fair_refresh_{_name}_{_event.lower()} AFTER {_event} ON {_table} BEGIN {_refresh_sql(_identity)} END;\n"
 _schema += """
+CREATE TRIGGER IF NOT EXISTS fair_ready_count_insert AFTER INSERT ON fair_ready
+WHEN NEW.active=1 BEGIN
+    UPDATE fair_workspace_service SET ready_count=ready_count+1
+    WHERE workspace_key=NEW.workspace_key AND service_class=NEW.service_class AND lane=NEW.lane;
+    UPDATE fair_root_service SET ready_count=ready_count+1
+    WHERE root_request_identifier=NEW.root_request_identifier AND lane=NEW.lane;
+END;
+CREATE TRIGGER IF NOT EXISTS fair_ready_count_delete AFTER DELETE ON fair_ready
+WHEN OLD.active=1 BEGIN
+    UPDATE fair_workspace_service SET ready_count=ready_count-1
+    WHERE workspace_key=OLD.workspace_key AND service_class=OLD.service_class AND lane=OLD.lane;
+    UPDATE fair_root_service SET ready_count=ready_count-1
+    WHERE root_request_identifier=OLD.root_request_identifier AND lane=OLD.lane;
+END;
+CREATE TRIGGER IF NOT EXISTS fair_ready_count_update AFTER UPDATE ON fair_ready
+WHEN (OLD.active,OLD.workspace_key,OLD.service_class,OLD.root_request_identifier,OLD.lane)
+    IS NOT (NEW.active,NEW.workspace_key,NEW.service_class,NEW.root_request_identifier,NEW.lane)
+BEGIN
+    UPDATE fair_workspace_service SET ready_count=ready_count-1
+    WHERE OLD.active=1 AND workspace_key=OLD.workspace_key AND service_class=OLD.service_class AND lane=OLD.lane;
+    UPDATE fair_root_service SET ready_count=ready_count-1
+    WHERE OLD.active=1 AND root_request_identifier=OLD.root_request_identifier AND lane=OLD.lane;
+    UPDATE fair_workspace_service SET ready_count=ready_count+1
+    WHERE NEW.active=1 AND workspace_key=NEW.workspace_key AND service_class=NEW.service_class AND lane=NEW.lane;
+    UPDATE fair_root_service SET ready_count=ready_count+1
+    WHERE NEW.active=1 AND root_request_identifier=NEW.root_request_identifier AND lane=NEW.lane;
+END;
 CREATE TRIGGER IF NOT EXISTS fair_unowned_work AFTER INSERT ON work_items BEGIN
     INSERT OR IGNORE INTO fair_unowned VALUES (NEW.id);
 END;
@@ -191,13 +235,56 @@ async def ensure_services(
 ) -> None:
     await connection.execute(
         """INSERT OR IGNORE INTO fair_workspace_service
-        SELECT scope,lane,?,?,sequence FROM fair_lanes""",
-        (context.service_class.value, key),
+        (scope,lane,service_class,workspace_key,sequence,ready_count)
+        SELECT l.scope,l.lane,?,?,l.sequence,
+            (SELECT count(*) FROM fair_ready f WHERE f.workspace_key=?
+                AND f.service_class=? AND f.lane=l.lane AND f.active=1)
+        FROM fair_lanes l WHERE NOT EXISTS(SELECT 1 FROM fair_workspace_service s
+            WHERE s.scope=l.scope AND s.lane=l.lane AND s.service_class=? AND s.workspace_key=?)""",
+        (
+            context.service_class.value,
+            key,
+            key,
+            context.service_class.value,
+            context.service_class.value,
+            key,
+        ),
     )
     await connection.execute(
         """INSERT OR IGNORE INTO fair_root_service
-        SELECT scope,lane,?,?,?,sequence FROM fair_lanes""",
-        (context.service_class.value, key, root_key),
+        (scope,lane,service_class,workspace_key,root_request_identifier,sequence,ready_count)
+        SELECT l.scope,l.lane,?,?,?,l.sequence,
+            (SELECT count(*) FROM fair_ready f WHERE f.root_request_identifier=?
+                AND f.lane=l.lane AND f.active=1)
+        FROM fair_lanes l WHERE NOT EXISTS(SELECT 1 FROM fair_root_service s
+            WHERE s.scope=l.scope AND s.lane=l.lane AND s.root_request_identifier=?)""",
+        (context.service_class.value, key, root_key, root_key, root_key),
+    )
+
+
+async def initialize_service_counts(connection: AsyncConnection) -> None:
+    """Initialize the live-group projection once during the schema upgrade."""
+    await connection.execute(
+        """UPDATE fair_workspace_service SET ready_count=(SELECT count(*) FROM fair_ready f
+        WHERE f.workspace_key=fair_workspace_service.workspace_key
+          AND f.service_class=fair_workspace_service.service_class
+          AND f.lane=fair_workspace_service.lane AND f.active=1)"""
+    )
+    await connection.execute(
+        """UPDATE fair_root_service SET ready_count=(SELECT count(*) FROM fair_ready f
+        WHERE f.root_request_identifier=fair_root_service.root_request_identifier
+          AND f.lane=fair_root_service.lane AND f.active=1)"""
+    )
+
+
+async def initialize_legacy_lease_projection(connection: AsyncConnection) -> None:
+    """Populate the expiry seek once when upgrading a pre-watch database."""
+    await connection.execute(
+        """UPDATE fair_ready SET legacy_lease_expires_at_utc_ns=(
+        SELECT w.lease_expires_at_utc_ns FROM work_items w WHERE w.id=fair_ready.work_item_id
+          AND w.state IN ('leased','cancelling') AND NOT EXISTS(
+            SELECT 1 FROM stage_attempts a WHERE a.work_item_id=w.id AND a.state IN ('pending','active'))
+          AND NOT EXISTS(SELECT 1 FROM work_stages s WHERE s.work_item_id=w.id AND s.state IN ('pending','running')))"""
     )
 
 
@@ -517,8 +604,9 @@ async def discover(
     rows = await (
         await connection.execute(
             f"""SELECT w.lane,w.service_class,w.workspace_key,w.sequence,{preference}
-        FROM fair_workspace_service w JOIN fair_lanes l ON l.scope=w.scope AND l.lane=w.lane
-        WHERE w.scope=? AND EXISTS(SELECT 1 FROM fair_ready f
+        FROM fair_workspace_service w INDEXED BY fair_workspace_ready_turn
+        JOIN fair_lanes l ON l.scope=w.scope AND l.lane=w.lane
+        WHERE w.scope=? AND w.ready_count>0 AND EXISTS(SELECT 1 FROM fair_ready f
             WHERE f.workspace_key=w.workspace_key AND f.service_class=w.service_class
               AND f.lane=w.lane AND {membership}) {frontier}
         ORDER BY {preference},w.sequence,w.workspace_key,w.lane,w.service_class LIMIT ?""",
@@ -534,8 +622,9 @@ async def discover(
             lane, service, key = str(row[0]), str(row[1]), str(row[2])
             used = used_roots.setdefault((lane, service, key), [])
             all_excluded = encode_json([*excluded, *work_ids])
-            root_sql = f"""SELECT r.root_request_identifier,r.sequence FROM fair_root_service r
+            root_sql = f"""SELECT r.root_request_identifier,r.sequence FROM fair_root_service r INDEXED BY fair_root_ready_turn
                 WHERE r.scope=? AND r.lane=? AND r.service_class=? AND r.workspace_key=?
+                  AND r.ready_count>0
                   AND r.root_request_identifier NOT IN (SELECT value FROM json_each(?))
                   AND EXISTS(SELECT 1 FROM fair_ready f WHERE f.root_request_identifier=r.root_request_identifier
                     AND f.lane=r.lane AND {membership})

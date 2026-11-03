@@ -37,6 +37,23 @@ class StageDispatcher:
     _pass_time: int | None = field(default=None, init=False)
     _expired_after: ExpiryCursor | None = field(default=None, init=False)
     _expired_time: int | None = field(default=None, init=False)
+    _progress_after: str | None = field(default=None, init=False)
+    _progress_reconcile_at: int = field(default=0, init=False)
+
+    async def _progress(self) -> bool:
+        now = self.manager.utc_now_ns()
+        drained = await self.manager.database.drain_progress_notifications(now_utc_ns=now)
+        more = drained.more or drained.woke > 0
+        if now >= self._progress_reconcile_at:
+            page = await self.manager.database.reconcile_progress_waits(
+                after=self._progress_after, limit=self.page_size, now_utc_ns=now
+            )
+            self._progress_after = page.next_cursor if page.more else None
+            # Reconciliation only inspects bounded durable metadata. A quiet
+            # dependency never needs another handler turn to stay asleep.
+            self._progress_reconcile_at = now + 1_000_000_000
+            more = more or page.woke > 0
+        return more
 
     def _requirements(self, candidate: DispatchCandidate) -> tuple[ResourceRequest, ...]:
         if candidate.stage_identifier is not None:
@@ -178,6 +195,7 @@ class StageDispatcher:
             while True:
                 # Recovery is independent of the advisory capacity filter.
                 await self._recover()
+                progress_pending = await self._progress()
                 if self._pass_time is None:
                     self._pass_time = self.manager.utc_now_ns()
                 page = await self.manager.database.fair_dispatch_candidates(
@@ -251,7 +269,7 @@ class StageDispatcher:
                 if not page.has_more:
                     self._after = None
                     self._pass_time = None
-                    if handed_off:
+                    if handed_off or progress_pending:
                         await anyio.lowlevel.checkpoint()
                     else:
                         await anyio.sleep(self.poll_seconds)

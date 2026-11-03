@@ -14,6 +14,7 @@ from carl.core.models import (
     StrictModel,
 )
 from carl.core.work import HoldoffDecision, WorkDefinition, WorkRequester
+from carl.core.work_progress import WorkProgressWatch
 
 
 class WorkOutcomeKind(JsonStringEnumeration):
@@ -78,6 +79,8 @@ class RetryWork(StrictModel):
     records: tuple[RecordDraft, ...] = ()
     artifacts: tuple[ArtifactDraft, ...] = ()
     outputs: tuple[NamedOutput, ...] = ()
+    progress_watch: WorkProgressWatch | None = None
+    progress_observed_through_revision: int | None = Field(default=None, ge=0)
     delay_ns: int = Field(ge=0)
     reason: JsonValue
     result: JsonValue

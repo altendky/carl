@@ -7,6 +7,7 @@ from time import time_ns
 from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from carl.coordinator_progress import consumer_progress_watch
 from carl.core.analysis_batch import ListingAnalysisSelectionPolicy
 from carl.core.json import encode_json
 from carl.core.marketplace_search import Marketplace
@@ -22,6 +23,7 @@ from carl.core.pipeline import (
     pipeline_collection_failed,
 )
 from carl.core.work import WorkCapability, WorkRequester
+from carl.core.work_progress import WorkProgressWatch
 from carl.core.worker import (
     AttemptContext,
     CompletedWork,
@@ -34,6 +36,7 @@ from carl.io.worker import TypedWorkHandler, WorkHandlerRegistry
 
 _WAIT_NS = 2_000_000_000
 _PAGE_SIZE = 50
+_SOURCE_PROBE_SIZE = 32
 _LISTING_REQUEST_KIND = ("carl", "marketplace", "pipeline_listing")
 
 
@@ -60,6 +63,7 @@ async def _run_pipeline(
     dependencies: PipelineWorkerDependencies,
 ) -> WorkOutcome:
     database = dependencies.database
+    observed_through_revision = await database.work_progress_watermark()
     checkpoint = _mapping((await database.work(context.work_item_identifier)).get("result"))
     entries = _entries(checkpoint.get("listings"))
     child_ids = tuple(str(entry["work_identifier"]) for entry in entries)
@@ -224,7 +228,13 @@ async def _run_pipeline(
             # Do not present a bounded subset as exhaustive processing.
             budget_exhausted = True
     cursors[source_key] = cursor
-    searches = await database.pipeline_work_rows(payload.search_work_identifiers)
+    searches: list[dict[str, JsonValue]] = []
+    for offset in range(0, len(payload.search_work_identifiers), 1000):
+        searches.extend(
+            await database.pipeline_work_rows(
+                payload.search_work_identifiers[offset : offset + 1000]
+            )
+        )
     searches_pending = sum(work["state"] in {"pending", "leased"} for work in searches)
     search_failures = sum(
         work["state"] == "terminal_failure"
@@ -261,11 +271,29 @@ async def _run_pipeline(
     inputs = (
         NamedInput(name=("pipeline_intent",), object_identifier=payload.intent_record_identifier),
     )
-    # At a terminal search boundary one final scan is needed even if the first
-    # scan raced the last page publication. Existing fixed runs have no waiter.
+    # A retained page is runnable even while its source is still publishing.
+    # Probe large retained source lists in durable bounded passes. Keep the
+    # original watermark so an early source's later publication cannot be lost.
     unseen = False
-    if not discovery_stopped and not searches_pending:
-        for kind, identifier in sources:
+    probing = False
+    probe_baseline = observed_through_revision
+    if not discovery_stopped and child_pending < options.maximum_inflight_listings:
+        probe = _mapping(checkpoint.get("discovery_probe"))
+        probe_index = _integer(probe.get("next_source_index")) % len(sources)
+        probe_remaining = min(_integer(probe.get("remaining_sources")), len(sources))
+        prior_baseline = probe.get("observed_through_revision")
+        if (
+            probe_remaining > 0
+            and isinstance(prior_baseline, int)
+            and not isinstance(prior_baseline, bool)
+            and prior_baseline >= 0
+        ):
+            probe_baseline = min(observed_through_revision, prior_baseline)
+        else:
+            probe_index = (source_index + 1) % len(sources)
+            probe_remaining = len(sources)
+        for _ in range(min(_SOURCE_PROBE_SIZE, probe_remaining)):
+            kind, identifier = sources[probe_index]
             rows = await database.pipeline_search_occurrences(
                 search_work_identifiers=(identifier,) if kind == "work" else (),
                 search_run_record_identifiers=(identifier,) if kind == "run" else (),
@@ -274,11 +302,60 @@ async def _run_pipeline(
             )
             if rows:
                 unseen = True
+                result["next_source_index"] = probe_index
                 break
-    if searches_pending or child_pending or unseen:
+            probe_index = (probe_index + 1) % len(sources)
+            probe_remaining -= 1
+        if not unseen and probe_remaining:
+            probing = True
+            result["discovery_probe"] = {
+                "next_source_index": probe_index,
+                "remaining_sources": probe_remaining,
+                "observed_through_revision": probe_baseline,
+            }
+        elif not unseen and not searches_pending:
+            # An early source may have published its final page during a later
+            # durable probe pass. Its terminal snapshot is now stable; perform
+            # one fresh bounded pass before completing the pipeline.
+            probing = any(
+                _integer(work.get("progress_revision")) > probe_baseline for work in searches
+            )
+    if searches_pending or child_pending or unseen or probing:
+        runnable = unseen or probing
+        watch = None
+        if not runnable:
+            # A full window waits for listing slots, rather than waking on
+            # every new search page which it cannot consume yet.
+            source_identifiers = (
+                tuple(
+                    str(work["identifier"])
+                    for work in searches
+                    if work["state"] in {"pending", "leased"}
+                )
+                if discovery_stopped or child_pending < options.maximum_inflight_listings
+                else ()
+            )
+            if child_pending:
+                listing_watch = await consumer_progress_watch(
+                    database,
+                    parent_work_identifier=context.work_item_identifier,
+                    requester_kind=_LISTING_REQUEST_KIND,
+                    work_identifiers=tuple(str(entry["work_identifier"]) for entry in entries),
+                )
+                watch = listing_watch.model_copy(
+                    update={
+                        "work_identifiers": tuple(
+                            dict.fromkeys((*listing_watch.work_identifiers, *source_identifiers))
+                        )
+                    }
+                )
+            else:
+                watch = WorkProgressWatch(work_identifiers=tuple(dict.fromkeys(source_identifiers)))
         return RetryWork(
             inputs=inputs,
-            delay_ns=_WAIT_NS,
+            delay_ns=0 if runnable else _WAIT_NS,
+            progress_watch=watch,
+            progress_observed_through_revision=probe_baseline if watch is not None else None,
             reason={"kind": "pipeline_continuation"},
             result=result,
         )

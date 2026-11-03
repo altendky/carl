@@ -361,6 +361,8 @@ async def test_request_search_refresh_inherits_request_and_accepts_strategy_over
             requester_identifier=queued.work_identifier,
         )
         assert len(search_children) == 1
+        assert outcome.progress_watch is not None
+        assert outcome.progress_watch.work_identifiers == search_children
         assert await database.work_state(search_children[0]) is WorkState.PENDING
 
         child_kind = ("carl", "facebook", "work", "collect_item")
@@ -602,6 +604,10 @@ async def test_item_phase_reuses_successful_pages_without_decodo_work(
 
         assert isinstance(resumed, RetryWork)
         assert resumed.reason == {"kind": "waiting_for_item_collections"}
+        assert resumed.progress_watch is not None
+        assert resumed.progress_watch.consumer_requester_kinds == (
+            ("carl", "facebook", "search_refresh", "item"),
+        )
         assert resumed.result["reused_successful_item_pages"] == 2
         assert resumed.result["item_collection_work_identifiers"] == ["current-child"]
 
