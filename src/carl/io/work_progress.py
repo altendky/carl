@@ -131,7 +131,7 @@ async def mark(connection: AsyncConnection, work: str) -> None:
 async def wake(connection: AsyncConnection, build: str, now: int) -> int:
     row = await (
         await connection.execute(
-            "SELECT stage_id FROM progress_wait_builds WHERE id=? AND state IN ('building','armed')",
+            "SELECT stage_id,work_id FROM progress_wait_builds WHERE id=? AND state IN ('building','armed')",
             (build,),
         )
     ).fetchone()
@@ -147,8 +147,8 @@ async def wake(connection: AsyncConnection, build: str, now: int) -> int:
     changed = await connection.changes()
     if changed:
         await connection.execute(
-            "UPDATE fair_ready SET ready_since_utc_ns=max(?,coalesce((SELECT json_extract(definition_json,'$.not_before_utc_ns') FROM work_stages WHERE id=?),0)) WHERE stage_id=?",
-            (now, stage, stage),
+            "UPDATE fair_ready SET ready_since_utc_ns=max(?,coalesce((SELECT json_extract(definition_json,'$.not_before_utc_ns') FROM work_stages WHERE id=?),0)) WHERE work_item_id=? AND stage_id=?",
+            (now, stage, str(row[1]), stage),
         )
     await connection.execute(
         "UPDATE progress_wait_builds SET state='inactive',stage_id=NULL WHERE id=?", (build,)
@@ -184,11 +184,14 @@ async def group_progress(
     )
     # One current continuation per logical consumer; historical builds do not
     # enlarge the group fanout query's output or its scan.
+    # Spell out active-index membership: SQLite does not infer that the single
+    # pending state implies the partial index's pending/running predicate.
     rows = await (
         await connection.execute(
             """SELECT b.id FROM work_stages s JOIN progress_wait_builds b ON b.stage_id=s.id
         JOIN progress_wait_groups g ON g.build_id=b.id AND g.kind_json=?
-        WHERE s.work_item_id=? AND s.state='pending' AND b.state IN ('building','armed')""",
+        WHERE s.work_item_id=? AND s.state IN ('pending','running') AND s.state='pending'
+          AND b.state IN ('building','armed')""",
             (kind, parent),
         )
     ).fetchall()

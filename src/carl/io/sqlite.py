@@ -8661,11 +8661,15 @@ class Database:
         async with self._connections.reader() as connection:
             cursor = await connection.execute(
                 """
-                SELECT count(*) FROM work_items AS work
+                SELECT count(*)
+                FROM (
+                    SELECT DISTINCT work_item_id
+                    FROM work_requests INDEXED BY work_requests_requester
+                    WHERE requester_identifier=?
+                ) AS requested
+                CROSS JOIN work_items AS work ON work.id=requested.work_item_id
                 WHERE work.state='completed'
                   AND json_extract(work.result_json,'$.state')='completed_with_failures'
-                  AND EXISTS (SELECT 1 FROM work_requests AS request
-                    WHERE request.work_item_id=work.id AND request.requester_identifier=?)
                 """,
                 (workspace_record_identifier,),
             )
