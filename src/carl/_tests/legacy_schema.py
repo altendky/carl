@@ -3,6 +3,7 @@
 import sqlite3
 
 from carl.io.fair_scheduling import FAIR_SCHEMA
+from carl.io.scheduler_activity import SCHEDULER_SCHEMA
 from carl.io.work_progress import PROGRESS_SCHEMA
 
 _REQUESTER_COLUMNS = (
@@ -13,7 +14,7 @@ _REQUESTER_COLUMNS = (
 
 def without_fair_schema(schema: str) -> str:
     """Strip appended fairness DDL before executing a historical schema slice."""
-    schema = schema.removesuffix(PROGRESS_SCHEMA)
+    schema = schema.removesuffix(SCHEDULER_SCHEMA).removesuffix(PROGRESS_SCHEMA)
     if not schema.endswith(FAIR_SCHEMA):
         raise ValueError("Historical schema fixture must contain the current fairness suffix")
     schema = schema.removesuffix(FAIR_SCHEMA)
@@ -22,6 +23,7 @@ def without_fair_schema(schema: str) -> str:
     schema = schema.replace(
         "    progress_waiting INTEGER NOT NULL DEFAULT 0 CHECK(progress_waiting IN (0,1)),\n", ""
     )
+    schema = schema.replace("    wait_entered_at_utc_ns INTEGER,\n", "")
     return schema
 
 
@@ -32,12 +34,18 @@ def remove_fair_schema(connection: sqlite3.Connection) -> None:
     requester history and the fixture's historical metadata/upgrade assertions.
     """
     triggers = connection.execute(
-        "SELECT name FROM sqlite_schema WHERE type='trigger' AND (name GLOB 'fair_*' OR name GLOB 'progress_*')"
+        "SELECT name FROM sqlite_schema WHERE type='trigger' AND (name GLOB 'fair_*' OR name GLOB 'progress_*' OR name GLOB 'scheduler_*')"
     ).fetchall()
     for (name,) in triggers:
         escaped = str(name).replace('"', '""')
         connection.execute(f'DROP TRIGGER "{escaped}"')
     for name in (
+        "scheduler_waits",
+        "scheduler_executions",
+        "scheduler_rollups",
+        "scheduler_cooldowns",
+        "scheduler_gauges",
+        "scheduler_meta",
         "progress_wait_members",
         "progress_wait_groups",
         "progress_wait_source_chunks",
@@ -67,6 +75,8 @@ def remove_fair_schema(connection: sqlite3.Connection) -> None:
     stages = {row[1] for row in connection.execute("PRAGMA table_info(work_stages)")}
     if "progress_waiting" in stages:
         connection.execute("ALTER TABLE work_stages DROP COLUMN progress_waiting")
+    if "wait_entered_at_utc_ns" in stages:
+        connection.execute("ALTER TABLE work_stages DROP COLUMN wait_entered_at_utc_ns")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(work_requests)")}
     for name in ("scheduling_json", "parent_work_identifier"):
         if name in columns:

@@ -26,6 +26,7 @@ from carl.core.acquisition_identity import (
 from carl.core.activity import (
     ActiveNetworkActivity,
     ActivitySnapshot,
+    BoundedWorkActivity,
     NetworkActivityCounts,
     NetworkConnectivityActivity,
     NetworkPathActivity,
@@ -143,6 +144,11 @@ from carl.core.review_workspace import (
     ReviewClaimLease,
     ReviewWorksetConflict,
 )
+from carl.core.scheduler_activity import (
+    SchedulerActivity,
+    SchedulerWaitObservation,
+    SchedulerWorkStatus,
+)
 from carl.core.search_scope import search_scope_sha256
 from carl.core.stages import (
     StageAttemptContext,
@@ -195,6 +201,7 @@ from carl.core.work_dispatch import (
 from carl.core.work_progress import ProgressDrainResult, ProgressReconcilePage
 from carl.core.worker import FollowOnWork
 from carl.io import fair_scheduling as fair_sql
+from carl.io import scheduler_activity as scheduler_sql
 from carl.io import work_progress as progress_sql
 from carl.io.db import DEFAULT_BUSY_TIMEOUT_MS, DatabaseConnections
 from carl.route_cutover import rebuild_work_definition
@@ -224,9 +231,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=21,
+    version=22,
 )
 
+_V21_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 21})
+_V21_SCHEMA_DEFINITION_SHA256 = "1996b96bed45d25fe4dd507eeb5603e87964ecaec5a9a85fed4ffd4ef8cc0a01"
 _V20_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 20})
 _V20_SCHEMA_DEFINITION_SHA256 = "b4336f5f4093b362d02befe4ec345ceb34512091a1c04f4ee0904c22c6513059"
 _V19_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 19})
@@ -294,6 +303,7 @@ CREATE TABLE IF NOT EXISTS work_stages (
     execution INTEGER NOT NULL DEFAULT 0 CHECK (execution >= 0),
     eligible_at_utc_ns INTEGER NOT NULL CHECK (eligible_at_utc_ns >= 0),
     wait_kind TEXT,
+    wait_entered_at_utc_ns INTEGER,
     progress_waiting INTEGER NOT NULL DEFAULT 0 CHECK(progress_waiting IN (0,1)),
     created_at_utc_ns INTEGER NOT NULL CHECK (created_at_utc_ns >= 0),
     token TEXT,
@@ -931,6 +941,7 @@ ON records(json_extract(value_json, '$.search_run_record_identifier'), object_id
 """
     + fair_sql.FAIR_SCHEMA
     + progress_sql.PROGRESS_SCHEMA
+    + scheduler_sql.SCHEDULER_SCHEMA
 )
 
 _SCHEMA_DEFINITION_SHA256 = hashlib.sha256(_SCHEMA.encode()).hexdigest()
@@ -1123,6 +1134,82 @@ class Database:
     async def work_progress_watermark(self) -> int:
         async with self._connections.reader() as connection:
             return await progress_sql.watermark(connection)
+
+    def _scheduler_scope(self, coordination_scope: str | None) -> str:
+        if coordination_scope is not None:
+            if not coordination_scope or coordination_scope != coordination_scope.strip():
+                raise ValueError("Scheduler status scope must be nonempty and trimmed")
+            return coordination_scope
+        from carl.io.resource_permits import current_resource_manager, resource_coordination_scope
+
+        manager = current_resource_manager()
+        return (
+            manager.scope
+            if manager is not None and manager.database is self
+            else resource_coordination_scope()
+        )
+
+    async def scheduler_activity(
+        self,
+        *,
+        coordination_scope: str | None = None,
+        now_utc_ns: int,
+        recent_window_ns: int = 300_000_000_000,
+        maximum_samples: int = 8,
+    ) -> SchedulerActivity:
+        if now_utc_ns < 0 or recent_window_ns <= 0 or not 1 <= maximum_samples <= 8:
+            raise ValueError("Scheduler activity bounds are invalid")
+        async with self._connections.reader() as connection:
+            return await scheduler_sql.snapshot(
+                connection,
+                self._scheduler_scope(coordination_scope),
+                now_utc_ns,
+                recent_window_ns,
+                maximum_samples,
+            )
+
+    async def work_scheduler_status(
+        self, work_identifier: str, *, coordination_scope: str | None = None, now_utc_ns: int
+    ) -> SchedulerWorkStatus:
+        if not work_identifier or now_utc_ns < 0:
+            raise ValueError("Scheduler work status bounds are invalid")
+        async with self._connections.reader() as connection:
+            return await scheduler_sql.work_status(
+                connection, work_identifier, self._scheduler_scope(coordination_scope), now_utc_ns
+            )
+
+    async def work_with_scheduler_status(
+        self, work_identifier: str, *, coordination_scope: str | None = None, now_utc_ns: int
+    ) -> tuple[dict[str, JsonValue], SchedulerWorkStatus]:
+        async with self._connections.reader():
+            work = await self.work(work_identifier)
+            scheduler = await self.work_scheduler_status(
+                work_identifier, coordination_scope=coordination_scope, now_utc_ns=now_utc_ns
+            )
+        return work, scheduler
+
+    async def observe_scheduler_waits(
+        self,
+        *,
+        coordination_scope: str,
+        observations: Sequence[SchedulerWaitObservation],
+        now_utc_ns: int,
+    ) -> None:
+        if len(observations) > 32 or now_utc_ns < 0:
+            raise ValueError("Scheduler observation page exceeds its bound")
+        async with self._connections.writer() as connection:
+            await scheduler_sql.observe(
+                connection,
+                self._scheduler_scope(coordination_scope),
+                tuple(observations),
+                now_utc_ns,
+            )
+
+    async def prune_scheduler_telemetry(self, *, now_utc_ns: int, limit: int = 128) -> bool:
+        if now_utc_ns < 0 or not 1 <= limit <= 128:
+            raise ValueError("Scheduler retention bounds are invalid")
+        async with self._connections.writer() as connection:
+            return await scheduler_sql.prune(connection, now_utc_ns, limit)
 
     async def missing_consumer_edges(
         self,
@@ -2647,16 +2734,26 @@ class Database:
         identifier: str,
         result: StageClaimResult,
         now_utc_ns: int,
+        coordination_scope: str | None = None,
+        observed_reason: str | None = None,
     ) -> StageClaimResult:
         cursor = await connection.execute(
-            "SELECT state, wait_kind FROM work_stages WHERE id = ?", (identifier,)
+            "SELECT state, wait_kind,work_item_id,json_extract(definition_json,'$.resources') FROM work_stages WHERE id = ?",
+            (identifier,),
         )
         row = await cursor.fetchone()
         if row is not None and row[0] == "pending":
             kind = None if result.wait_kind is None else result.wait_kind.value
             await connection.execute(
-                "UPDATE work_stages SET wait_kind = ?, eligible_at_utc_ns = ? WHERE id = ?",
-                (kind, result.next_eligible_at_utc_ns or now_utc_ns, identifier),
+                "UPDATE work_stages SET wait_entered_at_utc_ns=CASE WHEN wait_kind IS ? THEN coalesce(wait_entered_at_utc_ns,?) ELSE ? END,wait_kind = ?, eligible_at_utc_ns = ? WHERE id = ?",
+                (
+                    kind,
+                    now_utc_ns,
+                    now_utc_ns,
+                    kind,
+                    result.next_eligible_at_utc_ns or now_utc_ns,
+                    identifier,
+                ),
             )
             if row[1] != kind:
                 await self._append_stage_event(
@@ -2665,6 +2762,31 @@ class Database:
                     "waiting",
                     now_utc_ns,
                     {"wait_kind": kind, "next_eligible_at_utc_ns": result.next_eligible_at_utc_ns},
+                )
+            if coordination_scope is not None:
+                resources = cast(list[dict[str, JsonValue]], decode_json(_text(row[3])))
+                reason = observed_reason or {
+                    "resource": "resource",
+                    "dependency": "dependency",
+                    "time": "time",
+                    "connectivity": "connectivity",
+                    "ownership": "logical_policy",
+                }.get(kind or "", "unknown")
+                observation = SchedulerWaitObservation.model_validate(
+                    {
+                        "work_identifier": row[2],
+                        "stage_identifier": identifier,
+                        "reason": reason,
+                        "resource_names": tuple(
+                            request["name"]
+                            for request in resources
+                            if request.get("name") in scheduler_sql.RESOURCE_NAMES
+                        ),
+                        "source": "admission",
+                    }
+                )
+                await scheduler_sql.observe(
+                    connection, coordination_scope, (observation,), now_utc_ns
                 )
         return result
 
@@ -2853,6 +2975,7 @@ class Database:
                         lease=None, wait_kind=StageWaitKind.TIME, next_eligible_at_utc_ns=eligible
                     ),
                     now_utc_ns,
+                    coordination_scope=resource_scope,
                 )
             cursor = await connection.execute(
                 """
@@ -2873,6 +2996,7 @@ class Database:
                         next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
                     ),
                     now_utc_ns,
+                    coordination_scope=resource_scope,
                 )
             network_stage = definition.network_activity is not None or any(
                 request.name == "http" for request in definition.resources
@@ -2894,6 +3018,7 @@ class Database:
                             ),
                         ),
                         now_utc_ns,
+                        coordination_scope=resource_scope,
                     )
             execution = _integer(stage[2]) + 1
             fair_allowed, fair_lane = await self._fair_gate(
@@ -2916,6 +3041,8 @@ class Database:
                         next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
                     ),
                     now_utc_ns,
+                    coordination_scope=resource_scope,
+                    observed_reason="fairness",
                 )
             try:
                 # Nested writer is a savepoint: unavailable HTTP/resource admission
@@ -3137,7 +3264,7 @@ class Database:
                         """
                         UPDATE work_stages SET state = 'running', execution = ?, token = ?,
                             worker_identifier = ?, coordination_scope = ?,
-                            lease_expires_at_utc_ns = ?, lease_json = ?, wait_kind = NULL
+                            lease_expires_at_utc_ns = ?, lease_json = ?, wait_kind = NULL,wait_entered_at_utc_ns=NULL
                         WHERE id = ? AND state = 'pending'
                         """,
                         (
@@ -3172,6 +3299,14 @@ class Database:
                             token=token,
                             now=now_utc_ns,
                         )
+                    await scheduler_sql.claimed(
+                        connection,
+                        stage=stage_identifier,
+                        execution=execution,
+                        scope=resource_scope,
+                        work=definition.work_item_identifier,
+                        now=now_utc_ns,
+                    )
                     return StageClaimResult(lease=lease)
             except _StageAdmissionDeferred as deferred:
                 if (
@@ -3182,7 +3317,11 @@ class Database:
                         connection, resource_scope, fair_lane, definition.work_item_identifier
                     )
                 return await self._stage_wait(
-                    connection, stage_identifier, deferred.result, now_utc_ns
+                    connection,
+                    stage_identifier,
+                    deferred.result,
+                    now_utc_ns,
+                    coordination_scope=resource_scope,
                 )
 
     @staticmethod
@@ -3379,6 +3518,20 @@ class Database:
         eligible_at_utc_ns: int,
         wait_kind: StageWaitKind | None = None,
     ) -> None:
+        previous = await (
+            await connection.execute(
+                "SELECT execution FROM work_stages WHERE id=? AND state='running'", (identifier,)
+            )
+        ).fetchone()
+        if previous is not None:
+            await scheduler_sql.finished(
+                connection,
+                stage=identifier,
+                execution=_integer(previous[0]),
+                now=eligible_at_utc_ns,
+                duration=None,
+                outcome="cancelled" if state == "cancelled" else "released",
+            )
         await connection.execute(
             "UPDATE resident_sessions SET active_stage_token = NULL WHERE active_stage_token = (SELECT token FROM work_stages WHERE id = ?)",
             (identifier,),
@@ -3387,10 +3540,18 @@ class Database:
             """
             UPDATE work_stages SET state = ?, token = NULL, worker_identifier = NULL,
                 coordination_scope = NULL, lease_expires_at_utc_ns = NULL, lease_json = NULL,
-                eligible_at_utc_ns = ?, wait_kind = ? WHERE id = ?
+                eligible_at_utc_ns = ?, wait_kind = ?, wait_entered_at_utc_ns=? WHERE id = ?
             """,
-            (state, eligible_at_utc_ns, None if wait_kind is None else wait_kind.value, identifier),
+            (
+                state,
+                eligible_at_utc_ns,
+                None if wait_kind is None else wait_kind.value,
+                eligible_at_utc_ns if wait_kind is not None else None,
+                identifier,
+            ),
         )
+
+        await scheduler_sql.after_transition(connection, eligible_at_utc_ns)
 
     async def suspend_stage(
         self,
@@ -3402,6 +3563,7 @@ class Database:
         artifacts: Sequence[ArtifactDraft] = (),
         outputs: Sequence[NamedOutput] = (),
         inputs: Sequence[NamedInput] = (),
+        phase_duration_ns: int | None = None,
     ) -> None:
         """Publish a checkpoint and continuation without spending an acquisition attempt."""
 
@@ -3420,6 +3582,14 @@ class Database:
         async with self._connections.writer() as connection:
             if not await self.validate_stage(lease, now_utc_ns=now_utc_ns):
                 raise LeaseLostError("The stage no longer owns its execution")
+            await scheduler_sql.finished(
+                connection,
+                stage=lease.definition.identifier,
+                execution=lease.execution,
+                now=now_utc_ns,
+                duration=phase_duration_ns,
+                outcome="suspended",
+            )
             await self.publish_leased_operation_checkpoint(
                 work_item_identifier=lease.definition.work_item_identifier,
                 lease_token=lease.token,
@@ -3454,8 +3624,8 @@ class Database:
             if not same_stage:
                 await self._register_stage(connection, continuation, now_utc_ns, continuation=True)
                 await connection.execute(
-                    "UPDATE work_stages SET wait_kind = ? WHERE id = ?",
-                    (wait.wait_kind.value, continuation.identifier),
+                    "UPDATE work_stages SET wait_kind = ?,wait_entered_at_utc_ns=? WHERE id = ?",
+                    (wait.wait_kind.value, now_utc_ns, continuation.identifier),
                 )
             await self._activate_progress_wait(connection, lease, wait, now_utc_ns)
             await self._append_stage_event(
@@ -3471,12 +3641,27 @@ class Database:
                 },
             )
 
-    async def complete_stage(self, lease: StageLease, *, now_utc_ns: int) -> None:
+    async def complete_stage(
+        self,
+        lease: StageLease,
+        *,
+        now_utc_ns: int,
+        phase_duration_ns: int | None = None,
+        phase_outcome: Literal["completed", "retry", "terminal_failure"] = "completed",
+    ) -> None:
         """Fence finalization before logical publication in the caller's same transaction."""
 
         async with self._connections.writer() as connection:
             if not await self.validate_stage(lease, now_utc_ns=now_utc_ns):
                 raise LeaseLostError("The stage no longer owns its execution")
+            await scheduler_sql.finished(
+                connection,
+                stage=lease.definition.identifier,
+                execution=lease.execution,
+                now=now_utc_ns,
+                duration=phase_duration_ns,
+                outcome=phase_outcome,
+            )
             await self._finish_stage_network(
                 connection,
                 lease,
@@ -4137,6 +4322,9 @@ class Database:
         )
         if await connection.changes() != 1:
             return False
+        await scheduler_sql.physical_release(
+            connection, lease.token, now_utc_ns, reclaimed=reclaimed
+        )
         await connection.execute(
             "UPDATE resident_sessions SET state = ? WHERE id = ?", (state.value, lease.identifier)
         )
@@ -4475,7 +4663,10 @@ class Database:
                   AND NOT EXISTS (SELECT 1 FROM resident_sessions WHERE resident_sessions.token = resource_permits.token)""",
                 (token, owner),
             )
-            return await connection.changes() == 1
+            changed = await connection.changes() == 1
+            if changed:
+                await scheduler_sql.physical_release(connection, token, time_ns())
+            return changed
 
     async def expired_resource_permits(
         self, *, scope: str, now_utc_ns: int
@@ -4522,7 +4713,10 @@ class Database:
                 """,
                 (token, owner, now_utc_ns),
             )
-            return await connection.changes() == 1
+            changed = await connection.changes() == 1
+            if changed:
+                await scheduler_sql.physical_release(connection, token, now_utc_ns, reclaimed=True)
+            return changed
 
     @classmethod
     @asynccontextmanager
@@ -4582,6 +4776,14 @@ class Database:
             "schema_identity_json": encode_json(_V20_DATABASE_SCHEMA.model_dump(mode="json")),
             "schema_version": "20",
             "schema_definition_sha256": _V20_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
+    def _v21_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V21_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "21",
+            "schema_definition_sha256": _V21_SCHEMA_DEFINITION_SHA256,
         }
 
     @staticmethod
@@ -4773,6 +4975,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v21_metadata())
                 and not await cls._metadata_matches(connection, cls._v20_metadata())
                 and not await cls._metadata_matches(connection, cls._v19_metadata())
                 and not await cls._metadata_matches(connection, cls._v18_metadata())
@@ -5279,6 +5482,12 @@ class Database:
                             connection, _text(request[1]), _integer(request[2])
                         )
                     after = _integer(requests[-1][0])
+                for key, value in self._v21_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value=? WHERE key=?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v21_metadata()):
+                await self._apply_schema(connection)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value=? WHERE key=?", (value, key)
@@ -5293,6 +5502,7 @@ class Database:
 
         legacy_projection_added = False
         for table, column, definition in (
+            ("work_stages", "wait_entered_at_utc_ns", "INTEGER"),
             (
                 "work_stages",
                 "progress_waiting",
@@ -5341,6 +5551,7 @@ class Database:
                 "ALTER TABLE work_requests ADD COLUMN parent_work_identifier TEXT REFERENCES work_items(id)"
             )
         await connection.execute(_SCHEMA)
+        await scheduler_sql.initialize(connection)
         await fair_sql.initialize_service_counts(connection)
         if legacy_projection_added:
             await fair_sql.initialize_legacy_lease_projection(connection)
@@ -6613,6 +6824,9 @@ class Database:
                 _json(data),
             ),
         )
+        await scheduler_sql.logical_event(
+            connection, work_item_identifier, event_kind.value, data, recorded_at_utc_ns
+        )
 
     @staticmethod
     async def _require_requester_not_cancelled(
@@ -7783,10 +7997,11 @@ class Database:
         captured_at_utc_ns: int,
         recent_window_ns: int,
         maximum_rows: int,
+        coordination_scope: str | None = None,
     ) -> ActivitySnapshot:
         """Read one consistent, bounded view of durable work and network activity."""
 
-        if captured_at_utc_ns < 0 or recent_window_ns <= 0 or maximum_rows < 1:
+        if captured_at_utc_ns < 0 or recent_window_ns <= 0 or not 1 <= maximum_rows <= 100:
             raise ValueError("Activity snapshot bounds are invalid")
         recent_since_utc_ns = max(0, captured_at_utc_ns - recent_window_ns)
         async with self._connections.reader() as connection:
@@ -7794,6 +8009,7 @@ class Database:
                 """
                 SELECT kind_parts_json, state, count(*)
                 FROM work_items
+                WHERE kind_parts_json IN (SELECT kind_parts_json FROM work_items GROUP BY kind_parts_json ORDER BY kind_parts_json LIMIT 33)
                 GROUP BY kind_parts_json, state
                 ORDER BY kind_parts_json, state
                 """
@@ -7805,6 +8021,7 @@ class Database:
                 FROM work_events AS event
                 JOIN work_items AS work ON work.id = event.work_item_id
                 WHERE event.recorded_at_utc_ns >= ?
+                  AND work.kind_parts_json IN (SELECT kind_parts_json FROM work_items GROUP BY kind_parts_json ORDER BY kind_parts_json LIMIT 33)
                   AND event.event_kind IN ('completed', 'terminal_failure', 'cancelled')
                 GROUP BY work.kind_parts_json, event.event_kind
                 ORDER BY work.kind_parts_json, event.event_kind
@@ -7813,10 +8030,10 @@ class Database:
             )
             recent_work_rows = await recent_work_cursor.fetchall()
             active_work_cursor = await connection.execute(
-                """
-                SELECT id, kind_parts_json, state, attempt, created_at_utc_ns,
+                f"""
+                SELECT substr(id,1,161), kind_parts_json, state, attempt, created_at_utc_ns,
                        eligible_at_utc_ns, lease_expires_at_utc_ns, lease_owner,
-                       payload_json, result_json, error_json
+                       {scheduler_sql.payload_projection("payload_json")}, {scheduler_sql.result_projection("result_json")}, {scheduler_sql.error_projection("error_json")}
                 FROM work_items
                 WHERE state IN ('pending', 'leased', 'cancelling')
                 ORDER BY state = 'leased' DESC, priority DESC, created_at_utc_ns, id
@@ -7826,10 +8043,10 @@ class Database:
             )
             active_work_rows = await active_work_cursor.fetchall()
             terminal_work_cursor = await connection.execute(
-                """
-                SELECT work.id, work.kind_parts_json, work.state, work.attempt,
+                f"""
+                SELECT substr(work.id,1,161), work.kind_parts_json, work.state, work.attempt,
                        work.created_at_utc_ns, work.eligible_at_utc_ns,
-                       work.payload_json, work.result_json, work.error_json,
+                       {scheduler_sql.payload_projection("work.payload_json")}, {scheduler_sql.result_projection("work.result_json")}, {scheduler_sql.error_projection("work.error_json")},
                        event.recorded_at_utc_ns
                 FROM work_events AS event
                 JOIN work_items AS work ON work.id = event.work_item_id
@@ -7870,6 +8087,7 @@ class Database:
                 JOIN network_activity_scopes AS scope
                   ON scope.network_activity_id = activity.id
                  AND scope.scope_kind = 'network_path'
+                 AND scope.scope_identity_json IN (SELECT scope_identity_json FROM network_activity_scopes WHERE scope_kind='network_path' GROUP BY scope_identity_json ORDER BY scope_identity_json LIMIT 17)
                 GROUP BY scope.scope_identity_json, activity.state
                 ORDER BY scope.scope_identity_json, activity.state
                 """,
@@ -7878,9 +8096,9 @@ class Database:
             network_path_rows = await network_path_cursor.fetchall()
             active_network_cursor = await connection.execute(
                 """
-                SELECT activity.id, activity.kind_parts_json,
+                SELECT substr(activity.id,1,161), activity.kind_parts_json,
                        scope.scope_identity_json, activity.state,
-                       activity.network_session_identifier, activity.ordinal,
+                       substr(activity.network_session_identifier,1,161), activity.ordinal,
                        activity.attempt, activity.created_at_utc_ns,
                        activity.eligible_at_utc_ns, activity.admitted_at_utc_ns,
                        activity.permit_expires_at_utc_ns
@@ -7897,13 +8115,20 @@ class Database:
             )
             active_network_rows = await active_network_cursor.fetchall()
             connectivity_cursor = await connection.execute(
-                """
+                f"""
                 SELECT paused, next_probe_utc_ns, probe_token, probe_expires_utc_ns,
-                       checked_at_utc_ns, result_json
+                       checked_at_utc_ns, {scheduler_sql.probe_projection("result_json")}
                 FROM network_connectivity WHERE singleton = 1
                 """
             )
             connectivity_row = await connectivity_cursor.fetchone()
+            scheduler = await scheduler_sql.snapshot(
+                connection,
+                self._scheduler_scope(coordination_scope),
+                captured_at_utc_ns,
+                recent_window_ns,
+                8,
+            )
 
         work_counts: dict[tuple[str, ...], dict[WorkState, int]] = {}
         for row in work_count_rows:
@@ -7915,7 +8140,7 @@ class Database:
             recent_work_counts.setdefault(kind, {})[WorkState(_text(row[1]))] = _integer(row[2])
         work_kinds = tuple(
             WorkKindActivity(
-                kind=kind,
+                kind=scheduler_sql.bounded_parts(_json(list(kind)))[0],
                 pending=counts.get(WorkState.PENDING, 0),
                 leased=counts.get(WorkState.LEASED, 0),
                 completed=counts.get(WorkState.COMPLETED, 0),
@@ -7927,30 +8152,45 @@ class Database:
                 recent_terminal_failure=recent_work_counts.get(kind, {}).get(
                     WorkState.TERMINAL_FAILURE, 0
                 ),
+                labels_truncated=scheduler_sql.bounded_parts(_json(list(kind)))[1],
             )
-            for kind, counts in sorted(work_counts.items())
+            for kind, counts in sorted(work_counts.items())[:32]
         )
 
-        def activity_from_row(row: Sequence[apsw.SQLiteValue], *, terminal: bool) -> WorkActivity:
-            kind = tuple(str(part) for part in decode_json(_text(row[1])))
+        def activity_from_row(
+            row: Sequence[apsw.SQLiteValue], *, terminal: bool
+        ) -> BoundedWorkActivity:
+            raw_kind = _text(row[1])
+            kind, kind_truncated = scheduler_sql.bounded_parts(raw_kind)
             payload = decode_json(_text(row[8] if not terminal else row[6]))
             result_value = row[9] if not terminal else row[7]
             error_value = row[10] if not terminal else row[8]
             result = None if result_value is None else decode_json(_text(result_value))
             error = None if error_value is None else decode_json(_text(error_value))
-            return WorkActivity(
-                identifier=_text(row[0]),
+            return BoundedWorkActivity(
+                identifier=_text(row[0])[:160],
                 kind=kind,
                 state=WorkState(_text(row[2])),
                 attempt=_integer(row[3]),
                 created_at_utc_ns=_integer(row[4]),
                 eligible_at_utc_ns=_integer(row[5]),
                 lease_expires_at_utc_ns=(None if terminal or row[6] is None else _integer(row[6])),
-                worker_identifier=(None if terminal or row[7] is None else _text(row[7])),
-                subject=work_subject(kind, payload),
-                stage=work_stage(result),
-                error_kind=work_error_kind(error),
+                worker_identifier=(None if terminal or row[7] is None else _text(row[7])[:160]),
+                subject=scheduler_sql.label(work_subject(kind, payload)),
+                stage=scheduler_sql.label(work_stage(result)),
+                error_kind=scheduler_sql.label(work_error_kind(error)),
                 terminal_at_utc_ns=(None if not terminal else _integer(row[9])),
+                identity_truncated=len(_text(row[0])) > 160
+                or (not terminal and row[7] is not None and len(_text(row[7])) > 160),
+                labels_truncated=kind_truncated
+                or any(
+                    value is not None and len(value) > 160
+                    for value in (
+                        work_subject(kind, payload),
+                        work_stage(result),
+                        work_error_kind(error),
+                    )
+                ),
             )
 
         network_counts = {state: 0 for state in NetworkActivityState}
@@ -7985,6 +8225,11 @@ class Database:
             captured_at_utc_ns=captured_at_utc_ns,
             recent_window_ns=recent_window_ns,
             work_kinds=work_kinds,
+            work_kind_groups_omitted=None if len(work_counts) > 32 else 0,
+            work_kind_groups_truncated=len(work_counts) > 32,
+            network_path_groups_omitted=None if len(path_counts) > 16 else 0,
+            network_path_groups_truncated=len(path_counts) > 16,
+            scheduler=scheduler,
             active_work=tuple(activity_from_row(row, terminal=False) for row in active_work_rows),
             recent_terminal_work=tuple(
                 activity_from_row(row, terminal=True) for row in terminal_work_rows
@@ -8003,7 +8248,7 @@ class Database:
             ),
             network_paths=tuple(
                 NetworkPathActivity(
-                    path=path,
+                    path=scheduler_sql.bounded_parts(_json(list(path)))[0],
                     pending=all_counts[NetworkActivityState.PENDING],
                     admitted=all_counts[NetworkActivityState.ADMITTED],
                     completed=all_counts[NetworkActivityState.COMPLETED],
@@ -8014,22 +8259,26 @@ class Database:
                     recent_skipped=recent_counts[NetworkActivityState.SKIPPED],
                     recent_failed=recent_counts[NetworkActivityState.FAILED],
                     recent_cancelled=recent_counts[NetworkActivityState.CANCELLED],
+                    labels_truncated=scheduler_sql.bounded_parts(_json(list(path)))[1],
                 )
-                for path, (all_counts, recent_counts) in sorted(path_counts.items())
+                for path, (all_counts, recent_counts) in sorted(path_counts.items())[:16]
             ),
             active_network=tuple(
                 ActiveNetworkActivity(
-                    identifier=_text(row[0]),
-                    kind=tuple(str(part) for part in decode_json(_text(row[1]))),
-                    path=tuple(str(part) for part in decode_json(_text(row[2]))),
+                    identifier=_text(row[0])[:160],
+                    kind=scheduler_sql.bounded_parts(_text(row[1]))[0],
+                    path=scheduler_sql.bounded_parts(_text(row[2]))[0],
                     state=NetworkActivityState(_text(row[3])),
-                    session_identifier=_text(row[4]),
+                    session_identifier=_text(row[4])[:160],
                     ordinal=_integer(row[5]),
                     attempt=_integer(row[6]),
                     created_at_utc_ns=_integer(row[7]),
                     eligible_at_utc_ns=_integer(row[8]),
                     admitted_at_utc_ns=None if row[9] is None else _integer(row[9]),
                     permit_expires_at_utc_ns=(None if row[10] is None else _integer(row[10])),
+                    identity_truncated=len(_text(row[0])) > 160 or len(_text(row[4])) > 160,
+                    labels_truncated=scheduler_sql.bounded_parts(_text(row[1]))[1]
+                    or scheduler_sql.bounded_parts(_text(row[2]))[1],
                 )
                 for row in active_network_rows
             ),

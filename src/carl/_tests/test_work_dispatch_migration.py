@@ -101,6 +101,7 @@ def _rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
                                 "parent_work_identifier",
                                 "scheduling_json",
                                 "progress_waiting",
+                                "wait_entered_at_utc_ns",
                             }
                         )
                         + ' FROM "'
@@ -114,7 +115,7 @@ def _rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name!='schema_metadata'"
             )
             if name not in {"work_scheduling", "work_consumer_edges", "consumer_group_progress"}
-            and not name.startswith(("fair_", "work_progress_", "progress_"))
+            and not name.startswith(("fair_", "work_progress_", "progress_", "scheduler_"))
         }
 
 
@@ -122,8 +123,8 @@ def _assert_current_schema(path: Path) -> None:
     with closing(sqlite3.connect(path)) as connection:
         actual = dict(connection.execute("SELECT key, value FROM schema_metadata"))
         assert actual == Database._expected_metadata()
-        assert sqlite.DATABASE_SCHEMA.version == 21
-        assert actual["schema_version"] == "21"
+        assert sqlite.DATABASE_SCHEMA.version == 22
+        assert actual["schema_version"] == "22"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         for name, expected in _INDEX_COLUMNS.items():
             # Verify key order and descending priority, not just index names.
@@ -268,7 +269,7 @@ def _copy_seed_to_legacy(seed: Path, path: Path) -> None:
             added_columns = {
                 "work_items": {"acquisition_resource_identity_json"},
                 "work_requests": {"parent_work_identifier", "scheduling_json"},
-                "work_stages": {"progress_waiting"},
+                "work_stages": {"progress_waiting", "wait_entered_at_utc_ns"},
             }.get(name, set())
             assert available - set(columns) == added_columns - set(columns)
             quoted = ",".join('"' + column.replace('"', '""') + '"' for column in columns)

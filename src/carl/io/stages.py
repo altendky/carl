@@ -5,8 +5,8 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from time import time_ns
-from typing import Protocol
+from time import perf_counter_ns, time_ns
+from typing import Literal, Protocol
 from uuid import uuid4
 
 import anyio
@@ -48,6 +48,11 @@ class StageExecution:
     invocation: dict[str, JsonValue]
     finalized: bool = False
     finalizing: bool = False
+    started_monotonic_ns: int = field(default_factory=perf_counter_ns)
+
+    def _phase_duration_ns(self) -> int | None:
+        elapsed = self.manager.monotonic_now_ns() - self.started_monotonic_ns
+        return elapsed if elapsed >= 0 else None
 
     async def apply(self, outcome: StageHandlerResult) -> None:
         """Publish an outcome through this execution's continuation or final fence."""
@@ -147,6 +152,7 @@ class StageExecution:
             self.lease,
             wait,
             now_utc_ns=self.manager.utc_now_ns(),
+            phase_duration_ns=self._phase_duration_ns(),
             records=records,
             artifacts=artifacts,
             outputs=outputs,
@@ -169,8 +175,20 @@ class StageExecution:
             0, int((ended - datetime.fromisoformat(started)).total_seconds() * 1_000_000_000)
         )
         work = self.lease.work_lease
+        phase_outcome: Literal["completed", "retry", "terminal_failure"] = (
+            "completed"
+            if isinstance(outcome, CompletedWork)
+            else "retry"
+            if isinstance(outcome, RetryWork)
+            else "terminal_failure"
+        )
         async with database.transaction():
-            await database.complete_stage(self.lease, now_utc_ns=now)
+            await database.complete_stage(
+                self.lease,
+                now_utc_ns=now,
+                phase_duration_ns=self._phase_duration_ns(),
+                phase_outcome=phase_outcome,
+            )
             if isinstance(outcome, CompletedWork):
                 await database.complete_leased_operation(
                     work_item_identifier=work.work_item_identifier,
@@ -258,6 +276,7 @@ class StageManager:
     utc_now_ns: Callable[[], int] = time_ns
     lease_duration_ns: int = 60_000_000_000
     renewal_interval_ns: int = 20_000_000_000
+    monotonic_now_ns: Callable[[], int] = perf_counter_ns
 
     def __post_init__(self) -> None:
         if self.resources.database is not self.database:
@@ -373,7 +392,14 @@ class StageManager:
                     guard.discard_unadmitted = True
                     yield StageAdmission(result, None)
                     return
-                execution = StageExecution(self, lease, guard, provenance, deepcopy(invocation))
+                execution = StageExecution(
+                    self,
+                    lease,
+                    guard,
+                    provenance,
+                    deepcopy(invocation),
+                    started_monotonic_ns=self.monotonic_now_ns(),
+                )
                 body_error: BaseException | None = None
                 async with AsyncExitStack() as stack:
                     if lease.resource_lease is not None:

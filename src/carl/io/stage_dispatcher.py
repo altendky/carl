@@ -2,12 +2,18 @@
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import cast
 
 import anyio
 
 from carl.core.fair_scheduling import FairDispatchCursor
 from carl.core.models import CodeProvenance, JsonValue
 from carl.core.resources import ResourceRequest
+from carl.core.scheduler_activity import (
+    SchedulerBlocker,
+    SchedulerResourceName,
+    SchedulerWaitObservation,
+)
 from carl.core.work import WorkCancellationRequestedError, WorkCapability
 from carl.core.work_dispatch import DispatchCandidate, ExpiryCursor
 from carl.io.resident_sessions import ResidentSessionPool
@@ -45,6 +51,7 @@ class StageDispatcher:
         drained = await self.manager.database.drain_progress_notifications(now_utc_ns=now)
         more = drained.more or drained.woke > 0
         if now >= self._progress_reconcile_at:
+            await self.manager.database.prune_scheduler_telemetry(now_utc_ns=now, limit=128)
             page = await self.manager.database.reconcile_progress_waits(
                 after=self._progress_after, limit=self.page_size, now_utc_ns=now
             )
@@ -54,6 +61,31 @@ class StageDispatcher:
             self._progress_reconcile_at = now + 1_000_000_000
             more = more or page.woke > 0
         return more
+
+    def _wait_observation(
+        self,
+        candidate: DispatchCandidate,
+        reason: SchedulerBlocker,
+        resource_names: tuple[str, ...] = (),
+    ) -> SchedulerWaitObservation:
+        known = {
+            "http",
+            "cpu",
+            "analysis",
+            "routing_engines",
+            "resident_sessions",
+            "resident_state_bytes",
+        }
+        return SchedulerWaitObservation(
+            work_identifier=candidate.work_item_identifier,
+            stage_identifier=candidate.stage_identifier,
+            reason=reason,
+            resource_names=cast(
+                tuple[SchedulerResourceName, ...],
+                tuple(name for name in resource_names if name in known)[:8],
+            ),
+            source="advisory",
+        )
 
     def _requirements(self, candidate: DispatchCandidate) -> tuple[ResourceRequest, ...]:
         if candidate.stage_identifier is not None:
@@ -231,6 +263,7 @@ class StageDispatcher:
                     self.manager.resources.scope
                 )
                 handed_off = False
+                observations: list[SchedulerWaitObservation] = []
                 for candidate in page.items:
                     if candidate.work_item_identifier in self._queued:
                         continue
@@ -242,6 +275,13 @@ class StageDispatcher:
                     if not (execution_ready if requirements else metadata_ready):
                         # A receiver can become idle during the occupancy read.
                         # Refresh and advertise that lane before handing it work.
+                        if len(observations) < 32:
+                            observations.append(
+                                self._wait_observation(
+                                    candidate,
+                                    "execution_runner" if requirements else "metadata_runner",
+                                )
+                            )
                         continue
                     weighted_cpu = any(
                         request.name == "cpu" and request.units > 1 for request in requirements
@@ -251,10 +291,29 @@ class StageDispatcher:
                         > capacities.get(request.name, 0)
                         for request in requirements
                     ):
+                        if len(observations) < 32:
+                            observations.append(
+                                self._wait_observation(
+                                    candidate,
+                                    "resource",
+                                    tuple(
+                                        request.name
+                                        for request in requirements
+                                        if occupied.get(request.name, 0) + request.units
+                                        > capacities.get(request.name, 0)
+                                    ),
+                                )
+                            )
                         continue
                     if candidate.resident_session_identifier is not None and occupied.get(
                         "resident_sessions", 0
                     ) >= capacities.get("resident_sessions", 0):
+                        if len(observations) < 32:
+                            observations.append(
+                                self._wait_observation(
+                                    candidate, "resource", ("resident_sessions",)
+                                )
+                            )
                         continue
                     # Initial adapters may need a payload point read. They use
                     # the execution lane until their actual stage is registered.
@@ -265,6 +324,19 @@ class StageDispatcher:
                         handed_off = True
                     except anyio.WouldBlock:
                         self._queued.remove(candidate.work_item_identifier)
+                        if len(observations) < 32:
+                            observations.append(
+                                self._wait_observation(
+                                    candidate,
+                                    "execution_runner" if requirements else "metadata_runner",
+                                )
+                            )
+                if observations:
+                    await self.manager.database.observe_scheduler_waits(
+                        coordination_scope=self.manager.resources.scope,
+                        observations=tuple(observations),
+                        now_utc_ns=self.manager.utc_now_ns(),
+                    )
                 self._after = page.next_cursor
                 if not page.has_more:
                     self._after = None

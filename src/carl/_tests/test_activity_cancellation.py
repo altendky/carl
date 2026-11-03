@@ -7,8 +7,8 @@ from rich.console import Console, RenderableType
 
 from carl.core.activity import (
     ActivitySnapshot,
+    BoundedWorkActivity,
     NetworkActivityCounts,
-    WorkActivity,
     WorkKindActivity,
 )
 from carl.core.work import WorkState
@@ -21,8 +21,8 @@ def _render(renderable: RenderableType) -> str:
     return console.export_text()
 
 
-def _work(state: WorkState) -> WorkActivity:
-    return WorkActivity(
+def _work(state: WorkState) -> BoundedWorkActivity:
+    return BoundedWorkActivity(
         identifier="cancelled-refresh",
         kind=("carl", "test", "refresh"),
         state=state,

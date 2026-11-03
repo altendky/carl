@@ -4,6 +4,7 @@
 
 import sqlite3
 from collections.abc import Awaitable, Callable
+from contextlib import closing
 from pathlib import Path
 
 import anyio
@@ -42,7 +43,7 @@ def _saved(
 def _restore_version_eleven(path: Path) -> None:
     """Remove only v12 additions to leave the genuine preceding schema layout."""
 
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         remove_fair_schema(connection)
         connection.execute("DROP TABLE saved_image_lookup")
         connection.execute("DROP INDEX records_ebay_gallery_observation")

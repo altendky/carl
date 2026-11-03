@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter_ns, time_ns
+from typing import Protocol
 from uuid import uuid4
 
 import anyio
@@ -38,6 +39,7 @@ from carl.core.facebook_work import (
 )
 from carl.core.item_analysis import analysis_work_constraints
 from carl.core.marketplace_images import marketplace_image_network_constraint
+from carl.core.models import JsonValue
 from carl.core.pipeline import pipeline_work_constraints
 from carl.core.resources import ResourceRequest
 from carl.dataset_setup_stages import (
@@ -75,7 +77,7 @@ from carl.io.claude import ClaudeCli
 from carl.io.connectivity import ConnectivityMonitor
 from carl.io.dataset_setup import DatasetSetupEngine
 from carl.io.dataset_workflow_owner import managed_dataset_workflow_service
-from carl.io.paths import user_directories
+from carl.io.paths import CarlDirectories, user_directories
 from carl.io.proton import SharedProtonWireproxyManager
 from carl.io.provenance import collect_code_provenance_async, process_invocation
 from carl.io.resident_sessions import ResidentSessionPool
@@ -111,6 +113,26 @@ class WorkRuntime:
     database: Database
     registry: WorkHandlerRegistry
     stages: StageHandlerRegistry
+
+
+class StatelessRegistryBuilder(Protocol):
+    def __call__(
+        self, *, facebook: FacebookStatelessStageDependencies, ebay: EbayItemWorkerDependencies
+    ) -> StageHandlerRegistry: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeComposition:
+    """Explicit dependency composition; ordinary worker defaults remain unchanged."""
+
+    directories: CarlDirectories
+    stateless_registry_builder: StatelessRegistryBuilder = build_stateless_stage_registry
+    connectivity_probe: Callable[[], Awaitable[dict[str, JsonValue]]] | None = None
+    scheduling_utc_now_ns: Callable[[], int] = time_ns
+    coordinator_registry_builder: (
+        Callable[[Database, WorkHandlerRegistry], StageHandlerRegistry] | None
+    ) = None
+    dispatch_gate: anyio.Event | None = None
 
 
 async def prepare_worker_constraints(database: Database, repository_root: Path) -> None:
@@ -203,11 +225,15 @@ async def managed_worker_pool(
     eligible_identifiers: tuple[str, ...] | None = None,
     claude: ClaudeCli | None = None,
     worker_count: int | None = None,
+    composition: RuntimeComposition | None = None,
 ) -> AsyncGenerator[WorkRuntime]:
     """Run bounded workers against one shared durable queue."""
 
+    directories = user_directories() if composition is None else composition.directories
+    scheduling_now = time_ns if composition is None else composition.scheduling_utc_now_ns
+
     await prepare_worker_constraints(database, repository_root)
-    await database.reconcile_terminal_network_activities(recorded_at_utc_ns=time_ns())
+    _ = await database.reconcile_terminal_network_activities(recorded_at_utc_ns=time_ns())
     claude = ClaudeCli() if claude is None else claude
     analysis_registry = build_analysis_worker_registry(
         AnalysisWorkerDependencies(
@@ -235,14 +261,14 @@ async def managed_worker_pool(
     proton_manager = SharedProtonWireproxyManager()
     facebook_registry = build_routed_facebook_worker_registry(
         database=database,
-        directories=user_directories(),
+        directories=directories,
         new_identifier=_identifier,
         proton_manager=proton_manager,
     )
     ebay_registry = build_ebay_worker_registry(
         EbaySearchWorkerDependencies(
             database=database,
-            directories=user_directories(),
+            directories=directories,
             new_identifier=_identifier,
         )
     )
@@ -272,14 +298,14 @@ async def managed_worker_pool(
     ebay_item_registry = build_ebay_item_worker_registry(
         EbayItemWorkerDependencies(
             database=database,
-            directories=user_directories(),
+            directories=directories,
             new_identifier=_identifier,
             proton_manager=proton_manager,
         )
     )
     travel_registry = build_travel_worker_registry(
         TravelWorkerDependencies(
-            service=ConfiguredTravelService(directories=user_directories()),
+            service=ConfiguredTravelService(directories=directories),
             new_identifier=_identifier,
         )
     )
@@ -297,16 +323,24 @@ async def managed_worker_pool(
             *pipeline_registry.handlers,
             *pipeline_listing_registry.handlers,
             *travel_registry.handlers,
-            *build_travel_data_worker_registry(TravelDataManager(user_directories())).handlers,
+            *build_travel_data_worker_registry(TravelDataManager(directories)).handlers,
         )
     )
     manager = stage_manager(database)
+    if composition is not None:
+        manager = replace(manager, utc_now_ns=scheduling_now)
     provenance = await collect_code_provenance_async(repository_root)
     invocation = process_invocation()
-    directories = user_directories()
     residents = ResidentSessionPool(manager, StageHandlerRegistry((), ()), provenance, invocation)
     engine = DatasetSetupEngine(directories, manager=TravelDataManager(directories))
-    policy = StagePolicy(ConnectivityMonitor(database, _identifier, time_ns))
+    monitor = (
+        ConnectivityMonitor(database, _identifier, scheduling_now)
+        if composition is None or composition.connectivity_probe is None
+        else ConnectivityMonitor(
+            database, _identifier, scheduling_now, probe=composition.connectivity_probe
+        )
+    )
+    policy = StagePolicy(monitor)
     session_registry = build_session_stage_registry(
         facebook=FacebookSessionStageDependencies(
             database, directories, _identifier, proton_manager, residents
@@ -316,9 +350,13 @@ async def managed_worker_pool(
         ),
     )
     stage_registries = (
-        build_stateless_stage_registry(
+        (
+            build_stateless_stage_registry
+            if composition is None
+            else composition.stateless_registry_builder
+        )(
             facebook=FacebookStatelessStageDependencies(
-                database, directories, _identifier, proton_manager
+                database, directories, _identifier, proton_manager, utc_now_ns=scheduling_now
             ),
             ebay=EbayItemWorkerDependencies(
                 database, directories, _identifier, proton_manager=proton_manager
@@ -331,7 +369,13 @@ async def managed_worker_pool(
         build_ebay_analysis_stage_registry(
             AnalysisWorkerDependencies(database, claude, _identifier)
         ),
-        build_coordinator_stage_registry(database, registry),
+        (
+            composition.coordinator_registry_builder(database, registry)
+            if composition is not None and composition.coordinator_registry_builder is not None
+            else build_coordinator_stage_registry(database, registry)
+            if composition is None
+            else build_coordinator_stage_registry(database, registry, utc_now_ns=scheduling_now)
+        ),
         build_travel_stage_registry(
             TravelStageDependencies(
                 database, ConfiguredTravelService(directories=directories), _identifier
@@ -421,10 +465,16 @@ async def managed_worker_pool(
                     eligible_identifiers=eligible_identifiers,
                     execution_count=worker_count,
                 )
+
+                async def dispatch() -> None:
+                    if composition is not None and composition.dispatch_gate is not None:
+                        await composition.dispatch_gate.wait()
+                    await dispatcher.run()
+
                 # Pool tasks own independent admission, even if a caller opens
                 # this scope while holding an unrelated resource reservation.
-                task_group.start_soon(manager.resources._run_background, policy.run, ())  # pyright: ignore[reportPrivateUsage]
-                task_group.start_soon(manager.resources._run_background, dispatcher.run, ())  # pyright: ignore[reportPrivateUsage]
+                _ = task_group.start_soon(manager.resources._run_background, policy.run, ())  # pyright: ignore[reportPrivateUsage]
+                _ = task_group.start_soon(manager.resources._run_background, dispatch, ())  # pyright: ignore[reportPrivateUsage]
                 try:
                     yield WorkRuntime(database=database, registry=registry, stages=stages)
                 finally:
