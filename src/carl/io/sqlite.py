@@ -230,9 +230,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=22,
+    version=23,
 )
 
+_V22_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 22})
+_V22_SCHEMA_DEFINITION_SHA256 = "c250b9d74c7772b43569ca7342e462e986690aa290d7f1502e2a2525dd52c767"
 _V21_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 21})
 _V21_SCHEMA_DEFINITION_SHA256 = "1996b96bed45d25fe4dd507eeb5603e87964ecaec5a9a85fed4ffd4ef8cc0a01"
 _V20_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 20})
@@ -275,6 +277,16 @@ _V2_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 2})
 _V2_SCHEMA_DEFINITION_SHA256 = "bdd3d1b6a8dc041e7bf86e6c5881a06df910c0efe72612bb2135174b97db553b"
 _V1_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 1})
 _V1_SCHEMA_DEFINITION_SHA256 = "b3fa83413034992e01f84abf8ffe4993864cfad23b4792442b38b60a47b8dca6"
+
+_HISTORY_QUERY_INDEXES = """
+CREATE INDEX IF NOT EXISTS work_items_completed_acquisition
+ON work_items(kind_parts_json, acquisition_resource_identity_json, created_at_utc_ns DESC, id)
+WHERE state='completed' AND acquisition_resource_identity_json IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS work_events_terminal_time
+ON work_events(recorded_at_utc_ns, work_item_id, event_kind)
+WHERE event_kind IN ('completed', 'terminal_failure', 'cancelled');
+"""
 
 _SCHEMA = (
     """
@@ -941,6 +953,7 @@ ON records(json_extract(value_json, '$.search_run_record_identifier'), object_id
     + fair_sql.FAIR_SCHEMA
     + progress_sql.PROGRESS_SCHEMA
     + scheduler_sql.SCHEDULER_SCHEMA
+    + _HISTORY_QUERY_INDEXES
 )
 
 _SCHEMA_DEFINITION_SHA256 = hashlib.sha256(_SCHEMA.encode()).hexdigest()
@@ -4496,9 +4509,14 @@ class Database:
         their executor stopped. This snapshot can delay dispatch, never grant it.
         """
         async with self._connections.reader() as connection:
+            # The composite foreign key guarantees the allocation's scope.
+            # Joining by the globally unique token alone keeps the inner seek
+            # on its primary key instead of scanning all historical allocations
+            # through the scope index once for each held permit.
             cursor = await connection.execute(
-                """SELECT a.name,SUM(a.units) FROM resource_allocations AS a
-                JOIN resource_permits AS p ON p.token=a.permit_token AND p.scope=a.scope
+                """SELECT a.name,SUM(a.units)
+                FROM resource_permits AS p INDEXED BY resource_permits_occupied
+                CROSS JOIN resource_allocations AS a ON a.permit_token=p.token
                 WHERE p.scope=? AND p.state='held' GROUP BY a.name""",
                 (scope,),
             )
@@ -4778,6 +4796,14 @@ class Database:
         }
 
     @staticmethod
+    def _v22_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V22_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "22",
+            "schema_definition_sha256": _V22_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v21_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V21_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -4974,6 +5000,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v22_metadata())
                 and not await cls._metadata_matches(connection, cls._v21_metadata())
                 and not await cls._metadata_matches(connection, cls._v20_metadata())
                 and not await cls._metadata_matches(connection, cls._v19_metadata())
@@ -5487,6 +5514,12 @@ class Database:
                     )
             if await self._metadata_matches(connection, self._v21_metadata()):
                 await self._apply_schema(connection)
+                for key, value in self._v22_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value=? WHERE key=?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v22_metadata()):
+                await connection.execute(_HISTORY_QUERY_INDEXES)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value=? WHERE key=?", (value, key)
@@ -8081,15 +8114,18 @@ class Database:
             recent_work_cursor = await connection.execute(
                 """
                 SELECT work.kind_parts_json, event.event_kind, count(*)
-                FROM work_events AS event
-                JOIN work_items AS work ON work.id = event.work_item_id
+                FROM work_events AS event INDEXED BY work_events_terminal_time
+                CROSS JOIN work_items AS work ON work.id = event.work_item_id
                 WHERE event.recorded_at_utc_ns >= ?
-                  AND work.kind_parts_json IN (SELECT kind_parts_json FROM work_items GROUP BY kind_parts_json ORDER BY kind_parts_json LIMIT 33)
+                  AND work.kind_parts_json IN (SELECT value FROM json_each(?))
                   AND event.event_kind IN ('completed', 'terminal_failure', 'cancelled')
                 GROUP BY work.kind_parts_json, event.event_kind
                 ORDER BY work.kind_parts_json, event.event_kind
                 """,
-                (recent_since_utc_ns,),
+                (
+                    recent_since_utc_ns,
+                    _json(list(dict.fromkeys(_text(row[0]) for row in work_count_rows))),
+                ),
             )
             recent_work_rows = await recent_work_cursor.fetchall()
             active_work_cursor = await connection.execute(
@@ -8111,8 +8147,8 @@ class Database:
                        work.created_at_utc_ns, work.eligible_at_utc_ns,
                        {scheduler_sql.payload_projection("work.payload_json")}, {scheduler_sql.result_projection("work.result_json")}, {scheduler_sql.error_projection("work.error_json")},
                        event.recorded_at_utc_ns
-                FROM work_events AS event
-                JOIN work_items AS work ON work.id = event.work_item_id
+                FROM work_events AS event INDEXED BY work_events_terminal_time
+                CROSS JOIN work_items AS work ON work.id = event.work_item_id
                 WHERE event.event_kind IN ('completed', 'terminal_failure', 'cancelled')
                   AND event.recorded_at_utc_ns >= ?
                 ORDER BY event.sequence DESC
@@ -10855,8 +10891,9 @@ class Database:
             cursor = await connection.execute(
                 """
                 SELECT work.id, work.payload_json, work.result_json
-                FROM work_items AS work INDEXED BY work_items_analysis_lookup
+                FROM work_items AS work INDEXED BY work_items_completed_acquisition
                 WHERE work.kind_parts_json = ? AND work.state = 'completed'
+                  AND work.acquisition_resource_identity_json = ?
                   AND work.id != ? AND json_extract(work.payload_json, ?) = ?
                   AND EXISTS (
                       SELECT 1 FROM work_events AS event
@@ -10885,6 +10922,7 @@ class Database:
                 """,
                 (
                     _json(list(kind)),
+                    acquisition_resource_identity_json(kind, current_payload),
                     work_identifier,
                     selector,
                     selected,

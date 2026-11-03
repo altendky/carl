@@ -6,6 +6,7 @@ repos:
         # Frozen historical DDL is checked byte-for-byte against its schema hash.
         exclude: ^src/carl/_tests/data/schema_v[0-9]+\.sql$
       - id: end-of-file-fixer
+        exclude: ^src/carl/_tests/data/schema_v[0-9]+\.sql$
       - id: check-added-large-files
       - id: check-case-conflict
       - id: check-json
