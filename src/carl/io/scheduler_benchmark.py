@@ -521,6 +521,49 @@ async def _terminal(database: Database, identifiers: tuple[str, ...]) -> list[di
     return rows
 
 
+async def _outage_checkpointed(database: Database, identifiers: tuple[str, ...], now: int) -> bool:
+    # The probe callback runs before its durable decision and connectivity
+    # reviews finish. Advance the fixture clock only after every image has
+    # published its retry deadline or is blocked at network admission.
+    async with database._connections.reader() as connection:  # pyright: ignore[reportPrivateUsage]
+        row = await (
+            await connection.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM network_connectivity
+                    WHERE singleton=1 AND paused=1 AND probe_token IS NULL
+                      AND json_extract(result_json,'$.reachable')=0
+                ) AND (
+                    SELECT count(*) FROM json_each(?) AS requested
+                    JOIN work_items AS work ON work.id=requested.value
+                    LEFT JOIN work_stages AS stage ON stage.work_item_id=work.id
+                        AND stage.state IN ('pending','running')
+                    WHERE (
+                        work.state IN ('completed','terminal_failure','cancelled')
+                        AND stage.id IS NULL
+                    ) OR (
+                        work.state='pending' AND stage.id IS NULL
+                        AND json_extract(work.result_json,'$.state')='waiting_for_connectivity'
+                        AND work.eligible_at_utc_ns>?
+                    ) OR (
+                        work.state IN ('pending','leased') AND stage.state='pending'
+                        AND stage.wait_kind='connectivity' AND stage.eligible_at_utc_ns>?
+                        AND (
+                            json_extract(stage.definition_json,'$.network_activity') IS NOT NULL
+                            OR EXISTS (
+                                SELECT 1 FROM json_each(stage.definition_json,'$.resources')
+                                WHERE json_extract(value,'$.name')='http'
+                            )
+                        )
+                    )
+                )=?
+                """,
+                (encode_json(list(identifiers)), now, now, len(identifiers)),
+            )
+        ).fetchone()
+    return row is not None and row[0] == 1
+
+
 async def _scalar(database: Database, statement: str) -> int:
     # This benchmark owns the entire synthetic database. Only bounded scalar
     # lifecycle/cost measurements cross this private adapter boundary.
@@ -792,6 +835,16 @@ async def _run_iteration(
                             await _enqueue(database, state, [probe])
                             _ = await _terminal(database, (probe.identifier,))
                             state.checks.append("unrelated_progress_during_outage")
+                            if config.mode == BenchmarkMode.VERIFY:
+
+                                async def outage_checkpointed() -> bool:
+                                    return await _outage_checkpointed(
+                                        database,
+                                        tuple(definition.identifier for definition in definitions),
+                                        state.now(),
+                                    )
+
+                                await _until(outage_checkpointed)
                             state.outage = False
                             if config.mode == BenchmarkMode.VERIFY:
                                 state.offset_ns += 31_000_000_000

@@ -15,8 +15,15 @@ from pydantic import ValidationError
 from carl.benchmark_cli import scheduler
 from carl.core.benchmark import BenchmarkConfig, BenchmarkMode, BenchmarkScenario
 from carl.core.json import encode_json
+from carl.core.models import JsonValue
+from carl.core.stages import StageAttemptContext
+from carl.core.worker import RetryWork
+from carl.io import scheduler_benchmark as benchmark_io
 from carl.io.claude import ClaudeCli
 from carl.io.scheduler_benchmark import run_scheduler_benchmark
+from carl.io.sqlite import Database
+from carl.io.stage_policy import StagePolicy, _Review
+from carl.io.stage_publication import StageHandlerResult
 
 
 @pytest.fixture(params=("trio", "asyncio"))
@@ -107,6 +114,74 @@ async def test_throughput_uses_real_elapsed_and_reports_completed_denominator(
     )
     result = report.iterations[0]
     assert result.completed_per_second == result.completed * 1_000_000_000 / result.elapsed_ns
+
+
+@pytest.mark.anyio
+async def test_outage_clock_advance_waits_for_the_offline_review_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review_ready, release_review = anyio.Event(), anyio.Event()
+    state: benchmark_io._State | None = None
+    offsets_before_publication: list[int] = []
+    original_probe = benchmark_io._State.probe
+    original_review = StagePolicy.review
+    original_terminal = benchmark_io._terminal
+
+    async def probe(self: benchmark_io._State) -> dict[str, JsonValue]:
+        nonlocal state
+        state = self
+        return await original_probe(self)
+
+    async def review(
+        self: StagePolicy, payload: _Review, context: StageAttemptContext
+    ) -> StageHandlerResult:
+        outcome = await original_review(self, payload, context)
+        if (
+            not review_ready.is_set()
+            and isinstance(outcome, RetryWork)
+            and isinstance(outcome.reason, dict)
+            and outcome.reason.get("kind") == "connectivity_outage"
+        ):
+            review_ready.set()
+            await release_review.wait()
+            assert state is not None
+            offsets_before_publication.append(state.offset_ns)
+            # Returning this retry after the jump would schedule a fresh real
+            # 30-second wait. The benchmark must await its durable publication.
+            assert state.offset_ns == 0
+        return outcome
+
+    async def terminal(
+        database: Database, identifiers: tuple[str, ...]
+    ) -> list[dict[str, JsonValue]]:
+        rows = await original_terminal(database, identifiers)
+        if identifiers == ("unrelated",):
+            await review_ready.wait()
+            # No checkpoint after releasing the review: a caller that advances
+            # the clock immediately would do so before this review can resume.
+            release_review.set()
+        return rows
+
+    monkeypatch.setattr(benchmark_io._State, "probe", probe)
+    monkeypatch.setattr(StagePolicy, "review", review)
+    monkeypatch.setattr(benchmark_io, "_terminal", terminal)
+    report = await run_scheduler_benchmark(
+        BenchmarkConfig(
+            scenario=BenchmarkScenario.OUTAGE_AND_PACING,
+            items=2,
+            image_width=16,
+            image_height=16,
+            chunk_delay_ms=0,
+            analysis_delay_ms=0,
+            timeout_seconds=30,
+            capacities={"http": 2, "cpu": 2, "analysis": 1},
+        ),
+        repository_root=Path(__file__).resolve().parents[3],
+        work_parent=tmp_path,
+    )
+    assert offsets_before_publication == [0]
+    assert report.iterations[0].completed == 2
+    assert tuple(tmp_path.iterdir()) == ()
 
 
 @pytest.mark.parametrize("capacities", ({"secret": 1}, {"cpu": 0}, {"http": 257}))

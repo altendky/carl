@@ -1,6 +1,6 @@
 """Explicit scheduling intent, independent of acquisition identity and constraints."""
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from carl.core.models import JsonStringEnumeration, StrictModel
 
@@ -28,7 +28,33 @@ class FairLane(JsonStringEnumeration):
     RESIDENT = "resident"
 
 
+class FairDispatchLaneHorizon(StrictModel):
+    lane: FairLane
+    sequence: int = Field(ge=0)
+    interactive_streak: int = Field(ge=0)
+
+
+class FairDispatchHorizon(StrictModel):
+    """Immutable membership and ordering bounds for one ephemeral discovery pass."""
+
+    scope: str = Field(min_length=1)
+    captured_at_utc_ns: int = Field(ge=0)
+    workspace_rowid_high_water: int = Field(ge=0)
+    lanes: tuple[FairDispatchLaneHorizon, ...] = Field(
+        min_length=len(FairLane), max_length=len(FairLane)
+    )
+
+    @model_validator(mode="after")
+    def validate_lanes(self) -> "FairDispatchHorizon":
+        if {lane.lane for lane in self.lanes} != set(FairLane):
+            raise ValueError("A dispatch horizon requires each resource lane exactly once")
+        return self
+
+
 class FairDispatchCursor(StrictModel):
+    # Cursors are process-local, not stored in SQLite. A legacy cursor without
+    # its pass horizon must be rejected instead of resuming a mutable scan.
+    horizon: FairDispatchHorizon
     preference: int = Field(default=0, ge=0, le=1)
     lane: FairLane
     service_class: SchedulingServiceClass
