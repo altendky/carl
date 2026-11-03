@@ -199,6 +199,7 @@ from carl.core.work_dispatch import (
 )
 from carl.core.work_progress import ProgressDrainResult, ProgressReconcilePage
 from carl.core.worker import FollowOnWork
+from carl.io import fair_eligibility
 from carl.io import fair_scheduling as fair_sql
 from carl.io import scheduler_activity as scheduler_sql
 from carl.io import work_progress as progress_sql
@@ -2093,285 +2094,24 @@ class Database:
             for row in rows
         )
 
-    async def _fair_offer_eligible(
+    async def _fair_offers_eligible(
         self,
         connection: AsyncConnection,
         *,
         scope: str,
-        work_identifier: str,
-        stage_identifier: str | None,
+        offers: tuple[tuple[str, str | None], ...],
         lane: FairLane,
         now_utc_ns: int,
-    ) -> bool:
-        """Check only an offered head; do not create operations or reservations."""
-        row = await (
-            await connection.execute(
-                """SELECT state,lease_expires_at_utc_ns,kind_parts_json,
-                CASE WHEN kind_parts_json=? THEN json_extract(payload_json,'$.request.stack_identifier') END,
-                CASE WHEN kind_parts_json=? THEN json_extract(payload_json,'$.routing') END,
-                acquisition_resource_identity_json,eligible_at_utc_ns,payload_schema_version,attempt
-                FROM work_items WHERE id=?""",
-                (
-                    _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)),
-                    _json(list(COLLECT_SEARCH_WORK_KIND)),
-                    work_identifier,
-                ),
-            )
-        ).fetchone()
-        if row is None or row[0] not in ("pending", "leased"):
-            return False
-        stored_offer = await (
-            await connection.execute(
-                """SELECT o.signature,o.resources_json,f.stage_id,h.resources_json FROM fair_offers o
-            JOIN fair_ready f ON f.work_item_id=o.work_item_id
-            LEFT JOIN fair_initial_resources h ON h.kind_parts_json=f.kind_parts_json
-                AND h.payload_schema_version=f.payload_schema_version
-            WHERE o.scope=? AND o.lane=? AND o.work_item_id=?""",
-                (scope, lane.value, work_identifier),
-            )
-        ).fetchone()
-        initial = stored_offer is not None and _text(stored_offer[0]).startswith("initial:")
-        if initial:
-            expected = (
-                "initial:"
-                + hashlib.sha256(
-                    fair_sql.initial_offer_signature(
-                        _text(row[2]), _integer(row[7]), _integer(row[8])
-                    ).encode()
-                ).hexdigest()
-            )
-            if (
-                stored_offer is None
-                or stored_offer[0] != expected
-                or stored_offer[2] is not None
-                or stored_offer[1] != stored_offer[3]
-                or row[0] != "pending"
-                or _integer(row[6]) > now_utc_ns
-            ):
-                return False
-        if lane is FairLane.RESIDENT:
-            if _integer(row[6]) > now_utc_ns:
-                return False
-            pending = await (
-                await connection.execute(
-                    "SELECT json_extract(definition_json,'$.not_before_utc_ns') FROM work_stages WHERE work_item_id=? AND state='pending'",
-                    (work_identifier,),
-                )
-            ).fetchone()
-            if pending is not None and _integer(pending[0]) > now_utc_ns:
-                return False
-            if stage_identifier is not None:
-                stage_row = await (
-                    await connection.execute(
-                        "SELECT definition_json FROM work_stages WHERE id=? AND work_item_id=? AND state='pending'",
-                        (stage_identifier, work_identifier),
-                    )
-                ).fetchone()
-                if (
-                    stage_row is None
-                    or stored_offer is None
-                    or stored_offer[0] != hashlib.sha256(_text(stage_row[0]).encode()).hexdigest()
-                ):
-                    return False
-            if initial:
-                available, _, _ = await self._constraint_availability(
-                    connection,
-                    work_item_identifier=work_identifier,
-                    now_utc_ns=now_utc_ns,
-                    check_rates=True,
-                )
-                if not available:
-                    return False
-            if row[2] == _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)):
-                cooldowns = await self._ebay_search_stack_cooldowns(connection, now_utc_ns)
-                if (
-                    cooldowns.get("ebay_anonymous" if row[3] is None else _text(row[3]), 0)
-                    > now_utc_ns
-                ):
-                    return False
-            elif row[2] == _json(list(COLLECT_SEARCH_WORK_KIND)):
-                cooldowns = await self._facebook_search_route_cooldowns(connection, now_utc_ns)
-                if cooldowns.get("null" if row[4] is None else _text(row[4]), 0) > now_utc_ns:
-                    return False
-            return (
-                await (
-                    await connection.execute(
-                        "SELECT 1 FROM resident_sessions WHERE work_item_id=? AND state IN ('opening','ready','closing','quarantined') LIMIT 1",
-                        (work_identifier,),
-                    )
-                ).fetchone()
-                is None
-            )
-        if stage_identifier is None:
-            fresh = await (
-                await connection.execute(
-                    """SELECT f.stage_id,o.signature FROM fair_ready f JOIN fair_offers o ON o.work_item_id=f.work_item_id
-                WHERE f.work_item_id=? AND o.scope=? AND o.lane=?""",
-                    (work_identifier, scope, lane.value),
-                )
-            ).fetchone()
-            expected = (
-                "initial:"
-                + hashlib.sha256(
-                    fair_sql.initial_offer_signature(
-                        _text(row[2]), _integer(row[7]), _integer(row[8])
-                    ).encode()
-                ).hexdigest()
-            )
-            if (
-                row[0] != "pending"
-                or _integer(row[6]) > now_utc_ns
-                or fresh is None
-                or fresh[0] is not None
-                or fresh[1] != expected
-            ):
-                return False
-            active = await (
-                await connection.execute(
-                    "SELECT 1 FROM stage_attempts WHERE work_item_id=? AND state IN ('pending','active') LIMIT 1",
-                    (work_identifier,),
-                )
-            ).fetchone()
-            available, _, _ = await self._constraint_availability(
-                connection,
-                work_item_identifier=work_identifier,
-                now_utc_ns=now_utc_ns,
-                check_rates=True,
-            )
-            return active is None and available
-        if row[0] == "leased" and row[1] is not None and _integer(row[1]) > now_utc_ns:
-            return False
-        stage = await (
-            await connection.execute(
-                "SELECT definition_json,execution,created_at_utc_ns FROM work_stages WHERE id=? AND work_item_id=? AND state='pending'",
-                (stage_identifier, work_identifier),
-            )
-        ).fetchone()
-        if stage is None:
-            return False
-        definition = StageDefinition.model_validate_json(_text(stage[0]))
-        if definition.not_before_utc_ns > now_utc_ns:
-            return False
-        stored = await (
-            await connection.execute(
-                "SELECT signature FROM fair_offers WHERE scope=? AND lane=? AND work_item_id=?",
-                (scope, lane.value, work_identifier),
-            )
-        ).fetchone()
-        if (
-            stored is None
-            or stored[0] != hashlib.sha256(definition.model_dump_json().encode()).hexdigest()
-        ):
-            return False
-        dependency = await (
-            await connection.execute(
-                "SELECT 1 FROM stage_dependencies d JOIN work_items w ON w.id=d.dependency_work_id WHERE d.stage_id=? AND w.state NOT IN ('completed','terminal_failure','cancelled') LIMIT 1",
-                (stage_identifier,),
-            )
-        ).fetchone()
-        if dependency is not None:
-            return False
-        attempt = await (
-            await connection.execute(
-                "SELECT state FROM stage_attempts WHERE operation_id=?",
-                (definition.operation_identifier,),
-            )
-        ).fetchone()
-        available, _, _ = await self._constraint_availability(
+    ) -> frozenset[str]:
+        return await fair_eligibility.eligible_offers(
             connection,
-            work_item_identifier=work_identifier,
+            scope=scope,
+            offers=offers,
+            lane=lane,
             now_utc_ns=now_utc_ns,
-            check_rates=attempt is not None and attempt[0] == "pending",
+            ebay_cooldowns=await self._ebay_search_stack_cooldowns(connection, now_utc_ns),
+            facebook_cooldowns=await self._facebook_search_route_cooldowns(connection, now_utc_ns),
         )
-        if not available:
-            return False
-        if row[5] is not None:
-            peer = await (
-                await connection.execute(
-                    """SELECT 1 FROM work_items WHERE kind_parts_json=? AND acquisition_resource_identity_json=? AND id!=? AND state IN ('leased','cancelling') AND (lease_expires_at_utc_ns>? OR EXISTS(SELECT 1 FROM stage_attempts WHERE work_item_id=work_items.id AND state='active')) LIMIT 1""",
-                    (row[2], row[5], work_identifier, now_utc_ns),
-                )
-            ).fetchone()
-            if peer is not None:
-                return False
-        network = definition.network_activity is not None or any(
-            request.name == "http" for request in definition.resources
-        )
-        if not network:
-            return True
-        connectivity = await (
-            await connection.execute("SELECT paused FROM network_connectivity WHERE singleton=1")
-        ).fetchone()
-        if connectivity is not None and connectivity[0] == 1:
-            return False
-        if row[2] == _json(list(COLLECT_EBAY_SEARCH_WORK_KIND)):
-            cooldowns = await self._ebay_search_stack_cooldowns(connection, now_utc_ns)
-            stack = "ebay_anonymous" if row[3] is None else _text(row[3])
-            if cooldowns.get(stack, 0) > now_utc_ns:
-                return False
-        elif row[2] == _json(list(COLLECT_SEARCH_WORK_KIND)):
-            cooldowns = await self._facebook_search_route_cooldowns(connection, now_utc_ns)
-            routing = "null" if row[4] is None else _text(row[4])
-            if cooldowns.get(routing, 0) > now_utc_ns:
-                return False
-        template = definition.network_activity
-        if template is None:
-            return True
-        if template.not_before_utc_ns > now_utc_ns:
-            return False
-        constraints = await (
-            await connection.execute(
-                """SELECT DISTINCT c.definition_json FROM scheduling_constraints c
-            JOIN json_each(?) s ON c.scope_kind=json_extract(s.value,'$[0]') AND c.scope_identity_json=json_extract(s.value,'$[1]')
-            WHERE c.subject_kind='network_activity' AND NOT EXISTS(SELECT 1 FROM scheduling_constraint_retirements r WHERE r.identifier_parts_json=c.identifier_parts_json)""",
-                (
-                    _json(
-                        [
-                            [scope.kind.value, _json(list(scope.identity))]
-                            for scope in template.scopes
-                        ]
-                    ),
-                ),
-            )
-        ).fetchall()
-        for stored_constraint in constraints:
-            constraint = CONSTRAINT_ADAPTER.validate_json(_text(stored_constraint[0]))
-            identifier = _json(list(constraint.identifier))
-            if isinstance(constraint, UniformHoldoffConstraint):
-                delay = constraint.minimum_ns + int(
-                    hashlib.sha256(
-                        f"{stage_identifier}:{_integer(stage[1]) + 1}:{constraint.minimum_ns}:{constraint.maximum_ns}".encode()
-                    ).hexdigest(),
-                    16,
-                ) % (constraint.maximum_ns - constraint.minimum_ns + 1)
-                if _integer(stage[2]) + delay > now_utc_ns:
-                    return False
-            elif isinstance(constraint, SlidingWindowRateConstraint):
-                count = await (
-                    await connection.execute(
-                        "SELECT count(*) FROM rate_starts WHERE constraint_identifier_parts_json=? AND reserved_at_utc_ns>?",
-                        (identifier, now_utc_ns - constraint.period_ns),
-                    )
-                ).fetchone()
-                assert count is not None
-                if _integer(count[0]) >= constraint.maximum_starts:
-                    return False
-            elif isinstance(constraint, ConcurrencyConstraint):
-                count = await (
-                    await connection.execute(
-                        """SELECT count(*) FROM network_activities a JOIN network_activity_scopes s ON s.network_activity_id=a.id
-                    WHERE a.state='admitted' AND a.permit_expires_at_utc_ns>? AND s.scope_kind=? AND s.scope_identity_json=?""",
-                        (
-                            now_utc_ns,
-                            constraint.scope.kind.value,
-                            _json(list(constraint.scope.identity)),
-                        ),
-                    )
-                ).fetchone()
-                assert count is not None
-                if _integer(count[0]) >= constraint.maximum_active:
-                    return False
-        return True
 
     async def _fair_gate(
         self,
@@ -2400,12 +2140,13 @@ class Database:
             now=now_utc_ns,
         )
 
-        async def eligible(work: str, stage: str | None, offered_lane: FairLane) -> bool:
-            return await self._fair_offer_eligible(
+        async def eligible(
+            offers: tuple[tuple[str, str | None], ...], offered_lane: FairLane
+        ) -> frozenset[str]:
+            return await self._fair_offers_eligible(
                 connection,
                 scope=scope,
-                work_identifier=work,
-                stage_identifier=stage,
+                offers=offers,
                 lane=offered_lane,
                 now_utc_ns=now_utc_ns,
             )

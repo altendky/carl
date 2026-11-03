@@ -854,7 +854,7 @@ async def admission_allowed(
     work_identifier: str,
     capacities: dict[str, int],
     now: int,
-    eligible: Callable[[str, str | None, FairLane], Awaitable[bool]],
+    eligible: Callable[[tuple[tuple[str, str | None], ...], FairLane], Awaitable[frozenset[str]]],
 ) -> bool:
     """Arbitrate only live driver offers; inactive queue rows reserve no turn."""
     occupied_rows = await (
@@ -893,15 +893,17 @@ async def admission_allowed(
             (scope, lane.value, now, now, now - FAIR_AGING_NS, now - FAIR_AGING_NS),
         )
     ).fetchall()
+    eligible_work = await eligible(
+        tuple((str(row[0]), None if row[1] is None else str(row[1])) for row in rows), lane
+    )
     candidates: list[tuple[str, str, tuple[ResourceRequest, ...], int]] = []
     for row in rows:
         identifier = str(row[0])
-        stage = None if row[1] is None else str(row[1])
         requests = tuple(
             ResourceRequest.model_validate_json(encode_json(value))
             for value in cast(list[JsonValue], decode_json(str(row[3])))
         )
-        if not await eligible(identifier, stage, lane):
+        if identifier not in eligible_work:
             await clear_offer(connection, scope, lane, identifier)
             continue
         # A heavy CPU offer can drain CPU, but cannot stop unrelated budgets
