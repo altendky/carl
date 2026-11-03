@@ -103,7 +103,10 @@ async def _pending_publish(database: Database, initial: StageDefinition) -> Stag
             stage = await database.active_stage_for_work(
                 initial.work_item_identifier, initial.operation_identifier
             )
-            if stage is not None and stage.kind == _PUBLISH:
+            # Checkpoint visibility precedes the physical guard's cleanup.
+            # This assertion phase observes both the saved continuation and
+            # the completed HTTP teardown before checking its idle resources.
+            if stage is not None and stage.kind == _PUBLISH and await _held(database, "http") == 0:
                 return stage
             await anyio.sleep(0.01)
 
