@@ -5951,12 +5951,15 @@ class Database:
         operation_identifier: str,
         at_utc_ns: int,
         reason: str,
+        retired_definitions: tuple[Constraint, ...] = (),
     ) -> None:
         """Atomically retire known constraints and register immutable replacements.
 
         Retired definitions and rate reservations remain available for audit.
         Repeating a retirement leaves its original operation, reason, and timestamp
-        intact. A missing old constraint needs no retirement row.
+        intact. A missing old constraint needs no retirement row. Definitions can
+        restrict retirement to exact shipped policies, preserving customized
+        policies even when they reuse a known identifier.
         """
 
         if at_utc_ns < 0 or not reason or not operation_identifier:
@@ -5966,7 +5969,13 @@ class Database:
         replacement_identifiers = [constraint.identifier for constraint in replacements]
         if len(set(replacement_identifiers)) != len(replacement_identifiers):
             raise ValueError("Duplicate replacement constraint identifier")
-        if set(retired_identifiers) & set(replacement_identifiers):
+        expected_definitions: dict[tuple[str, ...], set[str]] = {}
+        for constraint in retired_definitions:
+            expected_definitions.setdefault(constraint.identifier, set()).add(
+                _json(constraint.model_dump(mode="json"))
+            )
+        retirement_identifiers = tuple(dict.fromkeys((*retired_identifiers, *expected_definitions)))
+        if set(retirement_identifiers) & set(replacement_identifiers):
             raise ValueError("A retired constraint cannot also be a replacement")
 
         async with self._connections.writer() as connection:
@@ -5983,7 +5992,7 @@ class Database:
                 )
                 if await cursor.fetchone() is not None:
                     raise ValueError("A retired constraint cannot be reactivated")
-            for identifier in retired_identifiers:
+            for identifier in retirement_identifiers:
                 identity_json = _json(list(identifier))
                 cursor = await connection.execute(
                     """
@@ -5996,10 +6005,16 @@ class Database:
                 if retired is not None:
                     continue
                 cursor = await connection.execute(
-                    "SELECT 1 FROM scheduling_constraints WHERE identifier_parts_json = ?",
+                    "SELECT definition_json FROM scheduling_constraints WHERE identifier_parts_json = ?",
                     (identity_json,),
                 )
-                if await cursor.fetchone() is None:
+                row = await cursor.fetchone()
+                if row is None:
+                    continue
+                if (
+                    identifier not in retired_identifiers
+                    and _text(row[0]) not in expected_definitions[identifier]
+                ):
                     continue
                 await connection.execute(
                     """

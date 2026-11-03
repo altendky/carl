@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import time_ns
 from typing import Protocol
 
 from carl.coordinator_progress import consumer_progress_watch
@@ -14,8 +13,6 @@ from carl.core.analysis_batch import (
     REQUEST_MISSING_ANALYSES_PAYLOAD_SCHEMA_VERSION,
     REQUEST_MISSING_ANALYSES_WORK_KIND,
     RequestMissingAnalysesPayload,
-    legacy_request_missing_analyses_constraint_identifiers,
-    request_missing_analyses_work_constraints,
 )
 from carl.core.components import Component, ComponentId, Registry
 from carl.core.models import JsonValue, NamedInput
@@ -80,13 +77,6 @@ async def _request_missing_analyses(
     context: AttemptContext,
     dependencies: AnalysisBatchWorkerDependencies,
 ) -> WorkOutcome:
-    await dependencies.database.supersede_constraints(
-        retired_identifiers=legacy_request_missing_analyses_constraint_identifiers(),
-        replacements=request_missing_analyses_work_constraints(),
-        operation_identifier=context.operation_identifier,
-        at_utc_ns=time_ns(),
-        reason="Allow independent analysis batches to plan concurrently",
-    )
     current = await dependencies.database.work(context.work_item_identifier)
     stored = current.get("result")
     checkpoint = stored if isinstance(stored, dict) else {}

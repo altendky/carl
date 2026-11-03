@@ -49,7 +49,6 @@ from carl.core.work import (
     ConcurrencyConstraint,
     SchedulingScope,
     SchedulingScopeKind,
-    SchedulingSubjectKind,
     SlidingWindowRateConstraint,
     WorkCapability,
     WorkDefinition,
@@ -400,7 +399,7 @@ def test_image_url_and_route_are_validated() -> None:
         ).deduplication_identity
     )
     constraints = image_network_constraints(ROUTE)
-    assert len(constraints) == 6
+    assert len(constraints) == 4
     shared_path_constraint = facebook_network_path_constraint(ROUTE)
     assert shared_path_constraint in constraints
     assert shared_path_constraint in facebook_item_network_constraints(ROUTE)
@@ -420,10 +419,7 @@ def test_image_url_and_route_are_validated() -> None:
         for constraint in constraints
         if isinstance(constraint, ConcurrencyConstraint)
     }
-    assert concurrency == {
-        (SchedulingSubjectKind.WORK_ITEM, SchedulingScopeKind.WORK_KIND): 25,
-        (SchedulingSubjectKind.NETWORK_ACTIVITY, SchedulingScopeKind.NETWORK_ACTIVITY_KIND): 25,
-    }
+    assert concurrency == {}
     assert {
         (constraint.maximum_starts, constraint.period_ns)
         for constraint in constraints
@@ -874,7 +870,6 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
             event_identifier="pre-fix-claim",
         )
         assert old_worker.lease is None
-        current_leases = []
         for index in range(IMAGE_SESSION_MAXIMUM_ACTIVE):
             current_worker = await database.claim_work(
                 supported_capabilities=(
@@ -890,7 +885,6 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
                 event_identifier=f"current-claim-{index}",
             )
             assert current_worker.lease is not None
-            current_leases.append(current_worker.lease)
         availability_checks = 0
         original_availability = database._constraint_availability
 
@@ -901,7 +895,7 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
 
         monkeypatch.setattr(database, "_constraint_availability", counted_availability)
         with anyio.fail_after(1):
-            blocked_worker = await database.claim_work(
+            next_worker = await database.claim_work(
                 supported_capabilities=(
                     WorkCapability(
                         kind=COLLECT_IMAGE_WORK_KIND,
@@ -915,10 +909,10 @@ async def test_hundreds_of_terminal_images_are_retried_in_one_bounded_call(
                 event_identifier="another-current-claim",
             )
 
-        assert blocked_worker.lease is None
-        assert blocked_worker.next_eligible_at_utc_ns == min(
-            lease.expires_at_utc_ns for lease in current_leases
-        )
+        # Retrying failures must not reinstall the former whole-work cap of25.
+        # Physical resource permits govern execution in the managed runtime.
+        assert next_worker.lease is not None
+        assert next_worker.next_eligible_at_utc_ns is None
         assert availability_checks == 1
 
 

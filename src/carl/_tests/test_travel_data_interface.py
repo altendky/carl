@@ -183,7 +183,7 @@ def test_cli_verify_reports_configuration_problems_but_status_remains_inspectabl
 
 
 @pytest.mark.anyio
-async def test_setup_requests_replay_exactly_without_inline_build_and_serialize_providers(
+async def test_setup_requests_replay_exactly_without_inline_build_or_work_cap(
     tmp_path: Path,
 ) -> None:
     async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
@@ -224,7 +224,8 @@ async def test_setup_requests_replay_exactly_without_inline_build_and_serialize_
             utc_now_ns=lambda: now,
             event_identifier="claim-two",
         )
-        assert second_claim.lease is None
+        assert second_claim.lease is not None
+        assert second_claim.lease.work_item_identifier != first_claim.lease.work_item_identifier
         # Neither request nor registration executes the dataset manager.
         assert not list(tmp_path.glob("**/manifest.json"))
 

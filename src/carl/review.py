@@ -105,7 +105,6 @@ from carl.core.ebay_refresh import (
     REFRESH_EBAY_SEARCH_WORK_KIND,
     RefreshEbaySearchPayload,
     refresh_ebay_search_work,
-    refresh_ebay_search_work_constraints,
 )
 from carl.core.ebay_search_support import (
     UnsupportedEbaySearchMode,
@@ -117,7 +116,6 @@ from carl.core.facebook_images import (
     RetryImageFailuresRequest,
     RetryImageFailuresResult,
     gallery_references,
-    image_session_work_constraint,
 )
 from carl.core.facebook_listing import (
     RequestFacebookListingDetailsPayload,
@@ -355,7 +353,6 @@ from carl.core.travel_data import (
     TravelDatasetPage,
     TravelDataSetupRequest,
     TravelDataStatus,
-    travel_data_constraint,
     travel_data_work,
     travel_data_work_identifier,
 )
@@ -629,9 +626,6 @@ class ReviewApplication:
                     created=False,
                     state=WorkState(str(existing["state"])),
                 )
-            await self.database.register_constraint(
-                travel_data_constraint(), registered_at_utc_ns=self.utc_now_ns()
-            )
             enqueued = await self.database.enqueue_work(
                 travel_data_work(request),
                 WorkRequester(
@@ -5942,10 +5936,6 @@ class ReviewApplication:
             maximum_items=request.maximum_items,
             maximum_images=request.maximum_images,
         )
-        for constraint in refresh_ebay_search_work_constraints():
-            await self.database.register_constraint(
-                constraint, registered_at_utc_ns=self.utc_now_ns()
-            )
         refresh_identifier = self.new_identifier()
         enqueued = await self.database.enqueue_work(
             refresh_ebay_search_work(
@@ -7008,10 +6998,6 @@ class ReviewApplication:
                 raise ReviewInputError("The retry source record is not a search run")
             source_kind = ImageFailureSourceKind.SEARCH_RUN
 
-        await self.database.register_constraint(
-            image_session_work_constraint(),
-            registered_at_utc_ns=self.utc_now_ns(),
-        )
         matched, retried = await self.database.retry_terminal_facebook_image_work_for_source(
             source_identifier=request.source_identifier,
             maximum_items=request.maximum_items,

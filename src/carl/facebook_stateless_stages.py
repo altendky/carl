@@ -14,7 +14,7 @@ from carl.core.facebook_images import (
     CollectImagePayload,
     image_network_activity,
     image_network_constraints,
-    legacy_image_network_constraint_identifiers,
+    legacy_image_pacing_constraint_identifiers,
 )
 from carl.core.facebook_work import (
     COLLECT_ITEM_WORK_KIND,
@@ -330,13 +330,13 @@ def build_facebook_stateless_stage_registry(
                     }
                 )
             await dependencies.database.supersede_constraints(
-                retired_identifiers=legacy_image_network_constraint_identifiers(
+                retired_identifiers=legacy_image_pacing_constraint_identifiers(
                     image.request_plan.routing
                 ),
                 replacements=image_network_constraints(image.request_plan.routing),
                 operation_identifier=context.operation_identifier,
                 at_utc_ns=image_dependencies.utc_now_ns(),
-                reason="Apply image request policy before durable HTTP stage admission",
+                reason="Apply image request pacing before durable HTTP stage admission",
             )
         except (ConfigurationFailure, RouteConfigurationFailure) as error:
             return TerminalFailureWork(

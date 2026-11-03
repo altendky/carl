@@ -13,6 +13,7 @@ from carl.core.components import Component, ComponentId
 from carl.core.json import encode_json
 from carl.core.models import CodeProvenance
 from carl.core.work import (
+    ConcurrencyConstraint,
     HoldoffDecision,
     NetworkActivityDefinition,
     NetworkActivityState,
@@ -33,6 +34,48 @@ _NETWORK_SCOPE = SchedulingScope(
 )
 _OVERALL_SCOPE = SchedulingScope(kind=SchedulingScopeKind.OVERALL, identity=())
 _WORK_SCOPE = SchedulingScope(kind=SchedulingScopeKind.WORK_KIND, identity=("test",))
+
+
+@pytest.mark.anyio
+async def test_definition_retirement_preserves_customized_policy(tmp_path: Path) -> None:
+    shipped = ConcurrencyConstraint(
+        identifier=("test", "capacity"), scope=_WORK_SCOPE, maximum_active=10
+    )
+    customized = shipped.model_copy(update={"maximum_active": 3})
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        await database.begin_operation(
+            operation_id="retirement",
+            component=Component(ComponentId(("test", "policy")), 1, lambda: None),
+            provenance=_provenance(),
+            invocation={},
+            configuration={},
+            started_at_utc=datetime.now(UTC).isoformat(),
+        )
+        await database.register_constraint(customized, registered_at_utc_ns=1)
+
+        async def retire(definition: ConcurrencyConstraint) -> None:
+            await database.supersede_constraints(
+                retired_identifiers=(),
+                replacements=(),
+                operation_identifier="retirement",
+                at_utc_ns=2,
+                reason="replace physical capacity policy",
+                retired_definitions=(definition,),
+            )
+
+        await retire(shipped)
+        async with database._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT count(*) FROM scheduling_constraint_retirements"
+            )
+            assert await cursor.fetchone() == (0,)
+        await retire(customized)
+        await retire(customized)
+        async with database._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT count(*) FROM scheduling_constraint_retirements"
+            )
+            assert await cursor.fetchone() == (1,)
 
 
 def _provenance() -> CodeProvenance:

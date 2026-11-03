@@ -41,7 +41,7 @@ from carl.core.facebook_images import (
     gallery_references,
     image_network_constraints,
     image_reuse_record,
-    legacy_image_network_constraint_identifiers,
+    legacy_image_pacing_constraint_identifiers,
     plan_image_followups,
 )
 from carl.core.facebook_search import (
@@ -1389,11 +1389,11 @@ def collect_images(
                 }
 
             await evidence_database.supersede_constraints(
-                retired_identifiers=legacy_image_network_constraint_identifiers(network_path),
+                retired_identifiers=legacy_image_pacing_constraint_identifiers(network_path),
                 replacements=image_network_constraints(network_path),
                 operation_identifier=operation_identifier,
                 at_utc_ns=time_ns(),
-                reason="Apply bounded image sessions and retain network pacing",
+                reason="Apply current image request pacing",
             )
             collection_identifiers: list[str] = []
             for entries in selected:

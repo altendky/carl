@@ -18,29 +18,15 @@ from carl.analysis_batch_workers import (
     build_analysis_batch_worker_registry,
 )
 from carl.coordinator_stages import build_coordinator_stage_registry
-from carl.core.analysis_batch import request_missing_analyses_work_constraints
 from carl.core.components import Component, ComponentId
-from carl.core.ebay import ebay_search_work_constraint
-from carl.core.ebay_items import (
-    ebay_item_work_constraints,
-    legacy_ebay_item_work_constraint_identifiers,
-)
-from carl.core.ebay_refresh import refresh_ebay_search_work_constraints
-from carl.core.facebook_images import (
-    image_session_work_constraint,
-    legacy_image_session_work_constraint_identifiers,
-)
-from carl.core.facebook_refresh import refresh_search_work_constraints
 from carl.core.facebook_work import (
     facebook_effective_search_work_constraint,
     facebook_network_path_constraint,
     facebook_search_work_constraint,
     legacy_facebook_network_path_constraint_identifier,
 )
-from carl.core.item_analysis import analysis_work_constraints
-from carl.core.marketplace_images import marketplace_image_network_constraint
+from carl.core.legacy_capacity import static_capacity_constraints
 from carl.core.models import JsonValue
-from carl.core.pipeline import pipeline_work_constraints
 from carl.core.resources import ResourceRequest
 from carl.dataset_setup_stages import (
     OWNED_STAGE_KIND,
@@ -141,29 +127,18 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
     search_routes = await database.facebook_search_work_routes()
     request_budget_routes = await database.legacy_facebook_request_budget_routes()
     constraints = (
-        *analysis_work_constraints(),
-        *refresh_search_work_constraints(),
-        *request_missing_analyses_work_constraints(),
-        image_session_work_constraint(),
-        marketplace_image_network_constraint(),
-        ebay_search_work_constraint(),
-        *ebay_item_work_constraints(),
-        *refresh_ebay_search_work_constraints(),
-        *pipeline_work_constraints(),
         *(facebook_search_work_constraint(route) for route in search_routes),
         *(facebook_effective_search_work_constraint(route) for route in search_routes),
         *(facebook_network_path_constraint(route) for route in request_budget_routes),
     )
     retired_identifiers = (
-        *legacy_image_session_work_constraint_identifiers(),
-        ("carl", "facebook", "image", "network_activity_concurrency", "all_cdns", "v3"),
-        *legacy_ebay_item_work_constraint_identifiers(),
         *await database.legacy_facebook_search_constraint_identifiers(),
         *(
             legacy_facebook_network_path_constraint_identifier(route)
             for route in request_budget_routes
         ),
     )
+    retired_definitions = static_capacity_constraints()
     operation_identifier = _identifier()
     started = perf_counter_ns()
     provenance = await collect_code_provenance_async(repository_root)
@@ -180,6 +155,9 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
             invocation=process_invocation(),
             configuration={
                 "retired_identifiers": [list(identifier) for identifier in retired_identifiers],
+                "retired_definitions": [
+                    constraint.model_dump(mode="json") for constraint in retired_definitions
+                ],
                 "constraints": [constraint.model_dump(mode="json") for constraint in constraints],
             },
             started_at_utc=datetime.now(UTC).isoformat(),
@@ -191,11 +169,10 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
                 operation_identifier=operation_identifier,
                 at_utc_ns=time_ns(),
                 reason=(
-                    "Apply shared image concurrency 25, eBay description concurrency 10, "
-                    "and Facebook search concurrency one for Proton, twenty for Decodo "
-                    "per requested/effective acquisition route; count only Facebook HTTP "
-                    "requests in Facebook route budgets"
+                    "Retire built-in static capacity caps superseded by staged host resource "
+                    "budgets; retain Facebook route admission and HTTP request pacing"
                 ),
+                retired_definitions=retired_definitions,
             )
             await database.complete_operation(
                 operation_id=operation_identifier,

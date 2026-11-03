@@ -236,7 +236,7 @@ def test_image_and_description_limits_have_new_immutable_identities() -> None:
         constraint.maximum_active
         for constraint in facebook_constraints
         if isinstance(constraint, ConcurrencyConstraint)
-    } == {25}
+    } == set()
 
     ebay_constraints = ebay_item_work_constraints()
     ebay_legacy = legacy_ebay_item_work_constraint_identifiers()
