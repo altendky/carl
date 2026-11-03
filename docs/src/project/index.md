@@ -233,8 +233,9 @@ Facebook search `network_path`, refresh `search_network_path`, and Facebook
 `image_network_path` fields select complete provider-qualified routes. CLI
 search and image collection default to `--network-provider decodo
 --network-route datacenter`. Explicit Proton paths use real Proton; there is
-no automatic provider fallback. Decodo searches run concurrently within the
-worker pool and request-rate limits; only actual Proton routes are serialized.
+no automatic provider fallback. Searches on either provider run within the
+shared resource capacities and request-rate limits. Requests within each
+resident session remain sequential.
 
 For an installation with older explicit Proton-to-Decodo route overrides, stop MCP
 servers and workers, then run `carl cutover-route-overrides` before removing those
@@ -774,8 +775,21 @@ authoritative. Recovery runs even when the snapshots show every resource occupie
 The former built-in static work-kind and image-request caps no longer impose a
 second execution ceiling. Their exact shipped definitions are retired without
 removing customized constraints, even when a custom definition uses the same scope.
-Facebook requested/effective search-route admission, request-rate limits, holdoffs,
-provider cooldowns, paid-request retry budgets and acquisition sharing still apply.
+Facebook's former requested/effective route concurrency caps are also retired.
+Startup examines their immutable definitions in metadata pages of at most 128,
+retiring only exact shipped versions. Requested routes remain in payloads and
+effective route binding remains lease-fenced provenance; binding imposes no
+additional search count. Each page commits independently, so interrupted startup
+can safely repeat retirement before dispatch. Pages bound individual reads and
+writes; total startup work remains proportional to retained route-policy history.
+The initial high-water keys bound each pass: later explicit registrations are
+examined on the next startup. Custom route constraints remain active.
+Older executables can still apply their old direct route caps or register policies;
+restart all workers on the new version to obtain the new behavior consistently.
+Resource capacities coordinate per database and host; the old route ceilings were
+database-wide, so they no longer impose a separate aggregate limit across hosts.
+Request-rate limits, holdoffs, provider cooldowns, paid-request retry budgets and
+acquisition sharing still apply.
 These resource capacities remain upper bounds rather than throughput promises;
 custom constraints or provider policy can defer a phase while resource slots are free.
 

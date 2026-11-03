@@ -278,7 +278,7 @@ async def test_requested_alias_cannot_bypass_effective_route_cooldown(tmp_path: 
         claim = await _claim(database, "alias")
         assert claim.lease is not None
         lease = claim.lease
-        assert await database.try_admit_facebook_search_route(
+        await database.bind_facebook_search_route(
             work_item_identifier="alias",
             lease_token=lease.token,
             worker_identifier=lease.worker_identifier,

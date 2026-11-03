@@ -1,8 +1,7 @@
 """Exact shipped static capacity policies superseded by physical resource permits.
 
 Keep these definitions immutable: matching an identifier alone could retire a
-custom policy with a different scope, subject, schema, or limit. Facebook's
-requested/effective route policies are intentionally outside this inventory.
+custom policy with a different scope, subject, schema, or limit.
 """
 
 from carl.core.analysis_batch import REQUEST_MISSING_ANALYSES_WORK_KIND
@@ -25,10 +24,53 @@ from carl.core.pipeline import LISTING_PIPELINE_WORK_KIND, SEARCH_PIPELINE_WORK_
 from carl.core.travel_data import TRAVEL_DATA_SETUP_WORK_KIND
 from carl.core.work import (
     ConcurrencyConstraint,
+    Constraint,
     SchedulingScope,
     SchedulingScopeKind,
     SchedulingSubjectKind,
 )
+
+FACEBOOK_ROUTE_CAPACITY_FAMILIES = (
+    ("carl", "facebook", "search", "route_concurrency"),
+    ("carl", "facebook", "search", "effective_route_concurrency"),
+)
+
+
+def is_legacy_facebook_route_capacity_constraint(constraint: Constraint) -> bool:
+    """Recognize full shipped route-cap definitions without guessing policy.
+
+    Both families shipped v1/v2 with a limit of one. Only Decodo routes
+    shipped v3, with a limit of twenty. Other definitions remain explicit
+    custom policy even when they reuse a familiar identifier.
+    """
+    if not isinstance(constraint, ConcurrencyConstraint):
+        return False
+    identifier = constraint.identifier
+    if len(identifier) < 6 or identifier[:4] not in FACEBOOK_ROUTE_CAPACITY_FAMILIES:
+        return False
+    version, routing = identifier[4], identifier[5:]
+    if any(not isinstance(part, str) or not part for part in routing):
+        return False
+    if version in ("v1", "v2"):
+        maximum = 1
+    elif version == "v3" and routing[0] == "decodo":
+        maximum = 20
+    else:
+        return False
+    scope_family = (
+        "search_acquisition"
+        if identifier[3] == "route_concurrency"
+        else "effective_search_acquisition"
+    )
+    return constraint == ConcurrencyConstraint(
+        identifier=identifier,
+        schema_version=1,
+        subject_kind=SchedulingSubjectKind.WORK_ITEM,
+        scope=SchedulingScope(
+            kind=SchedulingScopeKind.NETWORK_PATH, identity=(scope_family, *routing)
+        ),
+        maximum_active=maximum,
+    )
 
 
 def _work(

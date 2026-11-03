@@ -651,24 +651,14 @@ def build_facebook_session_stage_registry(
         payload: SearchPhasePayload, context: StageAttemptContext
     ) -> StageOutcome:
         progress = await _progress(dependencies.database, payload)
-        admitted = await dependencies.database.try_admit_facebook_search_route(
+        await dependencies.database.bind_facebook_search_route(
             work_item_identifier=context.work_item_identifier,
             lease_token=context.lease_token,
             worker_identifier=context.worker_identifier,
             routing=progress.search.routing,
             utc_now_ns=dependencies.utc_now_ns,
         )
-        outcome = _next(dependencies, context, progress, _OPEN if admitted else _ROUTE)
-        if not admitted:
-            outcome = outcome.model_copy(
-                update={
-                    "wait_kind": StageWaitKind.TIME,
-                    "continuation": outcome.continuation.model_copy(
-                        update={"not_before_utc_ns": dependencies.utc_now_ns() + 1_000_000_000}
-                    ),
-                }
-            )
-        return outcome
+        return _next(dependencies, context, progress, _OPEN)
 
     async def open_session(
         payload: SearchPhasePayload, context: StageAttemptContext

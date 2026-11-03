@@ -214,8 +214,8 @@ async def test_resolved_decodo_settings_determine_scope_before_session_port_sele
     def load(_path: Path) -> LoadedCarlConfiguration:
         return _loaded(tmp_path, override=True)
 
-    async def admit(*_args: object, **_kwargs: object) -> bool:
-        return True
+    async def bind(*_args: object, **_kwargs: object) -> None:
+        pass
 
     async def supersede(*_args: object, **_kwargs: object) -> None:
         pass
@@ -228,7 +228,7 @@ async def test_resolved_decodo_settings_determine_scope_before_session_port_sele
     monkeypatch.setattr(routed_workers, "build_facebook_worker_registry", registry)
     monkeypatch.setattr(routed_workers, "brave_navigation_headers", lambda: ())
     monkeypatch.setattr(routed_workers, "_execute", execute)
-    monkeypatch.setattr(Database, "try_admit_facebook_search_route", admit)
+    monkeypatch.setattr(Database, "bind_facebook_search_route", bind)
     monkeypatch.setattr(Database, "supersede_constraints", supersede)
     harness = _Harness(tmp_path / "carl.sqlite3", _PartitionSessionFactory(challenges=0))
     async with Database.managed(harness.path, initialize=True) as database:

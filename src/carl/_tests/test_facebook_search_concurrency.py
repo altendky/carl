@@ -1,4 +1,4 @@
-"""Parallel worker tasks and processes share durable Facebook search limits."""
+"""Parallel claims and effective route bindings have no built-in route ceiling."""
 
 # pyright: reportPrivateUsage=false
 
@@ -15,8 +15,9 @@ from carl._tests.test_effective_search_admission import (
     CAPABILITY,
     DATACENTER,
     TARGET,
-    _admit,
+    _bind,
     _claim,
+    _scopes,
 )
 from carl._tests.test_facebook_work import _payload
 from carl.core.facebook_refresh import (
@@ -24,12 +25,11 @@ from carl.core.facebook_refresh import (
     REFRESH_SEARCH_WORK_KIND,
     RefreshSearchPayload,
     refresh_search_work,
-    refresh_search_work_constraints,
 )
-from carl.core.facebook_work import collect_search_work
+from carl.core.facebook_work import FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, collect_search_work
 from carl.core.models import JsonValue
 from carl.core.work import WorkCapability, WorkLease, WorkRequester, WorkState
-from carl.io.sqlite import Database
+from carl.io.sqlite import Database, WorkCancellationRequestedError
 
 _PROCESS_CODE = """
 import json,sys
@@ -51,7 +51,7 @@ async def main():
             value=None if result.lease is None else result.lease.model_dump(mode='json')
         else:
             lease=WorkLease.model_validate_json(json.dumps(action['lease']))
-            value=await database.try_admit_facebook_search_route(
+            value=await database.bind_facebook_search_route(
                 work_item_identifier=lease.work_item_identifier,lease_token=lease.token,
                 worker_identifier=lease.worker_identifier,routing=tuple(action['route']),
                 utc_now_ns=lambda:10)
@@ -103,7 +103,7 @@ async def _parallel_processes(
 @pytest.mark.parametrize("route", (TARGET, DATACENTER))
 @pytest.mark.parametrize("work_kind", ("search", "refresh"))
 @pytest.mark.parametrize("execution", ("tasks", "processes"))
-async def test_eight_parallel_claimers_hold_exactly_the_route_limit(
+async def test_eight_parallel_claimers_do_not_have_a_builtin_route_limit(
     tmp_path: Path,
     route: tuple[str, ...],
     work_kind: Literal["search", "refresh"],
@@ -111,19 +111,13 @@ async def test_eight_parallel_claimers_hold_exactly_the_route_limit(
 ) -> None:
     path = tmp_path / "carl.sqlite3"
     count = 8
-    maximum_active = 20 if work_kind == "search" and route[0] == "decodo" else 1
     async with Database.managed(path, initialize=True) as database:
-        # Contend for the last slot without launching twenty-eight processes.
-        for index in range(maximum_active - 1):
-            _ = await _claim(database, f"prefill-{index}", route)
         capability = CAPABILITY
         if work_kind == "refresh":
             capability = WorkCapability(
                 kind=REFRESH_SEARCH_WORK_KIND,
                 payload_schema_version=REFRESH_SEARCH_PAYLOAD_SCHEMA_VERSION,
             )
-            for constraint in refresh_search_work_constraints():
-                await database.register_constraint(constraint, registered_at_utc_ns=1)
         for index in range(count):
             payload = _payload().model_copy(
                 update={
@@ -201,65 +195,23 @@ async def test_eight_parallel_claimers_hold_exactly_the_route_limit(
                         await event.wait()
                     start.set()
         winners = [lease for lease in results if lease is not None]
-        assert len(results) == count and len(winners) == 1
-        winner = winners[0]
+        assert len(results) == count and len(winners) == count
+        assert len({lease.work_item_identifier for lease in winners}) == count
         states = await database.work_states(tuple(f"search-{index}" for index in range(count)))
-        assert states.count(WorkState.LEASED) == 1
-        assert states.count(WorkState.PENDING) == count - 1
-        # Child constraints are per route; coordinator constraints remain global.
+        assert states.count(WorkState.LEASED) == count
         if work_kind == "search":
             other = await _claim(database, "other", (*route[:-1], "other"))
             assert other.work_item_identifier == "other"
-        await database.cancel_work(
-            winner.work_item_identifier,
-            reason="stop",
-            caller="test",
-            requested_at_utc_ns=11,
-            include_descendants=False,
-        )
-        blocked = await database.claim_work(
-            supported_capabilities=(capability,),
-            worker_identifier="blocked",
-            lease_token="blocked",
-            lease_duration_ns=1000,
-            utc_now_ns=lambda: 11,
-            event_identifier="blocked",
-        )
-        assert blocked.lease is None
-        assert await database.finalize_cancelled_work(
-            work_item_identifier=winner.work_item_identifier,
-            lease_token=winner.token,
-            worker_identifier=winner.worker_identifier,
-            operation_id=None,
-            utc_now_ns=lambda: 12,
-            event_identifier="cancelled",
-            ended_at_utc="2026-10-17T00:00:00+00:00",
-            duration_ns=0,
-        )
-        successor = await database.claim_work(
-            supported_capabilities=(capability,),
-            worker_identifier="successor",
-            lease_token="successor",
-            lease_duration_ns=1000,
-            utc_now_ns=lambda: 12,
-            event_identifier="successor",
-        )
-        assert successor.lease is not None
-        assert successor.lease.work_item_identifier != winner.work_item_identifier
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("route", (TARGET, DATACENTER))
-async def test_eight_parallel_alias_processes_admit_the_route_limit(
+async def test_eight_parallel_alias_processes_bind_the_same_effective_route(
     tmp_path: Path, route: tuple[str, ...]
 ) -> None:
     path = tmp_path / "carl.sqlite3"
     count = 8
-    maximum_active = 20 if route[0] == "decodo" else 1
     async with Database.managed(path, initialize=True) as database:
-        for index in range(maximum_active - 1):
-            lease = await _claim(database, f"prefill-{index}", ("proton", "prefill", str(index)))
-            assert await _admit(database, lease, route)
         leases = tuple(
             [
                 await _claim(database, f"alias-{index}", ("proton", "personal", f"alias-{index}"))
@@ -273,27 +225,21 @@ async def test_eight_parallel_alias_processes_admit_the_route_limit(
                 for lease in leases
             ),
         )
-        assert values.count(True) == 1 and values.count(False) == count - 1
-        winner = leases[values.index(True)]
-        loser = leases[values.index(False)]
-        assert await _admit(database, winner, route)
-        assert not await _admit(database, loser, route)
+        assert values == (None,) * count
+        for lease in leases:
+            assert (FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY, *route) in await _scopes(
+                database, lease.work_item_identifier
+            )
+        first, second = leases[:2]
+        await _bind(database, first, route)
+        await _bind(database, second, route)
         await database.cancel_work(
-            winner.work_item_identifier,
+            first.work_item_identifier,
             reason="stop",
             caller="test",
             requested_at_utc_ns=11,
             include_descendants=False,
         )
-        assert not await _admit(database, loser, route, now=11)
-        assert await database.finalize_cancelled_work(
-            work_item_identifier=winner.work_item_identifier,
-            lease_token=winner.token,
-            worker_identifier=winner.worker_identifier,
-            operation_id=None,
-            utc_now_ns=lambda: 12,
-            event_identifier="cancelled",
-            ended_at_utc="2026-10-17T00:00:00+00:00",
-            duration_ns=0,
-        )
-        assert await _admit(database, loser, route, now=12)
+        with pytest.raises(WorkCancellationRequestedError):
+            await _bind(database, first, route, now=11)
+        await _bind(database, second, route, now=11)

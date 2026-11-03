@@ -73,8 +73,6 @@ from carl.core.facebook_work import (
     FACEBOOK_EFFECTIVE_SEARCH_SCOPE_FAMILY,
     SuccessfulItemPageResult,
     facebook_effective_search_scope,
-    facebook_effective_search_work_constraint,
-    facebook_search_work_constraint,
 )
 from carl.core.fair_scheduling import (
     FairAdmission,
@@ -94,6 +92,7 @@ from carl.core.item_analysis import (
     UnavailableAnalysisImageSelection,
 )
 from carl.core.json import decode_json, encode_json
+from carl.core.legacy_capacity import FACEBOOK_ROUTE_CAPACITY_FAMILIES
 from carl.core.listing_identity import is_listing_identifier
 from carl.core.marketplace_search import (
     MARKETPLACE_SEARCH_TARGET_KIND,
@@ -5872,6 +5871,64 @@ class Database:
             ),
         )
 
+    @staticmethod
+    def _facebook_route_capacity_range(family: tuple[str, ...]) -> tuple[str, str]:
+        if family not in FACEBOOK_ROUTE_CAPACITY_FAMILIES:
+            raise ValueError("Unknown Facebook route capacity family")
+        prefix = _json(list(family))[:-1]
+        # The comma extends this exact JSON-array prefix. Its next codepoint
+        # bounds all such extensions without scanning neighboring families.
+        return prefix + ",", prefix + "-"
+
+    async def facebook_route_capacity_high_water(self, family: tuple[str, ...]) -> str | None:
+        """Freeze one indexed metadata range before a bounded retirement pass."""
+        lower, upper = self._facebook_route_capacity_range(family)
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                "SELECT max(identifier_parts_json) FROM scheduling_constraints "
+                "WHERE identifier_parts_json >= ? AND identifier_parts_json < ?",
+                (lower, upper),
+            )
+            row = await cursor.fetchone()
+        return None if row is None or row[0] is None else _text(row[0])
+
+    async def facebook_route_capacity_constraint_page(
+        self,
+        *,
+        family: tuple[str, ...],
+        through: str,
+        after: str | None = None,
+        limit: int = 128,
+    ) -> tuple[tuple[str, Constraint, bool], ...]:
+        """Read at most 128 definitions, advancing over retired/custom history too.
+
+        Cursors are the exact stored JSON keys, not decoded route aliases. The
+        retirement join does not filter rows, so a page cannot walk an unbounded
+        retired prefix while searching for a live candidate.
+        """
+        if isinstance(limit, bool) or not 1 <= limit <= 128:
+            raise ValueError("A route capacity page must contain 1 to 128 rows")
+        lower, upper = self._facebook_route_capacity_range(family)
+        if not lower <= through < upper or (after is not None and not lower <= after <= through):
+            raise ValueError("Route capacity cursor is outside its family range")
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT c.identifier_parts_json,c.definition_json,r.identifier_parts_json IS NOT NULL
+                FROM scheduling_constraints c
+                LEFT JOIN scheduling_constraint_retirements r
+                  ON r.identifier_parts_json=c.identifier_parts_json
+                WHERE c.identifier_parts_json > ? AND c.identifier_parts_json <= ?
+                ORDER BY c.identifier_parts_json LIMIT ?
+                """,
+                (lower if after is None else after, through, limit),
+            )
+            rows = await cursor.fetchall()
+        return tuple(
+            (_text(row[0]), CONSTRAINT_ADAPTER.validate_json(_text(row[1])), bool(row[2]))
+            for row in rows
+        )
+
     async def legacy_facebook_search_constraint_identifiers(self) -> tuple[tuple[str, ...], ...]:
         """Find persisted superseded requested and effective search limits.
 
@@ -6577,22 +6634,6 @@ class Database:
         kind_json = _json(list(definition.kind))
         deduplication_json = _json(list(definition.deduplication_identity))
         async with self._connections.writer() as connection:
-            if definition.kind == COLLECT_SEARCH_WORK_KIND:
-                routing = (
-                    definition.payload.get("routing")
-                    if isinstance(definition.payload, dict)
-                    else None
-                )
-                if (
-                    isinstance(routing, list)
-                    and routing
-                    and all(isinstance(part, str) and part for part in routing)
-                ):
-                    await self._register_constraint(
-                        connection,
-                        constraint=facebook_search_work_constraint(tuple(cast(list[str], routing))),
-                        registered_at_utc_ns=enqueued_at_utc_ns,
-                    )
             if requester.kind in (
                 ("carl", "mcp", "request_workspace_refresh"),
                 ("carl", "mcp", "create_workspace_search_revision"),
@@ -9418,7 +9459,7 @@ class Database:
             raise WorkCancellationRequestedError(work_item_identifier)
         return _integer(row[0]), _integer(row[1])
 
-    async def try_admit_facebook_search_route(
+    async def bind_facebook_search_route(
         self,
         *,
         work_item_identifier: str,
@@ -9426,16 +9467,16 @@ class Database:
         worker_identifier: str,
         routing: tuple[str, ...],
         utc_now_ns: Callable[[], int],
-    ) -> bool:
-        """Atomically bind an effective search route to an active, renewable lease.
+    ) -> None:
+        """Bind effective-route evidence to an active lease without a capacity cap.
 
         Requested scopes and payloads remain intact. Only previous effective-route
-        scopes are removed, including when waiting for the new route's capacity.
-        Proton admits one search and Decodo admits twenty per effective route
-        across processes, retaining each search's acquisition scope.
+        scopes are removed. Physical resource permits and request policy govern
+        execution; route provenance remains available across processes.
         """
 
-        constraint = facebook_effective_search_work_constraint(routing)
+        if not routing or any(not isinstance(part, str) or not part for part in routing):
+            raise ValueError("An effective route needs nonempty string parts")
         async with self._connections.writer() as connection:
             scope_json = _json(list(facebook_effective_search_scope(routing).identity))
             # Acquire SQLite's writer reservation before reading admission state.
@@ -9457,29 +9498,10 @@ class Database:
                 worker_identifier=worker_identifier,
                 now_utc_ns=now_utc_ns,
             )
-            if constraint is not None:
-                await self._register_constraint(
-                    connection, constraint=constraint, registered_at_utc_ns=now_utc_ns
-                )
-                cursor = await connection.execute(
-                    """
-                    SELECT count(*) FROM work_items INDEXED BY work_items_claim
-                    CROSS JOIN work_scopes ON work_scopes.work_item_id = work_items.id
-                    WHERE work_scopes.scope_kind = 'network_path'
-                      AND work_scopes.scope_identity_json = ?
-                      AND work_items.id != ? AND work_items.state IN ('leased','cancelling')
-                      AND work_items.lease_expires_at_utc_ns > ?
-                    """,
-                    (scope_json, work_item_identifier, now_utc_ns),
-                )
-                rows = await cursor.fetchall()
-                if _integer(rows[0][0]) >= constraint.maximum_active:
-                    return False
             await connection.execute(
                 "INSERT OR IGNORE INTO work_scopes VALUES (?, 'network_path', ?)",
                 (work_item_identifier, scope_json),
             )
-            return True
 
     async def renew_lease(
         self,
