@@ -20,13 +20,15 @@ from carl.analysis_batch_workers import (
 from carl.coordinator_stages import build_coordinator_stage_registry
 from carl.core.components import Component, ComponentId
 from carl.core.facebook_work import (
-    facebook_effective_search_work_constraint,
     facebook_network_path_constraint,
-    facebook_search_work_constraint,
     legacy_facebook_network_path_constraint_identifier,
 )
-from carl.core.legacy_capacity import static_capacity_constraints
-from carl.core.models import JsonValue
+from carl.core.legacy_capacity import (
+    FACEBOOK_ROUTE_CAPACITY_FAMILIES,
+    is_legacy_facebook_route_capacity_constraint,
+    static_capacity_constraints,
+)
+from carl.core.models import CodeProvenance, JsonValue
 from carl.core.resources import ResourceRequest
 from carl.dataset_setup_stages import (
     OWNED_STAGE_KIND,
@@ -124,19 +126,10 @@ class RuntimeComposition:
 async def prepare_worker_constraints(database: Database, repository_root: Path) -> None:
     """Upgrade immutable limits before workers can claim previously queued work."""
 
-    search_routes = await database.facebook_search_work_routes()
     request_budget_routes = await database.legacy_facebook_request_budget_routes()
-    constraints = (
-        *(facebook_search_work_constraint(route) for route in search_routes),
-        *(facebook_effective_search_work_constraint(route) for route in search_routes),
-        *(facebook_network_path_constraint(route) for route in request_budget_routes),
-    )
-    retired_identifiers = (
-        *await database.legacy_facebook_search_constraint_identifiers(),
-        *(
-            legacy_facebook_network_path_constraint_identifier(route)
-            for route in request_budget_routes
-        ),
+    constraints = tuple(facebook_network_path_constraint(route) for route in request_budget_routes)
+    retired_identifiers = tuple(
+        legacy_facebook_network_path_constraint_identifier(route) for route in request_budget_routes
     )
     retired_definitions = static_capacity_constraints()
     operation_identifier = _identifier()
@@ -170,7 +163,7 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
                 at_utc_ns=time_ns(),
                 reason=(
                     "Retire built-in static capacity caps superseded by staged host resource "
-                    "budgets; retain Facebook route admission and HTTP request pacing"
+                    "budgets; retain HTTP request pacing"
                 ),
                 retired_definitions=retired_definitions,
             )
@@ -192,6 +185,92 @@ async def prepare_worker_constraints(database: Database, repository_root: Path) 
                 duration_ns=perf_counter_ns() - started,
             )
             raise
+
+    await _retire_facebook_route_capacity(database, provenance)
+
+
+async def _retire_facebook_route_capacity(database: Database, provenance: CodeProvenance) -> None:
+    """Retire verified route caps in short audited batches before dispatch starts."""
+    high_waters: list[tuple[tuple[str, ...], str | None]] = []
+    for family in FACEBOOK_ROUTE_CAPACITY_FAMILIES:
+        high_waters.append((family, await database.facebook_route_capacity_high_water(family)))
+    for family, through in high_waters:
+        if through is None:
+            continue
+        after: str | None = None
+        while True:
+            page = await database.facebook_route_capacity_constraint_page(
+                family=family, through=through, after=after
+            )
+            if not page:
+                break
+            candidates = tuple(
+                constraint
+                for _, constraint, retired in page
+                if not retired and is_legacy_facebook_route_capacity_constraint(constraint)
+            )
+            if candidates:
+                operation_identifier = _identifier()
+                started = perf_counter_ns()
+                # Finish this bounded page's audit on cancellation. Between
+                # pages shutdown can interrupt, and a later startup can replay.
+                with anyio.CancelScope(shield=True):
+                    await database.begin_operation(
+                        operation_id=operation_identifier,
+                        component=Component(
+                            identifier=ComponentId(("carl", "work", "retire_route_capacity")),
+                            output_schema_version=1,
+                            implementation=_retire_facebook_route_capacity,
+                        ),
+                        provenance=provenance,
+                        invocation=process_invocation(),
+                        configuration={
+                            "family": list(family),
+                            "after": after,
+                            "through": through,
+                            "page_limit": 128,
+                            "retired_definitions": [
+                                constraint.model_dump(mode="json") for constraint in candidates
+                            ],
+                        },
+                        started_at_utc=datetime.now(UTC).isoformat(),
+                    )
+                    try:
+                        await database.supersede_constraints(
+                            retired_identifiers=(),
+                            replacements=(),
+                            retired_definitions=candidates,
+                            operation_identifier=operation_identifier,
+                            at_utc_ns=time_ns(),
+                            reason="Retire legacy Facebook route capacity in favor of staged resource budgets",
+                        )
+                        await database.complete_operation(
+                            operation_id=operation_identifier,
+                            records=(),
+                            artifacts=(),
+                            outputs=(),
+                            result={
+                                "state": "prepared",
+                                "scanned": len(page),
+                                "retired_candidates": len(candidates),
+                            },
+                            ended_at_utc=datetime.now(UTC).isoformat(),
+                            duration_ns=perf_counter_ns() - started,
+                        )
+                    except BaseException as error:
+                        await database.fail_operation(
+                            operation_id=operation_identifier,
+                            error={
+                                "kind": "constraint_policy_failure",
+                                "type": type(error).__name__,
+                            },
+                            result={"state": "failed"},
+                            ended_at_utc=datetime.now(UTC).isoformat(),
+                            duration_ns=perf_counter_ns() - started,
+                        )
+                        raise
+            after = page[-1][0]
+            await anyio.lowlevel.checkpoint()
 
 
 @asynccontextmanager
