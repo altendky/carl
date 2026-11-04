@@ -842,8 +842,11 @@ recognized request/parent forms; otherwise work shares one legacy bucket.
 
 Within a root, priority and eligibility ordering apply until a ready item has
 waited 30 seconds, when the oldest aged work takes precedence. Resource polling
-does not reset that age. An aged weighted CPU contender may stop lending
-newly free CPU units so its complete allocation can form. This drain holds no
+and stage continuations do not reset that logical work's age. A downloaded
+response awaiting publication retains its place among that root's queued jobs.
+Explicit stage deadlines and progress wake times still bound readiness; a new
+logical attempt uses its retry eligibility. An aged weighted CPU contender may
+stop lending newly free CPU units so its complete allocation can form. This drain holds no
 partial permit, expires without a live contender, and ends after admission,
 cancellation or changed ownership. It does not preempt running work. Unconfirmed
 held guards reduce known usable capacity; an unfulfillable drain yields and can
