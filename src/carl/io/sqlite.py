@@ -2016,62 +2016,68 @@ class Database:
         async with self._connections.writer() as connection:
             if not await fair_sql.enabled(connection, scope):
                 raise ValueError("Fair scheduling has not been enabled for this scope")
-            for identifier in dict.fromkeys(work_identifiers):
-                row = await (
-                    await connection.execute(
-                        """SELECT f.active,f.available_at_utc_ns,f.stage_id,s.definition_json,
-                    h.resources_json,h.resident,w.kind_parts_json,w.payload_schema_version,w.attempt
-                    FROM work_items w JOIN fair_ready f ON f.work_item_id=w.id
+            identifiers = tuple(dict.fromkeys(work_identifiers))
+            if not identifiers:
+                return
+            rows = await (
+                await connection.execute(
+                    """SELECT w.id,f.active,f.available_at_utc_ns,f.stage_id,s.definition_json,
+                        h.resources_json,h.resident,w.kind_parts_json,w.payload_schema_version,w.attempt,
+                        f.ready_since_utc_ns,EXISTS(SELECT 1 FROM resident_sessions resident
+                            WHERE resident.work_item_id=w.id
+                              AND resident.state IN ('opening','ready','closing','quarantined'))
+                    FROM json_each(?) requested
+                    CROSS JOIN work_items w ON w.id=requested.value
+                    JOIN fair_ready f ON f.work_item_id=w.id
                     LEFT JOIN work_stages s ON s.id=f.stage_id
                     LEFT JOIN fair_initial_resources h ON h.kind_parts_json=w.kind_parts_json
                         AND h.payload_schema_version=w.payload_schema_version
-                    WHERE w.id=?""",
-                        (identifier,),
-                    )
-                ).fetchone()
-                if row is None or row[0] != 1 or _integer(row[1]) > now_utc_ns:
+                    ORDER BY requested.key""",
+                    (_json(list(identifiers)),),
+                )
+            ).fetchall()
+            offers: list[fair_sql.FairOffer] = []
+            for row in rows:
+                identifier = _text(row[0])
+                if row[1] != 1 or _integer(row[2]) > now_utc_ns:
                     continue
-                stage_identifier = None if row[2] is None else _text(row[2])
+                stage_identifier = None if row[3] is None else _text(row[3])
                 resident = False
                 if stage_identifier is not None:
-                    definition = StageDefinition.model_validate_json(_text(row[3]))
+                    definition = StageDefinition.model_validate_json(_text(row[4]))
                     if definition.resident_session_identifier is not None:
-                        active = await (
-                            await connection.execute(
-                                "SELECT 1 FROM resident_sessions WHERE work_item_id=? AND state IN ('opening','ready','closing','quarantined') LIMIT 1",
-                                (identifier,),
-                            )
-                        ).fetchone()
-                        if active is not None:
+                        if row[11] == 1:
                             # The owning actor advertises its own exact executions.
                             continue
                         resident = True
                     signature = definition.model_dump_json()
                     resources = definition.resources
                 else:
-                    resident = row[5] == 1
+                    resident = row[6] == 1
                     signature = fair_sql.initial_offer_signature(
-                        _text(row[6]), _integer(row[7]), _integer(row[8])
+                        _text(row[7]), _integer(row[8]), _integer(row[9])
                     )
                     resources = ()
                 if stage_identifier is None or resident:
-                    if row[4] is None:
+                    if row[5] is None:
                         continue
                     resources = tuple(
                         ResourceRequest.model_validate(value)
-                        for value in cast(list[JsonValue], decode_json(_text(row[4])))
+                        for value in cast(list[JsonValue], decode_json(_text(row[5])))
                     )
-                await fair_sql.offer(
-                    connection,
-                    scope=scope,
-                    lane=fair_sql.lane_for(resources, resident=resident),
-                    work_identifier=identifier,
-                    stage_identifier=stage_identifier,
-                    signature=signature,
-                    resources=resources,
-                    now=now_utc_ns,
-                    initial=stage_identifier is None,
+                offers.append(
+                    fair_sql.FairOffer(
+                        scope=scope,
+                        lane=fair_sql.lane_for(resources, resident=resident),
+                        work_identifier=identifier,
+                        stage_identifier=stage_identifier,
+                        signature=signature,
+                        resources=resources,
+                        ready_since_utc_ns=_integer(row[10]),
+                        initial=stage_identifier is None,
+                    )
                 )
+            await fair_sql.offer_many(connection, tuple(offers), now=now_utc_ns)
 
     async def fair_admissions(self, scope: str, *, limit: int = 100) -> tuple[FairAdmission, ...]:
         if not 1 <= limit <= 1000:

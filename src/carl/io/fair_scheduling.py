@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, cast
 
 from pydantic import TypeAdapter
@@ -16,19 +16,17 @@ from carl.core.fair_scheduling import (
     FAIR_OFFER_NS,
     FairAdmission,
     FairDispatchCursor,
-    FairDispatchHorizon,
-    FairDispatchLaneHorizon,
     FairLane,
     SchedulingContext,
-    SchedulingServiceClass,
 )
 from carl.core.json import decode_json, encode_json
 from carl.core.models import JsonValue
 from carl.core.resources import ResourceRequest
 from carl.core.work import WorkRequester
+from carl.io import fair_discovery
 
 if TYPE_CHECKING:
-    from apsw import AsyncConnection, SQLiteValue
+    from apsw import AsyncConnection, Connection, SQLiteValue
 
 LEGACY_CONTEXT = SchedulingContext(root_request_identifier="legacy")
 _DRAIN_ADAPTER = TypeAdapter(CpuDrainIntent)
@@ -640,187 +638,18 @@ async def discover(
     excluded: tuple[str, ...],
     after: FairDispatchCursor | None,
 ) -> tuple[tuple[str, ...], FairDispatchCursor | None, bool]:
-    """Seek bounded heads within a finite pass despite concurrent admissions."""
-    if after is None:
-        snapshot = await (
-            await connection.execute(
-                """SELECT lane,sequence,interactive_streak,
-                    coalesce((SELECT max(rowid) FROM fair_workspace_service),0)
-                FROM fair_lanes WHERE scope=? ORDER BY lane LIMIT 6""",
-                (scope,),
-            )
-        ).fetchall()
-        horizon = FairDispatchHorizon(
-            scope=scope,
-            captured_at_utc_ns=now,
-            workspace_rowid_high_water=0 if not snapshot else max(0, _integer(snapshot[0][3])),
-            lanes=tuple(
-                FairDispatchLaneHorizon(
-                    lane=FairLane(str(row[0])),
-                    sequence=_integer(row[1]),
-                    interactive_streak=_integer(row[2]),
-                )
-                for row in snapshot
-            ),
-        )
-    else:
-        horizon = after.horizon
-        if horizon.scope != scope or horizon.captured_at_utc_ns != now:
-            raise ValueError("A dispatch cursor requires its original scope and frozen pass time")
-    membership = """f.active=1 AND f.available_at_utc_ns<=?
-        AND EXISTS(SELECT 1 FROM json_each(?) c
-            WHERE json_extract(c.value,'$[0]')=f.kind_parts_json
-              AND json_extract(c.value,'$[1]')=f.payload_schema_version)
-        AND (? IS NULL OR f.work_item_id IN (SELECT value FROM json_each(?)))
-        AND f.work_item_id NOT IN (SELECT value FROM json_each(?))"""
-    parameters = (now, capabilities, eligible, eligible, encode_json(list(excluded)))
-    preference = "CASE WHEN (w.service_class='interactive' AND l.interactive_streak<3) OR (w.service_class='background' AND l.interactive_streak>=3) THEN 0 ELSE 1 END"
-    frontier = ""
-    bindings: list[SQLiteValue] = [
-        encode_json(
-            [[lane.lane.value, lane.sequence, lane.interactive_streak] for lane in horizon.lanes]
-        ),
-        scope,
-        horizon.workspace_rowid_high_water,
-        *parameters,
-    ]
-    if after is not None:
-        frontier = (
-            f"AND ({preference},w.sequence,w.workspace_key,w.lane,w.service_class)>(?,?,?,?,?)"
-        )
-        bindings.extend(
-            (
-                after.preference,
-                after.workspace_sequence,
-                after.workspace_key,
-                after.lane.value,
-                after.service_class.value,
-            )
-        )
-    bindings.append(limit + 1)
-    rows = await (
-        await connection.execute(
-            f"""WITH lane_horizons AS MATERIALIZED (
-            SELECT json_extract(value,'$[0]') AS lane,
-                   json_extract(value,'$[1]') AS maximum_sequence,
-                   json_extract(value,'$[2]') AS interactive_streak FROM json_each(?)
-        ) SELECT w.lane,w.service_class,w.workspace_key,w.sequence,{preference}
-        FROM fair_workspace_service w INDEXED BY fair_workspace_ready_turn
-        JOIN lane_horizons l ON l.lane=w.lane
-        WHERE w.scope=? AND w.rowid<=? AND w.sequence<=l.maximum_sequence
-          AND w.ready_count>0 AND EXISTS(SELECT 1 FROM fair_ready f
-            WHERE f.workspace_key=w.workspace_key AND f.service_class=w.service_class
-              AND f.lane=w.lane AND {membership}) {frontier}
-        ORDER BY {preference},w.sequence,w.workspace_key,w.lane,w.service_class LIMIT ?""",
-            bindings,
-        )
-    ).fetchall()
-    work_ids: list[str] = []
-    used_roots: dict[tuple[str, str, str], list[str]] = {}
-    last: FairDispatchCursor | None = None
-    while len(work_ids) < limit:
-        progress = False
-        for row in rows[:limit]:
-            lane, service, key = str(row[0]), str(row[1]), str(row[2])
-            # Advance across an examined group even if its root disappears
-            # between the group read and the exact root lookup.
-            last = FairDispatchCursor(
-                horizon=horizon,
-                lane=FairLane(lane),
-                service_class=SchedulingServiceClass(service),
-                workspace_key=key,
-                workspace_sequence=_integer(row[3]),
-                root_sequence=0,
-                root_request_identifier="",
-                preference=_integer(row[4]),
-            )
-            used = used_roots.setdefault((lane, service, key), [])
-            all_excluded = encode_json([*excluded, *work_ids])
-            root_sql = f"""SELECT r.root_request_identifier,r.sequence FROM fair_root_service r INDEXED BY fair_root_ready_turn
-                WHERE r.scope=? AND r.lane=? AND r.service_class=? AND r.workspace_key=?
-                  AND r.ready_count>0
-                  AND r.root_request_identifier NOT IN (SELECT value FROM json_each(?))
-                  AND EXISTS(SELECT 1 FROM fair_ready f WHERE f.root_request_identifier=r.root_request_identifier
-                    AND f.lane=r.lane AND {membership})
-                ORDER BY r.sequence,r.root_request_identifier LIMIT 1"""
-            root_parameters = (
-                scope,
-                lane,
-                service,
-                key,
-                encode_json(used),
-                now,
-                capabilities,
-                eligible,
-                eligible,
-                all_excluded,
-            )
-            root = await (await connection.execute(root_sql, root_parameters)).fetchone()
-            if root is None and used:
-                used.clear()
-                root = await (
-                    await connection.execute(
-                        root_sql,
-                        (
-                            scope,
-                            lane,
-                            service,
-                            key,
-                            "[]",
-                            now,
-                            capabilities,
-                            eligible,
-                            eligible,
-                            all_excluded,
-                        ),
-                    )
-                ).fetchone()
-            if root is None:
-                continue
-            root_id = str(root[0])
-            used.append(root_id)
-            # Oldest aged work wins over arbitrary numeric priority. Otherwise
-            # preserve priority/eligibility/creation/ID inside this root.
-            oldest = await (
-                await connection.execute(
-                    f"SELECT f.work_item_id FROM fair_ready f INDEXED BY fair_ready_age WHERE f.root_request_identifier=? AND f.lane=? AND {membership} AND f.ready_since_utc_ns<=? ORDER BY f.ready_since_utc_ns,f.work_item_id LIMIT 1",
-                    (
-                        root_id,
-                        lane,
-                        now,
-                        capabilities,
-                        eligible,
-                        eligible,
-                        all_excluded,
-                        now - FAIR_AGING_NS,
-                    ),
-                )
-            ).fetchone()
-            selected = (
-                oldest
-                or await (
-                    await connection.execute(
-                        f"SELECT f.work_item_id FROM fair_ready f INDEXED BY fair_ready_priority WHERE f.root_request_identifier=? AND f.lane=? AND {membership} ORDER BY f.priority DESC,f.available_at_utc_ns,f.created_at_utc_ns,f.work_item_id LIMIT 1",
-                        (root_id, lane, now, capabilities, eligible, eligible, all_excluded),
-                    )
-                ).fetchone()
-            )
-            if selected is None:
-                continue
-            work_ids.append(str(selected[0]))
-            progress = True
-            last = last.model_copy(
-                update={
-                    "root_sequence": _integer(root[1]),
-                    "root_request_identifier": root_id,
-                }
-            )
-            if len(work_ids) == limit:
-                break
-        if not progress:
-            break
-    more = len(rows) > limit or len(work_ids) == limit
-    return tuple(work_ids), last if more else None, more
+    """Read one bounded page on the connection's worker, retaining its snapshot."""
+    return await connection.async_run(
+        fair_discovery.discover,
+        cast("Connection", cast(object, connection)),
+        scope=scope,
+        now=now,
+        limit=limit,
+        capabilities=capabilities,
+        eligible=eligible,
+        excluded=excluded,
+        after=after,
+    )
 
 
 def lane_for(resources: tuple[ResourceRequest, ...], *, resident: bool = False) -> FairLane:
@@ -865,6 +694,45 @@ async def promote_initial_offers(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class FairOffer:
+    scope: str
+    lane: FairLane
+    work_identifier: str
+    stage_identifier: str | None
+    signature: str
+    resources: tuple[ResourceRequest, ...]
+    ready_since_utc_ns: int
+    initial: bool = False
+
+
+_OFFER_UPSERT = """INSERT INTO fair_offers VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(scope,lane,work_item_id) DO UPDATE SET stage_id=excluded.stage_id,
+    signature=excluded.signature,resources_json=excluded.resources_json,
+    ready_since_utc_ns=excluded.ready_since_utc_ns,expires_at_utc_ns=excluded.expires_at_utc_ns"""
+
+
+def _offer_values(offer: FairOffer, now: int) -> tuple[SQLiteValue, ...]:
+    return (
+        offer.scope,
+        offer.lane.value,
+        offer.work_identifier,
+        offer.stage_identifier,
+        ("initial:" if offer.initial else "")
+        + hashlib.sha256(offer.signature.encode()).hexdigest(),
+        encode_json([request.model_dump(mode="json") for request in offer.resources]),
+        offer.ready_since_utc_ns,
+        now + FAIR_OFFER_NS,
+    )
+
+
+async def offer_many(
+    connection: AsyncConnection, offers: tuple[FairOffer, ...], *, now: int
+) -> None:
+    if offers:
+        await connection.executemany(_OFFER_UPSERT, (_offer_values(offer, now) for offer in offers))
+
+
 async def offer(
     connection: AsyncConnection,
     *,
@@ -884,19 +752,12 @@ async def offer(
     ).fetchone()
     ready = now if row is None else _integer(row[0])
     await connection.execute(
-        """INSERT INTO fair_offers VALUES (?,?,?,?,?,?,?,?)
-        ON CONFLICT(scope,lane,work_item_id) DO UPDATE SET stage_id=excluded.stage_id,
-        signature=excluded.signature,resources_json=excluded.resources_json,
-        ready_since_utc_ns=excluded.ready_since_utc_ns,expires_at_utc_ns=excluded.expires_at_utc_ns""",
-        (
-            scope,
-            lane.value,
-            work_identifier,
-            stage_identifier,
-            ("initial:" if initial else "") + hashlib.sha256(signature.encode()).hexdigest(),
-            encode_json([r.model_dump(mode="json") for r in resources]),
-            ready,
-            now + FAIR_OFFER_NS,
+        _OFFER_UPSERT,
+        _offer_values(
+            FairOffer(
+                scope, lane, work_identifier, stage_identifier, signature, resources, ready, initial
+            ),
+            now,
         ),
     )
 
