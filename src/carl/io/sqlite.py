@@ -199,7 +199,7 @@ from carl.core.work_dispatch import (
 )
 from carl.core.work_progress import ProgressDrainResult, ProgressReconcilePage
 from carl.core.worker import FollowOnWork
-from carl.io import fair_eligibility
+from carl.io import fair_eligibility, fair_gate
 from carl.io import fair_scheduling as fair_sql
 from carl.io import scheduler_activity as scheduler_sql
 from carl.io import work_progress as progress_sql
@@ -2134,41 +2134,20 @@ class Database:
         now_utc_ns: int,
         resident: bool = False,
     ) -> tuple[bool, FairLane | None]:
-        if not await fair_sql.enabled(connection, scope):
-            return True, None
-        lane = fair_sql.lane_for(resources, resident=resident)
-        await fair_sql.offer(
-            connection,
+        return await connection.async_run(
+            fair_gate.gate,
+            cast("apsw.Connection", cast(object, connection)),
             scope=scope,
-            lane=lane,
             work_identifier=work_identifier,
             stage_identifier=stage_identifier,
             signature=signature,
             resources=resources,
-            now=now_utc_ns,
-        )
-
-        async def eligible(
-            offers: tuple[tuple[str, str | None], ...], offered_lane: FairLane
-        ) -> frozenset[str]:
-            return await self._fair_offers_eligible(
-                connection,
-                scope=scope,
-                offers=offers,
-                lane=offered_lane,
-                now_utc_ns=now_utc_ns,
-            )
-
-        allowed = await fair_sql.admission_allowed(
-            connection,
-            scope=scope,
-            lane=lane,
-            work_identifier=work_identifier,
             capacities=capacities,
-            now=now_utc_ns,
-            eligible=eligible,
+            now_utc_ns=now_utc_ns,
+            resident=resident,
+            ebay_cooldowns=await self._ebay_search_stack_cooldowns(connection, now_utc_ns),
+            facebook_cooldowns=await self._facebook_search_route_cooldowns(connection, now_utc_ns),
         )
-        return allowed, lane
 
     async def _work_dispatch_snapshot(
         self, connection: AsyncConnection, identifier: str
