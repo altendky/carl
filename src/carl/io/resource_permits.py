@@ -256,7 +256,7 @@ class ExecutionGuard:
             return
         try:
             await self.wait_idle()
-            if self.seal():
+            if self.seal() and not self.discard_unadmitted:
                 with anyio.fail_after(40, shield=True):
                     await self.manager.database.release_resource_permit(
                         token=self.token, owner=self.owner
