@@ -199,7 +199,7 @@ from carl.core.work_dispatch import (
 )
 from carl.core.work_progress import ProgressDrainResult, ProgressReconcilePage
 from carl.core.worker import FollowOnWork
-from carl.io import fair_eligibility, fair_gate
+from carl.io import fair_eligibility, fair_gate, stage_claim
 from carl.io import fair_scheduling as fair_sql
 from carl.io import scheduler_activity as scheduler_sql
 from carl.io import work_progress as progress_sql
@@ -2682,84 +2682,25 @@ class Database:
         ):
             raise ValueError("Stage execution identities must be nonempty and trimmed")
         async with self._connections.writer() as connection:
-            cursor = await connection.execute(
-                "SELECT definition_json, state, execution, eligible_at_utc_ns, wait_kind, created_at_utc_ns, progress_waiting FROM work_stages WHERE id = ?",
-                (stage_identifier,),
+            preflight = await connection.async_run(
+                stage_claim.preflight,
+                cast("apsw.Connection", cast(object, connection)),
+                stage_identifier=stage_identifier,
+                now_utc_ns=now_utc_ns,
             )
-            stage = await cursor.fetchone()
-            if stage is None:
-                raise KeyError(stage_identifier)
-            definition = StageDefinition.model_validate_json(_text(stage[0]))
-            if stage[1] != "pending":
-                return StageClaimResult(
-                    lease=None,
-                    wait_kind=StageWaitKind.OWNERSHIP,
-                    next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
-                )
-            if stage[6] == 1:
-                return StageClaimResult(lease=None, wait_kind=StageWaitKind.DEPENDENCY)
-            cursor = await connection.execute(
-                "SELECT state, eligible_at_utc_ns, kind_parts_json, payload_schema_version FROM work_items WHERE id = ?",
-                (definition.work_item_identifier,),
-            )
-            work = await cursor.fetchone()
-            assert work is not None
-            if work[0] not in {"pending", "leased"}:
-                return StageClaimResult(lease=None, wait_kind=StageWaitKind.OWNERSHIP)
-            eligible = max(definition.not_before_utc_ns, _integer(work[1]))
-            if eligible > now_utc_ns:
-                return await self._stage_wait(
-                    connection,
-                    stage_identifier,
-                    StageClaimResult(
-                        lease=None, wait_kind=StageWaitKind.TIME, next_eligible_at_utc_ns=eligible
-                    ),
-                    now_utc_ns,
-                    coordination_scope=resource_scope,
-                )
-            cursor = await connection.execute(
-                """
-                SELECT 1 FROM stage_dependencies AS dependency
-                JOIN work_items AS work ON work.id = dependency.dependency_work_id
-                WHERE dependency.stage_id = ?
-                  AND work.state NOT IN ('completed','terminal_failure','cancelled') LIMIT 1
-                """,
-                (stage_identifier,),
-            )
-            if await cursor.fetchone() is not None:
-                return await self._stage_wait(
-                    connection,
-                    stage_identifier,
-                    StageClaimResult(
-                        lease=None,
-                        wait_kind=StageWaitKind.DEPENDENCY,
-                        next_eligible_at_utc_ns=now_utc_ns + 100_000_000,
-                    ),
-                    now_utc_ns,
-                    coordination_scope=resource_scope,
-                )
-            network_stage = definition.network_activity is not None or any(
-                request.name == "http" for request in definition.resources
-            )
-            if network_stage:
-                cursor = await connection.execute(
-                    "SELECT paused, next_probe_utc_ns FROM network_connectivity WHERE singleton = 1"
-                )
-                connectivity = await cursor.fetchone()
-                if connectivity is not None and connectivity[0] == 1:
+            if preflight.wait is not None:
+                if preflight.persist_wait:
                     return await self._stage_wait(
                         connection,
                         stage_identifier,
-                        StageClaimResult(
-                            lease=None,
-                            wait_kind=StageWaitKind.CONNECTIVITY,
-                            next_eligible_at_utc_ns=max(
-                                now_utc_ns + 100_000_000, _integer(connectivity[1])
-                            ),
-                        ),
+                        preflight.wait,
                         now_utc_ns,
                         coordination_scope=resource_scope,
                     )
+                return preflight.wait
+            stage, definition, work = preflight.stage, preflight.definition, preflight.work
+            assert work is not None
+            network_stage = preflight.network_stage
             execution = _integer(stage[2]) + 1
             fair_allowed, fair_lane = await self._fair_gate(
                 connection,
