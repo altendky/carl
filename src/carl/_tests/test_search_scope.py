@@ -3,6 +3,7 @@
 # Exercise private worker phases with bounded offline doubles.
 # pyright: reportPrivateUsage=false
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
@@ -98,6 +99,7 @@ class _Database:
     def __init__(self, marketplace: str) -> None:
         self.marketplace = marketplace
         self.selected: tuple[str, ...] = ()
+        self.item_requester_batches: list[tuple[str, ...]] = []
 
     async def get_record(self, identifier: str) -> tuple[tuple[str, ...], int, JsonValue]:
         if identifier.startswith("observation-"):
@@ -136,6 +138,13 @@ class _Database:
 
     async def requested_work_identifiers(self, **_kwargs: object) -> tuple[str, ...]:
         return ()
+
+    async def requested_work_for_requesters(
+        self, *, requester_kind: tuple[str, ...], requester_identifiers: Sequence[str]
+    ) -> tuple[tuple[str, str], ...]:
+        assert requester_kind == ("carl", "ebay", "search_refresh", "item")
+        self.item_requester_batches.append(tuple(requester_identifiers))
+        return tuple((requester, "only-new-item") for requester in requester_identifiers)
 
     async def records_by_identifiers(
         self, identifiers: tuple[str, ...]
@@ -195,11 +204,7 @@ async def test_ebay_changed_scope_does_not_fetch_or_compare_old_only_listings(
     async def listing_ids(_database: Database, identifier: str) -> tuple[str, ...]:
         return ("1",) if identifier == "base" else ("2",)
 
-    async def requested(_database: Database, _stage: str, _requester: str) -> str:
-        return "only-new-item"
-
     monkeypatch.setattr(ebay_refresh_workers, "_listing_identifiers", listing_ids)
-    monkeypatch.setattr(ebay_refresh_workers, "_requested", requested)
     outcome = await ebay_refresh_workers._item_phase(
         RefreshEbaySearchPayload(
             base_search_run_record_identifier="base",
@@ -216,6 +221,10 @@ async def test_ebay_changed_scope_does_not_fetch_or_compare_old_only_listings(
     assert outcome.result["selected_unique_listings"] == 1
     assert outcome.result["absent_from_refresh_listing_identifiers"] == []
     assert outcome.result["search_scope_comparison_valid"] is False
+    assert database.item_requester_batches == [
+        (ebay_refresh_workers._identifier("refresh", "item_requester", "2"),)
+    ]
+    assert set(database.selected) == {"only-new-item"}
 
 
 def _context() -> AttemptContext:

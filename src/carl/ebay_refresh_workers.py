@@ -161,17 +161,20 @@ async def _listing_identifiers(database: Database, identifier: str) -> tuple[str
     if len(_strings(occurrence_values)) != len(occurrence_values):
         raise ValueError("Search run has malformed occurrence references")
     identifiers: list[str] = []
-    for occurrence_identifier in _strings(occurrence_values):
-        occurrence_kind, _, occurrence = await database.get_record(occurrence_identifier)
-        item = _mapping(occurrence).get("item_identifier")
-        if occurrence_kind != ("carl", "ebay", "search_listing_occurrence") or not isinstance(
-            item, str
+    occurrence_identifiers = _strings(occurrence_values)
+    for offset in range(0, len(occurrence_identifiers), 1000):
+        for _, occurrence_kind, _, occurrence in await database.records_by_identifiers(
+            occurrence_identifiers[offset : offset + 1000]
         ):
-            raise ValueError("Search run has a malformed item occurrence")
-        # Validate before publishing any child work.
-        _ = EbayItemRequest(item_identifier=item)
-        if item not in identifiers:
-            identifiers.append(item)
+            item = _mapping(occurrence).get("item_identifier")
+            if occurrence_kind != ("carl", "ebay", "search_listing_occurrence") or not isinstance(
+                item, str
+            ):
+                raise ValueError("Search run has a malformed item occurrence")
+            # Validate before publishing any child work.
+            _ = EbayItemRequest(item_identifier=item)
+            if item not in identifiers:
+                identifiers.append(item)
     return tuple(identifiers)
 
 
@@ -263,11 +266,23 @@ async def _item_phase(
     )
     comparison_base_ids = () if scope_changed else base_ids
     selected = tuple(dict.fromkeys((*refreshed_ids, *comparison_base_ids)))[: payload.maximum_items]
+    requesters = tuple(
+        _identifier(context.work_item_identifier, "item_requester", item) for item in selected
+    )
+    requested_children: dict[str, str] = {}
+    for offset in range(0, len(requesters), 1000):
+        for requester, child in await database.requested_work_for_requesters(
+            requester_kind=_ITEM_REQUESTER,
+            requester_identifiers=requesters[offset : offset + 1000],
+        ):
+            if requester in requested_children:
+                raise RuntimeError(
+                    "Refresh stage requested more than one work item for one selection"
+                )
+            requested_children[requester] = child
     children: list[str] = []
-    reused = 0
-    for item in selected:
-        requester = _identifier(context.work_item_identifier, "item_requester", item)
-        child = await _requested(database, "item", requester)
+    for item, requester in zip(selected, requesters, strict=True):
+        child = requested_children.get(requester)
         if child is None:
             request = EbayItemRequest(
                 item_identifier=item,
@@ -299,11 +314,11 @@ async def _item_phase(
             child = await _enqueue(
                 definition, context, dependencies, stage="item", requester_identifier=requester
             )
-        work = await database.work(child)
-        if tuple(_strings(work.get("kind"))) == ("carl", "ebay", "extract", "item"):
-            reused += 1
         children.append(child)
     works = await _works(database, tuple(children))
+    reused = sum(
+        _strings(work.get("kind")) == ("carl", "ebay", "extract", "item") for work in works
+    )
     result: dict[str, JsonValue] = {
         **checkpoint,
         "stage": "collecting_items",

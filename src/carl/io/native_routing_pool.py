@@ -436,7 +436,6 @@ class NativeRoutingPool:
             async with self.manager.execution_guard(token, owner=self.manager.owner) as guard:
                 descriptor = guard.descriptor
                 assert descriptor is not None
-                guard.discard_unadmitted = True
                 with anyio.CancelScope(shield=True):
                     lease = await self.manager.database.try_acquire_resource_permit(
                         scope=self.manager.scope,
@@ -448,9 +447,9 @@ class NativeRoutingPool:
                         lease_duration_ns=self.manager.lease_duration_ns,
                     )
                 if lease is None:
+                    guard.discard_unadmitted = True
                     engine.ready.set()
                     return
-                guard.discard_unadmitted = False
                 async with (
                     self.manager.adopt(lease, guard) as permit,
                     anyio.create_task_group() as tasks,

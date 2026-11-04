@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-# The forwarding writer counts Python-to-SQL calls, excluding trigger internals.
+# Trace the real writer so native worker callbacks remain visible to the budget.
 # pyright: reportPrivateUsage=false
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import Any, cast
+from typing import Any
 
 import apsw
 import pytest
@@ -28,6 +28,8 @@ def anyio_backend(request: pytest.FixtureRequest) -> str:
 
 @dataclass
 class _CountingWriter:
+    """Async-call counter retained for the offer-publication tests."""
+
     connection: AsyncConnection
     statements: list[str] = field(default_factory=list)
 
@@ -69,20 +71,30 @@ async def test_one_real_claim_batches_eligibility_for_all_live_offers(
             await database.offer_fair_dispatch_candidates(
                 scope="test-host", work_identifiers=identifiers, now_utc_ns=NOW
             )
-            original = database._connections._writer
-            counter = _CountingWriter(original)
-            database._connections._writer = cast(AsyncConnection, cast(object, counter))
+            writer = database._connections._writer
+            statements: list[str] = []
+
+            def trace(event: dict[str, object], *, recorded: list[str] = statements) -> None:
+                # SQLite emits additional STMT notifications for trigger bodies.
+                # Count each executed application statement, including native SQL.
+                if not event.get("trigger"):
+                    statement = event["sql"]
+                    assert isinstance(statement, str)
+                    recorded.append(statement)
+
+            await writer.trace_v2(apsw.SQLITE_TRACE_STMT, trace, id="fair-admission-cost")
             try:
                 claim = await _claim(database, "stage-offer-000")
             finally:
-                database._connections._writer = original
+                await writer.trace_v2(0, None, id="fair-admission-cost")
             assert claim.lease is not None
             admissions = await database.fair_admissions("test-host")
             assert len(admissions) == 1
             assert admissions[0].work_item_identifier == "offer-000"
             assert admissions[0].sequence == 1
             assert (await database.work("offer-000"))["attempt"] == 1
-            counts[size] = len(counter.statements)
+            assert statements
+            counts[size] = len(statements)
     request.node.user_properties.extend(
         (f"admission_sql_calls_{size}_offers", count) for size, count in counts.items()
     )
