@@ -65,8 +65,6 @@ def _refresh_sql(identifier: str) -> str:
         coalesce(owner.service_class,'background'),{lane},s.id,w.kind_parts_json,
         w.payload_schema_version,w.priority,max(w.eligible_at_utc_ns,coalesce(s.eligible_at_utc_ns,0)),
         max(w.created_at_utc_ns,w.eligible_at_utc_ns,
-            CASE WHEN EXISTS(SELECT 1 FROM stage_attempts a WHERE a.operation_id=s.operation_id AND a.state='pending')
-                 THEN 0 ELSE coalesce(s.created_at_utc_ns,0) END,
             coalesce(json_extract(s.definition_json,'$.not_before_utc_ns'),0)),w.created_at_utc_ns,
         CASE WHEN w.state IN ('pending','leased') AND
             ((w.state='pending' AND s.id IS NULL AND NOT EXISTS(
@@ -86,8 +84,12 @@ def _refresh_sql(identifier: str) -> str:
         available_at_utc_ns=excluded.available_at_utc_ns,
         work_eligible_at_utc_ns=excluded.work_eligible_at_utc_ns,
         legacy_lease_expires_at_utc_ns=excluded.legacy_lease_expires_at_utc_ns,
-        ready_since_utc_ns=CASE WHEN fair_ready.stage_id IS excluded.stage_id
-            THEN fair_ready.ready_since_utc_ns ELSE excluded.ready_since_utc_ns END,
+        ready_since_utc_ns=CASE WHEN
+            (fair_ready.stage_id IS excluded.stage_id AND excluded.stage_id IS NOT NULL)
+            OR EXISTS(SELECT 1 FROM stage_attempts a WHERE a.work_item_id=excluded.work_item_id
+                AND a.state IN ('pending','active') AND a.state='active')
+            THEN max(fair_ready.ready_since_utc_ns,excluded.ready_since_utc_ns)
+            ELSE excluded.ready_since_utc_ns END,
         active=excluded.active;
     """
 
@@ -173,6 +175,7 @@ INSERT OR IGNORE INTO fair_roots VALUES ('["legacy"]','["legacy"]','background',
     '{"root_request_identifier":"legacy","workspace_identifier":null,"service_class":"background"}');
 """
 
+_REFRESH_TRIGGERS: dict[str, str] = {}
 for _name, _table, _identity, _events in (
     ("work", "work_items", "NEW.id", ("INSERT", "UPDATE")),
     ("stage", "work_stages", "NEW.work_item_id", ("INSERT", "UPDATE")),
@@ -181,7 +184,11 @@ for _name, _table, _identity, _events in (
     ("resident", "resident_sessions", "NEW.work_item_id", ("INSERT", "UPDATE")),
 ):
     for _event in _events:
-        _schema += f"CREATE TRIGGER IF NOT EXISTS fair_refresh_{_name}_{_event.lower()} AFTER {_event} ON {_table} BEGIN {_refresh_sql(_identity)} END;\n"
+        _trigger = f"fair_refresh_{_name}_{_event.lower()}"
+        _REFRESH_TRIGGERS[_trigger] = (
+            f"CREATE TRIGGER IF NOT EXISTS {_trigger} AFTER {_event} ON {_table} BEGIN {_refresh_sql(_identity)} END;\n"
+        )
+_schema += "".join(_REFRESH_TRIGGERS.values())
 _schema += """
 CREATE TRIGGER IF NOT EXISTS fair_ready_count_insert AFTER INSERT ON fair_ready
 WHEN NEW.active=1 BEGIN
@@ -218,6 +225,61 @@ CREATE TRIGGER IF NOT EXISTS fair_owned_work AFTER INSERT ON work_scheduling BEG
 END;
 """
 FAIR_SCHEMA = _schema
+
+
+async def migrate_logical_ready_age(connection: AsyncConnection) -> None:
+    """Replace schema-23 refresh triggers and repair current stage ages atomically."""
+    for name in _REFRESH_TRIGGERS:
+        await connection.execute(f"DROP TRIGGER IF EXISTS {name}")
+    await connection.execute("".join(_REFRESH_TRIGGERS.values()))
+    # Drive from live stages, not retained stage/work history. Only undo the
+    # identifiable stage-creation floor; preserve polling and explicit wake ages.
+    # Progress continuations can have a wake exactly at stage creation in a
+    # fixed clock, so retain their age even when that boundary is ambiguous.
+    await connection.execute(
+        """WITH ages AS MATERIALIZED (
+            SELECT stage.work_item_id,stage.id,
+                max(work.created_at_utc_ns,work.eligible_at_utc_ns,
+                    coalesce(json_extract(stage.definition_json,'$.not_before_utc_ns'),0)) AS logical_age,
+                max(work.created_at_utc_ns,work.eligible_at_utc_ns,
+                    CASE WHEN attempt.state='pending' THEN 0 ELSE stage.created_at_utc_ns END,
+                    coalesce(json_extract(stage.definition_json,'$.not_before_utc_ns'),0)) AS old_age
+            FROM work_stages stage INDEXED BY work_stages_active_work
+            CROSS JOIN work_items work ON work.id=stage.work_item_id
+            LEFT JOIN stage_attempts attempt ON attempt.operation_id=stage.operation_id
+            WHERE stage.state IN ('pending','running')
+        ), corrections AS MATERIALIZED (
+            SELECT ages.work_item_id,ages.id,
+                CASE WHEN ready.ready_since_utc_ns=ages.old_age
+                    AND ages.id NOT IN (SELECT continuation_id FROM progress_wait_builds)
+                THEN ages.logical_age ELSE max(ready.ready_since_utc_ns,ages.logical_age) END AS ready_age
+            FROM ages CROSS JOIN fair_ready ready ON ready.work_item_id=ages.work_item_id
+                AND ready.stage_id=ages.id
+        ) UPDATE fair_ready SET ready_since_utc_ns=corrections.ready_age FROM corrections
+        WHERE fair_ready.work_item_id=corrections.work_item_id
+            AND fair_ready.ready_since_utc_ns!=corrections.ready_age"""
+    )
+    # Schema 23 also retained the previous age when a delayed logical retry
+    # changed a NULL-stage row. A pending, unstarted attempt uses its own deadline.
+    await connection.execute(
+        """WITH initial AS MATERIALIZED (
+            SELECT work.id,max(work.created_at_utc_ns,work.eligible_at_utc_ns) AS ready_age
+            FROM work_items work INDEXED BY work_items_claim
+            CROSS JOIN fair_ready ready ON ready.work_item_id=work.id AND ready.stage_id IS NULL
+            WHERE work.state='pending' AND NOT EXISTS(
+                SELECT 1 FROM stage_attempts attempt WHERE attempt.work_item_id=work.id
+                    AND attempt.state IN ('pending','active'))
+        ) UPDATE fair_ready SET ready_since_utc_ns=initial.ready_age FROM initial
+        WHERE fair_ready.work_item_id=initial.id AND fair_ready.ready_since_utc_ns!=initial.ready_age"""
+    )
+    # Offers copy readiness for weighted CPU draining. Keep their stage binding,
+    # signature and expiry intact while bringing their copied age up to date.
+    await connection.execute(
+        """UPDATE fair_offers SET ready_since_utc_ns=ready.ready_since_utc_ns
+        FROM fair_ready ready WHERE fair_offers.work_item_id=ready.work_item_id
+            AND fair_offers.stage_id IS ready.stage_id
+            AND fair_offers.ready_since_utc_ns!=ready.ready_since_utc_ns"""
+    )
 
 
 def _integer(value: object) -> int:

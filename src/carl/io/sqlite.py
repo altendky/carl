@@ -231,9 +231,11 @@ DATABASE_SCHEMA = StorageSchemaIdentity(
     namespace=Namespace.CARL,
     domain=Domain.STORAGE,
     backend=StorageBackend.SQLITE,
-    version=23,
+    version=24,
 )
 
+_V23_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 23})
+_V23_SCHEMA_DEFINITION_SHA256 = "a4d3c6e84c5bf3c3fe46e898fc6bd20a7b80b032883fc6e4cb57c0a72085302a"
 _V22_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 22})
 _V22_SCHEMA_DEFINITION_SHA256 = "c250b9d74c7772b43569ca7342e462e986690aa290d7f1502e2a2525dd52c767"
 _V21_DATABASE_SCHEMA = DATABASE_SCHEMA.model_copy(update={"version": 21})
@@ -4537,6 +4539,14 @@ class Database:
         }
 
     @staticmethod
+    def _v23_metadata() -> dict[str, str]:
+        return {
+            "schema_identity_json": encode_json(_V23_DATABASE_SCHEMA.model_dump(mode="json")),
+            "schema_version": "23",
+            "schema_definition_sha256": _V23_SCHEMA_DEFINITION_SHA256,
+        }
+
+    @staticmethod
     def _v22_metadata() -> dict[str, str]:
         return {
             "schema_identity_json": encode_json(_V22_DATABASE_SCHEMA.model_dump(mode="json")),
@@ -4741,6 +4751,7 @@ class Database:
                 raise RuntimeError("Database has no Carl schema identity")
             if (
                 not await cls._metadata_matches(connection, cls._expected_metadata())
+                and not await cls._metadata_matches(connection, cls._v23_metadata())
                 and not await cls._metadata_matches(connection, cls._v22_metadata())
                 and not await cls._metadata_matches(connection, cls._v21_metadata())
                 and not await cls._metadata_matches(connection, cls._v20_metadata())
@@ -5261,6 +5272,12 @@ class Database:
                     )
             if await self._metadata_matches(connection, self._v22_metadata()):
                 await connection.execute(_HISTORY_QUERY_INDEXES)
+                for key, value in self._v23_metadata().items():
+                    await connection.execute(
+                        "UPDATE schema_metadata SET value=? WHERE key=?", (value, key)
+                    )
+            if await self._metadata_matches(connection, self._v23_metadata()):
+                await fair_sql.migrate_logical_ready_age(connection)
                 for key, value in self._expected_metadata().items():
                     await connection.execute(
                         "UPDATE schema_metadata SET value=? WHERE key=?", (value, key)
