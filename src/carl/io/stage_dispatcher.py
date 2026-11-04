@@ -235,6 +235,7 @@ class StageDispatcher:
                 tasks.start_soon(self._execute, metadata_receive.clone(), True)
             await execution_receive.aclose()
             await metadata_receive.aclose()
+            pass_active = False
             while True:
                 # Recovery is independent of the advisory capacity filter.
                 await self._recover()
@@ -380,10 +381,13 @@ class StageDispatcher:
                         now_utc_ns=self.manager.utc_now_ns(),
                     )
                 self._after = page.next_cursor
+                pass_active = pass_active or handed_off or progress_pending
                 if not page.has_more:
                     self._after = None
                     self._pass_time = None
-                    if handed_off or progress_pending:
+                    completed_pass_active = pass_active
+                    pass_active = False
+                    if completed_pass_active:
                         await anyio.lowlevel.checkpoint()
                     else:
                         await anyio.sleep(self.poll_seconds)
