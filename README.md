@@ -151,6 +151,22 @@ mise run check
 mise run pre-commit
 ```
 
+CI runs four isolated test shards for each supported Python version. Each shard uses
+`pytest-split` with deterministic selection, records its complete and selected test IDs, and
+uploads JUnit results and measured durations. A required audit checks that every collected test
+ran exactly once per version. Python 3.13 branch coverage is combined from all four shards before
+the full report is generated.
+
+To run one shard locally without changing the normal unsharded test command:
+
+```console
+uv run pytest --splits=4 --group=1 --splitting-algorithm=least_duration
+```
+
+Splitting uses the same committed `.test_durations` snapshot on every runner when available;
+without one, the first run balances test counts. CI artifacts retain selected-only measured
+durations for seven days so shard balance and end-to-end workflow latency can be reviewed.
+
 The implementation separates sans-I/O parsing and models in `carl.core`, effect adapters in
 `carl.io`, and application orchestration. Async work uses AnyIO with Trio. See the
 [architecture notes](docs/src/project/index.md),
