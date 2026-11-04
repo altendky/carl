@@ -64,7 +64,7 @@ jobs:
         if: ${{ !matrix.coverage }}
         run: >-
           uv run --locked --python ${{ matrix.python-version }} pytest
-          -p carl._tests.ci_shards --shard-manifest=shard-manifest.json
+          --shard-manifest=shard-manifest.json
           --splits=4 --group=${{ matrix.shard }} --splitting-algorithm=least_duration
           --store-durations --clean-durations
           --durations=30 --junitxml=test-results.xml
@@ -73,7 +73,7 @@ jobs:
         if: ${{ matrix.coverage }}
         run: >-
           uv run --locked --python ${{ matrix.python-version }} pytest
-          -p carl._tests.ci_shards --shard-manifest=shard-manifest.json
+          --shard-manifest=shard-manifest.json
           --splits=4 --group=${{ matrix.shard }} --splitting-algorithm=least_duration
           --store-durations --clean-durations
           --cov=carl --cov-report= --durations=30 --junitxml=test-results.xml

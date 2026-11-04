@@ -263,6 +263,40 @@ def test_manifest_plugin_is_inert_without_its_flag(pytester: pytest.Pytester) ->
     assert "carl_nodeid" not in (pytester.path / "plain.xml").read_text()
 
 
+def test_conftest_plugin_load_preserves_package_initialization_coverage(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coverage_path = pytester.path / "child.coverage"
+    monkeypatch.setenv("COVERAGE_FILE", str(coverage_path))
+    _ = pytester.makeconftest('pytest_plugins = ("carl._tests.ci_shards",)')
+    _ = pytester.makepyfile(
+        """
+        def test_version():
+            import carl
+            assert isinstance(carl.__version__, str) and carl.__version__
+        """
+    )
+    result = pytester.runpytest_subprocess(
+        "--shard-manifest=shard-manifest.json",
+        "--junitxml=test-results.xml",
+        "--cov=carl",
+        "--cov-report=",
+        "--cov-branch",
+    )
+    result.assert_outcomes(passed=1)
+    manifest = _manifest(pytester.path)
+    assert manifest["exit_code"] == 0
+    assert len(cast(list[str], manifest["full_nodeids"])) == 1
+    assert manifest["selected_nodeids"] == manifest["full_nodeids"]
+    executed, skipped, _ = ci_shards._junit(pytester.path / "test-results.xml")
+    assert executed == manifest["selected_nodeids"] and skipped == 0
+    data = CoverageData(basename=str(coverage_path))
+    data.read()
+    package_init = Path(ci_shards.__file__).resolve().parents[1] / "__init__.py"
+    # The package currently has one executable statement: its version assignment.
+    assert data.has_arcs() and data.lines(str(package_init))
+
+
 def test_real_split_hook_and_junit_keep_all_selected_skips(pytester: pytest.Pytester) -> None:
     _ = pytester.makepyfile(
         """
