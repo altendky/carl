@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from carl.core.json import decode_json, encode_json
@@ -273,19 +274,59 @@ async def close_wait(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ObservedWait:
+    stage: str | None
+    reason: str
+    resources: str
+    source: str
+    started: int
+    last_seen: int
+    expires: int
+
+
 async def observe(
     connection: AsyncConnection,
     scope: str,
     observations: tuple[SchedulerWaitObservation, ...],
     now: int,
 ) -> None:
-    for observation in observations:
-        row = await (
+    # Read current ownership and observations together in the caller's writer
+    # transaction. Repeated observations below still take effect in input order.
+    facts: dict[str, tuple[str, str | None, str | None]] = {}
+    waits: dict[str, _ObservedWait] = {}
+    if observations:
+        rows = await (
             await connection.execute(
-                "SELECT w.state,s.id,s.state FROM work_items w LEFT JOIN work_stages s ON s.work_item_id=w.id AND s.state IN ('pending','running') WHERE w.id=?",
-                (observation.work_identifier,),
+                """SELECT w.id,w.state,s.id,s.state,wait.work_id,wait.stage_id,
+                    wait.reason,wait.resources_json,wait.source,wait.started_ns,
+                    wait.last_seen_ns,wait.expires_ns
+                FROM json_each(?) selected
+                CROSS JOIN work_items w ON w.id=selected.value
+                LEFT JOIN work_stages s ON s.work_item_id=w.id AND s.state IN ('pending','running')
+                LEFT JOIN scheduler_waits wait ON wait.scope=? AND wait.work_id=w.id""",
+                (
+                    encode_json(list(dict.fromkeys(item.work_identifier for item in observations))),
+                    scope,
+                ),
             )
-        ).fetchone()
+        ).fetchall()
+        for row in rows:
+            work = str(row[0])
+            facts[work] = (str(row[1]), cast(str | None, row[2]), cast(str | None, row[3]))
+            if row[4] is not None:
+                waits[work] = _ObservedWait(
+                    cast(str | None, row[5]),
+                    str(row[6]),
+                    str(row[7]),
+                    str(row[8]),
+                    cast(int, row[9]),
+                    cast(int, row[10]),
+                    cast(int, row[11]),
+                )
+    changed: dict[str, _ObservedWait] = {}
+    for observation in observations:
+        row = facts.get(observation.work_identifier)
         if (
             row is None
             or row[0] not in ("pending", "leased")
@@ -293,42 +334,63 @@ async def observe(
             or observation.stage_identifier != row[1]
         ):
             continue
-        old = await (
-            await connection.execute(
-                "SELECT stage_id,reason,source,started_ns,last_seen_ns FROM scheduler_waits WHERE scope=? AND work_id=?",
-                (scope, observation.work_identifier),
-            )
-        ).fetchone()
+        old = waits.get(observation.work_identifier)
         same = (
             old is not None
-            and cast(int, old[3]) <= now <= cast(int, old[4]) + WAIT_TTL_NS
-            and (old[0], old[1], old[2])
+            and old.started <= now <= old.last_seen + WAIT_TTL_NS
+            and (old.stage, old.reason, old.source)
             == (
                 observation.stage_identifier,
                 observation.reason,
                 observation.source,
             )
         )
-        if same and old is not None and now - cast(int, old[4]) < 1_000_000_000:
+        if same and old is not None and now - old.last_seen < 1_000_000_000:
             continue
-        if old is not None and not same:
-            await close_wait(connection, scope, observation.work_identifier, now)
-        await connection.execute(
+        if old is not None and not same and old.reason == "resource":
+            duration = now - old.started
+            # Keep interval closure and rollup eviction in observation order,
+            # including intermediate intervals for duplicate work identifiers.
+            await rollup(
+                connection,
+                scope,
+                now,
+                "observed_resource_wait",
+                duration=duration,
+                method="observed_lower_bound",
+                censored=True,
+            )
+        current = _ObservedWait(
+            observation.stage_identifier,
+            observation.reason,
+            encode_json(list(observation.resource_names)),
+            observation.source,
+            old.started if same and old is not None else now,
+            now,
+            now + WAIT_TTL_NS,
+        )
+        waits[observation.work_identifier] = current
+        changed[observation.work_identifier] = current
+    if changed:
+        await connection.executemany(
             """INSERT INTO scheduler_waits VALUES(?,?,?,?,?,?,?,?,?)
             ON CONFLICT(scope,work_id) DO UPDATE SET stage_id=excluded.stage_id,reason=excluded.reason,
             resources_json=excluded.resources_json,source=excluded.source,started_ns=excluded.started_ns,
             last_seen_ns=excluded.last_seen_ns,expires_ns=excluded.expires_ns""",
-            (
-                scope,
-                observation.work_identifier,
-                observation.stage_identifier,
-                observation.reason,
-                encode_json(list(observation.resource_names)),
-                observation.source,
-                old[3] if same and old is not None else now,
-                now,
-                now + WAIT_TTL_NS,
-            ),
+            [
+                (
+                    scope,
+                    work,
+                    wait.stage,
+                    wait.reason,
+                    wait.resources,
+                    wait.source,
+                    wait.started,
+                    wait.last_seen,
+                    wait.expires,
+                )
+                for work, wait in changed.items()
+            ],
         )
     # A hard cap bounds open observations even for custom enormous queues.
     count = await (await connection.execute("SELECT count(*) FROM scheduler_waits")).fetchone()
