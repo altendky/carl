@@ -4,13 +4,18 @@ from __future__ import annotations
 
 # Trace the real writer so native worker callbacks remain visible to the budget.
 # pyright: reportPrivateUsage=false
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import TracebackType
+from typing import Any
 
 import apsw
 import pytest
 
 from carl._tests.test_fair_storage import _seed
 from carl._tests.test_stage_storage import NOW, _claim
+from carl.io.db import AsyncConnection
 from carl.io.sqlite import Database
 
 pytestmark = pytest.mark.anyio
@@ -19,6 +24,36 @@ pytestmark = pytest.mark.anyio
 @pytest.fixture(params=("trio", "asyncio"))
 def anyio_backend(request: pytest.FixtureRequest) -> str:
     return str(request.param)
+
+
+@dataclass
+class _CountingWriter:
+    """Async-call counter retained for the offer-publication tests."""
+
+    connection: AsyncConnection
+    statements: list[str] = field(default_factory=list)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.connection, name)
+
+    async def __aenter__(self) -> Any:
+        return await self.connection.__aenter__()
+
+    async def __aexit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Any:
+        return await self.connection.__aexit__(exception_type, exception, traceback)
+
+    async def execute(self, statement: str, bindings: apsw.Bindings | None = None) -> Any:
+        self.statements.append(statement)
+        return await self.connection.execute(statement, bindings)
+
+    async def executemany(self, statement: str, bindings: Iterable[apsw.Bindings]) -> Any:
+        self.statements.append(statement)
+        return await self.connection.executemany(statement, bindings)
 
 
 async def test_one_real_claim_batches_eligibility_for_all_live_offers(
