@@ -35,13 +35,16 @@ jobs:
         run: env --unset=GITHUB_ACTIONS uv run --locked --python 3.13.18 basedpyright --level error
 
   test:
-    name: Test (Python ${{ matrix.python-version }})
+    name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     env:
       MERGIFY_TOKEN_AVAILABLE: ${{ secrets.MERGIFY_TOKEN != '' }}
+      COVERAGE_FILE: .coverage.${{ matrix.python-version }}.${{ matrix.shard }}
     strategy:
       fail-fast: false
       matrix:
+        python-version: ["3.13.18", "3.14.10"]
+        shard: [1, 2, 3, 4]
         include:
           - python-version: 3.13.18
             coverage: true
@@ -59,14 +62,36 @@ jobs:
 
       - name: Run tests
         if: ${{ !matrix.coverage }}
-        run: uv run --locked --python ${{ matrix.python-version }} pytest --durations=30 --junitxml=test-results.xml
+        run: >-
+          uv run --locked --python ${{ matrix.python-version }} pytest
+          -p carl._tests.ci_shards --shard-manifest=shard-manifest.json
+          --splits=4 --group=${{ matrix.shard }} --splitting-algorithm=least_duration
+          --store-durations --clean-durations
+          --durations=30 --junitxml=test-results.xml
 
-      - name: Run tests with terminal coverage
+      - name: Run tests with coverage
         if: ${{ matrix.coverage }}
         run: >-
           uv run --locked --python ${{ matrix.python-version }} pytest
-          --cov=carl --cov-report=term-missing --durations=30
-          --junitxml=test-results.xml
+          -p carl._tests.ci_shards --shard-manifest=shard-manifest.json
+          --splits=4 --group=${{ matrix.shard }} --splitting-algorithm=least_duration
+          --store-durations --clean-durations
+          --cov=carl --cov-report= --durations=30 --junitxml=test-results.xml
+
+      - name: Upload shard results and coverage
+        if: ${{ !cancelled() && hashFiles('test-results.xml') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.python-version }}-${{ matrix.shard }}
+          path: |
+            test-results.xml
+            shard-manifest.json
+            .test_durations
+            .coverage.${{ matrix.python-version }}.${{ matrix.shard }}
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
 
       - name: Upload test results to Mergify CI Insights
         if: ${{ !cancelled() && env.MERGIFY_TOKEN_AVAILABLE == 'true' && hashFiles('test-results.xml') != '' }}
@@ -74,4 +99,40 @@ jobs:
         with:
           token: ${{ secrets.MERGIFY_TOKEN }}
           report_path: test-results.xml
-          job_name: Test (Python ${{ matrix.python-version }})
+          job_name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }}/4)
+
+  coverage:
+    name: Coverage and shard audit
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.13.18
+
+      - name: Download shard results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: test-results-*
+          path: test-results
+
+      - name: Verify complete, disjoint test execution
+        run: >-
+          uv run --locked --python 3.13.18 python -m carl._tests.ci_shards
+          --artifacts test-results --versions 3.13.18 3.14.10 --shards 4
+          --coverage-version 3.13.18
+
+      - name: Combine coverage and report
+        shell: bash
+        run: |
+          coverage_files=()
+          for shard in 1 2 3 4; do
+            coverage_files+=("test-results/test-results-3.13.18-${shard}/.coverage.3.13.18.${shard}")
+          done
+          uv run --locked --python 3.13.18 coverage combine "${coverage_files[@]}"
+          uv run --locked --python 3.13.18 coverage report --show-missing
