@@ -109,6 +109,8 @@ from carl.core.review_workspace import (
     ReleaseReviewClaimResult,
     RenameReviewWorkspaceRequest,
     RenewReviewClaimRequest,
+    RequestWorkspaceRefreshAllRequest,
+    RequestWorkspaceRefreshAllResult,
     RequestWorkspaceRefreshRequest,
     RequestWorkspaceRefreshResult,
     RetryWorkspaceSearchTrackRequest,
@@ -464,6 +466,13 @@ Workspaces may mix sources. Review IDs use ebay:<item ID> for eBay and bare nume
 copy returned identities unchanged through reviews, claims, worksets, snapshots, and analysis. Add another phrase with create_workspace_search; after it
 completes, refresh that track with request_workspace_refresh before requesting analysis. Refreshes
 advance the selected track without replacing the workspace.
+Use request_workspace_refresh_all with a workspace ID to refresh every enabled track whose initial
+search completed, using each track's saved specification and default refresh options. It returns one
+queued, active, skipped, or failed outcome per track, plus unique work IDs for get_work_status.
+Disabled or incomplete tracks are skipped; one track's failure does not prevent the others from queueing.
+An active refresh is reused atomically even if its captured options or specification differ from the
+current track. Repeated bulk calls are safe while work remains active; after completion, another call
+can queue a new refresh. request_workspace_refresh still requires a track ID when several tracks are eligible.
 To adjust the same watch, read get_review_workspace, then revise_workspace_search_track with its
 current search_specification_version as expected_version and the complete replacement search spec.
 This preserves the track ID, listing first/last-seen history, and prior runs; inspect immutable
@@ -899,6 +908,13 @@ def tool_definitions(
         """Queue a refresh of one workspace search track, defaulting when only one exists."""
 
         return await expected(lambda: application.request_workspace_refresh(request))
+
+    async def request_workspace_refresh_all(
+        request: RequestWorkspaceRefreshAllRequest,
+    ) -> RequestWorkspaceRefreshAllResult:
+        """Refresh all enabled, initialized workspace tracks using saved specs and default options; return per-track outcomes and reuse active work."""
+
+        return await expected(lambda: application.request_workspace_refresh_all(request))
 
     async def set_workspace_search_track_enabled(
         request: SetWorkspaceSearchTrackEnabledRequest,
@@ -1472,6 +1488,13 @@ def tool_definitions(
             ("carl", "review", "request_workspace_refresh"),
             request_workspace_refresh,
             request_workspace_refresh.__doc__ or "",
+            _OPEN_WORLD_MUTATION,
+        ),
+        ToolDefinition(
+            "request_workspace_refresh_all",
+            ("carl", "review", "request_workspace_refresh_all"),
+            request_workspace_refresh_all,
+            request_workspace_refresh_all.__doc__ or "",
             _OPEN_WORLD_MUTATION,
         ),
         ToolDefinition(

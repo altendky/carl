@@ -453,6 +453,26 @@ class RequestWorkspaceRefreshResult(StrictModel):
     base_search_run_record_identifier: str = Field(min_length=1)
 
 
+class RequestWorkspaceRefreshAllRequest(StrictModel):
+    workspace_record_identifier: str = Field(min_length=1)
+
+
+class WorkspaceTrackRefreshOutcome(StrictModel):
+    track_identifier: str = Field(min_length=1)
+    status: Literal["queued", "active", "skipped", "failed"]
+    work_identifier: str | None = None
+    created: bool | None = None
+    state: WorkState | None = None
+    base_search_run_record_identifier: str | None = None
+    reason: str | None = None
+
+
+class RequestWorkspaceRefreshAllResult(StrictModel):
+    workspace_record_identifier: str = Field(min_length=1)
+    tracks: tuple[WorkspaceTrackRefreshOutcome, ...]
+    work_identifiers: tuple[str, ...]
+
+
 class ListWorkspaceListingsRequest(StrictModel):
     workspace_record_identifier: str = Field(min_length=1)
     filters: ComposedListingFilters = ComposedListingFilters()

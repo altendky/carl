@@ -39048,6 +39048,292 @@
     }
   },
   {
+    "name": "request_workspace_refresh_all",
+    "description": "Refresh all enabled, initialized workspace tracks using saved specs and default options; return per-track outcomes and reuse active work.",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "RequestWorkspaceRefreshAllRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "workspace_record_identifier": {
+              "minLength": 1,
+              "title": "Workspace Record Identifier",
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_record_identifier"
+          ],
+          "title": "RequestWorkspaceRefreshAllRequest",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/RequestWorkspaceRefreshAllRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "request_workspace_refresh_allArguments"
+    },
+    "outputSchema": {
+      "type": "object",
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "workspace_record_identifier": {
+              "minLength": 1,
+              "title": "Workspace Record Identifier",
+              "type": "string"
+            },
+            "tracks": {
+              "items": {
+                "$ref": "#/$defs/WorkspaceTrackRefreshOutcome"
+              },
+              "title": "Tracks",
+              "type": "array"
+            },
+            "work_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Work Identifiers",
+              "type": "array"
+            }
+          },
+          "required": [
+            "workspace_record_identifier",
+            "tracks",
+            "work_identifiers"
+          ],
+          "title": "RequestWorkspaceRefreshAllResult",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "carl_tool_response_page",
+              "default": "carl_tool_response_page",
+              "title": "Kind",
+              "type": "string"
+            },
+            "tool_name": {
+              "title": "Tool Name",
+              "type": "string"
+            },
+            "cursor": {
+              "title": "Cursor",
+              "type": "string"
+            },
+            "payload_format": {
+              "enum": [
+                "structured_json",
+                "mcp_result_json"
+              ],
+              "title": "Payload Format",
+              "type": "string"
+            },
+            "encoding": {
+              "const": "utf-8",
+              "default": "utf-8",
+              "title": "Encoding",
+              "type": "string"
+            },
+            "fragment_location": {
+              "const": "structuredContent.json_fragment",
+              "default": "structuredContent.json_fragment",
+              "title": "Fragment Location",
+              "type": "string"
+            },
+            "total_json_bytes": {
+              "minimum": 0,
+              "title": "Total Json Bytes",
+              "type": "integer"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Unicode character offset in the original response JSON",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Next Cursor"
+            },
+            "has_more": {
+              "title": "Has More",
+              "type": "boolean"
+            },
+            "original_is_error": {
+              "title": "Original Is Error",
+              "type": "boolean"
+            },
+            "critical_metadata": {
+              "additionalProperties": {
+                "$ref": "#/$defs/CarlResponsePage_JsonValue"
+              },
+              "title": "Critical Metadata",
+              "type": "object"
+            },
+            "recovery_instructions": {
+              "default": "Read this full page from structuredContent, including json_fragment; content text is only a notice. Call get_tool_response_page with next_cursor until has_more is false. Concatenate json_fragment strings in offset order and parse the compact JSON. For structured_json it is the original structured payload; original_is_error retains the tool error flag. For mcp_result_json it is the complete original MCP result. Do not repeat the original tool: it already ran. After retaining the final fragment, call get_tool_response_page with that page's cursor and acknowledge=true for a small receipt. Retrieve unread pages before restarting this server process.",
+              "title": "Recovery Instructions",
+              "type": "string"
+            },
+            "json_fragment": {
+              "title": "Json Fragment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_name",
+            "cursor",
+            "payload_format",
+            "total_json_bytes",
+            "sha256",
+            "offset",
+            "next_cursor",
+            "has_more",
+            "original_is_error",
+            "json_fragment"
+          ],
+          "title": "ToolResponsePage",
+          "type": "object"
+        }
+      ],
+      "$defs": {
+        "WorkState": {
+          "enum": [
+            "pending",
+            "leased",
+            "completed",
+            "terminal_failure",
+            "cancelling",
+            "cancelled"
+          ],
+          "title": "WorkState",
+          "type": "string"
+        },
+        "WorkspaceTrackRefreshOutcome": {
+          "additionalProperties": false,
+          "properties": {
+            "track_identifier": {
+              "minLength": 1,
+              "title": "Track Identifier",
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "queued",
+                "active",
+                "skipped",
+                "failed"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "work_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Work Identifier"
+            },
+            "created": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Created"
+            },
+            "state": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "base_search_run_record_identifier": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Base Search Run Record Identifier"
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reason"
+            }
+          },
+          "required": [
+            "track_identifier",
+            "status"
+          ],
+          "title": "WorkspaceTrackRefreshOutcome",
+          "type": "object"
+        },
+        "CarlResponsePage_JsonValue": {}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "_meta": {
+      "carl/operation": [
+        "carl",
+        "review",
+        "request_workspace_refresh_all"
+      ]
+    }
+  },
+  {
     "name": "retry_image_failures",
     "description": "Requeue terminal image work linked to one exact search run or refresh.",
     "inputSchema": {

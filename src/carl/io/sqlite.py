@@ -8819,6 +8819,46 @@ class Database:
             )
         return identifiers
 
+    async def active_workspace_track_refresh(
+        self, workspace_record_identifier: str, track_identifier: str
+    ) -> tuple[str, WorkState, str] | None:
+        """Return the latest active refresh and its retained base run for one track.
+
+        This lookup joins an enclosing writer transaction, allowing a caller to
+        atomically reuse active work or enqueue a refresh when none exists.
+        """
+
+        async with self._connections.reader() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT work.id, work.state,
+                       json_extract(work.payload_json, '$.base_search_run_record_identifier'),
+                       json_type(work.payload_json, '$.base_search_run_record_identifier')
+                FROM work_requests AS request INDEXED BY work_requests_requester
+                CROSS JOIN work_items AS work ON work.id = request.work_item_id
+                WHERE request.requester_identifier = ?
+                  AND request.requester_kind_parts_json = ?
+                  AND json_extract(request.context_json, '$.track_identifier') = ?
+                  AND work.kind_parts_json IN (?, ?)
+                  AND work.state IN ('pending', 'leased')
+                ORDER BY work.created_at_utc_ns DESC, work.id DESC
+                LIMIT 1
+                """,
+                (
+                    workspace_record_identifier,
+                    _json(["carl", "mcp", "request_workspace_refresh"]),
+                    track_identifier,
+                    _json(["carl", "facebook", "work", "refresh_search"]),
+                    _json(["carl", "ebay", "work", "refresh_search"]),
+                ),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        if row[3] != "text" or not row[2]:
+            raise ValueError("Active workspace refresh has no valid base search run identifier")
+        return _text(row[0]), WorkState(_text(row[1])), _text(row[2])
+
     async def requested_work_edges(
         self, *, requester_kind: tuple[str, ...], requester_identifier: str
     ) -> tuple[dict[str, JsonValue], ...]:
