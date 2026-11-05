@@ -301,6 +301,8 @@ from carl.core.review_workspace import (
     ReleaseReviewClaimResult,
     RenameReviewWorkspaceRequest,
     RenewReviewClaimRequest,
+    RequestWorkspaceRefreshAllRequest,
+    RequestWorkspaceRefreshAllResult,
     RequestWorkspaceRefreshRequest,
     RequestWorkspaceRefreshResult,
     RetryWorkspaceSearchTrackRequest,
@@ -340,6 +342,7 @@ from carl.core.review_workspace import (
     WorkspaceSearchTrack,
     WorkspaceSearchTrackSpecificationRecord,
     WorkspaceSearchTrackStateRecord,
+    WorkspaceTrackRefreshOutcome,
     WorkspaceWorkStatus,
     WorkspaceWorkWaitResult,
     build_review_workspace_component_registry,
@@ -883,8 +886,8 @@ class ReviewApplication:
             code_provenance=code_provenance,
             source_tree_sha256=source_tree_sha256,
             capabilities=(
-                ServerCapability(identity=("carl", "mcp", "instructions"), version=66),
-                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=49),
+                ServerCapability(identity=("carl", "mcp", "instructions"), version=67),
+                ServerCapability(identity=("carl", "mcp", "tool_contracts"), version=50),
                 ServerCapability(
                     identity=("carl", "facebook", "price_partition_search_only"), version=1
                 ),
@@ -5995,6 +5998,14 @@ class ReviewApplication:
                 raise ReviewInputError("Enable the workspace search track before refreshing it")
             if track.current_search_run_record_identifier is None:
                 raise ReviewInputError("Wait for the search track's initial search to complete")
+        return await self._request_workspace_track_refresh(workspace, track, request)
+
+    async def _request_workspace_track_refresh(
+        self,
+        workspace: ReviewWorkspace,
+        track: WorkspaceSearchTrack,
+        request: RequestWorkspaceRefreshRequest,
+    ) -> RequestWorkspaceRefreshResult:
         assert track.current_search_run_record_identifier is not None
         if (
             track.latest_refresh_work_state in (WorkState.PENDING, WorkState.LEASED)
@@ -6047,6 +6058,94 @@ class ReviewApplication:
             created=result.created,
             state=WorkState(result.state),
             base_search_run_record_identifier=result.base_search_run_record_identifier,
+        )
+
+    async def request_workspace_refresh_all(
+        self, request: RequestWorkspaceRefreshAllRequest
+    ) -> RequestWorkspaceRefreshAllResult:
+        """Refresh each eligible track, independently reusing active workspace work."""
+
+        workspace = await self.get_review_workspace(request.workspace_record_identifier)
+        outcomes: list[WorkspaceTrackRefreshOutcome] = []
+        for selected_track in workspace.search_tracks:
+            try:
+                # Serialize the lookup and enqueue together: payload deduplication
+                # alone cannot reuse refreshes requested with different options.
+                async with self.database.transaction():
+                    # Another refresh may have completed, or the track may have
+                    # been edited, since this call enumerated the workspace.
+                    track = next(
+                        candidate
+                        for candidate in await self._workspace_search_tracks(workspace)
+                        if candidate.track_identifier == selected_track.track_identifier
+                    )
+                    skip_reason = (
+                        "disabled"
+                        if not track.enabled
+                        else "initial_search_incomplete"
+                        if track.current_search_run_record_identifier is None
+                        else None
+                    )
+                    if skip_reason is not None:
+                        outcomes.append(
+                            WorkspaceTrackRefreshOutcome(
+                                track_identifier=track.track_identifier,
+                                status="skipped",
+                                reason=skip_reason,
+                            )
+                        )
+                        continue
+                    active = await self.database.active_workspace_track_refresh(
+                        workspace.record_identifier, track.track_identifier
+                    )
+                    if active is not None:
+                        work_identifier, state, base_identifier = active
+                        outcome = WorkspaceTrackRefreshOutcome(
+                            track_identifier=track.track_identifier,
+                            status="active",
+                            work_identifier=work_identifier,
+                            created=False,
+                            state=state,
+                            base_search_run_record_identifier=base_identifier,
+                        )
+                    else:
+                        result = await self._request_workspace_track_refresh(
+                            workspace,
+                            track,
+                            RequestWorkspaceRefreshRequest(
+                                workspace_record_identifier=workspace.record_identifier,
+                                track_identifier=track.track_identifier,
+                            ),
+                        )
+                        outcome = WorkspaceTrackRefreshOutcome(
+                            track_identifier=track.track_identifier,
+                            status="queued" if result.created else "active",
+                            work_identifier=result.work_identifier,
+                            created=result.created,
+                            state=result.state,
+                            base_search_run_record_identifier=(
+                                result.base_search_run_record_identifier
+                            ),
+                        )
+                outcomes.append(outcome)
+            except Exception as error:
+                outcomes.append(
+                    WorkspaceTrackRefreshOutcome(
+                        track_identifier=selected_track.track_identifier,
+                        status="failed",
+                        reason=str(error) or type(error).__name__,
+                    )
+                )
+        return RequestWorkspaceRefreshAllResult(
+            workspace_record_identifier=workspace.record_identifier,
+            tracks=tuple(outcomes),
+            work_identifiers=tuple(
+                dict.fromkeys(
+                    outcome.work_identifier
+                    for outcome in outcomes
+                    if outcome.work_identifier is not None
+                )
+            ),
         )
 
     def _selected_workspace_product_guide(

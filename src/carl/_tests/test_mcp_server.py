@@ -40,12 +40,15 @@ from carl.core.pipeline import (
 from carl.core.review_workspace import (
     RecordWorkspaceBulkReviewRequest,
     RecordWorkspaceBulkReviewResult,
+    RequestWorkspaceRefreshAllRequest,
+    RequestWorkspaceRefreshAllResult,
     ReviewDisposition,
     ReviewState,
     ReviseWorkspaceSearchTrackRequest,
     WorksetBulkReviewSelection,
     WorkspaceSearchTrack,
     WorkspaceSearchTrackSpecificationRecord,
+    WorkspaceTrackRefreshOutcome,
 )
 from carl.core.work import WorkState
 from carl.io.sqlite import Database
@@ -108,6 +111,7 @@ EXPECTED_TOOLS = {
     "request_search_pipeline",
     "request_listing_details",
     "request_workspace_refresh",
+    "request_workspace_refresh_all",
     "rename_review_workspace",
     "run_search",
     "set_review_workspace_archived",
@@ -159,6 +163,74 @@ def _assert_analysis_batch_contracts(tools_by_name: dict[str, Any]) -> None:
         "missing_for_selected_guide",
         "never_analyzed_listing",
     ]
+
+
+@pytest.mark.anyio
+async def test_workspace_bulk_refresh_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    received: list[RequestWorkspaceRefreshAllRequest] = []
+    expected = RequestWorkspaceRefreshAllResult(
+        workspace_record_identifier="workspace-1",
+        tracks=(
+            WorkspaceTrackRefreshOutcome(
+                track_identifier="facebook-track",
+                status="queued",
+                work_identifier="refresh-1",
+                created=True,
+                state=WorkState.PENDING,
+                base_search_run_record_identifier="facebook-run",
+            ),
+            WorkspaceTrackRefreshOutcome(
+                track_identifier="ebay-track",
+                status="active",
+                work_identifier="refresh-2",
+                created=False,
+                state=WorkState.LEASED,
+                base_search_run_record_identifier="ebay-run",
+            ),
+            WorkspaceTrackRefreshOutcome(
+                track_identifier="disabled-track", status="skipped", reason="disabled"
+            ),
+            WorkspaceTrackRefreshOutcome(
+                track_identifier="failed-track", status="failed", reason="unsupported search"
+            ),
+        ),
+        work_identifiers=("refresh-1", "refresh-2"),
+    )
+
+    async def refresh_all(
+        _application: ReviewApplication, request: RequestWorkspaceRefreshAllRequest
+    ) -> RequestWorkspaceRefreshAllResult:
+        received.append(request)
+        return expected
+
+    monkeypatch.setattr(
+        ReviewApplication, "request_workspace_refresh_all", refresh_all, raising=False
+    )
+    async with Database.managed(tmp_path / "carl.sqlite3", initialize=True) as database:
+        application = ReviewApplication(database=database, repository_root=tmp_path)
+        async with Client(build_server(application)) as client:
+            invalid = await client.call_tool(
+                "request_workspace_refresh_all",
+                {
+                    "request": {
+                        "workspace_record_identifier": "workspace-1",
+                        "track_identifier": "facebook-track",
+                    }
+                },
+            )
+            assert invalid.is_error
+            assert not received
+            result = await client.call_tool(
+                "request_workspace_refresh_all",
+                {"request": {"workspace_record_identifier": "workspace-1"}},
+            )
+            assert not result.is_error
+            assert result.structured_content == expected.model_dump(mode="json")
+            assert received == [
+                RequestWorkspaceRefreshAllRequest(workspace_record_identifier="workspace-1")
+            ]
 
 
 @pytest.mark.anyio
@@ -488,6 +560,7 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
         )
         assert refresh.annotations.open_world_hint
         assert definitions_by_name["request_search_pipeline"].annotations.open_world_hint
+        assert definitions_by_name["request_workspace_refresh_all"].annotations.open_world_hint
         assert definitions_by_name["get_search_pipeline"].annotations.read_only_hint
         assert definitions_by_name[
             "list_workspace_search_track_versions"
@@ -631,10 +704,10 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
             assert capability_versions[("carl", "facebook", "search_run_membership")] == 1
             assert capability_versions[("carl", "facebook", "analysis_batch")] == 6
             assert capability_versions[("carl", "review", "provenance_summary")] == 1
-            assert capability_versions[("carl", "mcp", "instructions")] == 66
+            assert capability_versions[("carl", "mcp", "instructions")] == 67
             assert capability_versions[("carl", "facebook", "price_partition_search_only")] == 1
             assert capability_versions[("carl", "facebook", "analysis_timeout_retry")] == 1
-            assert capability_versions[("carl", "mcp", "tool_contracts")] == 49
+            assert capability_versions[("carl", "mcp", "tool_contracts")] == 50
             assert capability_versions[("carl", "mcp", "response_pages")] == 4
             assert capability_versions[("carl", "marketplace", "search_pipeline")] == 1
             assert capability_versions[("carl", "review", "workspace_work")] == 4
@@ -1153,6 +1226,10 @@ async def test_mcp_tool_discovery_and_empty_guide_listing(tmp_path: Path) -> Non
                             "track_identifier": "missing-track",
                         }
                     },
+                ),
+                await call_json(
+                    "request_workspace_refresh_all",
+                    {"request": {"workspace_record_identifier": "missing-workspace"}},
                 ),
                 await call_json(
                     "set_workspace_search_track_enabled",

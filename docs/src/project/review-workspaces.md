@@ -24,6 +24,25 @@ track ID. `request_workspace_refresh` advances one track without replacing the
 workspace. Thus the workspace remains the durable scope for review history,
 batches, worksets, selection snapshots, and search evolution.
 
+To refresh all eligible tracks explicitly, call `request_workspace_refresh_all`
+with `workspace_record_identifier`. It uses each enabled track's saved search
+specification and default refresh options, including mixed Facebook/eBay
+workspaces. The response contains one outcome per track: `queued` for new work,
+`active` for reused work, `skipped` with `disabled` or
+`initial_search_incomplete`, or `failed` with a reason. A failure on one track
+does not prevent the remaining tracks from queueing. Queue outcomes describe
+refresh requests; they do not mean acquisition has completed.
+
+Active refreshes are reused atomically, including refreshes with previously
+captured options or specification versions. Repeating the call while work is
+active returns its existing work IDs. After a refresh completes, another call
+may start a new refresh for that track. Poll the response's unique
+`work_identifiers` with `get_work_status` to follow those exact requests.
+`get_workspace_work_status` includes historical workspace work and is not a
+status group limited to this bulk call. The single-track
+`request_workspace_refresh` behavior is unchanged: omitting `track_identifier`
+still fails when several tracks are eligible.
+
 The track ID identifies a watch, not one immutable set of search parameters.
 Read `get_review_workspace` for its complete current `search_specification` and
 `search_specification_version`, then call `revise_workspace_search_track` with
