@@ -95,7 +95,7 @@ jobs:
 
       - name: Upload test results to Mergify CI Insights
         if: ${{ !cancelled() && env.MERGIFY_TOKEN_AVAILABLE == 'true' && hashFiles('test-results.xml') != '' }}
-        uses: mergifyio/gha-mergify-ci@29114c5c7ab4abec65e88509c3d05e94e05fbe52 # v28
+        uses: mergifyio/gha-mergify-ci@9a7adba0627bb4ff8f170b0e9854171b5b3e6235 # v29
         with:
           token: ${{ secrets.MERGIFY_TOKEN }}
           report_path: test-results.xml
